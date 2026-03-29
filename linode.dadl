@@ -32,7 +32,7 @@ backend:
 
   auth:
     type: bearer
-    credential: vault/linode-token
+    credential: linode_token
 
   defaults:
     headers:
