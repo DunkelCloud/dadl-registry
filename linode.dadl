@@ -1,0 +1,2210 @@
+# linode.dadl -- Linode (Akamai) REST API v4
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - Linode is now part of Akamai. The API is still branded "Linode API v4".
+# - "Linode" (capital L) = a cloud compute instance (virtual machine).
+# - Regions use short IDs like "us-east", "eu-west", "ap-southeast".
+# - Instance types use slugs like "g6-nanode-1", "g6-standard-2".
+# - Images use format "linode/ubuntu22.04" (official) or "private/12345" (custom).
+# - Filtering on list endpoints uses X-Filter header with JSON, NOT query params.
+#   Example: X-Filter: {"region": "us-east", "status": "running"}
+#   Operators: +and, +or, +gt, +gte, +lt, +lte, +contains, +neq, +order_by, +order
+# - All timestamps are ISO 8601 UTC.
+# - Some endpoints are public (no auth): regions, types, kernels.
+# - Destructive actions (delete, rebuild) are immediate and irreversible.
+# - Statistics endpoints have stricter rate limits (50 req/min).
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Linode REST API v4"
+source_url: "https://techdocs.akamai.com/linode-api/reference/api"
+date: "2026-03-29"
+
+backend:
+  name: linode
+  type: rest
+  base_url: https://api.linode.com/v4
+  description: "Linode (Akamai) cloud infrastructure API -- compute instances, volumes, DNS, networking, Kubernetes, databases, object storage, and account management"
+
+  auth:
+    type: bearer
+    credential: vault/linode-token
+
+  defaults:
+    headers:
+      Content-Type: application/json
+    pagination:
+      strategy: page
+      request:
+        cursor_param: page
+        limit_param: page_size
+        limit_default: 100
+      response:
+        next_cursor: "$.page"
+        has_more: "$.page < $.pages"
+      behavior: expose
+      max_pages: 20
+    errors:
+      format: json
+      message_path: "$.errors[0].reason"
+      code_path: "$.errors[0].field"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      terminal: [400, 401, 403, 404, 405]
+      rate_limit:
+        header: X-RateLimit-Remaining
+        retry_after_header: Retry-After
+    response:
+      result_path: "$.data"
+      metadata_path: "$"
+      max_items: 200
+
+  coverage:
+    endpoints: 118
+    total_endpoints: 400
+    percentage: 30
+    focus: "linodes, volumes, domains, nodebalancers, firewalls, VPCs, LKE, databases, object storage, images, stackscripts, regions, account, profile, events, tags"
+    missing: "longview, managed services, monitor, IAM/delegation, service transfers, beta programs, placement groups, support tickets"
+    last_reviewed: "2026-03-29"
+
+  setup:
+    credential_steps:
+      - "Log in to Linode Cloud Manager at https://cloud.linode.com"
+      - "Navigate to your profile icon (top right) → API Tokens"
+      - "Click 'Create a Personal Access Token'"
+      - "Set a label, expiry, and select scopes (Read/Write per category)"
+      - "Copy the token immediately -- it is shown only once"
+    env_var: CREDENTIAL_LINODE_TOKEN
+    backends_yaml: |
+      - name: linode
+        transport: rest
+        dadl: /app/dadl/linode.dadl
+    required_scopes:
+      - "linodes:read_write"
+      - "volumes:read_write"
+      - "domains:read_write"
+      - "nodebalancers:read_write"
+      - "firewall:read_write"
+      - "lke:read_write"
+      - "databases:read_write"
+      - "object_storage:read_write"
+      - "images:read_write"
+      - "stackscripts:read_write"
+      - "events:read_only"
+      - "account:read_only"
+      - "ips:read_write"
+    optional_scopes:
+      - "account:read_write"
+      - "vpc:read_write"
+    docs_url: "https://techdocs.akamai.com/linode-api/reference/get-started"
+    notes: "Personal Access Tokens (PATs) are the simplest auth method. OAuth2 is also supported for third-party apps. Scopes are per-category with read_only or read_write levels."
+
+  hints:
+    list_linodes:
+      filtering: "Use X-Filter header for server-side filtering, e.g. {\"region\": \"us-east\", \"status\": \"running\"}"
+      sorting: "Use +order_by and +order in X-Filter, e.g. {\"+order_by\": \"created\", \"+order\": \"desc\"}"
+    create_linode:
+      required_combo: "region + type are always required. Add image to auto-provision a disk and boot."
+      root_pass: "Required when image is set. Must meet complexity requirements."
+      authorized_keys: "Array of SSH public keys -- added to root's authorized_keys when image is set."
+    rebuild_linode:
+      warning: "Destroys all disks and rebuilds from the specified image. This is irreversible."
+    resize_linode:
+      note: "Linode is powered off during resize. Warm resize (allow_auto_disk_resize) may keep data."
+    create_volume:
+      attach: "Set linode_id to auto-attach. Otherwise create unattached and use attach_volume."
+    create_lke_cluster:
+      k8s_versions: "Call list_lke_versions first to get available Kubernetes version strings."
+
+  tools:
+
+    # =========================================================================
+    # LINODES (Compute Instances) -- Core CRUD & Lifecycle
+    # =========================================================================
+
+    list_linodes:
+      method: GET
+      path: /linode/instances
+      access: read
+      description: "List all Linode instances. Supports X-Filter header for filtering by region, status, tags, etc."
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_linode:
+      method: GET
+      path: /linode/instances/{linodeId}
+      access: read
+      description: "Get details of a specific Linode instance"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_linode:
+      method: POST
+      path: /linode/instances
+      access: write
+      description: "Create a new Linode instance. Requires region and type. Set image to auto-provision and boot."
+      params:
+        region: { type: string, in: body, required: true, description: "Region ID (e.g. us-east, eu-west)" }
+        type: { type: string, in: body, required: true, description: "Instance type slug (e.g. g6-nanode-1)" }
+        label: { type: string, in: body, description: "Display name (3-64 chars, alphanumeric/dash/underscore)" }
+        image: { type: string, in: body, description: "Image ID (e.g. linode/ubuntu22.04). Required for auto-provisioning." }
+        root_pass: { type: string, in: body, description: "Root password. Required when image is set." }
+        authorized_keys: { type: array, in: body, description: "SSH public keys for root access" }
+        authorized_users: { type: array, in: body, description: "Linode usernames whose SSH keys to include" }
+        booted: { type: boolean, in: body, description: "Boot after creation (default true when image is set)" }
+        backups_enabled: { type: boolean, in: body }
+        swap_size: { type: integer, in: body, description: "Swap disk size in MB (default 512)" }
+        private_ip: { type: boolean, in: body, description: "Allocate a private IPv4 address" }
+        tags: { type: array, in: body }
+        firewall_id: { type: integer, in: body, description: "Firewall to attach on creation" }
+        stackscript_id: { type: integer, in: body }
+        stackscript_data: { type: object, in: body, description: "UDF data for the StackScript" }
+        backup_id: { type: integer, in: body, description: "Backup ID to restore from" }
+        metadata: { type: object, in: body, description: "User data via metadata.user_data (base64-encoded)" }
+      pagination: none
+
+    update_linode:
+      method: PUT
+      path: /linode/instances/{linodeId}
+      access: write
+      description: "Update a Linode's label, tags, alerts, backups schedule, or watchdog"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        tags: { type: array, in: body }
+        backups: { type: object, in: body, description: "Backup schedule config" }
+        alerts: { type: object, in: body, description: "Alert thresholds (cpu, io, network, transfer)" }
+        watchdog_enabled: { type: boolean, in: body }
+      pagination: none
+
+    delete_linode:
+      method: DELETE
+      path: /linode/instances/{linodeId}
+      access: dangerous
+      description: "Delete a Linode instance and all associated disks and IPs. Irreversible."
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    boot_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/boot
+      access: write
+      description: "Boot a Linode instance"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        config_id: { type: integer, in: body, description: "Config profile to boot. Uses default if omitted." }
+      pagination: none
+
+    reboot_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/reboot
+      access: write
+      description: "Reboot a Linode instance"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        config_id: { type: integer, in: body }
+      pagination: none
+
+    shutdown_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/shutdown
+      access: write
+      description: "Shut down a Linode instance"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    rebuild_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/rebuild
+      access: dangerous
+      description: "Rebuild a Linode from an image. Destroys all existing disks. Irreversible."
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        image: { type: string, in: body, required: true }
+        root_pass: { type: string, in: body, required: true }
+        authorized_keys: { type: array, in: body }
+        authorized_users: { type: array, in: body }
+        stackscript_id: { type: integer, in: body }
+        stackscript_data: { type: object, in: body }
+        booted: { type: boolean, in: body }
+        metadata: { type: object, in: body }
+      pagination: none
+
+    resize_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/resize
+      access: write
+      description: "Resize a Linode to a new plan type. Powers off the instance during resize."
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "New instance type slug" }
+        allow_auto_disk_resize: { type: boolean, in: body, description: "Auto-resize disks to fill new allocation" }
+        migration_type: { type: string, in: body, description: "warm or cold (default cold)" }
+      pagination: none
+
+    clone_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/clone
+      access: write
+      description: "Clone a Linode to a new instance"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        region: { type: string, in: body }
+        type: { type: string, in: body }
+        label: { type: string, in: body }
+        backups_enabled: { type: boolean, in: body }
+        private_ip: { type: boolean, in: body }
+        configs: { type: array, in: body, description: "Config profile IDs to clone" }
+        disks: { type: array, in: body, description: "Disk IDs to clone" }
+      pagination: none
+
+    migrate_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/migrate
+      access: write
+      description: "Initiate a DC migration or accept a pending host migration"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        region: { type: string, in: body, description: "Target region for DC migration" }
+        upgrade: { type: boolean, in: body }
+      pagination: none
+
+    reset_linode_password:
+      method: POST
+      path: /linode/instances/{linodeId}/password
+      access: write
+      description: "Reset the root password for a Linode. Instance must be powered off."
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        root_pass: { type: string, in: body, required: true }
+      pagination: none
+
+    rescue_linode:
+      method: POST
+      path: /linode/instances/{linodeId}/rescue
+      access: write
+      description: "Boot a Linode into rescue mode with optional device mappings"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        devices: { type: object, in: body, description: "Device slot mappings (sda-sdg)" }
+      pagination: none
+
+    # =========================================================================
+    # LINODE DISKS
+    # =========================================================================
+
+    list_linode_disks:
+      method: GET
+      path: /linode/instances/{linodeId}/disks
+      access: read
+      description: "List disks for a Linode"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_linode_disk:
+      method: GET
+      path: /linode/instances/{linodeId}/disks/{diskId}
+      access: read
+      description: "Get a specific disk"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        diskId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_linode_disk:
+      method: POST
+      path: /linode/instances/{linodeId}/disks
+      access: write
+      description: "Create a new disk for a Linode"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        label: { type: string, in: body, required: true }
+        size: { type: integer, in: body, required: true, description: "Size in MB" }
+        filesystem: { type: string, in: body, description: "raw, swap, ext3, ext4, initrd" }
+        image: { type: string, in: body }
+        root_pass: { type: string, in: body }
+        authorized_keys: { type: array, in: body }
+        authorized_users: { type: array, in: body }
+        stackscript_id: { type: integer, in: body }
+        stackscript_data: { type: object, in: body }
+      pagination: none
+
+    update_linode_disk:
+      method: PUT
+      path: /linode/instances/{linodeId}/disks/{diskId}
+      access: write
+      description: "Update a disk's label"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        diskId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+      pagination: none
+
+    delete_linode_disk:
+      method: DELETE
+      path: /linode/instances/{linodeId}/disks/{diskId}
+      access: dangerous
+      description: "Delete a disk"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        diskId: { type: integer, in: path, required: true }
+      pagination: none
+
+    resize_linode_disk:
+      method: POST
+      path: /linode/instances/{linodeId}/disks/{diskId}/resize
+      access: write
+      description: "Resize a disk. Linode must be powered off."
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        diskId: { type: integer, in: path, required: true }
+        size: { type: integer, in: body, required: true, description: "New size in MB" }
+      pagination: none
+
+    # =========================================================================
+    # LINODE IPS & NETWORKING INFO
+    # =========================================================================
+
+    get_linode_ips:
+      method: GET
+      path: /linode/instances/{linodeId}/ips
+      access: read
+      description: "Get all networking information (IPv4, IPv6) for a Linode"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    allocate_linode_ip:
+      method: POST
+      path: /linode/instances/{linodeId}/ips
+      access: write
+      description: "Allocate an additional IPv4 address for a Linode"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "ipv4" }
+        public: { type: boolean, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # LINODE BACKUPS
+    # =========================================================================
+
+    list_linode_backups:
+      method: GET
+      path: /linode/instances/{linodeId}/backups
+      access: read
+      description: "List backups for a Linode (automatic daily/weekly + manual snapshots)"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_linode_snapshot:
+      method: POST
+      path: /linode/instances/{linodeId}/backups
+      access: write
+      description: "Create a manual snapshot backup"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        label: { type: string, in: body, required: true }
+      pagination: none
+
+    get_linode_backup:
+      method: GET
+      path: /linode/instances/{linodeId}/backups/{backupId}
+      access: read
+      description: "Get a specific backup"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        backupId: { type: integer, in: path, required: true }
+      pagination: none
+
+    restore_linode_backup:
+      method: POST
+      path: /linode/instances/{linodeId}/backups/{backupId}/restore
+      access: write
+      description: "Restore a backup to a Linode"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        backupId: { type: integer, in: path, required: true }
+        linode_id: { type: integer, in: body, required: true, description: "Target Linode ID" }
+        overwrite: { type: boolean, in: body, description: "Overwrite existing disks on target" }
+      pagination: none
+
+    enable_linode_backups:
+      method: POST
+      path: /linode/instances/{linodeId}/backups/enable
+      access: write
+      description: "Enable the backups service for a Linode"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    cancel_linode_backups:
+      method: POST
+      path: /linode/instances/{linodeId}/backups/cancel
+      access: dangerous
+      description: "Cancel the backups service for a Linode. All backups are deleted."
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # LINODE STATISTICS
+    # =========================================================================
+
+    get_linode_stats:
+      method: GET
+      path: /linode/instances/{linodeId}/stats
+      access: read
+      description: "Get CPU, IO, network, and netv6 stats for the current month"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_linode_stats_by_month:
+      method: GET
+      path: /linode/instances/{linodeId}/stats/{year}/{month}
+      access: read
+      description: "Get statistics for a specific year/month"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+        year: { type: integer, in: path, required: true }
+        month: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_linode_transfer:
+      method: GET
+      path: /linode/instances/{linodeId}/transfer
+      access: read
+      description: "Get network transfer usage for the current month"
+      params:
+        linodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # LINODE TYPES & KERNELS (public, no auth required)
+    # =========================================================================
+
+    list_linode_types:
+      method: GET
+      path: /linode/types
+      access: read
+      description: "List available Linode instance types (plans) with pricing and specs"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_linode_type:
+      method: GET
+      path: /linode/types/{typeId}
+      access: read
+      description: "Get a specific instance type by slug"
+      params:
+        typeId: { type: string, in: path, required: true }
+      pagination: none
+
+    list_kernels:
+      method: GET
+      path: /linode/kernels
+      access: read
+      description: "List available kernels"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    # =========================================================================
+    # VOLUMES (Block Storage)
+    # =========================================================================
+
+    list_volumes:
+      method: GET
+      path: /volumes
+      access: read
+      description: "List all block storage volumes"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_volume:
+      method: GET
+      path: /volumes/{volumeId}
+      access: read
+      description: "Get a specific volume"
+      params:
+        volumeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_volume:
+      method: POST
+      path: /volumes
+      access: write
+      description: "Create a block storage volume. Set linode_id to auto-attach."
+      params:
+        label: { type: string, in: body, required: true }
+        size: { type: integer, in: body, description: "Size in GB (default 20, max 10240)" }
+        region: { type: string, in: body, description: "Required if not attaching to a Linode" }
+        linode_id: { type: integer, in: body, description: "Linode to auto-attach to" }
+        config_id: { type: integer, in: body }
+        tags: { type: array, in: body }
+        encryption: { type: string, in: body, description: "enabled or disabled" }
+      pagination: none
+
+    update_volume:
+      method: PUT
+      path: /volumes/{volumeId}
+      access: write
+      description: "Update a volume's label or tags"
+      params:
+        volumeId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_volume:
+      method: DELETE
+      path: /volumes/{volumeId}
+      access: dangerous
+      description: "Delete a volume. Must be detached first."
+      params:
+        volumeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    attach_volume:
+      method: POST
+      path: /volumes/{volumeId}/attach
+      access: write
+      description: "Attach a volume to a Linode"
+      params:
+        volumeId: { type: integer, in: path, required: true }
+        linode_id: { type: integer, in: body, required: true }
+        config_id: { type: integer, in: body }
+        persist_across_boots: { type: boolean, in: body }
+      pagination: none
+
+    detach_volume:
+      method: POST
+      path: /volumes/{volumeId}/detach
+      access: write
+      description: "Detach a volume from its Linode"
+      params:
+        volumeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    resize_volume:
+      method: POST
+      path: /volumes/{volumeId}/resize
+      access: write
+      description: "Resize a volume. Can only increase size."
+      params:
+        volumeId: { type: integer, in: path, required: true }
+        size: { type: integer, in: body, required: true, description: "New size in GB" }
+      pagination: none
+
+    clone_volume:
+      method: POST
+      path: /volumes/{volumeId}/clone
+      access: write
+      description: "Clone a volume"
+      params:
+        volumeId: { type: integer, in: path, required: true }
+        label: { type: string, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DOMAINS (DNS)
+    # =========================================================================
+
+    list_domains:
+      method: GET
+      path: /domains
+      access: read
+      description: "List all domains"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_domain:
+      method: GET
+      path: /domains/{domainId}
+      access: read
+      description: "Get a specific domain"
+      params:
+        domainId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_domain:
+      method: POST
+      path: /domains
+      access: write
+      description: "Create a domain (DNS zone)"
+      params:
+        domain: { type: string, in: body, required: true, description: "The domain name (e.g. example.com)" }
+        type: { type: string, in: body, required: true, description: "master or slave" }
+        soa_email: { type: string, in: body, description: "SOA email. Required for master domains." }
+        description: { type: string, in: body }
+        refresh_sec: { type: integer, in: body }
+        retry_sec: { type: integer, in: body }
+        expire_sec: { type: integer, in: body }
+        ttl_sec: { type: integer, in: body }
+        master_ips: { type: array, in: body, description: "Required for slave domains" }
+        axfr_ips: { type: array, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_domain:
+      method: PUT
+      path: /domains/{domainId}
+      access: write
+      description: "Update a domain"
+      params:
+        domainId: { type: integer, in: path, required: true }
+        domain: { type: string, in: body }
+        description: { type: string, in: body }
+        soa_email: { type: string, in: body }
+        refresh_sec: { type: integer, in: body }
+        retry_sec: { type: integer, in: body }
+        expire_sec: { type: integer, in: body }
+        ttl_sec: { type: integer, in: body }
+        status: { type: string, in: body, description: "active, disabled, or edit_mode" }
+        master_ips: { type: array, in: body }
+        axfr_ips: { type: array, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_domain:
+      method: DELETE
+      path: /domains/{domainId}
+      access: dangerous
+      description: "Delete a domain and all its records"
+      params:
+        domainId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- Domain Records ---
+
+    list_domain_records:
+      method: GET
+      path: /domains/{domainId}/records
+      access: read
+      description: "List DNS records for a domain"
+      params:
+        domainId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_domain_record:
+      method: GET
+      path: /domains/{domainId}/records/{recordId}
+      access: read
+      description: "Get a specific DNS record"
+      params:
+        domainId: { type: integer, in: path, required: true }
+        recordId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_domain_record:
+      method: POST
+      path: /domains/{domainId}/records
+      access: write
+      description: "Create a DNS record (A, AAAA, CNAME, MX, TXT, SRV, NS, CAA)"
+      params:
+        domainId: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "A, AAAA, CNAME, MX, TXT, SRV, NS, CAA, PTR" }
+        name: { type: string, in: body, description: "Hostname or subdomain" }
+        target: { type: string, in: body, required: true, description: "Record value (IP, hostname, text)" }
+        priority: { type: integer, in: body, description: "For MX and SRV records" }
+        weight: { type: integer, in: body, description: "For SRV records" }
+        port: { type: integer, in: body, description: "For SRV records" }
+        protocol: { type: string, in: body, description: "For SRV records" }
+        service: { type: string, in: body, description: "For SRV records" }
+        tag: { type: string, in: body, description: "For CAA records (issue, issuewild, iodef)" }
+        ttl_sec: { type: integer, in: body }
+      pagination: none
+
+    update_domain_record:
+      method: PUT
+      path: /domains/{domainId}/records/{recordId}
+      access: write
+      description: "Update a DNS record"
+      params:
+        domainId: { type: integer, in: path, required: true }
+        recordId: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        target: { type: string, in: body }
+        priority: { type: integer, in: body }
+        weight: { type: integer, in: body }
+        port: { type: integer, in: body }
+        ttl_sec: { type: integer, in: body }
+      pagination: none
+
+    delete_domain_record:
+      method: DELETE
+      path: /domains/{domainId}/records/{recordId}
+      access: dangerous
+      description: "Delete a DNS record"
+      params:
+        domainId: { type: integer, in: path, required: true }
+        recordId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # NODEBALANCERS (Load Balancers)
+    # =========================================================================
+
+    list_nodebalancers:
+      method: GET
+      path: /nodebalancers
+      access: read
+      description: "List all NodeBalancers"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_nodebalancer:
+      method: GET
+      path: /nodebalancers/{nodeBalancerId}
+      access: read
+      description: "Get a specific NodeBalancer"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_nodebalancer:
+      method: POST
+      path: /nodebalancers
+      access: write
+      description: "Create a NodeBalancer"
+      params:
+        region: { type: string, in: body, required: true }
+        label: { type: string, in: body }
+        client_conn_throttle: { type: integer, in: body, description: "Connections per second throttle (0-20)" }
+        configs: { type: array, in: body, description: "Inline config definitions with nested nodes" }
+        tags: { type: array, in: body }
+        firewall_id: { type: integer, in: body }
+      pagination: none
+
+    update_nodebalancer:
+      method: PUT
+      path: /nodebalancers/{nodeBalancerId}
+      access: write
+      description: "Update a NodeBalancer's label, throttle, or tags"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        client_conn_throttle: { type: integer, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_nodebalancer:
+      method: DELETE
+      path: /nodebalancers/{nodeBalancerId}
+      access: dangerous
+      description: "Delete a NodeBalancer"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- NodeBalancer Configs ---
+
+    list_nodebalancer_configs:
+      method: GET
+      path: /nodebalancers/{nodeBalancerId}/configs
+      access: read
+      description: "List configs (ports) for a NodeBalancer"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    create_nodebalancer_config:
+      method: POST
+      path: /nodebalancers/{nodeBalancerId}/configs
+      access: write
+      description: "Create a NodeBalancer config (listener port)"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        port: { type: integer, in: body, description: "Port to listen on (1-65535, default 80)" }
+        protocol: { type: string, in: body, description: "http, https, tcp" }
+        algorithm: { type: string, in: body, description: "roundrobin, leastconn, source" }
+        stickiness: { type: string, in: body, description: "none, table, http_cookie" }
+        check: { type: string, in: body, description: "none, connection, http, http_body" }
+        check_interval: { type: integer, in: body }
+        check_timeout: { type: integer, in: body }
+        check_attempts: { type: integer, in: body }
+        check_path: { type: string, in: body, description: "Health check URL path" }
+        check_passive: { type: boolean, in: body }
+        cipher_suite: { type: string, in: body, description: "recommended, legacy" }
+        ssl_cert: { type: string, in: body }
+        ssl_key: { type: string, in: body }
+        proxy_protocol: { type: string, in: body, description: "none, v1, v2" }
+      pagination: none
+
+    update_nodebalancer_config:
+      method: PUT
+      path: /nodebalancers/{nodeBalancerId}/configs/{configId}
+      access: write
+      description: "Update a NodeBalancer config"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        configId: { type: integer, in: path, required: true }
+        port: { type: integer, in: body }
+        protocol: { type: string, in: body }
+        algorithm: { type: string, in: body }
+        stickiness: { type: string, in: body }
+        check: { type: string, in: body }
+        check_interval: { type: integer, in: body }
+        check_timeout: { type: integer, in: body }
+        check_attempts: { type: integer, in: body }
+        check_path: { type: string, in: body }
+        check_passive: { type: boolean, in: body }
+        ssl_cert: { type: string, in: body }
+        ssl_key: { type: string, in: body }
+        proxy_protocol: { type: string, in: body }
+      pagination: none
+
+    delete_nodebalancer_config:
+      method: DELETE
+      path: /nodebalancers/{nodeBalancerId}/configs/{configId}
+      access: dangerous
+      description: "Delete a NodeBalancer config"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        configId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- NodeBalancer Nodes ---
+
+    list_nodebalancer_nodes:
+      method: GET
+      path: /nodebalancers/{nodeBalancerId}/configs/{configId}/nodes
+      access: read
+      description: "List backend nodes for a NodeBalancer config"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        configId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    create_nodebalancer_node:
+      method: POST
+      path: /nodebalancers/{nodeBalancerId}/configs/{configId}/nodes
+      access: write
+      description: "Add a backend node to a NodeBalancer config"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        configId: { type: integer, in: path, required: true }
+        address: { type: string, in: body, required: true, description: "Private IP:port (e.g. 192.168.1.1:80)" }
+        label: { type: string, in: body, required: true }
+        weight: { type: integer, in: body, description: "Load balancing weight (1-255)" }
+        mode: { type: string, in: body, description: "accept, reject, backup, drain" }
+      pagination: none
+
+    update_nodebalancer_node:
+      method: PUT
+      path: /nodebalancers/{nodeBalancerId}/configs/{configId}/nodes/{nodeId}
+      access: write
+      description: "Update a backend node"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        configId: { type: integer, in: path, required: true }
+        nodeId: { type: integer, in: path, required: true }
+        address: { type: string, in: body }
+        label: { type: string, in: body }
+        weight: { type: integer, in: body }
+        mode: { type: string, in: body }
+      pagination: none
+
+    delete_nodebalancer_node:
+      method: DELETE
+      path: /nodebalancers/{nodeBalancerId}/configs/{configId}/nodes/{nodeId}
+      access: dangerous
+      description: "Remove a backend node"
+      params:
+        nodeBalancerId: { type: integer, in: path, required: true }
+        configId: { type: integer, in: path, required: true }
+        nodeId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # FIREWALLS
+    # =========================================================================
+
+    list_firewalls:
+      method: GET
+      path: /networking/firewalls
+      access: read
+      description: "List all firewalls"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_firewall:
+      method: GET
+      path: /networking/firewalls/{firewallId}
+      access: read
+      description: "Get a specific firewall"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_firewall:
+      method: POST
+      path: /networking/firewalls
+      access: admin
+      description: "Create a firewall with inbound/outbound rules"
+      params:
+        label: { type: string, in: body, required: true }
+        rules: { type: object, in: body, required: true, description: "Object with inbound, outbound arrays and inbound_policy, outbound_policy (ACCEPT/DROP)" }
+        devices: { type: object, in: body, description: "Devices to apply to: {linodes: [id], nodebalancers: [id]}" }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_firewall:
+      method: PUT
+      path: /networking/firewalls/{firewallId}
+      access: admin
+      description: "Update a firewall's label, tags, or status"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        status: { type: string, in: body, description: "enabled or disabled" }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_firewall:
+      method: DELETE
+      path: /networking/firewalls/{firewallId}
+      access: dangerous
+      description: "Delete a firewall"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_firewall_rules:
+      method: GET
+      path: /networking/firewalls/{firewallId}/rules
+      access: read
+      description: "Get the current rules for a firewall"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_firewall_rules:
+      method: PUT
+      path: /networking/firewalls/{firewallId}/rules
+      access: admin
+      description: "Replace all rules for a firewall"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+        inbound: { type: array, in: body, description: "Array of inbound rules" }
+        inbound_policy: { type: string, in: body, description: "ACCEPT or DROP" }
+        outbound: { type: array, in: body, description: "Array of outbound rules" }
+        outbound_policy: { type: string, in: body, description: "ACCEPT or DROP" }
+      pagination: none
+
+    list_firewall_devices:
+      method: GET
+      path: /networking/firewalls/{firewallId}/devices
+      access: read
+      description: "List devices (Linodes, NodeBalancers) attached to a firewall"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    create_firewall_device:
+      method: POST
+      path: /networking/firewalls/{firewallId}/devices
+      access: admin
+      description: "Attach a device to a firewall"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+        id: { type: integer, in: body, required: true, description: "Device ID" }
+        type: { type: string, in: body, required: true, description: "linode or nodebalancer" }
+      pagination: none
+
+    delete_firewall_device:
+      method: DELETE
+      path: /networking/firewalls/{firewallId}/devices/{deviceId}
+      access: dangerous
+      description: "Detach a device from a firewall"
+      params:
+        firewallId: { type: integer, in: path, required: true }
+        deviceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # NETWORKING (IPs)
+    # =========================================================================
+
+    list_ip_addresses:
+      method: GET
+      path: /networking/ips
+      access: read
+      description: "List all IP addresses on the account"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_ip_address:
+      method: GET
+      path: /networking/ips/{address}
+      access: read
+      description: "Get info about an IP address"
+      params:
+        address: { type: string, in: path, required: true }
+      pagination: none
+
+    update_ip_rdns:
+      method: PUT
+      path: /networking/ips/{address}
+      access: write
+      description: "Update reverse DNS for an IP address"
+      params:
+        address: { type: string, in: path, required: true }
+        rdns: { type: string, in: body, description: "Reverse DNS hostname. Set to null to reset." }
+      pagination: none
+
+    allocate_ip:
+      method: POST
+      path: /networking/ips
+      access: write
+      description: "Allocate a new IP address"
+      params:
+        type: { type: string, in: body, required: true, description: "ipv4" }
+        public: { type: boolean, in: body, required: true }
+        linode_id: { type: integer, in: body, required: true }
+      pagination: none
+
+    list_ipv6_ranges:
+      method: GET
+      path: /networking/ipv6/ranges
+      access: read
+      description: "List all IPv6 ranges"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    list_vlans:
+      method: GET
+      path: /networking/vlans
+      access: read
+      description: "List all VLANs on the account"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    # =========================================================================
+    # VPCs
+    # =========================================================================
+
+    list_vpcs:
+      method: GET
+      path: /vpcs
+      access: read
+      description: "List all VPCs"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_vpc:
+      method: GET
+      path: /vpcs/{vpcId}
+      access: read
+      description: "Get a specific VPC"
+      params:
+        vpcId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_vpc:
+      method: POST
+      path: /vpcs
+      access: write
+      description: "Create a VPC"
+      params:
+        label: { type: string, in: body, required: true }
+        region: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        subnets: { type: array, in: body, description: "Array of {label, ipv4} subnet definitions" }
+      pagination: none
+
+    update_vpc:
+      method: PUT
+      path: /vpcs/{vpcId}
+      access: write
+      description: "Update a VPC's label or description"
+      params:
+        vpcId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        description: { type: string, in: body }
+      pagination: none
+
+    delete_vpc:
+      method: DELETE
+      path: /vpcs/{vpcId}
+      access: dangerous
+      description: "Delete a VPC. All subnets must be empty."
+      params:
+        vpcId: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_vpc_subnets:
+      method: GET
+      path: /vpcs/{vpcId}/subnets
+      access: read
+      description: "List subnets in a VPC"
+      params:
+        vpcId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    create_vpc_subnet:
+      method: POST
+      path: /vpcs/{vpcId}/subnets
+      access: write
+      description: "Create a subnet in a VPC"
+      params:
+        vpcId: { type: integer, in: path, required: true }
+        label: { type: string, in: body, required: true }
+        ipv4: { type: string, in: body, required: true, description: "CIDR range (e.g. 10.0.0.0/24)" }
+      pagination: none
+
+    update_vpc_subnet:
+      method: PUT
+      path: /vpcs/{vpcId}/subnets/{subnetId}
+      access: write
+      description: "Update a subnet's label"
+      params:
+        vpcId: { type: integer, in: path, required: true }
+        subnetId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+      pagination: none
+
+    delete_vpc_subnet:
+      method: DELETE
+      path: /vpcs/{vpcId}/subnets/{subnetId}
+      access: dangerous
+      description: "Delete a subnet. Must have no attached Linodes."
+      params:
+        vpcId: { type: integer, in: path, required: true }
+        subnetId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # KUBERNETES (LKE)
+    # =========================================================================
+
+    list_lke_clusters:
+      method: GET
+      path: /lke/clusters
+      access: read
+      description: "List all LKE (Linode Kubernetes Engine) clusters"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_lke_cluster:
+      method: GET
+      path: /lke/clusters/{clusterId}
+      access: read
+      description: "Get a specific LKE cluster"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_lke_cluster:
+      method: POST
+      path: /lke/clusters
+      access: write
+      description: "Create an LKE cluster"
+      params:
+        label: { type: string, in: body, required: true }
+        region: { type: string, in: body, required: true }
+        k8s_version: { type: string, in: body, required: true, description: "Kubernetes version string" }
+        node_pools: { type: array, in: body, required: true, description: "Array of {type, count} pool definitions" }
+        control_plane: { type: object, in: body, description: "HA control plane config: {high_availability: true}" }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_lke_cluster:
+      method: PUT
+      path: /lke/clusters/{clusterId}
+      access: write
+      description: "Update an LKE cluster's label, k8s_version, tags, or control plane"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        k8s_version: { type: string, in: body }
+        tags: { type: array, in: body }
+        control_plane: { type: object, in: body }
+      pagination: none
+
+    delete_lke_cluster:
+      method: DELETE
+      path: /lke/clusters/{clusterId}
+      access: dangerous
+      description: "Delete an LKE cluster and all associated node pools"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_lke_kubeconfig:
+      method: GET
+      path: /lke/clusters/{clusterId}/kubeconfig
+      access: read
+      description: "Get the base64-encoded kubeconfig for a cluster"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_lke_dashboard:
+      method: GET
+      path: /lke/clusters/{clusterId}/dashboard
+      access: read
+      description: "Get the Kubernetes dashboard URL"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_lke_api_endpoints:
+      method: GET
+      path: /lke/clusters/{clusterId}/api-endpoints
+      access: read
+      description: "List API server endpoints for a cluster"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+      pagination: none
+
+    recycle_lke_cluster:
+      method: POST
+      path: /lke/clusters/{clusterId}/recycle
+      access: dangerous
+      description: "Recycle (replace) all nodes in the cluster"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- LKE Node Pools ---
+
+    list_lke_node_pools:
+      method: GET
+      path: /lke/clusters/{clusterId}/pools
+      access: read
+      description: "List node pools in an LKE cluster"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_lke_node_pool:
+      method: GET
+      path: /lke/clusters/{clusterId}/pools/{poolId}
+      access: read
+      description: "Get a specific node pool"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+        poolId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_lke_node_pool:
+      method: POST
+      path: /lke/clusters/{clusterId}/pools
+      access: write
+      description: "Add a node pool to an LKE cluster"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "Linode type slug for pool nodes" }
+        count: { type: integer, in: body, required: true }
+        autoscaler: { type: object, in: body, description: "{enabled: true, min: 1, max: 10}" }
+        tags: { type: array, in: body }
+        labels: { type: object, in: body, description: "Kubernetes labels for pool nodes" }
+        taints: { type: array, in: body, description: "Kubernetes taints for pool nodes" }
+      pagination: none
+
+    update_lke_node_pool:
+      method: PUT
+      path: /lke/clusters/{clusterId}/pools/{poolId}
+      access: write
+      description: "Update a node pool's count, autoscaler, labels, or taints"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+        poolId: { type: integer, in: path, required: true }
+        count: { type: integer, in: body }
+        autoscaler: { type: object, in: body }
+        labels: { type: object, in: body }
+        taints: { type: array, in: body }
+      pagination: none
+
+    delete_lke_node_pool:
+      method: DELETE
+      path: /lke/clusters/{clusterId}/pools/{poolId}
+      access: dangerous
+      description: "Delete a node pool"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+        poolId: { type: integer, in: path, required: true }
+      pagination: none
+
+    recycle_lke_node_pool:
+      method: POST
+      path: /lke/clusters/{clusterId}/pools/{poolId}/recycle
+      access: dangerous
+      description: "Recycle (replace) all nodes in a pool"
+      params:
+        clusterId: { type: integer, in: path, required: true }
+        poolId: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_lke_versions:
+      method: GET
+      path: /lke/versions
+      access: read
+      description: "List available Kubernetes versions for LKE"
+
+    # =========================================================================
+    # DATABASES (Managed)
+    # =========================================================================
+
+    list_databases:
+      method: GET
+      path: /databases/instances
+      access: read
+      description: "List all managed database instances (MySQL, PostgreSQL)"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    list_database_engines:
+      method: GET
+      path: /databases/engines
+      access: read
+      description: "List available database engines and versions"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    list_database_types:
+      method: GET
+      path: /databases/types
+      access: read
+      description: "List available database types (plans) with pricing"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    # --- MySQL ---
+
+    list_mysql_databases:
+      method: GET
+      path: /databases/mysql/instances
+      access: read
+      description: "List all MySQL managed databases"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_mysql_database:
+      method: GET
+      path: /databases/mysql/instances/{instanceId}
+      access: read
+      description: "Get a specific MySQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_mysql_database:
+      method: POST
+      path: /databases/mysql/instances
+      access: write
+      description: "Create a managed MySQL database"
+      params:
+        label: { type: string, in: body, required: true }
+        region: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "Database plan type slug" }
+        engine: { type: string, in: body, required: true, description: "Engine ID (e.g. mysql/8.0.30)" }
+        allow_list: { type: array, in: body, description: "IPs/CIDRs allowed to connect" }
+        cluster_size: { type: integer, in: body, description: "1 or 3 (HA)" }
+        encrypted: { type: boolean, in: body }
+        ssl_connection: { type: boolean, in: body }
+        replication_type: { type: string, in: body, description: "none, asynch, semi_synch" }
+      pagination: none
+
+    update_mysql_database:
+      method: PUT
+      path: /databases/mysql/instances/{instanceId}
+      access: write
+      description: "Update a MySQL database's label, allow_list, or updates config"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        allow_list: { type: array, in: body }
+        updates: { type: object, in: body, description: "Maintenance window: {day_of_week, duration, frequency, hour_of_day}" }
+      pagination: none
+
+    delete_mysql_database:
+      method: DELETE
+      path: /databases/mysql/instances/{instanceId}
+      access: dangerous
+      description: "Delete a MySQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_mysql_credentials:
+      method: GET
+      path: /databases/mysql/instances/{instanceId}/credentials
+      access: read
+      description: "Get connection credentials (username, password) for a MySQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    reset_mysql_credentials:
+      method: POST
+      path: /databases/mysql/instances/{instanceId}/credentials/reset
+      access: write
+      description: "Reset the root password for a MySQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_mysql_ssl:
+      method: GET
+      path: /databases/mysql/instances/{instanceId}/ssl
+      access: read
+      description: "Get the SSL CA certificate for a MySQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    patch_mysql_database:
+      method: POST
+      path: /databases/mysql/instances/{instanceId}/patch
+      access: write
+      description: "Apply the latest patch to a MySQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- PostgreSQL ---
+
+    list_postgresql_databases:
+      method: GET
+      path: /databases/postgresql/instances
+      access: read
+      description: "List all PostgreSQL managed databases"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_postgresql_database:
+      method: GET
+      path: /databases/postgresql/instances/{instanceId}
+      access: read
+      description: "Get a specific PostgreSQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_postgresql_database:
+      method: POST
+      path: /databases/postgresql/instances
+      access: write
+      description: "Create a managed PostgreSQL database"
+      params:
+        label: { type: string, in: body, required: true }
+        region: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        engine: { type: string, in: body, required: true, description: "Engine ID (e.g. postgresql/14.6)" }
+        allow_list: { type: array, in: body }
+        cluster_size: { type: integer, in: body, description: "1 or 3 (HA)" }
+        encrypted: { type: boolean, in: body }
+        ssl_connection: { type: boolean, in: body }
+        replication_type: { type: string, in: body, description: "none, asynch, semi_synch" }
+        replication_commit_type: { type: string, in: body, description: "off, on, remote_write, remote_apply, local" }
+      pagination: none
+
+    update_postgresql_database:
+      method: PUT
+      path: /databases/postgresql/instances/{instanceId}
+      access: write
+      description: "Update a PostgreSQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        allow_list: { type: array, in: body }
+        updates: { type: object, in: body }
+      pagination: none
+
+    delete_postgresql_database:
+      method: DELETE
+      path: /databases/postgresql/instances/{instanceId}
+      access: dangerous
+      description: "Delete a PostgreSQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_postgresql_credentials:
+      method: GET
+      path: /databases/postgresql/instances/{instanceId}/credentials
+      access: read
+      description: "Get connection credentials for a PostgreSQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    reset_postgresql_credentials:
+      method: POST
+      path: /databases/postgresql/instances/{instanceId}/credentials/reset
+      access: write
+      description: "Reset the root password for a PostgreSQL database"
+      params:
+        instanceId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # OBJECT STORAGE
+    # =========================================================================
+
+    list_object_storage_buckets:
+      method: GET
+      path: /object-storage/buckets
+      access: read
+      description: "List all Object Storage buckets"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_object_storage_bucket:
+      method: GET
+      path: /object-storage/buckets/{regionId}/{bucket}
+      access: read
+      description: "Get a specific bucket"
+      params:
+        regionId: { type: string, in: path, required: true, description: "Cluster/region ID (e.g. us-east-1)" }
+        bucket: { type: string, in: path, required: true }
+      pagination: none
+
+    create_object_storage_bucket:
+      method: POST
+      path: /object-storage/buckets
+      access: write
+      description: "Create an Object Storage bucket"
+      params:
+        label: { type: string, in: body, required: true, description: "Bucket name (3-63 chars, globally unique)" }
+        region: { type: string, in: body, required: true, description: "Cluster/region ID" }
+        cors_enabled: { type: boolean, in: body }
+        acl: { type: string, in: body, description: "private, public-read, authenticated-read, public-read-write" }
+      pagination: none
+
+    delete_object_storage_bucket:
+      method: DELETE
+      path: /object-storage/buckets/{regionId}/{bucket}
+      access: dangerous
+      description: "Delete an Object Storage bucket. Must be empty."
+      params:
+        regionId: { type: string, in: path, required: true }
+        bucket: { type: string, in: path, required: true }
+      pagination: none
+
+    list_object_storage_bucket_contents:
+      method: GET
+      path: /object-storage/buckets/{regionId}/{bucket}/object-list
+      access: read
+      description: "List objects in a bucket"
+      params:
+        regionId: { type: string, in: path, required: true }
+        bucket: { type: string, in: path, required: true }
+        marker: { type: string, in: query, description: "Cursor for pagination" }
+        delimiter: { type: string, in: query, description: "Delimiter for virtual directory listing" }
+        prefix: { type: string, in: query, description: "Filter by prefix" }
+        page_size: { type: integer, in: query }
+      pagination: none
+
+    create_object_storage_object_url:
+      method: POST
+      path: /object-storage/buckets/{regionId}/{bucket}/object-url
+      access: write
+      description: "Create a pre-signed URL for upload or download"
+      params:
+        regionId: { type: string, in: path, required: true }
+        bucket: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Object key" }
+        method: { type: string, in: body, required: true, description: "GET or PUT" }
+        content_type: { type: string, in: body, description: "For PUT: content type of the upload" }
+        expires_in: { type: integer, in: body, description: "URL expiry in seconds (default 3600)" }
+      pagination: none
+
+    # --- Object Storage Keys ---
+
+    list_object_storage_keys:
+      method: GET
+      path: /object-storage/keys
+      access: read
+      description: "List S3-compatible access keys"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    create_object_storage_key:
+      method: POST
+      path: /object-storage/keys
+      access: admin
+      description: "Create an S3-compatible access key"
+      params:
+        label: { type: string, in: body, required: true }
+        bucket_access: { type: array, in: body, description: "Restrict key to specific buckets: [{region, bucket_name, permissions}]" }
+        regions: { type: array, in: body, description: "Regions to generate endpoint URLs for" }
+      pagination: none
+
+    delete_object_storage_key:
+      method: DELETE
+      path: /object-storage/keys/{keyId}
+      access: dangerous
+      description: "Revoke an S3-compatible access key"
+      params:
+        keyId: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_object_storage_clusters:
+      method: GET
+      path: /object-storage/clusters
+      access: read
+      description: "List Object Storage cluster/region endpoints"
+
+    # =========================================================================
+    # IMAGES
+    # =========================================================================
+
+    list_images:
+      method: GET
+      path: /images
+      access: read
+      description: "List all images (official + custom). Rate limited to 20 req/min."
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_image:
+      method: GET
+      path: /images/{imageId}
+      access: read
+      description: "Get a specific image"
+      params:
+        imageId: { type: string, in: path, required: true }
+      pagination: none
+
+    create_image:
+      method: POST
+      path: /images
+      access: write
+      description: "Create a custom image from an existing Linode disk"
+      params:
+        disk_id: { type: integer, in: body, required: true, description: "Source disk ID" }
+        label: { type: string, in: body }
+        description: { type: string, in: body }
+        cloud_init: { type: boolean, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_image:
+      method: PUT
+      path: /images/{imageId}
+      access: write
+      description: "Update an image's label, description, or tags"
+      params:
+        imageId: { type: string, in: path, required: true }
+        label: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_image:
+      method: DELETE
+      path: /images/{imageId}
+      access: dangerous
+      description: "Delete a custom image"
+      params:
+        imageId: { type: string, in: path, required: true }
+      pagination: none
+
+    upload_image:
+      method: POST
+      path: /images/upload
+      access: write
+      description: "Get a URL for uploading a machine image (raw or gzip compressed)"
+      params:
+        label: { type: string, in: body, required: true }
+        region: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        cloud_init: { type: boolean, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    replicate_image:
+      method: POST
+      path: /images/{imageId}/replicate
+      access: write
+      description: "Replicate a custom image to additional regions"
+      params:
+        imageId: { type: string, in: path, required: true }
+        regions: { type: array, in: body, required: true, description: "Target region IDs" }
+      pagination: none
+
+    # =========================================================================
+    # STACKSCRIPTS
+    # =========================================================================
+
+    list_stackscripts:
+      method: GET
+      path: /linode/stackscripts
+      access: read
+      description: "List StackScripts (yours + community). Rate limited to 60 req/min."
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_stackscript:
+      method: GET
+      path: /linode/stackscripts/{stackscriptId}
+      access: read
+      description: "Get a specific StackScript"
+      params:
+        stackscriptId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_stackscript:
+      method: POST
+      path: /linode/stackscripts
+      access: write
+      description: "Create a StackScript"
+      params:
+        label: { type: string, in: body, required: true }
+        script: { type: string, in: body, required: true, description: "The script body (bash)" }
+        images: { type: array, in: body, required: true, description: "Compatible image IDs (e.g. [linode/ubuntu22.04])" }
+        description: { type: string, in: body }
+        is_public: { type: boolean, in: body }
+        rev_note: { type: string, in: body }
+      pagination: none
+
+    update_stackscript:
+      method: PUT
+      path: /linode/stackscripts/{stackscriptId}
+      access: write
+      description: "Update a StackScript"
+      params:
+        stackscriptId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        script: { type: string, in: body }
+        images: { type: array, in: body }
+        description: { type: string, in: body }
+        is_public: { type: boolean, in: body }
+        rev_note: { type: string, in: body }
+      pagination: none
+
+    delete_stackscript:
+      method: DELETE
+      path: /linode/stackscripts/{stackscriptId}
+      access: dangerous
+      description: "Delete a StackScript"
+      params:
+        stackscriptId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # REGIONS (public, no auth required)
+    # =========================================================================
+
+    list_regions:
+      method: GET
+      path: /regions
+      access: read
+      description: "List all available regions with capabilities and status"
+
+    get_region:
+      method: GET
+      path: /regions/{regionId}
+      access: read
+      description: "Get a specific region"
+      params:
+        regionId: { type: string, in: path, required: true }
+      pagination: none
+
+    get_region_availability:
+      method: GET
+      path: /regions/{regionId}/availability
+      access: read
+      description: "Get compute type availability for a region"
+      params:
+        regionId: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # TAGS
+    # =========================================================================
+
+    list_tags:
+      method: GET
+      path: /tags
+      access: read
+      description: "List all tags"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    create_tag:
+      method: POST
+      path: /tags
+      access: write
+      description: "Create a tag and optionally attach it to resources"
+      params:
+        label: { type: string, in: body, required: true }
+        linodes: { type: array, in: body, description: "Linode IDs to tag" }
+        volumes: { type: array, in: body }
+        domains: { type: array, in: body }
+        nodebalancers: { type: array, in: body }
+      pagination: none
+
+    delete_tag:
+      method: DELETE
+      path: /tags/{label}
+      access: dangerous
+      description: "Delete a tag from all resources"
+      params:
+        label: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # EVENTS
+    # =========================================================================
+
+    list_events:
+      method: GET
+      path: /account/events
+      access: read
+      description: "List account events (create, delete, boot, etc.)"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_event:
+      method: GET
+      path: /account/events/{eventId}
+      access: read
+      description: "Get a specific event"
+      params:
+        eventId: { type: integer, in: path, required: true }
+      pagination: none
+
+    mark_event_seen:
+      method: POST
+      path: /account/events/{eventId}/seen
+      access: write
+      description: "Mark an event as seen"
+      params:
+        eventId: { type: integer, in: path, required: true }
+      pagination: none
+
+    mark_event_read:
+      method: POST
+      path: /account/events/{eventId}/read
+      access: write
+      description: "Mark an event as read"
+      params:
+        eventId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ACCOUNT
+    # =========================================================================
+
+    get_account:
+      method: GET
+      path: /account
+      access: read
+      description: "Get account contact and billing info"
+      pagination: none
+
+    get_account_settings:
+      method: GET
+      path: /account/settings
+      access: read
+      description: "Get account-wide settings (managed, backups defaults, network helper)"
+      pagination: none
+
+    update_account_settings:
+      method: PUT
+      path: /account/settings
+      access: admin
+      description: "Update account settings"
+      params:
+        backups_enabled: { type: boolean, in: body }
+        longview_subscription: { type: string, in: body }
+        network_helper: { type: boolean, in: body }
+      pagination: none
+
+    get_account_transfer:
+      method: GET
+      path: /account/transfer
+      access: read
+      description: "Get network transfer pool usage for the current month"
+      pagination: none
+
+    # --- Users ---
+
+    list_users:
+      method: GET
+      path: /account/users
+      access: read
+      description: "List account users"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_user:
+      method: GET
+      path: /account/users/{username}
+      access: read
+      description: "Get a specific user"
+      params:
+        username: { type: string, in: path, required: true }
+      pagination: none
+
+    create_user:
+      method: POST
+      path: /account/users
+      access: admin
+      description: "Create a new user on the account"
+      params:
+        username: { type: string, in: body, required: true }
+        email: { type: string, in: body, required: true }
+        restricted: { type: boolean, in: body, description: "If true, must configure grants" }
+      pagination: none
+
+    update_user:
+      method: PUT
+      path: /account/users/{username}
+      access: admin
+      description: "Update a user"
+      params:
+        username: { type: string, in: path, required: true }
+        email: { type: string, in: body }
+        restricted: { type: boolean, in: body }
+      pagination: none
+
+    delete_user:
+      method: DELETE
+      path: /account/users/{username}
+      access: dangerous
+      description: "Delete a user from the account"
+      params:
+        username: { type: string, in: path, required: true }
+      pagination: none
+
+    get_user_grants:
+      method: GET
+      path: /account/users/{username}/grants
+      access: read
+      description: "Get permissions/grants for a restricted user"
+      params:
+        username: { type: string, in: path, required: true }
+      pagination: none
+
+    update_user_grants:
+      method: PUT
+      path: /account/users/{username}/grants
+      access: admin
+      description: "Update permissions/grants for a restricted user"
+      params:
+        username: { type: string, in: path, required: true }
+        global: { type: object, in: body, description: "Global grant flags" }
+        linode: { type: array, in: body }
+        domain: { type: array, in: body }
+        nodebalancer: { type: array, in: body }
+        volume: { type: array, in: body }
+        image: { type: array, in: body }
+        longview: { type: array, in: body }
+        stackscript: { type: array, in: body }
+        database: { type: array, in: body }
+      pagination: none
+
+    # =========================================================================
+    # PROFILE
+    # =========================================================================
+
+    get_profile:
+      method: GET
+      path: /profile
+      access: read
+      description: "Get the current user's profile"
+      pagination: none
+
+    update_profile:
+      method: PUT
+      path: /profile
+      access: admin
+      description: "Update the current user's profile"
+      params:
+        email: { type: string, in: body }
+        timezone: { type: string, in: body }
+        email_notifications: { type: boolean, in: body }
+        authorized_keys: { type: array, in: body }
+        restricted: { type: boolean, in: body }
+        lish_auth_method: { type: string, in: body, description: "password_keys, keys_only, disabled" }
+      pagination: none
+
+    # --- SSH Keys ---
+
+    list_ssh_keys:
+      method: GET
+      path: /profile/ssh-keys
+      access: read
+      description: "List SSH keys on the current user's profile"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    get_ssh_key:
+      method: GET
+      path: /profile/ssh-keys/{sshKeyId}
+      access: read
+      description: "Get a specific SSH key"
+      params:
+        sshKeyId: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_ssh_key:
+      method: POST
+      path: /profile/ssh-keys
+      access: write
+      description: "Add an SSH key to the profile"
+      params:
+        label: { type: string, in: body, required: true }
+        ssh_key: { type: string, in: body, required: true, description: "Public key string" }
+      pagination: none
+
+    update_ssh_key:
+      method: PUT
+      path: /profile/ssh-keys/{sshKeyId}
+      access: write
+      description: "Update an SSH key's label"
+      params:
+        sshKeyId: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+      pagination: none
+
+    delete_ssh_key:
+      method: DELETE
+      path: /profile/ssh-keys/{sshKeyId}
+      access: dangerous
+      description: "Remove an SSH key from the profile"
+      params:
+        sshKeyId: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- Personal Access Tokens ---
+
+    list_tokens:
+      method: GET
+      path: /profile/tokens
+      access: read
+      description: "List personal access tokens"
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query }
+
+    create_token:
+      method: POST
+      path: /profile/tokens
+      access: admin
+      description: "Create a personal access token"
+      params:
+        label: { type: string, in: body, required: true }
+        scopes: { type: string, in: body, required: true, description: "Space-separated scopes (e.g. linodes:read_write volumes:read_only)" }
+        expiry: { type: string, in: body, description: "ISO 8601 expiry date. Null for no expiry." }
+      pagination: none
+
+    delete_token:
+      method: DELETE
+      path: /profile/tokens/{tokenId}
+      access: dangerous
+      description: "Revoke a personal access token"
+      params:
+        tokenId: { type: integer, in: path, required: true }
+      pagination: none
+
+  # ===========================================================================
+  # EXAMPLES
+  # ===========================================================================
+
+  examples:
+    - name: "Provision a web server"
+      description: "Create a Linode with Ubuntu, wait for it to boot, then get its IP"
+      code: |
+        const linode = await api.create_linode({
+          region: "us-east",
+          type: "g6-nanode-1",
+          image: "linode/ubuntu22.04",
+          root_pass: "s3cur3P@ssw0rd!",
+          label: "web-server-01",
+          tags: ["production", "web"],
+          booted: true,
+          private_ip: true,
+          backups_enabled: true
+        });
+        const details = await api.get_linode({ linodeId: linode.id });
+        return { id: details.id, label: details.label, ipv4: details.ipv4, status: details.status };
+
+    - name: "Set up DNS for a domain"
+      description: "Create a domain and add A + MX records"
+      code: |
+        const domain = await api.create_domain({
+          domain: "example.com",
+          type: "master",
+          soa_email: "admin@example.com"
+        });
+        await api.create_domain_record({
+          domainId: domain.id,
+          type: "A",
+          name: "",
+          target: "203.0.113.1"
+        });
+        await api.create_domain_record({
+          domainId: domain.id,
+          type: "MX",
+          name: "",
+          target: "mail.example.com",
+          priority: 10
+        });
+        const records = await api.list_domain_records({ domainId: domain.id });
+        return records;
+
+    - name: "Create LKE cluster with autoscaler"
+      description: "Provision a Kubernetes cluster with an autoscaling node pool"
+      code: |
+        const versions = await api.list_lke_versions();
+        const latest = versions[0].id;
+        const cluster = await api.create_lke_cluster({
+          label: "prod-cluster",
+          region: "us-east",
+          k8s_version: latest,
+          node_pools: [{ type: "g6-standard-2", count: 3 }],
+          control_plane: { high_availability: true },
+          tags: ["production"]
+        });
+        const kubeconfig = await api.get_lke_kubeconfig({ clusterId: cluster.id });
+        return { id: cluster.id, kubeconfig_base64: kubeconfig.kubeconfig };
