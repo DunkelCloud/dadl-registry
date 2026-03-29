@@ -1,0 +1,27 @@
+name: Update dadl.ai submodule
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  update-submodule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dadl.ai
+        uses: actions/checkout@v4
+        with:
+          repository: DunkelCloud/dadl.ai
+          token: ${{ secrets.DADL_AI_PAT }}
+          submodules: true
+
+      - name: Update definitions submodule to latest
+        run: |
+          git submodule update --remote definitions
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add definitions
+          git diff --cached --quiet || git commit -m "chore: update dadl-registry to $(cd definitions && git rev-parse --short HEAD)"
+
+      - name: Push
+        run: git push
