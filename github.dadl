@@ -6,18 +6,18 @@ backend:
   description: "GitHub REST API — repositories, issues, pull requests, commits, and code search"
 
   coverage:
-    endpoints: 189
+    endpoints: 204
     total_endpoints: 900
-    percentage: 21
-    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + artifacts + dispatch), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, code scanning, dependabot, secret scanning"
-    missing: "projects v2, packages, codespaces, copilot, security advisories, rate limit API, git LFS, autolinks, repository rulesets"
+    percentage: 23
+    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + artifacts + dispatch), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions)"
+    missing: "projects v2, codespaces, copilot, security advisories, rate limit API, git LFS, autolinks, repository rulesets"
     last_reviewed: "2026-03-28"
 
   setup:
     credential_steps:
       - "Navigate to GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)"
       - "Click 'Generate new token (classic)'"
-      - "Select scopes: repo (full access), read:org (list organizations), workflow (actions), admin:repo_hook (webhooks), delete_repo (delete repos), gist, notifications, read:packages"
+      - "Select scopes: repo (full access), read:org (list organizations), workflow (actions), admin:repo_hook (webhooks), delete_repo (delete repos), gist, notifications, read:packages, write:packages, delete:packages"
       - "Copy the token (starts with ghp_ or github_pat_)"
     env_var: CREDENTIAL_GITHUB_TOKEN
     backends_yaml: |
@@ -2519,4 +2519,157 @@ backend:
         state: { type: string, in: body, required: true }
         resolution: { type: string, in: body }
         resolution_comment: { type: string, in: body }
+      pagination: none
+
+    # ── Packages (Organization) ───────────────────────────────────
+
+    list_org_packages:
+      method: GET
+      path: /orgs/{org}/packages
+      access: read
+      description: "List packages in an organization. package_type is required: npm, maven, rubygems, docker, nuget, container."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: query, required: true, description: "npm, maven, rubygems, docker, nuget, container" }
+        visibility: { type: string, in: query, description: "public, private, internal" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_org_package:
+      method: GET
+      path: /orgs/{org}/packages/{package_type}/{package_name}
+      access: read
+      description: "Get a specific package in an organization."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_org_package:
+      method: DELETE
+      path: /orgs/{org}/packages/{package_type}/{package_name}
+      access: dangerous
+      description: "Delete an entire package in an organization. Requires admin permissions. Cannot be undone after 30 days."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+      pagination: none
+
+    restore_org_package:
+      method: POST
+      path: /orgs/{org}/packages/{package_type}/{package_name}/restore
+      access: admin
+      description: "Restore a deleted organization package. Only works within 30 days of deletion."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+        token: { type: string, in: query, description: "Package token from delete response" }
+      pagination: none
+
+    list_org_package_versions:
+      method: GET
+      path: /orgs/{org}/packages/{package_type}/{package_name}/versions
+      access: read
+      description: "List all versions of an organization package. Filter by state: active (default), deleted."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+        state: { type: string, in: query, description: "active (default), deleted" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_org_package_version:
+      method: GET
+      path: /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}
+      access: read
+      description: "Get a specific version of an organization package."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+        package_version_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    delete_org_package_version:
+      method: DELETE
+      path: /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}
+      access: dangerous
+      description: "Delete a specific version of an organization package. Cannot be undone after 30 days."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+        package_version_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    restore_org_package_version:
+      method: POST
+      path: /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}/restore
+      access: admin
+      description: "Restore a deleted version of an organization package. Only works within 30 days."
+      params:
+        org: { type: string, in: path, required: true }
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+        package_version_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── Packages (Authenticated User) ─────────────────────────────
+
+    list_user_packages:
+      method: GET
+      path: /user/packages
+      access: read
+      description: "List packages owned by the authenticated user. package_type is required: npm, maven, rubygems, docker, nuget, container."
+      params:
+        package_type: { type: string, in: query, required: true, description: "npm, maven, rubygems, docker, nuget, container" }
+        visibility: { type: string, in: query, description: "public, private, internal" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_user_package:
+      method: GET
+      path: /user/packages/{package_type}/{package_name}
+      access: read
+      description: "Get a package owned by the authenticated user."
+      params:
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_user_package:
+      method: DELETE
+      path: /user/packages/{package_type}/{package_name}
+      access: dangerous
+      description: "Delete a package owned by the authenticated user. Cannot be undone after 30 days."
+      params:
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_user_package_versions:
+      method: GET
+      path: /user/packages/{package_type}/{package_name}/versions
+      access: read
+      description: "List all versions of a package owned by the authenticated user."
+      params:
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+        state: { type: string, in: query, description: "active (default), deleted" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    delete_user_package_version:
+      method: DELETE
+      path: /user/packages/{package_type}/{package_name}/versions/{package_version_id}
+      access: dangerous
+      description: "Delete a specific version of a package owned by the authenticated user."
+      params:
+        package_type: { type: string, in: path, required: true }
+        package_name: { type: string, in: path, required: true }
+        package_version_id: { type: integer, in: path, required: true }
       pagination: none
