@@ -1,0 +1,2587 @@
+# cloudflare.dadl -- Cloudflare REST API v4
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - Most endpoints require either {account_id} or {zone_id} as path parameter.
+# - account_id: identifies your Cloudflare account (found in dashboard URL or /accounts endpoint).
+# - zone_id: identifies a domain/zone within your account (found via list_zones).
+# - Pages, Workers, KV, R2, D1, Access are account-scoped (/accounts/{account_id}/...).
+# - DNS, SSL, Cache, Page Rules, Load Balancers are zone-scoped (/zones/{zone_id}/...).
+# - DNS record types: A, AAAA, CNAME, MX, TXT, NS, SRV, CAA, CERT, HTTPS, LOC, PTR, SVCB, TLSA, URI, and more.
+# - Pagination uses page/per_page query params. Default per_page is 20, max 50 for most endpoints.
+# - Rate limits: 1200 requests per 5 minutes per user. Some endpoints have stricter limits.
+# - All timestamps are ISO 8601 UTC.
+# - Proxied DNS records route traffic through Cloudflare (orange cloud); non-proxied are DNS-only (grey cloud).
+# - Workers KV is eventually consistent. R2 is strongly consistent.
+# - Pages deployments use multipart uploads for direct upload or Git integration for auto-deploy.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Cloudflare REST API v4"
+source_url: "https://developers.cloudflare.com/api/"
+date: "2026-03-30"
+
+backend:
+  name: cloudflare
+  type: rest
+  version: "1.0"
+  base_url: https://api.cloudflare.com/client/v4
+  description: "Cloudflare API -- DNS, Pages, Workers, KV, R2, D1, Zones, SSL/TLS, Cache, Load Balancers, Firewall/WAF, Page Rules, Access (Zero Trust), and account management"
+
+  auth:
+    type: bearer
+    credential: cloudflare_api_token
+
+  defaults:
+    headers:
+      Content-Type: application/json
+    pagination:
+      strategy: page
+      request:
+        cursor_param: page
+        limit_param: per_page
+        limit_default: 20
+      response:
+        next_cursor: "$.result_info.page"
+        has_more: "$.result_info.page < $.result_info.total_pages"
+      behavior: expose
+      max_pages: 20
+    errors:
+      format: json
+      message_path: "$.errors[0].message"
+      code_path: "$.errors[0].code"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      terminal: [400, 401, 403, 404, 405, 409]
+      rate_limit:
+        header: X-RateLimit-Remaining
+        retry_after_header: Retry-After
+    response:
+      result_path: "$.result"
+      metadata_path: "$.result_info"
+      max_items: 200
+
+  coverage:
+    endpoints: 248
+    total_endpoints: 1500
+    percentage: 17
+    focus: "zones, DNS records, DNSSEC, DNS settings, Pages projects/deployments/domains, Workers scripts/routes/secrets/cron/deployments/tails, KV namespaces/keys, R2 buckets/lifecycle/CORS/domains, D1 databases/queries, SSL/TLS certificates/custom hostnames, cache purge/settings, load balancers/pools/monitors, firewall rules/rulesets/rate limits, page rules, Access apps/policies/groups, accounts/members/roles"
+    missing: "Argo, Spectrum, Stream, Images (transformations), Email Routing, Waiting Room, Web3, Registrar, Turnstile, Queues, Hyperdrive, Vectorize, AI Gateway, Durable Objects, Zone Lockdown, IP Access Rules, User-Agent Blocking, Logpush, Notifications, Audit Logs"
+    last_reviewed: "2026-03-30"
+
+  setup:
+    credential_steps:
+      - "Log in to Cloudflare dashboard at https://dash.cloudflare.com"
+      - "Go to My Profile (top right) → API Tokens"
+      - "Click 'Create Token'"
+      - "Use a template (e.g. 'Edit zone DNS') or create a custom token with specific permissions"
+      - "Copy the token immediately -- it is shown only once"
+    env_var: CREDENTIAL_CLOUDFLARE_API_TOKEN
+    backends_yaml: |
+      - name: cloudflare
+        transport: rest
+        dadl: /app/dadl/cloudflare.dadl
+    required_scopes:
+      - "zone:read"
+      - "zone:edit"
+      - "dns:read"
+      - "dns:edit"
+      - "pages:read"
+      - "pages:edit"
+      - "workers:read"
+      - "workers:edit"
+    optional_scopes:
+      - "account:read"
+      - "account:edit"
+      - "ssl:read"
+      - "ssl:edit"
+      - "firewall:read"
+      - "firewall:edit"
+      - "load_balancer:read"
+      - "load_balancer:edit"
+      - "access:read"
+      - "access:edit"
+    docs_url: "https://developers.cloudflare.com/fundamentals/api/get-started/create-token/"
+    notes: "API Tokens (scoped) are preferred over Global API Key. Tokens can be restricted to specific zones and permissions. The Global API Key uses X-Auth-Email + X-Auth-Key headers instead of Bearer token."
+
+  hints:
+    list_zones:
+      filtering: "Filter by name, status, account.id, account.name via query params"
+      note: "Returns zone_id needed for all zone-scoped endpoints"
+    create_dns_record:
+      proxied: "Set proxied=true for Cloudflare proxy (orange cloud), false for DNS-only (grey cloud). Not all record types support proxying."
+      types: "Supported: A, AAAA, CNAME, MX, TXT, NS, SRV, CAA, CERT, HTTPS, LOC, PTR, SVCB, TLSA, URI"
+      srv_format: "SRV records use data object: {service, proto, name, priority, weight, port, target}"
+    batch_dns_records:
+      note: "Atomic batch: all operations succeed or all fail. Supports deletes, patches, puts, and posts in one call."
+    create_pages_project:
+      source: "Set source.type to 'github' or 'gitlab' for Git integration, or omit for direct upload"
+      build_config: "build_command, destination_dir, root_dir, web_analytics_tag"
+    create_pages_deployment:
+      direct_upload: "For direct upload, use multipart/form-data with files. For Git-connected projects, deployments trigger automatically on push."
+    rollback_pages_deployment:
+      warning: "Rolls back production to a previous deployment. Does not delete the current deployment."
+    upload_worker_script:
+      format: "Multipart form: main module content + metadata JSON with bindings, compatibility_date, etc."
+    kv_write_value:
+      consistency: "KV is eventually consistent. Writes may take up to 60s to propagate globally."
+      expiration: "Set expiration (Unix timestamp) or expiration_ttl (seconds) for auto-deletion."
+    purge_cache:
+      modes: "purge_everything=true for full purge, or use files/tags/hosts/prefixes for selective purge"
+    create_load_balancer:
+      steering: "Steering policies: off, geo, random, dynamic_latency, proximity, least_outstanding_requests, least_connections"
+
+  tools:
+
+    # =========================================================================
+    # ACCOUNTS
+    # =========================================================================
+
+    list_accounts:
+      method: GET
+      path: /accounts
+      access: read
+      description: "List all accounts you have access to"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        direction: { type: string, in: query, description: "asc or desc" }
+        name: { type: string, in: query, description: "Filter by account name" }
+
+    get_account:
+      method: GET
+      path: /accounts/{account_id}
+      access: read
+      description: "Get account details"
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_account:
+      method: PUT
+      path: /accounts/{account_id}
+      access: admin
+      description: "Update account settings"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        settings: { type: object, in: body }
+      pagination: none
+
+    # =========================================================================
+    # ACCOUNT MEMBERS & ROLES
+    # =========================================================================
+
+    list_account_members:
+      method: GET
+      path: /accounts/{account_id}/members
+      access: read
+      description: "List all account members"
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        order: { type: string, in: query }
+        status: { type: string, in: query, description: "accepted, pending, rejected" }
+        direction: { type: string, in: query }
+
+    get_account_member:
+      method: GET
+      path: /accounts/{account_id}/members/{member_id}
+      access: read
+      description: "Get account member details"
+      params:
+        account_id: { type: string, in: path, required: true }
+        member_id: { type: string, in: path, required: true }
+      pagination: none
+
+    add_account_member:
+      method: POST
+      path: /accounts/{account_id}/members
+      access: admin
+      description: "Add a member to an account"
+      params:
+        account_id: { type: string, in: path, required: true }
+        email: { type: string, in: body, required: true }
+        roles: { type: array, in: body, required: true, description: "Array of role IDs" }
+        policies: { type: array, in: body }
+      pagination: none
+
+    update_account_member:
+      method: PUT
+      path: /accounts/{account_id}/members/{member_id}
+      access: admin
+      description: "Update account member roles"
+      params:
+        account_id: { type: string, in: path, required: true }
+        member_id: { type: string, in: path, required: true }
+        roles: { type: array, in: body, required: true }
+      pagination: none
+
+    remove_account_member:
+      method: DELETE
+      path: /accounts/{account_id}/members/{member_id}
+      access: admin
+      description: "Remove a member from an account"
+      params:
+        account_id: { type: string, in: path, required: true }
+        member_id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_account_roles:
+      method: GET
+      path: /accounts/{account_id}/roles
+      access: read
+      description: "List all available roles for an account"
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    get_account_role:
+      method: GET
+      path: /accounts/{account_id}/roles/{role_id}
+      access: read
+      description: "Get role details and permissions"
+      params:
+        account_id: { type: string, in: path, required: true }
+        role_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ZONES
+    # =========================================================================
+
+    list_zones:
+      method: GET
+      path: /zones
+      access: read
+      description: "List, search, sort, and filter zones. Returns zone_id needed for all zone-scoped endpoints."
+      params:
+        name: { type: string, in: query, description: "Filter by domain name" }
+        status: { type: string, in: query, description: "active, pending, initializing, moved, deleted, deactivated" }
+        account.id: { type: string, in: query, description: "Filter by account ID" }
+        account.name: { type: string, in: query }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        order: { type: string, in: query, description: "name, status, account.id, account.name" }
+        direction: { type: string, in: query, description: "asc or desc" }
+        match: { type: string, in: query, description: "any or all (default all)" }
+      response:
+        result_path: "$.result"
+        transform: |
+          map({
+            id, name, status, paused, type,
+            account_id: .account.id,
+            name_servers,
+            plan: .plan.name,
+            created_on, modified_on
+          })
+
+    get_zone:
+      method: GET
+      path: /zones/{zone_id}
+      access: read
+      description: "Get zone details"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_zone:
+      method: POST
+      path: /zones
+      access: write
+      description: "Create a new zone (add a domain to Cloudflare)"
+      params:
+        name: { type: string, in: body, required: true, description: "Domain name (e.g. example.com)" }
+        account: { type: object, in: body, required: true, description: "Object with 'id' field for account ID" }
+        type: { type: string, in: body, description: "full (default), partial, or secondary" }
+      pagination: none
+
+    update_zone:
+      method: PATCH
+      path: /zones/{zone_id}
+      access: write
+      description: "Edit zone properties (paused, type, vanity nameservers)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        paused: { type: boolean, in: body }
+        type: { type: string, in: body }
+        vanity_name_servers: { type: array, in: body }
+      pagination: none
+
+    delete_zone:
+      method: DELETE
+      path: /zones/{zone_id}
+      access: dangerous
+      description: "Delete a zone and all associated settings. Irreversible."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    check_zone_activation:
+      method: PUT
+      path: /zones/{zone_id}/activation_check
+      access: write
+      description: "Trigger activation check for a PENDING zone. Rate limited (5min paygo/enterprise, 1hr free)."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ZONE SETTINGS
+    # =========================================================================
+
+    list_zone_settings:
+      method: GET
+      path: /zones/{zone_id}/settings
+      access: read
+      description: "Get all zone settings"
+      params:
+        zone_id: { type: string, in: path, required: true }
+
+    get_zone_setting:
+      method: GET
+      path: /zones/{zone_id}/settings/{setting_id}
+      access: read
+      description: "Get a single zone setting by ID"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        setting_id: { type: string, in: path, required: true, description: "e.g. ssl, min_tls_version, always_use_https, browser_cache_ttl, cache_level, development_mode, minify, security_level, waf, http2, http3, websockets, ip_geolocation, etc." }
+      pagination: none
+
+    update_zone_setting:
+      method: PATCH
+      path: /zones/{zone_id}/settings/{setting_id}
+      access: write
+      description: "Update a single zone setting"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        setting_id: { type: string, in: path, required: true }
+        value: { type: string, in: body, required: true, description: "New value for the setting" }
+      pagination: none
+
+    # =========================================================================
+    # ZONE HOLDS
+    # =========================================================================
+
+    get_zone_hold:
+      method: GET
+      path: /zones/{zone_id}/hold
+      access: read
+      description: "Get zone hold status and metadata"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_zone_hold:
+      method: POST
+      path: /zones/{zone_id}/hold
+      access: admin
+      description: "Enforce a zone hold (block zone creation with this hostname)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        include_subdomains: { type: boolean, in: body }
+      pagination: none
+
+    delete_zone_hold:
+      method: DELETE
+      path: /zones/{zone_id}/hold
+      access: admin
+      description: "Remove zone hold (permanently or temporarily)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        hold_after: { type: string, in: query, description: "ISO 8601 timestamp to re-enable hold" }
+      pagination: none
+
+    # =========================================================================
+    # ZONE SUBSCRIPTIONS & PLANS
+    # =========================================================================
+
+    list_zone_plans:
+      method: GET
+      path: /zones/{zone_id}/available_plans
+      access: read
+      description: "List available plans the zone can subscribe to"
+      params:
+        zone_id: { type: string, in: path, required: true }
+
+    get_zone_subscription:
+      method: GET
+      path: /zones/{zone_id}/subscription
+      access: read
+      description: "Get zone subscription details"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_zone_subscription:
+      method: POST
+      path: /zones/{zone_id}/subscription
+      access: write
+      description: "Create zone subscription (plan/add-on)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        rate_plan: { type: object, in: body, required: true }
+        component_values: { type: array, in: body }
+      pagination: none
+
+    # =========================================================================
+    # DNS RECORDS (complete)
+    # =========================================================================
+
+    list_dns_records:
+      method: GET
+      path: /zones/{zone_id}/dns_records
+      access: read
+      description: "List, search, sort, and filter DNS records for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        type: { type: string, in: query, description: "A, AAAA, CNAME, MX, TXT, NS, SRV, CAA, etc." }
+        name: { type: string, in: query, description: "DNS record name (e.g. example.com)" }
+        content: { type: string, in: query, description: "DNS record content (e.g. IP address)" }
+        proxied: { type: boolean, in: query }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        order: { type: string, in: query, description: "type, name, content, ttl, proxied" }
+        direction: { type: string, in: query }
+        match: { type: string, in: query, description: "any or all" }
+        tag: { type: string, in: query, description: "Filter by tag" }
+        tag-match: { type: string, in: query, description: "any or all" }
+        comment: { type: string, in: query, description: "Substring of comment" }
+
+    get_dns_record:
+      method: GET
+      path: /zones/{zone_id}/dns_records/{dns_record_id}
+      access: read
+      description: "Get a single DNS record"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        dns_record_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_dns_record:
+      method: POST
+      path: /zones/{zone_id}/dns_records
+      access: write
+      description: "Create a new DNS record"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "A, AAAA, CNAME, MX, TXT, NS, SRV, CAA, etc." }
+        name: { type: string, in: body, required: true, description: "DNS record name (@ for root)" }
+        content: { type: string, in: body, required: true, description: "Record content (IP, hostname, text, etc.)" }
+        ttl: { type: integer, in: body, description: "TTL in seconds (1 = automatic)" }
+        proxied: { type: boolean, in: body, description: "Whether to proxy through Cloudflare (orange cloud)" }
+        priority: { type: integer, in: body, description: "Priority for MX records" }
+        comment: { type: string, in: body, description: "Comment for the record" }
+        tags: { type: array, in: body, description: "Tags for the record" }
+        data: { type: object, in: body, description: "Structured data for SRV, CAA, HTTPS, SVCB, etc." }
+      pagination: none
+
+    update_dns_record:
+      method: PATCH
+      path: /zones/{zone_id}/dns_records/{dns_record_id}
+      access: write
+      description: "Update (partial) a DNS record"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        dns_record_id: { type: string, in: path, required: true }
+        type: { type: string, in: body }
+        name: { type: string, in: body }
+        content: { type: string, in: body }
+        ttl: { type: integer, in: body }
+        proxied: { type: boolean, in: body }
+        comment: { type: string, in: body }
+        tags: { type: array, in: body }
+        data: { type: object, in: body }
+      pagination: none
+
+    overwrite_dns_record:
+      method: PUT
+      path: /zones/{zone_id}/dns_records/{dns_record_id}
+      access: write
+      description: "Overwrite (full replace) a DNS record"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        dns_record_id: { type: string, in: path, required: true }
+        type: { type: string, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        content: { type: string, in: body, required: true }
+        ttl: { type: integer, in: body }
+        proxied: { type: boolean, in: body }
+        priority: { type: integer, in: body }
+        comment: { type: string, in: body }
+        tags: { type: array, in: body }
+        data: { type: object, in: body }
+      pagination: none
+
+    delete_dns_record:
+      method: DELETE
+      path: /zones/{zone_id}/dns_records/{dns_record_id}
+      access: dangerous
+      description: "Delete a DNS record"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        dns_record_id: { type: string, in: path, required: true }
+      pagination: none
+
+    batch_dns_records:
+      method: POST
+      path: /zones/{zone_id}/dns_records/batch
+      access: write
+      description: "Batch create/update/delete DNS records atomically in one transaction"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        deletes: { type: array, in: body, description: "Array of records to delete (each with id)" }
+        patches: { type: array, in: body, description: "Array of records to partially update" }
+        puts: { type: array, in: body, description: "Array of records to fully replace" }
+        posts: { type: array, in: body, description: "Array of new records to create" }
+      pagination: none
+
+    import_dns_records:
+      method: POST
+      path: /zones/{zone_id}/dns_records/import
+      access: write
+      description: "Import DNS records from a BIND config file"
+      content_type: multipart/form-data
+      params:
+        zone_id: { type: string, in: path, required: true }
+        file: { type: file_url, in: body, required: true, description: "BIND zone file" }
+      pagination: none
+
+    export_dns_records:
+      method: GET
+      path: /zones/{zone_id}/dns_records/export
+      access: read
+      description: "Export DNS records as BIND zone file"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      response:
+        binary: true
+        content_type: text/plain
+      pagination: none
+
+    scan_dns_records:
+      method: POST
+      path: /zones/{zone_id}/dns_records/scan
+      access: write
+      description: "Scan for common DNS records and auto-add them"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DNSSEC
+    # =========================================================================
+
+    get_dnssec:
+      method: GET
+      path: /zones/{zone_id}/dnssec
+      access: read
+      description: "Get DNSSEC status and configuration"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_dnssec:
+      method: PATCH
+      path: /zones/{zone_id}/dnssec
+      access: write
+      description: "Enable or disable DNSSEC"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        status: { type: string, in: body, required: true, description: "active or disabled" }
+      pagination: none
+
+    delete_dnssec:
+      method: DELETE
+      path: /zones/{zone_id}/dnssec
+      access: dangerous
+      description: "Delete DNSSEC records"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DNS SETTINGS
+    # =========================================================================
+
+    get_zone_dns_settings:
+      method: GET
+      path: /zones/{zone_id}/dns_settings
+      access: read
+      description: "Get DNS settings for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_zone_dns_settings:
+      method: PATCH
+      path: /zones/{zone_id}/dns_settings
+      access: write
+      description: "Update DNS settings for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        ns_ttl: { type: integer, in: body }
+        zone_mode: { type: string, in: body }
+      pagination: none
+
+    get_account_dns_settings:
+      method: GET
+      path: /accounts/{account_id}/dns_settings
+      access: read
+      description: "Get DNS settings for an account"
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_account_dns_settings:
+      method: PATCH
+      path: /accounts/{account_id}/dns_settings
+      access: write
+      description: "Update DNS settings for an account"
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DNS ANALYTICS
+    # =========================================================================
+
+    get_dns_analytics:
+      method: GET
+      path: /zones/{zone_id}/dns_analytics/report
+      access: read
+      description: "Get summarized aggregate DNS metrics over a time period"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        since: { type: string, in: query, description: "ISO 8601 start time" }
+        until: { type: string, in: query, description: "ISO 8601 end time" }
+        metrics: { type: string, in: query, description: "Comma-separated: queryCount, uncachedCount, staleCount, responseTimeAvg, etc." }
+        dimensions: { type: string, in: query }
+        filters: { type: string, in: query }
+        sort: { type: string, in: query }
+        limit: { type: integer, in: query }
+      pagination: none
+
+    get_dns_analytics_by_time:
+      method: GET
+      path: /zones/{zone_id}/dns_analytics/report/bytime
+      access: read
+      description: "Get aggregate DNS metrics grouped by time interval"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        since: { type: string, in: query }
+        until: { type: string, in: query }
+        metrics: { type: string, in: query }
+        dimensions: { type: string, in: query }
+        filters: { type: string, in: query }
+        sort: { type: string, in: query }
+        limit: { type: integer, in: query }
+        time_delta: { type: string, in: query, description: "Time interval: hour, day, dekaminute, etc." }
+      pagination: none
+
+    # =========================================================================
+    # CLOUDFLARE PAGES -- Projects (complete)
+    # =========================================================================
+
+    list_pages_projects:
+      method: GET
+      path: /accounts/{account_id}/pages/projects
+      access: read
+      description: "List all Cloudflare Pages projects"
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+      response:
+        result_path: "$.result"
+        transform: |
+          map({
+            name, id, subdomain,
+            source_type: (.source.type // "direct_upload"),
+            repo: (.source.config.repo_name // null),
+            owner: (.source.config.owner // null),
+            production_branch,
+            build_command: .build_config.build_command,
+            domains,
+            created_on,
+            latest_status: .canonical_deployment.latest_stage.status,
+            latest_deploy: .canonical_deployment.created_on,
+            latest_commit: .canonical_deployment.deployment_trigger.metadata.commit_message
+          })
+
+    get_pages_project:
+      method: GET
+      path: /accounts/{account_id}/pages/projects/{project_name}
+      access: read
+      description: "Get a Pages project by name"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+      pagination: none
+
+    create_pages_project:
+      method: POST
+      path: /accounts/{account_id}/pages/projects
+      access: write
+      description: "Create a new Pages project"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Project name (slug format)" }
+        production_branch: { type: string, in: body, description: "Git branch for production (default: main)" }
+        build_config: { type: object, in: body, description: "Build config: build_command, destination_dir, root_dir, web_analytics_tag" }
+        deployment_configs: { type: object, in: body, description: "Environment-specific configs for preview and production" }
+        source: { type: object, in: body, description: "Git source config: type (github/gitlab), config with owner, repo_name, production_branch, etc." }
+      pagination: none
+
+    update_pages_project:
+      method: PATCH
+      path: /accounts/{account_id}/pages/projects/{project_name}
+      access: write
+      description: "Update Pages project attributes"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        production_branch: { type: string, in: body }
+        build_config: { type: object, in: body }
+        deployment_configs: { type: object, in: body }
+      pagination: none
+
+    delete_pages_project:
+      method: DELETE
+      path: /accounts/{account_id}/pages/projects/{project_name}
+      access: dangerous
+      description: "Delete a Pages project and all deployments. Irreversible."
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+      pagination: none
+
+    purge_pages_build_cache:
+      method: POST
+      path: /accounts/{account_id}/pages/projects/{project_name}/purge_build_cache
+      access: write
+      description: "Purge all cached build artifacts for a Pages project"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # CLOUDFLARE PAGES -- Deployments (complete)
+    # =========================================================================
+
+    list_pages_deployments:
+      method: GET
+      path: /accounts/{account_id}/pages/projects/{project_name}/deployments
+      access: read
+      description: "List all deployments for a Pages project"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        env: { type: string, in: query, description: "preview or production" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+      response:
+        result_path: "$.result"
+        transform: |
+          map({
+            id, short_id, environment, url,
+            branch: .deployment_trigger.metadata.branch,
+            commit: .deployment_trigger.metadata.commit_message,
+            commit_hash: .deployment_trigger.metadata.commit_hash,
+            trigger_type: .deployment_trigger.type,
+            status: .latest_stage.status,
+            stage: .latest_stage.name,
+            created_on, modified_on,
+            aliases
+          })
+
+    get_pages_deployment:
+      method: GET
+      path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}
+      access: read
+      description: "Get a specific deployment"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        deployment_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_pages_deployment:
+      method: POST
+      path: /accounts/{account_id}/pages/projects/{project_name}/deployments
+      access: write
+      description: "Create a new deployment (direct upload via multipart or trigger Git build)"
+      content_type: multipart/form-data
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        branch: { type: string, in: body, description: "Git branch name" }
+      pagination: none
+
+    delete_pages_deployment:
+      method: DELETE
+      path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}
+      access: dangerous
+      description: "Delete a deployment"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        deployment_id: { type: string, in: path, required: true }
+      pagination: none
+
+    retry_pages_deployment:
+      method: POST
+      path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/retry
+      access: write
+      description: "Retry a failed deployment"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        deployment_id: { type: string, in: path, required: true }
+      pagination: none
+
+    rollback_pages_deployment:
+      method: POST
+      path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/rollback
+      access: write
+      description: "Rollback production to a previous deployment"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        deployment_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_pages_deployment_logs:
+      method: GET
+      path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/history/logs
+      access: read
+      description: "Get build/deployment logs for a specific deployment"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        deployment_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # CLOUDFLARE PAGES -- Domains (complete)
+    # =========================================================================
+
+    list_pages_domains:
+      method: GET
+      path: /accounts/{account_id}/pages/projects/{project_name}/domains
+      access: read
+      description: "List all custom domains for a Pages project"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+
+    get_pages_domain:
+      method: GET
+      path: /accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}
+      access: read
+      description: "Get a specific Pages domain"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        domain_name: { type: string, in: path, required: true }
+      pagination: none
+
+    add_pages_domain:
+      method: POST
+      path: /accounts/{account_id}/pages/projects/{project_name}/domains
+      access: write
+      description: "Add a custom domain to a Pages project"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Domain name (e.g. www.example.com)" }
+      pagination: none
+
+    retry_pages_domain_validation:
+      method: PATCH
+      path: /accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}
+      access: write
+      description: "Retry domain validation for a Pages custom domain"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        domain_name: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_pages_domain:
+      method: DELETE
+      path: /accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}
+      access: dangerous
+      description: "Remove a custom domain from a Pages project"
+      params:
+        account_id: { type: string, in: path, required: true }
+        project_name: { type: string, in: path, required: true }
+        domain_name: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # WORKERS -- Scripts
+    # =========================================================================
+
+    list_worker_scripts:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts
+      access: read
+      description: "List all uploaded Worker scripts"
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    get_worker_script:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts/{script_name}
+      access: read
+      description: "Fetch raw Worker script content"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    upload_worker_script:
+      method: PUT
+      path: /accounts/{account_id}/workers/scripts/{script_name}
+      access: write
+      description: "Upload or update a Worker script (multipart: module content + metadata with bindings)"
+      content_type: multipart/form-data
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_worker_script:
+      method: DELETE
+      path: /accounts/{account_id}/workers/scripts/{script_name}
+      access: dangerous
+      description: "Delete a Worker script"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+        force: { type: boolean, in: query, description: "Force delete even if routes are attached" }
+      pagination: none
+
+    get_worker_script_content:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts/{script_name}/content/v2
+      access: read
+      description: "Fetch Worker script content only (without metadata)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    update_worker_script_content:
+      method: PUT
+      path: /accounts/{account_id}/workers/scripts/{script_name}/content
+      access: write
+      description: "Update Worker script content without changing settings/bindings"
+      content_type: multipart/form-data
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # WORKERS -- Routes (zone-scoped)
+    # =========================================================================
+
+    list_worker_routes:
+      method: GET
+      path: /zones/{zone_id}/workers/routes
+      access: read
+      description: "List all Worker routes for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+
+    get_worker_route:
+      method: GET
+      path: /zones/{zone_id}/workers/routes/{route_id}
+      access: read
+      description: "Get a specific Worker route"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        route_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_worker_route:
+      method: POST
+      path: /zones/{zone_id}/workers/routes
+      access: write
+      description: "Create a Worker route (map URL pattern to a Worker script)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        pattern: { type: string, in: body, required: true, description: "URL pattern (e.g. example.com/api/*)" }
+        script: { type: string, in: body, required: true, description: "Worker script name" }
+      pagination: none
+
+    update_worker_route:
+      method: PUT
+      path: /zones/{zone_id}/workers/routes/{route_id}
+      access: write
+      description: "Update a Worker route"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        route_id: { type: string, in: path, required: true }
+        pattern: { type: string, in: body, required: true }
+        script: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_worker_route:
+      method: DELETE
+      path: /zones/{zone_id}/workers/routes/{route_id}
+      access: write
+      description: "Delete a Worker route"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        route_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # WORKERS -- Cron Triggers, Secrets, Deployments, Tails, Subdomain
+    # =========================================================================
+
+    list_worker_cron_triggers:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts/{script_name}/schedules
+      access: read
+      description: "List cron triggers for a Worker"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    update_worker_cron_triggers:
+      method: PUT
+      path: /accounts/{account_id}/workers/scripts/{script_name}/schedules
+      access: write
+      description: "Set cron triggers for a Worker (replaces all existing triggers)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_worker_secrets:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts/{script_name}/secrets
+      access: read
+      description: "List secrets bound to a Worker (names only, values not returned)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+
+    put_worker_secret:
+      method: PUT
+      path: /accounts/{account_id}/workers/scripts/{script_name}/secrets
+      access: write
+      description: "Add or update a secret binding for a Worker"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        text: { type: string, in: body, required: true }
+        type: { type: string, in: body, description: "secret_text (default)" }
+      pagination: none
+
+    delete_worker_secret:
+      method: DELETE
+      path: /accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}
+      access: write
+      description: "Remove a secret binding from a Worker"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+        secret_name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_worker_deployments:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts/{script_name}/deployments
+      access: read
+      description: "List deployments for a Worker (latest first)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+
+    create_worker_deployment:
+      method: POST
+      path: /accounts/{account_id}/workers/scripts/{script_name}/deployments
+      access: write
+      description: "Create a Worker deployment (percentage-based rollout)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_worker_tails:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts/{script_name}/tails
+      access: read
+      description: "List active tails (live log streams) for a Worker"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+
+    create_worker_tail:
+      method: POST
+      path: /accounts/{account_id}/workers/scripts/{script_name}/tails
+      access: write
+      description: "Start a tail to receive live logs and exceptions from a Worker"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_worker_tail:
+      method: DELETE
+      path: /accounts/{account_id}/workers/scripts/{script_name}/tails/{tail_id}
+      access: write
+      description: "Delete a Worker tail"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+        tail_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_worker_subdomain:
+      method: GET
+      path: /accounts/{account_id}/workers/scripts/{script_name}/subdomain
+      access: read
+      description: "Check workers.dev subdomain status for a Worker"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+      pagination: none
+
+    set_worker_subdomain:
+      method: POST
+      path: /accounts/{account_id}/workers/scripts/{script_name}/subdomain
+      access: write
+      description: "Enable or disable workers.dev subdomain for a Worker"
+      params:
+        account_id: { type: string, in: path, required: true }
+        script_name: { type: string, in: path, required: true }
+        enabled: { type: boolean, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # KV NAMESPACES
+    # =========================================================================
+
+    list_kv_namespaces:
+      method: GET
+      path: /accounts/{account_id}/storage/kv/namespaces
+      access: read
+      description: "List all Workers KV namespaces"
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_kv_namespace:
+      method: GET
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}
+      access: read
+      description: "Get a KV namespace"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_kv_namespace:
+      method: POST
+      path: /accounts/{account_id}/storage/kv/namespaces
+      access: write
+      description: "Create a KV namespace"
+      params:
+        account_id: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+      pagination: none
+
+    rename_kv_namespace:
+      method: PUT
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}
+      access: write
+      description: "Rename a KV namespace"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_kv_namespace:
+      method: DELETE
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}
+      access: dangerous
+      description: "Delete a KV namespace and all its keys"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # KV KEYS & VALUES
+    # =========================================================================
+
+    list_kv_keys:
+      method: GET
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/keys
+      access: read
+      description: "List keys in a KV namespace"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+        prefix: { type: string, in: query, description: "Filter keys by prefix" }
+        limit: { type: integer, in: query, description: "Max keys to return (default 1000)" }
+        cursor: { type: string, in: query, description: "Pagination cursor from previous response" }
+      pagination:
+        strategy: cursor
+        request:
+          cursor_param: cursor
+          limit_param: limit
+          limit_default: 1000
+        response:
+          next_cursor: "$.result_info.cursor"
+          has_more: "$.result_info.cursor != ''"
+        behavior: expose
+        max_pages: 20
+
+    kv_read_value:
+      method: GET
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/{key_name}
+      access: read
+      description: "Read a value from KV by key name"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+        key_name: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    kv_write_value:
+      method: PUT
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/{key_name}
+      access: write
+      description: "Write a key-value pair to KV. Eventually consistent (up to 60s propagation)."
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+        key_name: { type: string, in: path, required: true }
+        expiration: { type: integer, in: query, description: "Unix timestamp for auto-deletion" }
+        expiration_ttl: { type: integer, in: query, description: "Seconds until auto-deletion" }
+      pagination: none
+
+    kv_delete_value:
+      method: DELETE
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/{key_name}
+      access: write
+      description: "Delete a key from KV"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+        key_name: { type: string, in: path, required: true }
+      pagination: none
+
+    kv_get_metadata:
+      method: GET
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/metadata/{key_name}
+      access: read
+      description: "Get metadata for a KV key"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+        key_name: { type: string, in: path, required: true }
+      pagination: none
+
+    kv_bulk_write:
+      method: PUT
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/bulk
+      access: write
+      description: "Write multiple key-value pairs to KV in one request"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+      pagination: none
+
+    kv_bulk_delete:
+      method: POST
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/bulk/delete
+      access: write
+      description: "Delete multiple keys from KV in one request"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+      pagination: none
+
+    kv_bulk_read:
+      method: POST
+      path: /accounts/{account_id}/storage/kv/namespaces/{namespace_id}/bulk/get
+      access: read
+      description: "Read multiple keys from KV in one request (up to 100)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        namespace_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # R2 (Object Storage) -- Buckets
+    # =========================================================================
+
+    list_r2_buckets:
+      method: GET
+      path: /accounts/{account_id}/r2/buckets
+      access: read
+      description: "List all R2 buckets"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name_contains: { type: string, in: query }
+        cursor: { type: string, in: query }
+        per_page: { type: integer, in: query }
+        order: { type: string, in: query }
+        direction: { type: string, in: query }
+      pagination:
+        strategy: cursor
+        request:
+          cursor_param: cursor
+          limit_param: per_page
+          limit_default: 20
+        response:
+          next_cursor: "$.result_info.cursor"
+          has_more: "$.result_info.cursor != ''"
+        behavior: expose
+        max_pages: 10
+
+    get_r2_bucket:
+      method: GET
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}
+      access: read
+      description: "Get R2 bucket properties"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+      pagination: none
+
+    create_r2_bucket:
+      method: POST
+      path: /accounts/{account_id}/r2/buckets
+      access: write
+      description: "Create an R2 bucket"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        locationHint: { type: string, in: body, description: "Location hint (e.g. wnam, enam, weur, eeur, apac)" }
+      pagination: none
+
+    delete_r2_bucket:
+      method: DELETE
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}
+      access: dangerous
+      description: "Delete an R2 bucket (must be empty)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # R2 -- Lifecycle, CORS, Domains
+    # =========================================================================
+
+    get_r2_lifecycle:
+      method: GET
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/lifecycle
+      access: read
+      description: "Get R2 bucket lifecycle rules"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+      pagination: none
+
+    set_r2_lifecycle:
+      method: PUT
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/lifecycle
+      access: write
+      description: "Set R2 bucket lifecycle rules"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+        rules: { type: array, in: body, required: true }
+      pagination: none
+
+    get_r2_cors:
+      method: GET
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/cors
+      access: read
+      description: "Get R2 bucket CORS policy"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+      pagination: none
+
+    set_r2_cors:
+      method: PUT
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/cors
+      access: write
+      description: "Set R2 bucket CORS policy"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_r2_cors:
+      method: DELETE
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/cors
+      access: write
+      description: "Delete R2 bucket CORS policy"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_r2_custom_domains:
+      method: GET
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/domains/custom
+      access: read
+      description: "List custom domains for an R2 bucket"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+
+    add_r2_custom_domain:
+      method: POST
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/domains/custom
+      access: write
+      description: "Add a custom domain to an R2 bucket"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+        domain: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_r2_custom_domain:
+      method: DELETE
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/domains/custom/{domain}
+      access: write
+      description: "Remove a custom domain from an R2 bucket"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+        domain: { type: string, in: path, required: true }
+      pagination: none
+
+    get_r2_managed_domain:
+      method: GET
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/domains/managed
+      access: read
+      description: "Get r2.dev public domain status"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+      pagination: none
+
+    set_r2_managed_domain:
+      method: PUT
+      path: /accounts/{account_id}/r2/buckets/{bucket_name}/domains/managed
+      access: write
+      description: "Enable or disable r2.dev public access"
+      params:
+        account_id: { type: string, in: path, required: true }
+        bucket_name: { type: string, in: path, required: true }
+        enabled: { type: boolean, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # D1 (Database)
+    # =========================================================================
+
+    list_d1_databases:
+      method: GET
+      path: /accounts/{account_id}/d1/database
+      access: read
+      description: "List all D1 databases"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: query }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_d1_database:
+      method: GET
+      path: /accounts/{account_id}/d1/database/{database_id}
+      access: read
+      description: "Get D1 database details"
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_d1_database:
+      method: POST
+      path: /accounts/{account_id}/d1/database
+      access: write
+      description: "Create a D1 database"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        primary_location_hint: { type: string, in: body, description: "wnam, enam, weur, eeur, apac" }
+      pagination: none
+
+    delete_d1_database:
+      method: DELETE
+      path: /accounts/{account_id}/d1/database/{database_id}
+      access: dangerous
+      description: "Delete a D1 database"
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+      pagination: none
+
+    d1_query:
+      method: POST
+      path: /accounts/{account_id}/d1/database/{database_id}/query
+      access: write
+      description: "Execute SQL query on D1 (results as objects)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+        sql: { type: string, in: body, required: true }
+        params: { type: array, in: body, description: "Bind parameters for the query" }
+      pagination: none
+
+    d1_raw_query:
+      method: POST
+      path: /accounts/{account_id}/d1/database/{database_id}/raw
+      access: write
+      description: "Execute SQL query on D1 (results as arrays, more compact)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+        sql: { type: string, in: body, required: true }
+        params: { type: array, in: body }
+      pagination: none
+
+    d1_export:
+      method: POST
+      path: /accounts/{account_id}/d1/database/{database_id}/export
+      access: read
+      description: "Export D1 database as SQL dump"
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+        output_format: { type: string, in: body, description: "sql" }
+      pagination: none
+
+    d1_import:
+      method: POST
+      path: /accounts/{account_id}/d1/database/{database_id}/import
+      access: write
+      description: "Import SQL into a D1 database"
+      content_type: multipart/form-data
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+      pagination: none
+
+    d1_time_travel_bookmark:
+      method: GET
+      path: /accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark
+      access: read
+      description: "Get current or historical D1 database bookmark (point-in-time)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+        timestamp: { type: string, in: query, description: "ISO 8601 timestamp" }
+      pagination: none
+
+    d1_time_travel_restore:
+      method: POST
+      path: /accounts/{account_id}/d1/database/{database_id}/time_travel/restore
+      access: dangerous
+      description: "Restore D1 database to a point in time. Overwrites current state."
+      params:
+        account_id: { type: string, in: path, required: true }
+        database_id: { type: string, in: path, required: true }
+        bookmark: { type: string, in: body, description: "Bookmark ID to restore to" }
+        timestamp: { type: string, in: body, description: "ISO 8601 timestamp to restore to" }
+      pagination: none
+
+    # =========================================================================
+    # SSL/TLS -- Custom Certificates
+    # =========================================================================
+
+    list_custom_certificates:
+      method: GET
+      path: /zones/{zone_id}/custom_certificates
+      access: read
+      description: "List all custom SSL certificates for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        status: { type: string, in: query }
+
+    get_custom_certificate:
+      method: GET
+      path: /zones/{zone_id}/custom_certificates/{cert_id}
+      access: read
+      description: "Get custom certificate details"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        cert_id: { type: string, in: path, required: true }
+      pagination: none
+
+    upload_custom_certificate:
+      method: POST
+      path: /zones/{zone_id}/custom_certificates
+      access: write
+      description: "Upload a new custom SSL certificate"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        certificate: { type: string, in: body, required: true, description: "PEM-encoded certificate" }
+        private_key: { type: string, in: body, required: true, description: "PEM-encoded private key" }
+        bundle_method: { type: string, in: body, description: "ubiquitous (default), optimal, force" }
+      pagination: none
+
+    update_custom_certificate:
+      method: PATCH
+      path: /zones/{zone_id}/custom_certificates/{cert_id}
+      access: write
+      description: "Update a custom SSL certificate or private key"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        cert_id: { type: string, in: path, required: true }
+        certificate: { type: string, in: body }
+        private_key: { type: string, in: body }
+      pagination: none
+
+    delete_custom_certificate:
+      method: DELETE
+      path: /zones/{zone_id}/custom_certificates/{cert_id}
+      access: dangerous
+      description: "Remove a custom SSL certificate"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        cert_id: { type: string, in: path, required: true }
+      pagination: none
+
+    prioritize_certificates:
+      method: PUT
+      path: /zones/{zone_id}/custom_certificates/prioritize
+      access: write
+      description: "Set priority order for custom certificates"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SSL/TLS -- Certificate Packs
+    # =========================================================================
+
+    list_certificate_packs:
+      method: GET
+      path: /zones/{zone_id}/ssl/certificate_packs
+      access: read
+      description: "List all certificate packs for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        status: { type: string, in: query }
+
+    get_certificate_pack:
+      method: GET
+      path: /zones/{zone_id}/ssl/certificate_packs/{pack_id}
+      access: read
+      description: "Get a specific certificate pack"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        pack_id: { type: string, in: path, required: true }
+      pagination: none
+
+    order_certificate_pack:
+      method: POST
+      path: /zones/{zone_id}/ssl/certificate_packs/order
+      access: write
+      description: "Order an advanced certificate pack"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        hosts: { type: array, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "advanced" }
+        validation_method: { type: string, in: body, required: true, description: "txt, http, email" }
+        certificate_authority: { type: string, in: body, description: "lets_encrypt, google, ssl_com" }
+      pagination: none
+
+    delete_certificate_pack:
+      method: DELETE
+      path: /zones/{zone_id}/ssl/certificate_packs/{pack_id}
+      access: dangerous
+      description: "Delete a certificate pack"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        pack_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SSL/TLS -- Custom Hostnames
+    # =========================================================================
+
+    list_custom_hostnames:
+      method: GET
+      path: /zones/{zone_id}/custom_hostnames
+      access: read
+      description: "List all custom hostnames for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        hostname: { type: string, in: query }
+        id: { type: string, in: query }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        order: { type: string, in: query }
+        ssl: { type: integer, in: query, description: "Filter by SSL status (0 or 1)" }
+
+    get_custom_hostname:
+      method: GET
+      path: /zones/{zone_id}/custom_hostnames/{hostname_id}
+      access: read
+      description: "Get custom hostname details including SSL status and verification"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        hostname_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_custom_hostname:
+      method: POST
+      path: /zones/{zone_id}/custom_hostnames
+      access: write
+      description: "Create a custom hostname and request SSL certificate"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        hostname: { type: string, in: body, required: true }
+        ssl: { type: object, in: body, description: "SSL config: method (http/txt/email), type (dv), settings" }
+        custom_origin_server: { type: string, in: body, description: "Origin server hostname" }
+      pagination: none
+
+    update_custom_hostname:
+      method: PATCH
+      path: /zones/{zone_id}/custom_hostnames/{hostname_id}
+      access: write
+      description: "Update custom hostname SSL config or trigger DCV"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        hostname_id: { type: string, in: path, required: true }
+        ssl: { type: object, in: body }
+        custom_origin_server: { type: string, in: body }
+      pagination: none
+
+    delete_custom_hostname:
+      method: DELETE
+      path: /zones/{zone_id}/custom_hostnames/{hostname_id}
+      access: dangerous
+      description: "Delete a custom hostname and revoke its SSL certificates"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        hostname_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SSL/TLS -- Settings & Verification
+    # =========================================================================
+
+    get_ssl_recommendation:
+      method: GET
+      path: /zones/{zone_id}/ssl/recommendation
+      access: read
+      description: "Get SSL/TLS mode recommendation for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_ssl_verification:
+      method: GET
+      path: /zones/{zone_id}/ssl/verification
+      access: read
+      description: "Get SSL verification info and DCV status"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        retry: { type: boolean, in: query }
+      pagination: none
+
+    get_universal_ssl_settings:
+      method: GET
+      path: /zones/{zone_id}/ssl/universal/settings
+      access: read
+      description: "Get Universal SSL settings for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_universal_ssl_settings:
+      method: PATCH
+      path: /zones/{zone_id}/ssl/universal/settings
+      access: write
+      description: "Update Universal SSL settings (enable/disable)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        enabled: { type: boolean, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # CACHE
+    # =========================================================================
+
+    purge_cache:
+      method: POST
+      path: /zones/{zone_id}/purge_cache
+      access: write
+      description: "Purge cached content. Use purge_everything for full purge, or files/tags/hosts/prefixes for selective."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        purge_everything: { type: boolean, in: body, description: "Set true to purge all cached files" }
+        files: { type: array, in: body, description: "Array of URLs to purge" }
+        tags: { type: array, in: body, description: "Array of Cache-Tag values to purge (Enterprise)" }
+        hosts: { type: array, in: body, description: "Array of hostnames to purge" }
+        prefixes: { type: array, in: body, description: "Array of URL prefixes to purge (Enterprise)" }
+      pagination: none
+
+    get_cache_reserve:
+      method: GET
+      path: /zones/{zone_id}/cache/cache_reserve
+      access: read
+      description: "Get Cache Reserve status"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_cache_reserve:
+      method: PATCH
+      path: /zones/{zone_id}/cache/cache_reserve
+      access: write
+      description: "Enable or disable Cache Reserve"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        value: { type: string, in: body, required: true }
+      pagination: none
+
+    get_tiered_cache:
+      method: GET
+      path: /zones/{zone_id}/cache/tiered_cache_smart_topology_enable
+      access: read
+      description: "Get Smart Tiered Cache setting"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_tiered_cache:
+      method: PATCH
+      path: /zones/{zone_id}/cache/tiered_cache_smart_topology_enable
+      access: write
+      description: "Enable or disable Smart Tiered Cache"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        value: { type: string, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # LOAD BALANCERS
+    # =========================================================================
+
+    list_load_balancers:
+      method: GET
+      path: /zones/{zone_id}/load_balancers
+      access: read
+      description: "List all load balancers for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+
+    get_load_balancer:
+      method: GET
+      path: /zones/{zone_id}/load_balancers/{lb_id}
+      access: read
+      description: "Get load balancer details"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        lb_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_load_balancer:
+      method: POST
+      path: /zones/{zone_id}/load_balancers
+      access: write
+      description: "Create a load balancer"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Hostname for the LB (e.g. lb.example.com)" }
+        default_pools: { type: array, in: body, required: true, description: "Array of pool IDs" }
+        fallback_pool: { type: string, in: body, required: true, description: "Pool ID for fallback" }
+        proxied: { type: boolean, in: body }
+        steering_policy: { type: string, in: body, description: "off, geo, random, dynamic_latency, proximity, least_outstanding_requests, least_connections" }
+        session_affinity: { type: string, in: body, description: "none, cookie, ip_cookie, header" }
+        session_affinity_ttl: { type: integer, in: body }
+        rules: { type: array, in: body }
+      pagination: none
+
+    update_load_balancer:
+      method: PUT
+      path: /zones/{zone_id}/load_balancers/{lb_id}
+      access: write
+      description: "Update a load balancer"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        lb_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        default_pools: { type: array, in: body }
+        fallback_pool: { type: string, in: body }
+        proxied: { type: boolean, in: body }
+        steering_policy: { type: string, in: body }
+        session_affinity: { type: string, in: body }
+        rules: { type: array, in: body }
+      pagination: none
+
+    delete_load_balancer:
+      method: DELETE
+      path: /zones/{zone_id}/load_balancers/{lb_id}
+      access: dangerous
+      description: "Delete a load balancer"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        lb_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # LOAD BALANCER POOLS (account-scoped)
+    # =========================================================================
+
+    list_lb_pools:
+      method: GET
+      path: /accounts/{account_id}/load_balancers/pools
+      access: read
+      description: "List all load balancer pools"
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    get_lb_pool:
+      method: GET
+      path: /accounts/{account_id}/load_balancers/pools/{pool_id}
+      access: read
+      description: "Get load balancer pool details"
+      params:
+        account_id: { type: string, in: path, required: true }
+        pool_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_lb_pool:
+      method: POST
+      path: /accounts/{account_id}/load_balancers/pools
+      access: write
+      description: "Create a load balancer pool"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        origins: { type: array, in: body, required: true, description: "Array of {name, address, weight, enabled}" }
+        monitor: { type: string, in: body, description: "Monitor ID to attach" }
+        notification_email: { type: string, in: body }
+        enabled: { type: boolean, in: body }
+        minimum_origins: { type: integer, in: body }
+      pagination: none
+
+    update_lb_pool:
+      method: PUT
+      path: /accounts/{account_id}/load_balancers/pools/{pool_id}
+      access: write
+      description: "Update a load balancer pool"
+      params:
+        account_id: { type: string, in: path, required: true }
+        pool_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        origins: { type: array, in: body }
+        monitor: { type: string, in: body }
+        enabled: { type: boolean, in: body }
+      pagination: none
+
+    delete_lb_pool:
+      method: DELETE
+      path: /accounts/{account_id}/load_balancers/pools/{pool_id}
+      access: dangerous
+      description: "Delete a load balancer pool"
+      params:
+        account_id: { type: string, in: path, required: true }
+        pool_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_lb_pool_health:
+      method: GET
+      path: /accounts/{account_id}/load_balancers/pools/{pool_id}/health
+      access: read
+      description: "Get pool health status"
+      params:
+        account_id: { type: string, in: path, required: true }
+        pool_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # LOAD BALANCER MONITORS (account-scoped)
+    # =========================================================================
+
+    list_lb_monitors:
+      method: GET
+      path: /accounts/{account_id}/load_balancers/monitors
+      access: read
+      description: "List all load balancer monitors"
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    get_lb_monitor:
+      method: GET
+      path: /accounts/{account_id}/load_balancers/monitors/{monitor_id}
+      access: read
+      description: "Get load balancer monitor details"
+      params:
+        account_id: { type: string, in: path, required: true }
+        monitor_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_lb_monitor:
+      method: POST
+      path: /accounts/{account_id}/load_balancers/monitors
+      access: write
+      description: "Create a load balancer health monitor"
+      params:
+        account_id: { type: string, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "http, https, tcp" }
+        expected_codes: { type: string, in: body, description: "Expected HTTP status codes (e.g. 2xx, 200)" }
+        path: { type: string, in: body, description: "HTTP path to monitor" }
+        interval: { type: integer, in: body, description: "Interval in seconds (default 60)" }
+        timeout: { type: integer, in: body, description: "Timeout in seconds (default 5)" }
+        retries: { type: integer, in: body, description: "Number of retries (default 2)" }
+        method: { type: string, in: body, description: "HTTP method (GET, HEAD)" }
+        description: { type: string, in: body }
+      pagination: none
+
+    update_lb_monitor:
+      method: PUT
+      path: /accounts/{account_id}/load_balancers/monitors/{monitor_id}
+      access: write
+      description: "Update a load balancer monitor"
+      params:
+        account_id: { type: string, in: path, required: true }
+        monitor_id: { type: string, in: path, required: true }
+        type: { type: string, in: body }
+        expected_codes: { type: string, in: body }
+        path: { type: string, in: body }
+        interval: { type: integer, in: body }
+        timeout: { type: integer, in: body }
+        retries: { type: integer, in: body }
+      pagination: none
+
+    delete_lb_monitor:
+      method: DELETE
+      path: /accounts/{account_id}/load_balancers/monitors/{monitor_id}
+      access: dangerous
+      description: "Delete a load balancer monitor"
+      params:
+        account_id: { type: string, in: path, required: true }
+        monitor_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL RULES (legacy, still functional)
+    # =========================================================================
+
+    list_firewall_rules:
+      method: GET
+      path: /zones/{zone_id}/firewall/rules
+      access: read
+      description: "List firewall rules for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        id: { type: string, in: query }
+        action: { type: string, in: query }
+
+    get_firewall_rule:
+      method: GET
+      path: /zones/{zone_id}/firewall/rules/{rule_id}
+      access: read
+      description: "Get a specific firewall rule"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        rule_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_firewall_rules:
+      method: POST
+      path: /zones/{zone_id}/firewall/rules
+      access: write
+      description: "Create one or more firewall rules"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_firewall_rule:
+      method: PUT
+      path: /zones/{zone_id}/firewall/rules/{rule_id}
+      access: write
+      description: "Update a firewall rule"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        rule_id: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_firewall_rule:
+      method: DELETE
+      path: /zones/{zone_id}/firewall/rules/{rule_id}
+      access: write
+      description: "Delete a firewall rule"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        rule_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # RULESETS (modern WAF)
+    # =========================================================================
+
+    list_account_rulesets:
+      method: GET
+      path: /accounts/{account_id}/rulesets
+      access: read
+      description: "List all account-level rulesets"
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    list_zone_rulesets:
+      method: GET
+      path: /zones/{zone_id}/rulesets
+      access: read
+      description: "List all zone-level rulesets"
+      params:
+        zone_id: { type: string, in: path, required: true }
+
+    get_zone_ruleset:
+      method: GET
+      path: /zones/{zone_id}/rulesets/{ruleset_id}
+      access: read
+      description: "Get a specific zone ruleset"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        ruleset_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_zone_ruleset:
+      method: POST
+      path: /zones/{zone_id}/rulesets
+      access: write
+      description: "Create a zone ruleset"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        kind: { type: string, in: body, required: true, description: "managed, custom, root, zone" }
+        phase: { type: string, in: body, required: true, description: "http_request_firewall_custom, http_ratelimit, http_request_firewall_managed, etc." }
+        rules: { type: array, in: body, required: true }
+      pagination: none
+
+    update_zone_ruleset:
+      method: PUT
+      path: /zones/{zone_id}/rulesets/{ruleset_id}
+      access: write
+      description: "Update/deploy a zone ruleset (replaces all rules)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        ruleset_id: { type: string, in: path, required: true }
+        rules: { type: array, in: body, required: true }
+        description: { type: string, in: body }
+      pagination: none
+
+    delete_zone_ruleset:
+      method: DELETE
+      path: /zones/{zone_id}/rulesets/{ruleset_id}
+      access: dangerous
+      description: "Delete a zone ruleset"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        ruleset_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_zone_ruleset_phase:
+      method: GET
+      path: /zones/{zone_id}/rulesets/phases/{phase}/entrypoint
+      access: read
+      description: "Get the entry point ruleset for a phase (e.g. http_ratelimit, http_request_firewall_custom)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        phase: { type: string, in: path, required: true }
+      pagination: none
+
+    update_zone_ruleset_phase:
+      method: PUT
+      path: /zones/{zone_id}/rulesets/phases/{phase}/entrypoint
+      access: write
+      description: "Update the entry point ruleset for a phase"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        phase: { type: string, in: path, required: true }
+        rules: { type: array, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # PAGE RULES
+    # =========================================================================
+
+    list_page_rules:
+      method: GET
+      path: /zones/{zone_id}/pagerules
+      access: read
+      description: "List all page rules for a zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        status: { type: string, in: query, description: "active or disabled" }
+        order: { type: string, in: query }
+        direction: { type: string, in: query }
+        match: { type: string, in: query }
+
+    get_page_rule:
+      method: GET
+      path: /zones/{zone_id}/pagerules/{pagerule_id}
+      access: read
+      description: "Get a specific page rule"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        pagerule_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_page_rule:
+      method: POST
+      path: /zones/{zone_id}/pagerules
+      access: write
+      description: "Create a page rule"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        targets: { type: array, in: body, required: true, description: "Array with URL pattern targets" }
+        actions: { type: array, in: body, required: true, description: "Array of actions (forwarding_url, always_use_https, cache_level, ssl, etc.)" }
+        priority: { type: integer, in: body }
+        status: { type: string, in: body, description: "active or disabled" }
+      pagination: none
+
+    update_page_rule:
+      method: PUT
+      path: /zones/{zone_id}/pagerules/{pagerule_id}
+      access: write
+      description: "Replace a page rule entirely"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        pagerule_id: { type: string, in: path, required: true }
+        targets: { type: array, in: body, required: true }
+        actions: { type: array, in: body, required: true }
+        priority: { type: integer, in: body }
+        status: { type: string, in: body }
+      pagination: none
+
+    delete_page_rule:
+      method: DELETE
+      path: /zones/{zone_id}/pagerules/{pagerule_id}
+      access: write
+      description: "Delete a page rule"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        pagerule_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ACCESS (Zero Trust) -- Applications
+    # =========================================================================
+
+    list_access_apps:
+      method: GET
+      path: /accounts/{account_id}/access/apps
+      access: read
+      description: "List all Cloudflare Access applications"
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_access_app:
+      method: GET
+      path: /accounts/{account_id}/access/apps/{app_id}
+      access: read
+      description: "Get Access application details"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_access_app:
+      method: POST
+      path: /accounts/{account_id}/access/apps
+      access: write
+      description: "Create an Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        domain: { type: string, in: body, required: true, description: "Protected domain" }
+        type: { type: string, in: body, required: true, description: "self_hosted, saas, ssh, vnc, bookmark, app_launcher" }
+        session_duration: { type: string, in: body, description: "e.g. 24h, 30m" }
+        policies: { type: array, in: body }
+      pagination: none
+
+    update_access_app:
+      method: PUT
+      path: /accounts/{account_id}/access/apps/{app_id}
+      access: write
+      description: "Update an Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        domain: { type: string, in: body }
+        type: { type: string, in: body }
+        session_duration: { type: string, in: body }
+        policies: { type: array, in: body }
+      pagination: none
+
+    delete_access_app:
+      method: DELETE
+      path: /accounts/{account_id}/access/apps/{app_id}
+      access: dangerous
+      description: "Delete an Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ACCESS -- Policies (reusable)
+    # =========================================================================
+
+    list_access_policies:
+      method: GET
+      path: /accounts/{account_id}/access/policies
+      access: read
+      description: "List all reusable Access policies"
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_access_policy:
+      method: GET
+      path: /accounts/{account_id}/access/policies/{policy_id}
+      access: read
+      description: "Get a reusable Access policy"
+      params:
+        account_id: { type: string, in: path, required: true }
+        policy_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_access_policy:
+      method: POST
+      path: /accounts/{account_id}/access/policies
+      access: write
+      description: "Create a reusable Access policy"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        decision: { type: string, in: body, required: true, description: "allow, deny, non_identity, bypass" }
+        include: { type: array, in: body, required: true, description: "Rules that must match (OR logic)" }
+        exclude: { type: array, in: body, description: "Rules that must not match" }
+        require: { type: array, in: body, description: "Rules that must all match (AND logic)" }
+      pagination: none
+
+    update_access_policy:
+      method: PUT
+      path: /accounts/{account_id}/access/policies/{policy_id}
+      access: write
+      description: "Update a reusable Access policy"
+      params:
+        account_id: { type: string, in: path, required: true }
+        policy_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        decision: { type: string, in: body }
+        include: { type: array, in: body }
+        exclude: { type: array, in: body }
+        require: { type: array, in: body }
+      pagination: none
+
+    delete_access_policy:
+      method: DELETE
+      path: /accounts/{account_id}/access/policies/{policy_id}
+      access: dangerous
+      description: "Delete a reusable Access policy"
+      params:
+        account_id: { type: string, in: path, required: true }
+        policy_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ACCESS -- Application-Scoped Policies
+    # =========================================================================
+
+    list_access_app_policies:
+      method: GET
+      path: /accounts/{account_id}/access/apps/{app_id}/policies
+      access: read
+      description: "List policies for a specific Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+
+    get_access_app_policy:
+      method: GET
+      path: /accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}
+      access: read
+      description: "Get a specific policy for an Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+        policy_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_access_app_policy:
+      method: POST
+      path: /accounts/{account_id}/access/apps/{app_id}/policies
+      access: write
+      description: "Create a policy for a specific Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        decision: { type: string, in: body, required: true, description: "allow, deny, non_identity, bypass" }
+        include: { type: array, in: body, required: true }
+        exclude: { type: array, in: body }
+        require: { type: array, in: body }
+        precedence: { type: integer, in: body }
+      pagination: none
+
+    update_access_app_policy:
+      method: PUT
+      path: /accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}
+      access: write
+      description: "Update a policy for an Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+        policy_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        decision: { type: string, in: body }
+        include: { type: array, in: body }
+        exclude: { type: array, in: body }
+        require: { type: array, in: body }
+      pagination: none
+
+    delete_access_app_policy:
+      method: DELETE
+      path: /accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}
+      access: dangerous
+      description: "Delete a policy for an Access application"
+      params:
+        account_id: { type: string, in: path, required: true }
+        app_id: { type: string, in: path, required: true }
+        policy_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ACCESS -- Groups
+    # =========================================================================
+
+    list_access_groups:
+      method: GET
+      path: /accounts/{account_id}/access/groups
+      access: read
+      description: "List all Access groups"
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_access_group:
+      method: GET
+      path: /accounts/{account_id}/access/groups/{group_id}
+      access: read
+      description: "Get Access group details"
+      params:
+        account_id: { type: string, in: path, required: true }
+        group_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_access_group:
+      method: POST
+      path: /accounts/{account_id}/access/groups
+      access: write
+      description: "Create an Access group"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        include: { type: array, in: body, required: true, description: "Include rules (OR logic): email, email_domain, ip, everyone, service_token, group, azure, github, gsuite, okta, saml, certificate, geo" }
+        exclude: { type: array, in: body, description: "Exclude rules (NOT logic)" }
+        require: { type: array, in: body, description: "Require rules (AND logic)" }
+      pagination: none
+
+    update_access_group:
+      method: PUT
+      path: /accounts/{account_id}/access/groups/{group_id}
+      access: write
+      description: "Update an Access group"
+      params:
+        account_id: { type: string, in: path, required: true }
+        group_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        include: { type: array, in: body }
+        exclude: { type: array, in: body }
+        require: { type: array, in: body }
+      pagination: none
+
+    delete_access_group:
+      method: DELETE
+      path: /accounts/{account_id}/access/groups/{group_id}
+      access: dangerous
+      description: "Delete an Access group"
+      params:
+        account_id: { type: string, in: path, required: true }
+        group_id: { type: string, in: path, required: true }
+      pagination: none
+
+  # ===========================================================================
+  # EXAMPLES
+  # ===========================================================================
+
+  examples:
+    - name: "Setup DNS for a new domain"
+      description: "Find a zone and create common DNS records (A, CNAME, MX, TXT)"
+      code: |
+        const zones = await api.list_zones({ name: "example.com" });
+        const zoneId = zones[0].id;
+        await api.create_dns_record({ zone_id: zoneId, type: "A", name: "@", content: "203.0.113.1", proxied: true, ttl: 1 });
+        await api.create_dns_record({ zone_id: zoneId, type: "CNAME", name: "www", content: "example.com", proxied: true, ttl: 1 });
+        await api.create_dns_record({ zone_id: zoneId, type: "MX", name: "@", content: "mail.example.com", priority: 10, ttl: 3600 });
+        await api.create_dns_record({ zone_id: zoneId, type: "TXT", name: "@", content: "v=spf1 include:_spf.google.com ~all", ttl: 3600 });
+        return await api.list_dns_records({ zone_id: zoneId });
+
+    - name: "Deploy and configure Pages project"
+      description: "Create a Pages project, add a custom domain, and list deployments"
+      code: |
+        const project = await api.create_pages_project({
+          account_id: accountId,
+          name: "my-site",
+          production_branch: "main",
+          build_config: { build_command: "npm run build", destination_dir: "dist" }
+        });
+        await api.add_pages_domain({ account_id: accountId, project_name: "my-site", name: "www.example.com" });
+        const deployments = await api.list_pages_deployments({ account_id: accountId, project_name: "my-site" });
+        return { project, deployments };
+
+    - name: "Purge cache and check settings"
+      description: "Purge all cached content for a zone and verify cache settings"
+      code: |
+        await api.purge_cache({ zone_id: zoneId, purge_everything: true });
+        const settings = await api.list_zone_settings({ zone_id: zoneId });
+        const cacheSettings = settings.filter(s => ["browser_cache_ttl", "cache_level", "development_mode"].includes(s.id));
+        return cacheSettings;
