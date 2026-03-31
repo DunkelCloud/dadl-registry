@@ -4,7 +4,7 @@
   "title": "DADL — Dunkel API Description Language v0.1",
   "description": "Schema for .dadl files — declarative YAML descriptions of REST APIs for ToolMesh",
   "type": "object",
-  "required": ["spec", "backend"],
+  "required": ["spec", "credits", "source_name", "source_url", "date", "backend"],
   "properties": {
     "spec": {
       "type": "string",
@@ -13,18 +13,22 @@
     "credits": {
       "type": "array",
       "items": { "type": "string" },
+      "minItems": 1,
       "description": "Free-form list of contributors, maintainers, and sponsors"
     },
     "source_name": {
       "type": "string",
+      "minLength": 1,
       "description": "Name of the source API being described"
     },
     "source_url": {
       "type": "string",
+      "pattern": "^https?://",
       "description": "URL to the original API documentation"
     },
     "date": {
       "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
       "description": "Creation or last-modified date (YYYY-MM-DD)"
     },
     "backend": {
@@ -356,7 +360,7 @@
         },
         "access": {
           "type": "string",
-          "description": "Access classification for authorization and policy mapping. Well-known values: read, write, admin, dangerous. Custom values allowed."
+          "description": "Access classification for authorization and policy mapping. Well-fnown values: read, write, admin, dangerous. Custom values allowed."
         },
         "description": {
           "type": "string",
