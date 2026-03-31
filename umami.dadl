@@ -7,11 +7,11 @@ backend:
   description: "Umami open-source web analytics — privacy-friendly alternative to Google Analytics"
 
   coverage:
-    endpoints: 12
-    total_endpoints: 40
-    percentage: 30
-    focus: "authentication, websites, website statistics, metrics, pageviews, events, active users, realtime"
-    missing: "users, teams, reports, sessions, links, pixels, shares, admin, event-data"
+    endpoints: 89
+    total_endpoints: 89
+    percentage: 100
+    focus: "authentication, me, websites, statistics, metrics, pageviews, events, event-data, sessions, session-data, realtime, users, teams, reports, share, links, pixels, admin"
+    missing: "none"
     last_reviewed: "2026-03-31"
 
   setup:
@@ -63,6 +63,7 @@ backend:
   # Timestamps:
   #   All time-based query parameters (startAt, endAt) use Unix timestamps
   #   in MILLISECONDS (not seconds). Example: 1711929600000 for 2024-04-01.
+  #   Report endpoints use ISO date strings (startDate, endDate) instead.
   #
   # Metrics types:
   #   The metrics endpoint accepts a 'type' parameter to select what to measure:
@@ -71,9 +72,21 @@ backend:
   #   event, hostname, tag, distinctId
   #
   # Filters:
-  #   Stats, metrics, pageviews, and events endpoints accept filter parameters
-  #   as query params: path, referrer, title, browser, os, device, country,
-  #   region, city, language, hostname, tag, event, utmSource, utmMedium, etc.
+  #   Stats, metrics, pageviews, events, and sessions endpoints accept
+  #   filter parameters as query params: path, referrer, title, query,
+  #   browser, os, device, country, region, city, language, hostname,
+  #   tag, event, distinctId, utmSource, utmMedium, utmCampaign,
+  #   utmContent, utmTerm, segment, cohort
+  #
+  # Team roles:
+  #   team-member, team-view-only, team-manager
+  #
+  # User roles:
+  #   admin, user, view-only
+  #
+  # Report types:
+  #   attribution, breakdown, funnel, goal, journey, performance,
+  #   retention, revenue, utm
   #
   # Typical workflow:
   #   1. authenticate (login) → get token
@@ -103,6 +116,43 @@ backend:
       description: "Verify if the current JWT token is still valid. Returns user info if valid."
       pagination: none
 
+    # ── Me (Current User) ──────────────────────────────────────────
+
+    get_me:
+      method: GET
+      path: /me
+      access: read
+      description: "Get the current authenticated user's profile info based on the JWT token."
+      pagination: none
+
+    get_my_teams:
+      method: GET
+      path: /me/teams
+      access: read
+      description: "Get all teams the current authenticated user belongs to."
+      pagination: none
+
+    get_my_websites:
+      method: GET
+      path: /me/websites
+      access: read
+      description: "Get all websites the current authenticated user has access to."
+      params:
+        includeTeams: { type: boolean, in: query }
+      pagination: none
+
+    # ── Send (Tracking) ─────────────────────────────────────────────
+
+    send_event:
+      method: POST
+      path: /send
+      access: write
+      description: "Register a pageview or custom event. No authentication required. Requires a User-Agent header. Used by the tracking script."
+      params:
+        type: { type: string, in: body, required: true }
+        payload: { type: object, in: body, required: true }
+      pagination: none
+
     # ── Websites ────────────────────────────────────────────────────
 
     list_websites:
@@ -111,6 +161,8 @@ backend:
       access: read
       description: "List all websites registered in Umami. Returns website IDs, names, domains, and creation dates."
       params:
+        includeTeams: { type: boolean, in: query }
+        search: { type: string, in: query }
         page: { type: integer, in: query, default: 1 }
         pageSize: { type: integer, in: query, default: 10 }
         orderBy: { type: string, in: query, default: "name" }
@@ -134,6 +186,7 @@ backend:
         name: { type: string, in: body, required: true }
         domain: { type: string, in: body, required: true }
         shareId: { type: string, in: body }
+        teamId: { type: string, in: body }
       pagination: none
 
     update_website:
@@ -148,11 +201,31 @@ backend:
         shareId: { type: string, in: body }
       pagination: none
 
+    transfer_website:
+      method: POST
+      path: /websites/{websiteId}/transfer
+      access: write
+      description: "Transfer a website to a different user or team. IMPORTANT: Only the current owner of the website can transfer it — there is no admin bypass. Use teamId to assign to a team (requester must own the website and be a team member with transfer permission). Use userId to claim a team-owned website back to yourself (requester must be in the team with transfer permission). To remove from a team, pass teamId: null."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        teamId: { type: string, in: body }
+        userId: { type: string, in: body }
+      pagination: none
+
     delete_website:
       method: DELETE
       path: /websites/{websiteId}
       access: dangerous
       description: "Delete a website and all its analytics data. Irreversible."
+      params:
+        websiteId: { type: string, in: path, required: true }
+      pagination: none
+
+    reset_website:
+      method: POST
+      path: /websites/{websiteId}/reset
+      access: dangerous
+      description: "Reset a website by removing all its analytics data. The website itself is preserved but all stats are deleted. Irreversible."
       params:
         websiteId: { type: string, in: path, required: true }
       pagination: none
@@ -168,6 +241,15 @@ backend:
         websiteId: { type: string, in: path, required: true }
       pagination: none
 
+    get_website_daterange:
+      method: GET
+      path: /websites/{websiteId}/daterange
+      access: read
+      description: "Get the date range of available analytics data for a website."
+      params:
+        websiteId: { type: string, in: path, required: true }
+      pagination: none
+
     get_website_stats:
       method: GET
       path: /websites/{websiteId}/stats
@@ -177,15 +259,22 @@ backend:
         websiteId: { type: string, in: path, required: true }
         startAt: { type: integer, in: query, required: true }
         endAt: { type: integer, in: query, required: true }
+        compare: { type: string, in: query }
         path: { type: string, in: query }
         referrer: { type: string, in: query }
         title: { type: string, in: query }
+        query: { type: string, in: query }
         browser: { type: string, in: query }
         os: { type: string, in: query }
         device: { type: string, in: query }
         country: { type: string, in: query }
         region: { type: string, in: query }
         city: { type: string, in: query }
+        language: { type: string, in: query }
+        hostname: { type: string, in: query }
+        tag: { type: string, in: query }
+        event: { type: string, in: query }
+        distinctId: { type: string, in: query }
       pagination: none
 
     get_website_pageviews:
@@ -225,6 +314,45 @@ backend:
         device: { type: string, in: query }
       pagination: none
 
+    get_website_metrics_expanded:
+      method: GET
+      path: /websites/{websiteId}/metrics/expanded
+      access: read
+      description: "Get expanded metrics with pageviews, visitors, visits, bounces, and totaltime per entry. Same parameters as get_website_metrics."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        type: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 500 }
+        offset: { type: integer, in: query, default: 0 }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        country: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        device: { type: string, in: query }
+      pagination: none
+
+    # ── Events ──────────────────────────────────────────────────────
+
+    get_website_events:
+      method: GET
+      path: /websites/{websiteId}/events
+      access: read
+      description: "Get custom event details for a website within a time range."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+        event: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+      pagination: none
+
     get_website_events_series:
       method: GET
       path: /websites/{websiteId}/events/series
@@ -237,4 +365,806 @@ backend:
         unit: { type: string, in: query, required: true }
         timezone: { type: string, in: query }
         event: { type: string, in: query }
+      pagination: none
+
+    get_website_events_stats:
+      method: GET
+      path: /websites/{websiteId}/events/stats
+      access: read
+      description: "Get aggregated event statistics for a website within a time range."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        compare: { type: string, in: query }
+        event: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+      pagination: none
+
+    # ── Event Data ──────────────────────────────────────────────────
+
+    get_event_data:
+      method: GET
+      path: /websites/{websiteId}/event-data
+      access: read
+      description: "Get event data grouped by name for a website."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    get_event_data_by_id:
+      method: GET
+      path: /websites/{websiteId}/event-data/{eventId}
+      access: read
+      description: "Get event data for a specific individual event."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        eventId: { type: string, in: path, required: true }
+      pagination: none
+
+    get_event_data_events:
+      method: GET
+      path: /websites/{websiteId}/event-data/events
+      access: read
+      description: "Get event names and their property counts."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        event: { type: string, in: query }
+      pagination: none
+
+    get_event_data_fields:
+      method: GET
+      path: /websites/{websiteId}/event-data/fields
+      access: read
+      description: "Get event property names and their value counts."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+      pagination: none
+
+    get_event_data_properties:
+      method: GET
+      path: /websites/{websiteId}/event-data/properties
+      access: read
+      description: "Get event names and their associated property counts."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+      pagination: none
+
+    get_event_data_values:
+      method: GET
+      path: /websites/{websiteId}/event-data/values
+      access: read
+      description: "Get event data counts for a specific event and property combination."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        event: { type: string, in: query, required: true }
+        propertyName: { type: string, in: query, required: true }
+      pagination: none
+
+    get_event_data_stats:
+      method: GET
+      path: /websites/{websiteId}/event-data/stats
+      access: read
+      description: "Get aggregated event data statistics: total events, properties, and records count."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+      pagination: none
+
+    # ── Sessions ────────────────────────────────────────────────────
+
+    list_sessions:
+      method: GET
+      path: /websites/{websiteId}/sessions
+      access: read
+      description: "List sessions for a website within a time range."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        device: { type: string, in: query }
+        country: { type: string, in: query }
+        region: { type: string, in: query }
+        city: { type: string, in: query }
+        language: { type: string, in: query }
+      pagination: none
+
+    get_sessions_stats:
+      method: GET
+      path: /websites/{websiteId}/sessions/stats
+      access: read
+      description: "Get aggregated session statistics for a website."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        device: { type: string, in: query }
+        country: { type: string, in: query }
+      pagination: none
+
+    get_sessions_weekly:
+      method: GET
+      path: /websites/{websiteId}/sessions/weekly
+      access: read
+      description: "Get sessions grouped by hour-of-weekday (heatmap data)."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        timezone: { type: string, in: query, required: true }
+      pagination: none
+
+    get_session:
+      method: GET
+      path: /websites/{websiteId}/sessions/{sessionId}
+      access: read
+      description: "Get details of a specific session."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        sessionId: { type: string, in: path, required: true }
+      pagination: none
+
+    get_session_activity:
+      method: GET
+      path: /websites/{websiteId}/sessions/{sessionId}/activity
+      access: read
+      description: "Get activity log for a specific session (pageviews, events)."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        sessionId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+      pagination: none
+
+    get_session_properties:
+      method: GET
+      path: /websites/{websiteId}/sessions/{sessionId}/properties
+      access: read
+      description: "Get custom properties stored for a specific session."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        sessionId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Session Data ────────────────────────────────────────────────
+
+    get_session_data_properties:
+      method: GET
+      path: /websites/{websiteId}/session-data/properties
+      access: read
+      description: "Get session data counts grouped by property name."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+      pagination: none
+
+    get_session_data_values:
+      method: GET
+      path: /websites/{websiteId}/session-data/values
+      access: read
+      description: "Get session data counts for a specific property."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        propertyName: { type: string, in: query, required: true }
+      pagination: none
+
+    # ── Realtime ────────────────────────────────────────────────────
+
+    get_realtime:
+      method: GET
+      path: /realtime/{websiteId}
+      access: read
+      description: "Get realtime statistics for a website (last 30 minutes). Returns countries, urls, referrers, events, series, totals, and timestamp."
+      params:
+        websiteId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Users (Admin only, self-hosted) ─────────────────────────────
+
+    create_user:
+      method: POST
+      path: /users
+      access: write
+      description: "Create a new user. Admin only. Roles: admin, user, view-only."
+      params:
+        username: { type: string, in: body, required: true }
+        password: { type: string, in: body, required: true }
+        role: { type: string, in: body, required: true }
+      pagination: none
+
+    get_user:
+      method: GET
+      path: /users/{userId}
+      access: read
+      description: "Get a user by ID. Admin only."
+      params:
+        userId: { type: string, in: path, required: true }
+      pagination: none
+
+    update_user:
+      method: POST
+      path: /users/{userId}
+      access: write
+      description: "Update a user. Admin only. Only include fields you want to change."
+      params:
+        userId: { type: string, in: path, required: true }
+        username: { type: string, in: body }
+        password: { type: string, in: body }
+        role: { type: string, in: body }
+      pagination: none
+
+    delete_user:
+      method: DELETE
+      path: /users/{userId}
+      access: dangerous
+      description: "Delete a user. Admin only. Irreversible."
+      params:
+        userId: { type: string, in: path, required: true }
+      pagination: none
+
+    get_user_websites:
+      method: GET
+      path: /users/{userId}/websites
+      access: read
+      description: "Get all websites accessible by a specific user."
+      params:
+        userId: { type: string, in: path, required: true }
+        includeTeams: { type: boolean, in: query }
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    get_user_teams:
+      method: GET
+      path: /users/{userId}/teams
+      access: read
+      description: "Get all teams a specific user belongs to."
+      params:
+        userId: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    # ── Teams ───────────────────────────────────────────────────────
+
+    list_teams:
+      method: GET
+      path: /teams
+      access: read
+      description: "List all teams."
+      params:
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    create_team:
+      method: POST
+      path: /teams
+      access: write
+      description: "Create a new team."
+      params:
+        name: { type: string, in: body, required: true }
+      pagination: none
+
+    join_team:
+      method: POST
+      path: /teams/join
+      access: write
+      description: "Join a team using an access code."
+      params:
+        accessCode: { type: string, in: body, required: true }
+      pagination: none
+
+    get_team:
+      method: GET
+      path: /teams/{teamId}
+      access: read
+      description: "Get a team by ID."
+      params:
+        teamId: { type: string, in: path, required: true }
+      pagination: none
+
+    update_team:
+      method: POST
+      path: /teams/{teamId}
+      access: write
+      description: "Update team properties. Only include fields you want to change."
+      params:
+        teamId: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        accessCode: { type: string, in: body }
+      pagination: none
+
+    delete_team:
+      method: DELETE
+      path: /teams/{teamId}
+      access: dangerous
+      description: "Delete a team. Irreversible."
+      params:
+        teamId: { type: string, in: path, required: true }
+      pagination: none
+
+    list_team_users:
+      method: GET
+      path: /teams/{teamId}/users
+      access: read
+      description: "List all members of a team."
+      params:
+        teamId: { type: string, in: path, required: true }
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    add_team_user:
+      method: POST
+      path: /teams/{teamId}/users
+      access: write
+      description: "Add a user to a team. Roles: team-member, team-view-only, team-manager."
+      params:
+        teamId: { type: string, in: path, required: true }
+        userId: { type: string, in: body, required: true }
+        role: { type: string, in: body, required: true }
+      pagination: none
+
+    get_team_user:
+      method: GET
+      path: /teams/{teamId}/users/{userId}
+      access: read
+      description: "Get a specific team member."
+      params:
+        teamId: { type: string, in: path, required: true }
+        userId: { type: string, in: path, required: true }
+      pagination: none
+
+    update_team_user:
+      method: POST
+      path: /teams/{teamId}/users/{userId}
+      access: write
+      description: "Update a team member's role."
+      params:
+        teamId: { type: string, in: path, required: true }
+        userId: { type: string, in: path, required: true }
+        role: { type: string, in: body, required: true }
+      pagination: none
+
+    remove_team_user:
+      method: DELETE
+      path: /teams/{teamId}/users/{userId}
+      access: dangerous
+      description: "Remove a user from a team."
+      params:
+        teamId: { type: string, in: path, required: true }
+        userId: { type: string, in: path, required: true }
+      pagination: none
+
+    list_team_websites:
+      method: GET
+      path: /teams/{teamId}/websites
+      access: read
+      description: "List all websites assigned to a team."
+      params:
+        teamId: { type: string, in: path, required: true }
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    # ── Reports ─────────────────────────────────────────────────────
+
+    list_reports:
+      method: GET
+      path: /reports
+      access: read
+      description: "List all reports for a website."
+      params:
+        websiteId: { type: string, in: query, required: true }
+        type: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    create_report:
+      method: POST
+      path: /reports
+      access: write
+      description: "Create a new report."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        parameters: { type: object, in: body, required: true }
+      pagination: none
+
+    get_report:
+      method: GET
+      path: /reports/{reportId}
+      access: read
+      description: "Get a report by ID."
+      params:
+        reportId: { type: string, in: path, required: true }
+      pagination: none
+
+    update_report:
+      method: POST
+      path: /reports/{reportId}
+      access: write
+      description: "Update a report."
+      params:
+        reportId: { type: string, in: path, required: true }
+        websiteId: { type: string, in: body }
+        type: { type: string, in: body }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        parameters: { type: object, in: body }
+      pagination: none
+
+    delete_report:
+      method: DELETE
+      path: /reports/{reportId}
+      access: dangerous
+      description: "Delete a report. Irreversible."
+      params:
+        reportId: { type: string, in: path, required: true }
+      pagination: none
+
+    run_attribution_report:
+      method: POST
+      path: /reports/attribution
+      access: read
+      description: "Run an attribution report. Models: firstClick, lastClick. Types: path, event."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        timezone: { type: string, in: body }
+        model: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        step: { type: string, in: body, required: true }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_breakdown_report:
+      method: POST
+      path: /reports/breakdown
+      access: read
+      description: "Run a breakdown report to cross-reference multiple dimensions."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        fields: { type: array, in: body, required: true }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_funnel_report:
+      method: POST
+      path: /reports/funnel
+      access: read
+      description: "Run a funnel report. Requires at least 2 steps, each with type (path/event) and value."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        steps: { type: array, in: body, required: true }
+        window: { type: integer, in: body }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_goal_report:
+      method: POST
+      path: /reports/goal
+      access: read
+      description: "Run a goal report. Type: path or event."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        value: { type: string, in: body, required: true }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_journey_report:
+      method: POST
+      path: /reports/journey
+      access: read
+      description: "Run a journey/path report. Steps must be 3-7."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        steps: { type: integer, in: body, required: true }
+        startStep: { type: string, in: body, required: true }
+        endStep: { type: string, in: body }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_performance_report:
+      method: POST
+      path: /reports/performance
+      access: read
+      description: "Run a web vitals performance report. Metrics: lcp, inp, cls, fcp, ttfb."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        unit: { type: string, in: body }
+        timezone: { type: string, in: body }
+        metric: { type: string, in: body }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_retention_report:
+      method: POST
+      path: /reports/retention
+      access: read
+      description: "Run a retention/cohort report."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        timezone: { type: string, in: body, required: true }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_revenue_report:
+      method: POST
+      path: /reports/revenue
+      access: read
+      description: "Run a revenue report."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        timezone: { type: string, in: body, required: true }
+        currency: { type: string, in: body, required: true }
+        compare: { type: string, in: body }
+        filters: { type: array, in: body }
+      pagination: none
+
+    run_utm_report:
+      method: POST
+      path: /reports/utm
+      access: read
+      description: "Run a UTM campaign report."
+      params:
+        websiteId: { type: string, in: body, required: true }
+        startDate: { type: string, in: body, required: true }
+        endDate: { type: string, in: body, required: true }
+        filters: { type: array, in: body }
+      pagination: none
+
+    # ── Share ───────────────────────────────────────────────────────
+
+    create_share:
+      method: POST
+      path: /share
+      access: write
+      description: "Create a share page. Share types: 1=website, 2=link, 3=pixel, 4=board."
+      params:
+        entityId: { type: string, in: body, required: true }
+        shareType: { type: integer, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        parameters: { type: object, in: body }
+      pagination: none
+
+    get_share:
+      method: GET
+      path: /share/id/{shareId}
+      access: read
+      description: "Get a share page by its ID."
+      params:
+        shareId: { type: string, in: path, required: true }
+      pagination: none
+
+    update_share:
+      method: POST
+      path: /share/id/{shareId}
+      access: write
+      description: "Update a share page."
+      params:
+        shareId: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        parameters: { type: object, in: body }
+      pagination: none
+
+    delete_share:
+      method: DELETE
+      path: /share/id/{shareId}
+      access: dangerous
+      description: "Delete a share page. Irreversible."
+      params:
+        shareId: { type: string, in: path, required: true }
+      pagination: none
+
+    list_website_shares:
+      method: GET
+      path: /websites/{websiteId}/shares
+      access: read
+      description: "List all share pages for a website."
+      params:
+        websiteId: { type: string, in: path, required: true }
+      pagination: none
+
+    create_website_share:
+      method: POST
+      path: /websites/{websiteId}/shares
+      access: write
+      description: "Create a share page for a specific website."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        parameters: { type: object, in: body }
+      pagination: none
+
+    # ── Links ───────────────────────────────────────────────────────
+
+    list_links:
+      method: GET
+      path: /links
+      access: read
+      description: "List all tracked links."
+      params:
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    create_link:
+      method: POST
+      path: /links
+      access: write
+      description: "Create a tracked link. Slug must be at least 8 characters."
+      params:
+        name: { type: string, in: body, required: true }
+        url: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        teamId: { type: string, in: body }
+      pagination: none
+
+    get_link:
+      method: GET
+      path: /links/{linkId}
+      access: read
+      description: "Get a tracked link by ID."
+      params:
+        linkId: { type: string, in: path, required: true }
+      pagination: none
+
+    update_link:
+      method: POST
+      path: /links/{linkId}
+      access: write
+      description: "Update a tracked link."
+      params:
+        linkId: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        url: { type: string, in: body }
+        slug: { type: string, in: body }
+      pagination: none
+
+    delete_link:
+      method: DELETE
+      path: /links/{linkId}
+      access: dangerous
+      description: "Delete a tracked link. Irreversible."
+      params:
+        linkId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Pixels ──────────────────────────────────────────────────────
+
+    list_pixels:
+      method: GET
+      path: /pixels
+      access: read
+      description: "List all tracking pixels."
+      params:
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    create_pixel:
+      method: POST
+      path: /pixels
+      access: write
+      description: "Create a tracking pixel. Slug must be at least 8 characters."
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        teamId: { type: string, in: body }
+      pagination: none
+
+    get_pixel:
+      method: GET
+      path: /pixels/{pixelId}
+      access: read
+      description: "Get a tracking pixel by ID."
+      params:
+        pixelId: { type: string, in: path, required: true }
+      pagination: none
+
+    update_pixel:
+      method: POST
+      path: /pixels/{pixelId}
+      access: write
+      description: "Update a tracking pixel."
+      params:
+        pixelId: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+      pagination: none
+
+    delete_pixel:
+      method: DELETE
+      path: /pixels/{pixelId}
+      access: dangerous
+      description: "Delete a tracking pixel. Irreversible."
+      params:
+        pixelId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Admin (self-hosted only) ────────────────────────────────────
+
+    admin_list_users:
+      method: GET
+      path: /admin/users
+      access: read
+      description: "List all users in the Umami instance. Admin only."
+      params:
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    admin_list_websites:
+      method: GET
+      path: /admin/websites
+      access: read
+      description: "List all websites across all users. Admin only."
+      params:
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
+      pagination: none
+
+    admin_list_teams:
+      method: GET
+      path: /admin/teams
+      access: read
+      description: "List all teams in the Umami instance. Admin only."
+      params:
+        search: { type: string, in: query }
+        page: { type: integer, in: query }
+        pageSize: { type: integer, in: query }
       pagination: none
