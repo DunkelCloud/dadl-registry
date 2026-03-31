@@ -14,12 +14,12 @@ backend:
   description: "Vikunja open-source task management — project planning, kanban boards, and task tracking"
 
   coverage:
-    endpoints: 18
+    endpoints: 19
     total_endpoints: 80
-    percentage: 23
+    percentage: 24
     focus: "projects, tasks, views, buckets, labels, comments, positions"
     missing: "teams, users, shares, attachments, notifications, webhooks, subscriptions, filters, saved filters"
-    last_reviewed: "2026-03-26"
+    last_reviewed: "2026-03-31"
 
   setup:
     credential_steps:
@@ -82,7 +82,8 @@ backend:
   #   Kanban views group tasks into buckets (e.g. Backlog, Doing, Done).
   #   list_project_tasks on a kanban view returns buckets with nested tasks,
   #   NOT a flat task list. Use list_buckets to get bucket metadata.
-  #   Moving a task between buckets requires update_task with bucket_id.
+  #   Moving a task between buckets requires move_task_to_bucket
+  #   (NOT update_task — bucket_id in update_task has no effect).
   #
   # Position values:
   #   Positions are float64 values. To insert a task between two others,
@@ -92,6 +93,12 @@ backend:
   #
   # Priority values:
   #   0 = unset, 1 = low, 2 = medium, 3 = high, 4 = urgent, 5 = critical
+  #
+  # Update semantics:
+  #   update_task is a composite that does GET → merge → POST.
+  #   Vikunja's raw POST /tasks/{id} resets missing fields to zero,
+  #   so the composite reads the current state first and only overwrites
+  #   fields that were explicitly provided. Safe for partial updates.
   #
   # Typical workflow:
   #   1. list_projects → pick project_id
@@ -126,6 +133,10 @@ backend:
         per_page: { type: integer, in: query, default: 50 }
         filter: { type: string, in: query }
         s: { type: string, in: query }
+      response:
+        transform: |
+          [.[] | {title: .title, tasks: [.tasks[]? | {id: .id, title: .title, priority: .priority, done: .done, due_date: .due_date, labels: [.labels[]?.title]}]}]
+        allow_jq_override: true
 
     get_task:
       method: GET
@@ -134,6 +145,10 @@ backend:
       description: "Get a single task by its ID, including all details, assignees, labels, and relations."
       params:
         id: { type: integer, in: path, required: true }
+      response:
+        transform: |
+          {id, title, description, done, priority, due_date, project_id, bucket_id, position, percent_done, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks}
+        allow_jq_override: true
       pagination: none
 
     create_task:
@@ -154,11 +169,11 @@ backend:
         position: { type: number, in: body }
       pagination: none
 
-    update_task:
+    _update_task_raw:
       method: POST
       path: /tasks/{id}
       access: write
-      description: "Update an existing task. Only include fields you want to change. Set bucket_id to move between kanban columns."
+      description: "Internal: raw task update (sends full object). Use the update_task composite instead."
       params:
         id: { type: integer, in: path, required: true }
         title: { type: string, in: body }
@@ -167,7 +182,18 @@ backend:
         priority: { type: integer, in: body }
         due_date: { type: string, in: body }
         position: { type: number, in: body }
-        bucket_id: { type: integer, in: body }
+      pagination: none
+
+    move_task_to_bucket:
+      method: POST
+      path: /projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks
+      access: write
+      description: "Move a task to a different kanban bucket. Use list_buckets to get bucket IDs. This is the only way to move tasks between kanban columns."
+      params:
+        project_id: { type: integer, in: path, required: true }
+        view_id: { type: integer, in: path, required: true }
+        bucket_id: { type: integer, in: path, required: true }
+        task_id: { type: integer, in: body, required: true }
       pagination: none
 
     delete_task:
@@ -189,6 +215,9 @@ backend:
         per_page: { type: integer, in: query, default: 50 }
         s: { type: string, in: query }
         is_archived: { type: boolean, in: query }
+      response:
+        transform: |
+          [.[] | {id: .id, title: .title, description: .description, is_archived: .is_archived, views: [.views[]? | {id: .id, title: .title, view_kind: .view_kind}]}]
 
     get_project:
       method: GET
@@ -212,7 +241,7 @@ backend:
       method: GET
       path: /projects/{project_id}/views/{view_id}/buckets
       access: read
-      description: "List all kanban buckets for a project view. Returns bucket id, title, and task count. Use bucket_id in update_task to move tasks between columns."
+      description: "List all kanban buckets for a project view. Returns bucket id, title, and task count. Use move_task_to_bucket to move tasks between columns."
       params:
         project_id: { type: integer, in: path, required: true }
         view_id: { type: integer, in: path, required: true }
@@ -266,3 +295,44 @@ backend:
         task_id: { type: integer, in: path, required: true }
         comment: { type: string, in: body, required: true }
       pagination: none
+
+  composites:
+    update_task:
+      description: "Update an existing task. Only include fields you want to change — unchanged fields are preserved. To move between kanban buckets, use move_task_to_bucket instead."
+      params:
+        id:
+          type: number
+          required: true
+          description: "Task ID"
+        title:
+          type: string
+          description: "New title"
+        description:
+          type: string
+          description: "New description"
+        done:
+          type: boolean
+          description: "Mark as done/undone"
+        priority:
+          type: number
+          description: "Priority: 0=unset, 1=low, 2=medium, 3=high, 4=urgent, 5=critical"
+        due_date:
+          type: string
+          description: "Due date (ISO 8601)"
+        position:
+          type: number
+          description: "Sort position (float64)"
+      timeout: 15s
+      depends_on: [get_task, _update_task_raw]
+      code: |
+        const current = await api.get_task({ id: params.id });
+        const merged = {
+          id: params.id,
+          title: params.title !== undefined ? params.title : current.title,
+          description: params.description !== undefined ? params.description : current.description,
+          done: params.done !== undefined ? params.done : current.done,
+          priority: params.priority !== undefined ? params.priority : current.priority,
+          due_date: params.due_date !== undefined ? params.due_date : current.due_date,
+          position: params.position !== undefined ? params.position : current.position,
+        };
+        return await api._update_task_raw(merged);
