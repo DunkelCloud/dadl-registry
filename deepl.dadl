@@ -1,0 +1,478 @@
+# deepl.dadl — DeepL REST API for ToolMesh
+# Machine translation, document translation, glossaries, text improvement, and usage tracking
+#
+# Domain Notes for LLM consumers:
+# - DeepL uses "DeepL-Auth-Key" scheme in Authorization header, NOT standard Bearer
+# - Language codes: source langs are short (EN, DE, FR), target langs can be regional (EN-GB, EN-US, PT-BR, PT-PT)
+# - Free API uses api-free.deepl.com, Pro uses api.deepl.com — base_url must match the plan
+# - Glossaries require source_lang to be explicitly set in translate calls
+# - Document translation is async: upload → poll status → download result
+# - The /v2/write/rephrase endpoint does NOT translate — it improves text in the same language
+# - formality and writing_style are only supported for select target languages
+# - Max 50 texts per translate request, max 128 KiB request body for translation
+# - Translated documents are auto-deleted after download (one-time retrieval)
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+credits:
+  - "Dunkel Cloud GmbH"
+source_name: "DeepL REST API v2"
+source_url: https://developers.deepl.com/docs
+date: "2026-03-31"
+
+backend:
+  name: deepl
+  type: rest
+  version: "1.0"
+  base_url: https://api.deepl.com/v2
+  description: "DeepL REST API v2 — machine translation, document translation, glossary management, text improvement (Write), and usage tracking"
+
+  coverage:
+    endpoints: 14
+    total_endpoints: 18
+    percentage: 78
+    focus: "text translation, document translation, glossaries, text improvement (Write), languages, usage"
+    missing: "admin API (key management, org usage), voice API (WebSocket), style rules CRUD"
+    last_reviewed: "2026-03-31"
+
+  setup:
+    credential_steps:
+      - "Sign up for a DeepL API account at https://www.deepl.com/pro-api"
+      - "Choose API Free (500k chars/month) or API Pro (pay-per-use)"
+      - "Navigate to Account → API Keys"
+      - "Copy your Authentication Key (format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx for Free, without :fx for Pro)"
+    env_var: CREDENTIAL_DEEPL_AUTH_KEY
+    backends_yaml: |
+      - name: deepl
+        transport: rest
+        dadl: /app/dadl/deepl.dadl
+        url: "https://api.deepl.com/v2"      # use https://api-free.deepl.com/v2 for Free plan
+    required_scopes: []
+    docs_url: "https://developers.deepl.com/docs"
+    notes: >
+      Free API keys end with ":fx" and must use api-free.deepl.com. Pro keys use api.deepl.com.
+      Legacy auth via query param auth_key was deprecated Nov 2025. All auth must use the
+      Authorization header with "DeepL-Auth-Key" scheme. Rate limits are not publicly documented
+      but 429 responses include Retry-After header.
+
+  auth:
+    type: bearer
+    credential: deepl_auth_key
+    inject_into: header
+    header_name: Authorization
+    prefix: "DeepL-Auth-Key "
+    # DeepL uses custom scheme: "DeepL-Auth-Key <key>" instead of standard "Bearer <key>"
+
+  defaults:
+    errors:
+      format: json
+      message_path: "$.message"
+      retry_on: [429, 502, 503, 529]
+      terminal: [400, 401, 403, 404, 413, 456]
+      # 456 = quota exceeded, 529 = too many requests (DeepL-specific)
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      rate_limit:
+        retry_after_header: Retry-After
+    response:
+      allow_jq_override: true
+
+  tools:
+
+    # ─── Text Translation ────────────────────────────────────────────────
+
+    translate:
+      method: POST
+      path: /translate
+      access: write
+      content_type: application/json
+      description: "Translate text into a target language. Supports up to 50 texts per request (max 128 KiB body). Auto-detects source language if not specified."
+      params:
+        text:
+          type: array
+          in: body
+          required: true
+          description: "Array of texts to translate (max 50 items, UTF-8 plain text)"
+        target_lang:
+          type: string
+          in: body
+          required: true
+          description: "Target language code, e.g. EN-US, DE, FR, ES, PT-BR, ZH-HANS"
+        source_lang:
+          type: string
+          in: body
+          description: "Source language code. Omit for auto-detection"
+        model_type:
+          type: string
+          in: body
+          description: "latency_optimized (default), quality_optimized, or prefer_quality_optimized"
+        formality:
+          type: string
+          in: body
+          description: "default, more, less, prefer_more, prefer_less — only DE, FR, IT, ES, NL, PL, PT-BR, PT-PT, JA, RU"
+        context:
+          type: string
+          in: body
+          description: "Additional context to influence translation (not translated itself)"
+        glossary_id:
+          type: string
+          in: body
+          description: "Glossary ID to use. Requires source_lang to be set"
+        split_sentences:
+          type: string
+          in: body
+          description: "0 (no split), 1 (default, punctuation+newlines), nonewlines (punctuation only)"
+        preserve_formatting:
+          type: boolean
+          in: body
+          description: "Preserve original formatting conventions"
+        tag_handling:
+          type: string
+          in: body
+          description: "xml or html — enables tag-aware translation"
+        ignore_tags:
+          type: array
+          in: body
+          description: "XML/HTML tags whose content should not be translated"
+        show_billed_characters:
+          type: boolean
+          in: body
+          description: "Include billed_characters count in response"
+      response:
+        result_path: "$"
+
+    # ─── Document Translation ────────────────────────────────────────────
+    # Workflow: upload_document → check_document_status (poll) → download_document
+
+    upload_document:
+      method: POST
+      path: /document
+      access: write
+      content_type: multipart/form-data
+      max_body_size: 50MB
+      description: "Upload a document for translation. Returns document_id and document_key for status polling and download. Supports docx, pptx, xlsx, pdf, html, txt, xliff, srt, jpg, png."
+      params:
+        file:
+          type: file_url
+          in: body
+          required: true
+          description: "Document file to translate"
+        target_lang:
+          type: string
+          in: body
+          required: true
+          description: "Target language code"
+        source_lang:
+          type: string
+          in: body
+          description: "Source language code. Omit for auto-detection"
+        glossary_id:
+          type: string
+          in: body
+          description: "Glossary ID to use. Requires source_lang to be set"
+        formality:
+          type: string
+          in: body
+          description: "default, more, less, prefer_more, prefer_less"
+        output_format:
+          type: string
+          in: body
+          description: "Desired output format extension, e.g. pdf (not all combinations supported)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    check_document_status:
+      method: POST
+      path: /document/{document_id}
+      access: read
+      content_type: application/json
+      description: "Check the translation status of an uploaded document. Status: queued, translating, done, error. Poll until done."
+      depends_on: [upload_document]
+      params:
+        document_id:
+          type: string
+          in: path
+          required: true
+          description: "Document ID from upload_document response"
+        document_key:
+          type: string
+          in: body
+          required: true
+          description: "Document key from upload_document response"
+      response:
+        result_path: "$"
+      pagination: none
+
+    download_document:
+      method: POST
+      path: /document/{document_id}/result
+      access: read
+      content_type: application/json
+      description: "Download the translated document. Only available when status is 'done'. Document is auto-deleted after download (one-time retrieval)."
+      depends_on: [check_document_status]
+      params:
+        document_id:
+          type: string
+          in: path
+          required: true
+          description: "Document ID from upload_document response"
+        document_key:
+          type: string
+          in: body
+          required: true
+          description: "Document key from upload_document response"
+      response:
+        type: file_url
+        ttl: 1h
+      pagination: none
+
+    # ─── Glossary Management ─────────────────────────────────────────────
+
+    list_glossaries:
+      method: GET
+      path: /glossaries
+      access: read
+      description: "List all glossaries for the authenticated account"
+      response:
+        result_path: "$.glossaries"
+      pagination: none
+
+    create_glossary:
+      method: POST
+      path: /glossaries
+      access: write
+      content_type: application/json
+      description: "Create a new glossary with term pairs. Entries are TSV or CSV formatted (one pair per line)."
+      params:
+        name:
+          type: string
+          in: body
+          required: true
+          description: "Human-readable glossary name"
+        source_lang:
+          type: string
+          in: body
+          required: true
+          description: "Source language code, e.g. en"
+        target_lang:
+          type: string
+          in: body
+          required: true
+          description: "Target language code, e.g. de"
+        entries:
+          type: string
+          in: body
+          required: true
+          description: "Glossary entries as TSV or CSV string (one term pair per line)"
+        entries_format:
+          type: string
+          in: body
+          required: true
+          description: "Format of entries: tsv or csv"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_glossary:
+      method: GET
+      path: /glossaries/{glossary_id}
+      access: read
+      description: "Retrieve metadata of a single glossary (name, languages, entry count, creation time)"
+      params:
+        glossary_id:
+          type: string
+          in: path
+          required: true
+          description: "Glossary ID"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_glossary_entries:
+      method: GET
+      path: /glossaries/{glossary_id}/entries
+      access: read
+      description: "Retrieve all term pairs of a glossary as tab-separated values"
+      params:
+        glossary_id:
+          type: string
+          in: path
+          required: true
+          description: "Glossary ID"
+        Accept:
+          type: string
+          in: header
+          default: "text/tab-separated-values"
+          description: "Response format — must be text/tab-separated-values"
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_glossary:
+      method: DELETE
+      path: /glossaries/{glossary_id}
+      access: dangerous
+      description: "Permanently delete a glossary. This action cannot be undone."
+      params:
+        glossary_id:
+          type: string
+          in: path
+          required: true
+          description: "Glossary ID to delete"
+      pagination: none
+
+    list_glossary_language_pairs:
+      method: GET
+      path: /glossary-language-pairs
+      access: read
+      description: "List all supported source-target language pairs for glossaries"
+      response:
+        result_path: "$.supported_languages"
+      pagination: none
+
+    # ─── Text Improvement (Write) ────────────────────────────────────────
+
+    rephrase_text:
+      method: POST
+      path: /write/rephrase
+      access: write
+      content_type: application/json
+      description: "Improve and rephrase text without changing the language (max 10 KiB body). Supports writing styles and tones. Does NOT translate — source and target language must match."
+      params:
+        text:
+          type: array
+          in: body
+          required: true
+          description: "Array of texts to improve (UTF-8 plain text)"
+        target_lang:
+          type: string
+          in: body
+          description: "Target language (must match source): de, en-GB, en-US, es, fr, it, ja, ko, pt-BR, pt-PT, zh"
+        writing_style:
+          type: string
+          in: body
+          description: "simple, business, academic, casual, default, prefer_simple, prefer_business, prefer_academic, prefer_casual — mutually exclusive with tone"
+        tone:
+          type: string
+          in: body
+          description: "enthusiastic, friendly, confident, diplomatic, default, prefer_enthusiastic, prefer_friendly, prefer_confident, prefer_diplomatic — mutually exclusive with writing_style"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ─── Languages & Usage ───────────────────────────────────────────────
+
+    list_languages:
+      method: GET
+      path: /languages
+      access: read
+      description: "List supported languages. Use type=source for source languages, type=target for target languages (includes regional variants and formality support info)."
+      params:
+        type:
+          type: string
+          in: query
+          description: "source or target (default: source)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_usage:
+      method: GET
+      path: /usage
+      access: read
+      description: "Retrieve character usage and quota for the current billing period. Returns character_count (consumed) and character_limit (max allowed)."
+      response:
+        result_path: "$"
+      pagination: none
+
+  # ─── Examples ────────────────────────────────────────────────────────
+
+  examples:
+    - name: "Translate text"
+      description: "Translate English text to German with formal tone"
+      code: |
+        const result = await api.translate({
+          text: ["Hello, how are you?", "Please send the report."],
+          target_lang: "DE",
+          formality: "more"
+        });
+        return result.translations;
+
+    - name: "Translate with glossary"
+      description: "Create a glossary and use it for consistent translations"
+      code: |
+        const glossary = await api.create_glossary({
+          name: "Tech Terms EN-DE",
+          source_lang: "en",
+          target_lang: "de",
+          entries: "API\tSchnittstelle\ndeployment\tBereitstellung\nrepository\tRepository",
+          entries_format: "tsv"
+        });
+        const result = await api.translate({
+          text: ["The API deployment to the repository was successful."],
+          source_lang: "EN",
+          target_lang: "DE",
+          glossary_id: glossary.glossary_id
+        });
+        return result.translations;
+
+    - name: "Document translation workflow"
+      description: "Upload a document, poll status, and download the result"
+      code: |
+        const doc = await api.upload_document({
+          file: "https://toolmesh-host/files/f-abc123",
+          target_lang: "FR"
+        });
+        let status;
+        do {
+          status = await api.check_document_status({
+            document_id: doc.document_id,
+            document_key: doc.document_key
+          });
+        } while (status.status === "queued" || status.status === "translating");
+        if (status.status === "done") {
+          return await api.download_document({
+            document_id: doc.document_id,
+            document_key: doc.document_key
+          });
+        }
+        throw new Error(`Translation failed: ${status.message}`);
+
+    - name: "Improve text style"
+      description: "Rephrase text in a more business-like writing style"
+      code: |
+        const result = await api.rephrase_text({
+          text: ["Hey, just wanted to let you know that the thing is done."],
+          target_lang: "en-US",
+          writing_style: "business"
+        });
+        return result.improvements;
+
+    - name: "Check usage quota"
+      description: "Check remaining character quota and calculate percentage used"
+      code: |
+        const usage = await api.get_usage();
+        const pct = Math.round((usage.character_count / usage.character_limit) * 100);
+        return { ...usage, percentage_used: pct };
+
+  # ─── Hints ─────────────────────────────────────────────────────────
+
+  hints:
+    translate:
+      max_texts: "50 per request"
+      max_body_size: "128 KiB"
+      formality_langs: "DE, FR, IT, ES, NL, PL, PT-BR, PT-PT, JA, RU"
+      glossary_note: "glossary_id requires source_lang to be explicitly set"
+    upload_document:
+      supported_formats: "docx, doc, pptx, xlsx, pdf, htm, html, txt, xlf, xliff, srt, jpeg, jpg, png"
+      workflow: "upload → poll check_document_status → download_document"
+    download_document:
+      one_time: "document is auto-deleted after first download"
+    rephrase_text:
+      not_translation: "does not translate, only improves text in the same language"
+      mutually_exclusive: "writing_style and tone cannot be used together"
+      max_body_size: "10 KiB"
+    create_glossary:
+      tsv_format: "one entry per line, source TAB target"
+      csv_format: "one entry per line, source COMMA target"
