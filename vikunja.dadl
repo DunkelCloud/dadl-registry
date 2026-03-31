@@ -94,6 +94,12 @@ backend:
   # Priority values:
   #   0 = unset, 1 = low, 2 = medium, 3 = high, 4 = urgent, 5 = critical
   #
+  # Update semantics:
+  #   update_task is a composite that does GET → merge → POST.
+  #   Vikunja's raw POST /tasks/{id} resets missing fields to zero,
+  #   so the composite reads the current state first and only overwrites
+  #   fields that were explicitly provided. Safe for partial updates.
+  #
   # Typical workflow:
   #   1. list_projects → pick project_id
   #   2. list_views(project_id) → pick view_id (e.g. kanban view)
@@ -163,11 +169,11 @@ backend:
         position: { type: number, in: body }
       pagination: none
 
-    update_task:
+    _update_task_raw:
       method: POST
       path: /tasks/{id}
       access: write
-      description: "Update an existing task. Only include fields you want to change. To move between kanban buckets, use move_task_to_bucket instead."
+      description: "Internal: raw task update (sends full object). Use the update_task composite instead."
       params:
         id: { type: integer, in: path, required: true }
         title: { type: string, in: body }
@@ -289,3 +295,44 @@ backend:
         task_id: { type: integer, in: path, required: true }
         comment: { type: string, in: body, required: true }
       pagination: none
+
+  composites:
+    update_task:
+      description: "Update an existing task. Only include fields you want to change — unchanged fields are preserved. To move between kanban buckets, use move_task_to_bucket instead."
+      params:
+        id:
+          type: number
+          required: true
+          description: "Task ID"
+        title:
+          type: string
+          description: "New title"
+        description:
+          type: string
+          description: "New description"
+        done:
+          type: boolean
+          description: "Mark as done/undone"
+        priority:
+          type: number
+          description: "Priority: 0=unset, 1=low, 2=medium, 3=high, 4=urgent, 5=critical"
+        due_date:
+          type: string
+          description: "Due date (ISO 8601)"
+        position:
+          type: number
+          description: "Sort position (float64)"
+      timeout: 15s
+      depends_on: [get_task, _update_task_raw]
+      code: |
+        const current = await api.get_task({ id: params.id });
+        const merged = {
+          id: params.id,
+          title: params.title !== undefined ? params.title : current.title,
+          description: params.description !== undefined ? params.description : current.description,
+          done: params.done !== undefined ? params.done : current.done,
+          priority: params.priority !== undefined ? params.priority : current.priority,
+          due_date: params.due_date !== undefined ? params.due_date : current.due_date,
+          position: params.position !== undefined ? params.position : current.position,
+        };
+        return await api._update_task_raw(merged);
