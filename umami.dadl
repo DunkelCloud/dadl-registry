@@ -1,0 +1,240 @@
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+backend:
+  name: umami
+  type: rest
+  # base_url is intentionally omitted — must be provided via backends.yaml url field,
+  # because each deployment has its own Umami instance URL.
+  description: "Umami open-source web analytics — privacy-friendly alternative to Google Analytics"
+
+  coverage:
+    endpoints: 12
+    total_endpoints: 40
+    percentage: 30
+    focus: "authentication, websites, website statistics, metrics, pageviews, events, active users, realtime"
+    missing: "users, teams, reports, sessions, links, pixels, shares, admin, event-data"
+    last_reviewed: "2026-03-31"
+
+  setup:
+    credential_steps:
+      - "Log into your Umami instance as admin"
+      - "Navigate to Settings → Users or use the API login endpoint"
+      - "POST /api/auth/login with {username, password} to get a JWT token"
+      - "The token is returned in the response body as 'token'"
+    env_var: CREDENTIAL_UMAMI_API_TOKEN
+    backends_yaml: |
+      - name: umami
+        transport: rest
+        dadl: /app/dadl/umami.dadl
+        url: "https://your-umami-instance.com/api"
+    required_scopes:
+      - "admin or view-only access depending on endpoints used"
+    docs_url: "https://docs.umami.is/docs/api"
+    notes: "Umami is self-hosted. Replace the URL with your instance address. Token is a JWT obtained via /auth/login."
+
+  auth:
+    type: bearer
+    credential: umami_api_token
+    inject_into: header
+    header_name: Authorization
+    prefix: "Bearer "
+
+  defaults:
+    headers:
+      Content-Type: application/json
+      Accept: application/json
+    errors: &standard-errors
+      format: json
+      message_path: "$.message"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+
+  # ────────────────────────────────────────────────────────────────
+  # Domain notes (for LLM consumers of these tools)
+  #
+  # Authentication:
+  #   Umami uses JWT tokens obtained via POST /auth/login.
+  #   The token must be sent as Bearer token in the Authorization header.
+  #   Tokens expire — re-authenticate if you get 401 responses.
+  #
+  # Timestamps:
+  #   All time-based query parameters (startAt, endAt) use Unix timestamps
+  #   in MILLISECONDS (not seconds). Example: 1711929600000 for 2024-04-01.
+  #
+  # Metrics types:
+  #   The metrics endpoint accepts a 'type' parameter to select what to measure:
+  #   path, entry, exit, title, query, referrer, channel, domain,
+  #   country, region, city, browser, os, device, language, screen,
+  #   event, hostname, tag, distinctId
+  #
+  # Filters:
+  #   Stats, metrics, pageviews, and events endpoints accept filter parameters
+  #   as query params: path, referrer, title, browser, os, device, country,
+  #   region, city, language, hostname, tag, event, utmSource, utmMedium, etc.
+  #
+  # Typical workflow:
+  #   1. authenticate (login) → get token
+  #   2. list_websites → pick websiteId
+  #   3. get_website_stats(websiteId, startAt, endAt) → overview
+  #   4. get_website_metrics(websiteId, startAt, endAt, type) → drill down
+  #   5. get_website_active(websiteId) → realtime visitors
+  # ────────────────────────────────────────────────────────────────
+
+  tools:
+    # ── Authentication ──────────────────────────────────────────────
+
+    login:
+      method: POST
+      path: /auth/login
+      access: write
+      description: "Authenticate with Umami. Returns a JWT token for subsequent API calls. Send username and password in the request body."
+      params:
+        username: { type: string, in: body, required: true }
+        password: { type: string, in: body, required: true }
+      pagination: none
+
+    verify_token:
+      method: POST
+      path: /auth/verify
+      access: read
+      description: "Verify if the current JWT token is still valid. Returns user info if valid."
+      pagination: none
+
+    # ── Websites ────────────────────────────────────────────────────
+
+    list_websites:
+      method: GET
+      path: /websites
+      access: read
+      description: "List all websites registered in Umami. Returns website IDs, names, domains, and creation dates."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        pageSize: { type: integer, in: query, default: 10 }
+        orderBy: { type: string, in: query, default: "name" }
+      pagination: none
+
+    get_website:
+      method: GET
+      path: /websites/{websiteId}
+      access: read
+      description: "Get details of a specific website by its ID."
+      params:
+        websiteId: { type: string, in: path, required: true }
+      pagination: none
+
+    create_website:
+      method: POST
+      path: /websites
+      access: write
+      description: "Create a new website to track. Provide name and domain."
+      params:
+        name: { type: string, in: body, required: true }
+        domain: { type: string, in: body, required: true }
+        shareId: { type: string, in: body }
+      pagination: none
+
+    update_website:
+      method: POST
+      path: /websites/{websiteId}
+      access: write
+      description: "Update website properties. Only include fields you want to change."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        domain: { type: string, in: body }
+        shareId: { type: string, in: body }
+      pagination: none
+
+    delete_website:
+      method: DELETE
+      path: /websites/{websiteId}
+      access: dangerous
+      description: "Delete a website and all its analytics data. Irreversible."
+      params:
+        websiteId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Website Statistics ──────────────────────────────────────────
+
+    get_website_active:
+      method: GET
+      path: /websites/{websiteId}/active
+      access: read
+      description: "Get the number of active visitors on a website right now (last 5 minutes)."
+      params:
+        websiteId: { type: string, in: path, required: true }
+      pagination: none
+
+    get_website_stats:
+      method: GET
+      path: /websites/{websiteId}/stats
+      access: read
+      description: "Get summarized website statistics: pageviews, visitors, visits, bounces, and total time. Timestamps are Unix milliseconds."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        title: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        device: { type: string, in: query }
+        country: { type: string, in: query }
+        region: { type: string, in: query }
+        city: { type: string, in: query }
+      pagination: none
+
+    get_website_pageviews:
+      method: GET
+      path: /websites/{websiteId}/pageviews
+      access: read
+      description: "Get pageview time series within a given time range. Returns pageviews and sessions arrays with timestamps. Unit auto-scales if range exceeds maximum for chosen unit."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        unit: { type: string, in: query, required: true }
+        timezone: { type: string, in: query }
+        compare: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        country: { type: string, in: query }
+      pagination: none
+
+    get_website_metrics:
+      method: GET
+      path: /websites/{websiteId}/metrics
+      access: read
+      description: "Get metrics for a website grouped by type. Types: path, entry, exit, title, query, referrer, channel, domain, country, region, city, browser, os, device, language, screen, event, hostname, tag, distinctId. Returns [{x: value, y: count}]."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        type: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 500 }
+        offset: { type: integer, in: query, default: 0 }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        country: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        device: { type: string, in: query }
+      pagination: none
+
+    get_website_events_series:
+      method: GET
+      path: /websites/{websiteId}/events/series
+      access: read
+      description: "Get custom events within a time range as time series. Returns [{x: event_name, t: timestamp, y: count}]."
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        unit: { type: string, in: query, required: true }
+        timezone: { type: string, in: query }
+        event: { type: string, in: query }
+      pagination: none
