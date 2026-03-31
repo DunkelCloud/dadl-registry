@@ -1,4 +1,12 @@
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Umami Analytics REST API"
+source_url: "https://umami.is/docs/api"
+date: "2026-03-31"
+
 backend:
   name: umami
   type: rest
