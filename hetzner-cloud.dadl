@@ -1,0 +1,1584 @@
+# hetzner-cloud.dadl -- Hetzner Cloud REST API
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - Hetzner Cloud is a European IaaS provider (datacenters in DE, FI, US, SG).
+# - "Server" = a cloud compute instance (virtual machine), similar to AWS EC2.
+# - Server types use names like "cx22", "cpx11", "ccx13" (shared/dedicated vCPU).
+# - Locations use short IDs: "fsn1" (Falkenstein), "nbg1" (Nuremberg),
+#   "hel1" (Helsinki), "ash" (Ashburn), "hil" (Hillsboro), "sin" (Singapore).
+# - Datacenters append a number to locations: "fsn1-dc14", "nbg1-dc3".
+# - Images: "ubuntu-22.04" (public), numeric IDs for snapshots/backups.
+# - Labels are key-value pairs for organizing resources. Most list endpoints
+#   support label_selector query param with syntax: "env=prod,team=backend"
+#   or "env!=staging", "env in (prod,staging)", "!deprecated".
+# - All list endpoints support sorting via sort param: "id:asc", "name:desc".
+# - Actions are async operations. After creating/modifying resources, poll the
+#   returned action ID until status is "success" or "error".
+# - All timestamps are ISO 8601 UTC.
+# - Destructive actions (delete server, reset) are immediate and irreversible.
+# - Protection: resources can be delete-protected and/or rebuild-protected.
+# - Networks use RFC 1918 ranges (10.0.0.0/8). Subnets are within the network range.
+# - Firewalls use rules with direction (in/out), protocol, port, and source_ips/destination_ips.
+# - Volumes are network-attached block storage (ext4/xfs), attachable to one server.
+# - Floating IPs are static IPs assignable between servers in the same location.
+# - Primary IPs are the main IPs assigned to servers, can be reserved.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Hetzner Cloud API"
+source_url: "https://docs.hetzner.cloud"
+date: "2026-04-01"
+
+backend:
+  name: hetzner-cloud
+  type: rest
+  version: "1.0"
+  base_url: https://api.hetzner.cloud/v1
+  description: "Hetzner Cloud API -- servers, volumes, networks, load balancers, firewalls, floating IPs, primary IPs, images, SSH keys, placement groups, certificates, and infrastructure metadata"
+
+  auth:
+    type: bearer
+    credential: hetzner_cloud_token
+
+  defaults:
+    headers:
+      Content-Type: application/json
+    pagination:
+      strategy: page
+      request:
+        cursor_param: page
+        limit_param: per_page
+        limit_default: 25
+      response:
+        next_cursor: "$.meta.pagination.page"
+        has_more: "$.meta.pagination.next_page != null"
+      behavior: expose
+      max_pages: 20
+    errors:
+      format: json
+      message_path: "$.error.message"
+      code_path: "$.error.code"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      terminal: [400, 401, 403, 404, 409, 422]
+      rate_limit:
+        header: RateLimit-Remaining
+        retry_after_header: RateLimit-Reset
+    response:
+      max_items: 200
+
+  coverage:
+    endpoints: 122
+    total_endpoints: 200
+    percentage: 61
+    focus: "servers, server actions, server metrics, volumes, networks, firewalls, load balancers, load balancer metrics, floating IPs, primary IPs, images, SSH keys, placement groups, certificates, datacenters, locations, server types, ISOs, pricing"
+    missing: "storage boxes (separate API at api.hetzner.com), DNS zones/rrsets (separate API), S3 credential management"
+    last_reviewed: "2026-04-01"
+
+  setup:
+    credential_steps:
+      - "Log in to Hetzner Cloud Console at https://console.hetzner.cloud"
+      - "Select or create a project"
+      - "Navigate to Security -> API Tokens"
+      - "Click 'Generate API Token'"
+      - "Enter a description and select Read or Read & Write permissions"
+      - "Copy the token immediately -- it is shown only once"
+    env_var: CREDENTIAL_HETZNER_CLOUD_TOKEN
+    backends_yaml: |
+      - name: hetzner-cloud
+        transport: rest
+        dadl: /app/dadl/hetzner-cloud.dadl
+    required_scopes:
+      - "Read & Write (for full functionality)"
+    optional_scopes:
+      - "Read (for read-only access to all resources)"
+    docs_url: "https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/"
+    notes: "API tokens are scoped to a single project. To manage multiple projects, create one token per project. Tokens have either Read or Read & Write permission -- there are no per-resource scopes."
+
+  hints:
+    list_servers:
+      filtering: "Use label_selector for filtering, e.g. label_selector=env=prod,team=backend"
+      sorting: "Use sort param, e.g. sort=name:asc or sort=created:desc"
+      status_values: "initializing, starting, running, stopping, off, deleting, migrating, rebuilding, unknown"
+    create_server:
+      required_combo: "name + server_type + image are the minimum for a bootable server"
+      ssh_keys: "Array of SSH key IDs or names -- added during provisioning"
+      user_data: "Cloud-init user data (string, max 32KB). Server must support it."
+      location_vs_datacenter: "Set either location OR datacenter, not both. Location lets Hetzner pick the DC."
+    rebuild_server:
+      warning: "Destroys all data on the server and reinstalls from the specified image. Irreversible."
+    create_volume:
+      attach: "Set server to auto-attach, or create unattached and use attach_volume later"
+      size_limits: "Minimum 10 GB, maximum 10240 GB (10 TB)"
+    create_firewall:
+      rule_format: "Each rule needs direction (in/out), protocol (tcp/udp/icmp/esp/gre), and source_ips or destination_ips as CIDR array"
+    create_network:
+      ip_range: "Must be an RFC 1918 range (/8, /12, /16). Example: 10.0.0.0/16"
+    create_load_balancer:
+      algorithm: "round_robin (default) or least_connections"
+    get_server_metrics:
+      metric_types: "cpu = CPU utilization %. disk = disk.0.iops.read, disk.0.iops.write, disk.0.bandwidth.read, disk.0.bandwidth.write. network = network.0.bandwidth.in, network.0.bandwidth.out, network.0.pps.in, network.0.pps.out"
+      time_range: "max 24h per request. For longer ranges, increase step or make multiple calls."
+      response_format: "Prometheus-style: {timeseries: [{name, values: [[timestamp, value], ...]}]}"
+    get_load_balancer_metrics:
+      metric_types: "open_connections, connections_per_second, requests_per_second, bandwidth.in, bandwidth.out"
+
+  tools:
+
+    # =========================================================================
+    # SERVERS -- Core CRUD & Lifecycle
+    # =========================================================================
+
+    list_servers:
+      method: GET
+      path: /servers
+      access: read
+      description: "List all servers. Supports label_selector, name, sort, and status filtering."
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query, description: "Sort: id, id:asc, id:desc, name, name:asc, name:desc, created, created:asc, created:desc" }
+        name: { type: string, in: query, description: "Filter by exact server name" }
+        label_selector: { type: string, in: query, description: "Label filter, e.g. env=prod,team=backend" }
+        status: { type: string, in: query, description: "Filter by status: initializing, starting, running, stopping, off, deleting, migrating, rebuilding, unknown" }
+
+    get_server:
+      method: GET
+      path: /servers/{id}
+      access: read
+      description: "Get details of a specific server"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_server:
+      method: POST
+      path: /servers
+      access: write
+      description: "Create a new server. Returns server object and root_password (if no SSH keys). Action is async -- poll the returned action."
+      params:
+        name: { type: string, in: body, required: true, description: "Server name (unique within project)" }
+        server_type: { type: string, in: body, required: true, description: "Server type name (e.g. cx22, cpx11, ccx13)" }
+        image: { type: string, in: body, required: true, description: "Image ID or name (e.g. ubuntu-22.04, debian-12)" }
+        location: { type: string, in: body, description: "Location ID (e.g. fsn1, nbg1, hel1, ash). Mutually exclusive with datacenter." }
+        datacenter: { type: string, in: body, description: "Datacenter ID (e.g. fsn1-dc14). Mutually exclusive with location." }
+        ssh_keys: { type: array, in: body, description: "Array of SSH key IDs or names" }
+        volumes: { type: array, in: body, description: "Array of volume IDs to attach" }
+        firewalls: { type: array, in: body, description: "Array of objects: [{firewall: ID}]" }
+        networks: { type: array, in: body, description: "Array of network IDs to attach" }
+        user_data: { type: string, in: body, description: "Cloud-init user data (max 32KB)" }
+        labels: { type: object, in: body, description: "Key-value labels" }
+        automount: { type: boolean, in: body, description: "Auto-mount attached volumes" }
+        start_after_create: { type: boolean, in: body, description: "Start server after creation (default true)" }
+        public_net: { type: object, in: body, description: "Public network config: {enable_ipv4, enable_ipv6, ipv4, ipv6}" }
+        placement_group: { type: integer, in: body, description: "Placement group ID" }
+      pagination: none
+
+    update_server:
+      method: PUT
+      path: /servers/{id}
+      access: write
+      description: "Update a server's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_server:
+      method: DELETE
+      path: /servers/{id}
+      access: dangerous
+      description: "Delete a server immediately. All data on the server is lost. Irreversible."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SERVER ACTIONS -- Power, Rescue, Rebuild, Resize, ISO, Network
+    # =========================================================================
+
+    power_on_server:
+      method: POST
+      path: /servers/{id}/actions/poweron
+      access: write
+      description: "Power on a server"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    power_off_server:
+      method: POST
+      path: /servers/{id}/actions/poweroff
+      access: write
+      description: "Hard power off a server (like pulling the power cord). Use shutdown for graceful stop."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    reboot_server:
+      method: POST
+      path: /servers/{id}/actions/reboot
+      access: write
+      description: "Soft reboot a server (sends ACPI signal)"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    reset_server:
+      method: POST
+      path: /servers/{id}/actions/reset
+      access: write
+      description: "Hard reset a server (like pressing the reset button). Use reboot for graceful restart."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    shutdown_server:
+      method: POST
+      path: /servers/{id}/actions/shutdown
+      access: write
+      description: "Gracefully shut down a server (sends ACPI shutdown signal)"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    enable_rescue_server:
+      method: POST
+      path: /servers/{id}/actions/enable_rescue
+      access: write
+      description: "Enable rescue mode. Returns root_password for the rescue system. Reboot to enter rescue."
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: body, description: "Rescue OS type: linux64 (default) or linux32" }
+        ssh_keys: { type: array, in: body, description: "SSH key IDs for rescue system" }
+      pagination: none
+
+    disable_rescue_server:
+      method: POST
+      path: /servers/{id}/actions/disable_rescue
+      access: write
+      description: "Disable rescue mode"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    rebuild_server:
+      method: POST
+      path: /servers/{id}/actions/rebuild
+      access: dangerous
+      description: "Rebuild a server from an image. All data is destroyed. Irreversible."
+      params:
+        id: { type: integer, in: path, required: true }
+        image: { type: string, in: body, required: true, description: "Image ID or name to rebuild from" }
+      pagination: none
+
+    change_server_type:
+      method: POST
+      path: /servers/{id}/actions/change_type
+      access: write
+      description: "Change server type (resize). Server must be off. Disk can only be upgraded, not downgraded."
+      params:
+        id: { type: integer, in: path, required: true }
+        server_type: { type: string, in: body, required: true, description: "New server type name" }
+        upgrade_disk: { type: boolean, in: body, required: true, description: "Resize disk (true = upgrade, prevents future downgrade)" }
+      pagination: none
+
+    create_image_from_server:
+      method: POST
+      path: /servers/{id}/actions/create_image
+      access: write
+      description: "Create a snapshot image from a server"
+      params:
+        id: { type: integer, in: path, required: true }
+        description: { type: string, in: body }
+        type: { type: string, in: body, description: "snapshot (default) or backup" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    attach_iso_to_server:
+      method: POST
+      path: /servers/{id}/actions/attach_iso
+      access: write
+      description: "Attach an ISO to a server"
+      params:
+        id: { type: integer, in: path, required: true }
+        iso: { type: string, in: body, required: true, description: "ISO ID or name" }
+      pagination: none
+
+    detach_iso_from_server:
+      method: POST
+      path: /servers/{id}/actions/detach_iso
+      access: write
+      description: "Detach any ISO from a server"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    change_server_protection:
+      method: POST
+      path: /servers/{id}/actions/change_protection
+      access: admin
+      description: "Change delete and rebuild protection for a server"
+      params:
+        id: { type: integer, in: path, required: true }
+        delete: { type: boolean, in: body, description: "Enable/disable delete protection" }
+        rebuild: { type: boolean, in: body, description: "Enable/disable rebuild protection" }
+      pagination: none
+
+    change_server_dns_ptr:
+      method: POST
+      path: /servers/{id}/actions/change_dns_ptr
+      access: write
+      description: "Change reverse DNS entry for a server IP"
+      params:
+        id: { type: integer, in: path, required: true }
+        ip: { type: string, in: body, required: true, description: "IP address to set rDNS for" }
+        dns_ptr: { type: string, in: body, required: true, description: "Hostname for the reverse DNS entry (null to reset)" }
+      pagination: none
+
+    attach_server_to_network:
+      method: POST
+      path: /servers/{id}/actions/attach_to_network
+      access: write
+      description: "Attach a server to a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        network: { type: integer, in: body, required: true, description: "Network ID" }
+        ip: { type: string, in: body, description: "IP in the network range (auto-assigned if omitted)" }
+        alias_ips: { type: array, in: body, description: "Additional IPs in the network" }
+      pagination: none
+
+    detach_server_from_network:
+      method: POST
+      path: /servers/{id}/actions/detach_from_network
+      access: write
+      description: "Detach a server from a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        network: { type: integer, in: body, required: true, description: "Network ID" }
+      pagination: none
+
+    enable_server_backup:
+      method: POST
+      path: /servers/{id}/actions/enable_backup
+      access: write
+      description: "Enable automatic backups for a server"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    disable_server_backup:
+      method: POST
+      path: /servers/{id}/actions/disable_backup
+      access: write
+      description: "Disable automatic backups for a server. Existing backups are kept until their expiry."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    add_server_to_placement_group:
+      method: POST
+      path: /servers/{id}/actions/add_to_placement_group
+      access: write
+      description: "Add a server to a placement group. Server must be stopped."
+      params:
+        id: { type: integer, in: path, required: true }
+        placement_group: { type: integer, in: body, required: true, description: "Placement group ID" }
+      pagination: none
+
+    remove_server_from_placement_group:
+      method: POST
+      path: /servers/{id}/actions/remove_from_placement_group
+      access: write
+      description: "Remove a server from its placement group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_server_actions:
+      method: GET
+      path: /servers/{id}/actions
+      access: read
+      description: "List all actions for a server"
+      params:
+        id: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query, description: "Sort: id, id:asc, id:desc, command, command:asc, command:desc, status, status:asc, status:desc, started, started:asc, started:desc, finished, finished:asc, finished:desc" }
+        status: { type: string, in: query, description: "Filter by status: running, success, error" }
+
+    get_server_action:
+      method: GET
+      path: /servers/{id}/actions/{action_id}
+      access: read
+      description: "Get details of a specific server action"
+      params:
+        id: { type: integer, in: path, required: true }
+        action_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SERVER METRICS -- CPU, Disk, Network time series
+    # =========================================================================
+
+    get_server_metrics:
+      method: GET
+      path: /servers/{id}/metrics
+      access: read
+      description: "Get metrics (time series) for a server. Returns Prometheus-style data points for the requested metric types within the given time range."
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: query, required: true, description: "Comma-separated metric types: cpu, disk, network. Example: cpu,disk,network" }
+        start: { type: string, in: query, required: true, description: "ISO 8601 start time (e.g. 2026-03-31T00:00:00Z)" }
+        end: { type: string, in: query, required: true, description: "ISO 8601 end time (e.g. 2026-04-01T00:00:00Z)" }
+        step: { type: integer, in: query, description: "Resolution in seconds (default varies by range). Minimum 60 for short ranges." }
+      pagination: none
+
+    # =========================================================================
+    # LOAD BALANCER METRICS
+    # =========================================================================
+
+    get_load_balancer_metrics:
+      method: GET
+      path: /load_balancers/{id}/metrics
+      access: read
+      description: "Get metrics for a load balancer. Returns time series for open connections, connections/s, requests/s, and bandwidth."
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: query, required: true, description: "Comma-separated: open_connections, connections_per_second, requests_per_second, bandwidth" }
+        start: { type: string, in: query, required: true, description: "ISO 8601 start time" }
+        end: { type: string, in: query, required: true, description: "ISO 8601 end time" }
+        step: { type: integer, in: query, description: "Resolution in seconds" }
+      pagination: none
+
+    # =========================================================================
+    # VOLUMES -- Block Storage
+    # =========================================================================
+
+    list_volumes:
+      method: GET
+      path: /volumes
+      access: read
+      description: "List all volumes"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+        status: { type: string, in: query, description: "Filter: creating, available" }
+
+    get_volume:
+      method: GET
+      path: /volumes/{id}
+      access: read
+      description: "Get details of a specific volume"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_volume:
+      method: POST
+      path: /volumes
+      access: write
+      description: "Create a new volume. Set server to auto-attach, or leave unattached."
+      params:
+        name: { type: string, in: body, required: true }
+        size: { type: integer, in: body, required: true, description: "Size in GB (min 10, max 10240)" }
+        location: { type: string, in: body, description: "Location ID. Required if server is not set." }
+        server: { type: integer, in: body, description: "Server ID to auto-attach to" }
+        automount: { type: boolean, in: body, description: "Auto-mount after attach" }
+        format: { type: string, in: body, description: "Filesystem: ext4 or xfs" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_volume:
+      method: PUT
+      path: /volumes/{id}
+      access: write
+      description: "Update a volume's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_volume:
+      method: DELETE
+      path: /volumes/{id}
+      access: dangerous
+      description: "Delete a volume. Must be detached first."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    attach_volume:
+      method: POST
+      path: /volumes/{id}/actions/attach
+      access: write
+      description: "Attach a volume to a server"
+      params:
+        id: { type: integer, in: path, required: true }
+        server: { type: integer, in: body, required: true }
+        automount: { type: boolean, in: body }
+      pagination: none
+
+    detach_volume:
+      method: POST
+      path: /volumes/{id}/actions/detach
+      access: write
+      description: "Detach a volume from a server"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    resize_volume:
+      method: POST
+      path: /volumes/{id}/actions/resize
+      access: write
+      description: "Resize a volume. Can only increase size, not decrease."
+      params:
+        id: { type: integer, in: path, required: true }
+        size: { type: integer, in: body, required: true, description: "New size in GB (must be larger than current)" }
+      pagination: none
+
+    change_volume_protection:
+      method: POST
+      path: /volumes/{id}/actions/change_protection
+      access: admin
+      description: "Change delete protection for a volume"
+      params:
+        id: { type: integer, in: path, required: true }
+        delete: { type: boolean, in: body, description: "Enable/disable delete protection" }
+      pagination: none
+
+    # =========================================================================
+    # NETWORKS -- Private Cloud Networks
+    # =========================================================================
+
+    list_networks:
+      method: GET
+      path: /networks
+      access: read
+      description: "List all networks"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+
+    get_network:
+      method: GET
+      path: /networks/{id}
+      access: read
+      description: "Get details of a specific network"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_network:
+      method: POST
+      path: /networks
+      access: write
+      description: "Create a new network with an RFC 1918 IP range"
+      params:
+        name: { type: string, in: body, required: true }
+        ip_range: { type: string, in: body, required: true, description: "RFC 1918 CIDR range (e.g. 10.0.0.0/16)" }
+        subnets: { type: array, in: body, description: "Initial subnets to create" }
+        routes: { type: array, in: body, description: "Initial routes to create" }
+        labels: { type: object, in: body }
+        expose_routes_to_vswitch: { type: boolean, in: body }
+      pagination: none
+
+    update_network:
+      method: PUT
+      path: /networks/{id}
+      access: write
+      description: "Update a network's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+        expose_routes_to_vswitch: { type: boolean, in: body }
+      pagination: none
+
+    delete_network:
+      method: DELETE
+      path: /networks/{id}
+      access: dangerous
+      description: "Delete a network. All subnets and routes are removed."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    add_subnet_to_network:
+      method: POST
+      path: /networks/{id}/actions/add_subnet
+      access: write
+      description: "Add a subnet to a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "cloud, server, or vswitch" }
+        ip_range: { type: string, in: body, required: true, description: "CIDR range within the network" }
+        network_zone: { type: string, in: body, required: true, description: "Network zone (e.g. eu-central)" }
+        vswitch_id: { type: integer, in: body, description: "vSwitch ID (required for type=vswitch)" }
+      pagination: none
+
+    delete_subnet_from_network:
+      method: POST
+      path: /networks/{id}/actions/delete_subnet
+      access: write
+      description: "Delete a subnet from a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        ip_range: { type: string, in: body, required: true, description: "CIDR range of the subnet to delete" }
+      pagination: none
+
+    add_route_to_network:
+      method: POST
+      path: /networks/{id}/actions/add_route
+      access: write
+      description: "Add a route to a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        destination: { type: string, in: body, required: true, description: "Destination CIDR" }
+        gateway: { type: string, in: body, required: true, description: "Gateway IP (must be in the network)" }
+      pagination: none
+
+    delete_route_from_network:
+      method: POST
+      path: /networks/{id}/actions/delete_route
+      access: write
+      description: "Delete a route from a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        destination: { type: string, in: body, required: true }
+        gateway: { type: string, in: body, required: true }
+      pagination: none
+
+    change_network_protection:
+      method: POST
+      path: /networks/{id}/actions/change_protection
+      access: admin
+      description: "Change delete protection for a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        delete: { type: boolean, in: body }
+      pagination: none
+
+    # =========================================================================
+    # FIREWALLS -- Network Security
+    # =========================================================================
+
+    list_firewalls:
+      method: GET
+      path: /firewalls
+      access: read
+      description: "List all firewalls"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+
+    get_firewall:
+      method: GET
+      path: /firewalls/{id}
+      access: read
+      description: "Get details of a specific firewall including its rules"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_firewall:
+      method: POST
+      path: /firewalls
+      access: write
+      description: "Create a new firewall with optional initial rules and resource assignments"
+      params:
+        name: { type: string, in: body, required: true }
+        rules: { type: array, in: body, description: "Array of firewall rules" }
+        apply_to: { type: array, in: body, description: "Resources to apply to: [{type: server, server: {id: 123}}] or [{type: label_selector, label_selector: {selector: 'env=prod'}}]" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_firewall:
+      method: PUT
+      path: /firewalls/{id}
+      access: write
+      description: "Update a firewall's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_firewall:
+      method: DELETE
+      path: /firewalls/{id}
+      access: dangerous
+      description: "Delete a firewall. Must be unapplied from all resources first."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    set_firewall_rules:
+      method: POST
+      path: /firewalls/{id}/actions/set_rules
+      access: admin
+      description: "Overwrite all rules of a firewall. This replaces all existing rules."
+      params:
+        id: { type: integer, in: path, required: true }
+        rules: { type: array, in: body, required: true, description: "Complete set of firewall rules" }
+      pagination: none
+
+    apply_firewall_to_resources:
+      method: POST
+      path: /firewalls/{id}/actions/apply_to_resources
+      access: write
+      description: "Apply a firewall to servers or label selectors"
+      params:
+        id: { type: integer, in: path, required: true }
+        apply_to: { type: array, in: body, required: true, description: "Resources: [{type: server, server: {id: 123}}]" }
+      pagination: none
+
+    remove_firewall_from_resources:
+      method: POST
+      path: /firewalls/{id}/actions/remove_from_resources
+      access: write
+      description: "Remove a firewall from servers or label selectors"
+      params:
+        id: { type: integer, in: path, required: true }
+        remove_from: { type: array, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # LOAD BALANCERS
+    # =========================================================================
+
+    list_load_balancers:
+      method: GET
+      path: /load_balancers
+      access: read
+      description: "List all load balancers"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+
+    get_load_balancer:
+      method: GET
+      path: /load_balancers/{id}
+      access: read
+      description: "Get details of a specific load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_load_balancer:
+      method: POST
+      path: /load_balancers
+      access: write
+      description: "Create a new load balancer"
+      params:
+        name: { type: string, in: body, required: true }
+        load_balancer_type: { type: string, in: body, required: true, description: "Type name (e.g. lb11)" }
+        location: { type: string, in: body, description: "Location ID" }
+        network_zone: { type: string, in: body, description: "Network zone (e.g. eu-central)" }
+        algorithm: { type: object, in: body, description: "{type: round_robin} or {type: least_connections}" }
+        services: { type: array, in: body, description: "Service definitions (protocol, ports, health checks)" }
+        targets: { type: array, in: body, description: "Target definitions (server, label_selector, ip)" }
+        network: { type: integer, in: body, description: "Network ID for private networking" }
+        public_interface: { type: boolean, in: body, description: "Enable public interface (default true)" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_load_balancer:
+      method: PUT
+      path: /load_balancers/{id}
+      access: write
+      description: "Update a load balancer's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_load_balancer:
+      method: DELETE
+      path: /load_balancers/{id}
+      access: dangerous
+      description: "Delete a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    add_load_balancer_service:
+      method: POST
+      path: /load_balancers/{id}/actions/add_service
+      access: write
+      description: "Add a service (listener) to a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+        protocol: { type: string, in: body, required: true, description: "tcp, http, or https" }
+        listen_port: { type: integer, in: body, required: true }
+        destination_port: { type: integer, in: body, required: true }
+        proxyprotocol: { type: boolean, in: body }
+        health_check: { type: object, in: body, description: "Health check config" }
+        http: { type: object, in: body, description: "HTTP-specific settings (sticky sessions, redirect, certificates)" }
+      pagination: none
+
+    update_load_balancer_service:
+      method: POST
+      path: /load_balancers/{id}/actions/update_service
+      access: write
+      description: "Update a service on a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+        listen_port: { type: integer, in: body, required: true, description: "Identifies the service to update" }
+        protocol: { type: string, in: body }
+        destination_port: { type: integer, in: body }
+        proxyprotocol: { type: boolean, in: body }
+        health_check: { type: object, in: body }
+        http: { type: object, in: body }
+      pagination: none
+
+    delete_load_balancer_service:
+      method: POST
+      path: /load_balancers/{id}/actions/delete_service
+      access: write
+      description: "Delete a service from a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+        listen_port: { type: integer, in: body, required: true }
+      pagination: none
+
+    add_load_balancer_target:
+      method: POST
+      path: /load_balancers/{id}/actions/add_target
+      access: write
+      description: "Add a target to a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "server, label_selector, or ip" }
+        server: { type: object, in: body, description: "{id: server_id}" }
+        label_selector: { type: object, in: body, description: "{selector: 'env=prod'}" }
+        ip: { type: object, in: body, description: "{ip: '1.2.3.4'}" }
+        use_private_ip: { type: boolean, in: body }
+      pagination: none
+
+    remove_load_balancer_target:
+      method: POST
+      path: /load_balancers/{id}/actions/remove_target
+      access: write
+      description: "Remove a target from a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true }
+        server: { type: object, in: body }
+        label_selector: { type: object, in: body }
+        ip: { type: object, in: body }
+      pagination: none
+
+    change_load_balancer_type:
+      method: POST
+      path: /load_balancers/{id}/actions/change_type
+      access: write
+      description: "Change the type of a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+        load_balancer_type: { type: string, in: body, required: true }
+      pagination: none
+
+    change_load_balancer_protection:
+      method: POST
+      path: /load_balancers/{id}/actions/change_protection
+      access: admin
+      description: "Change delete protection for a load balancer"
+      params:
+        id: { type: integer, in: path, required: true }
+        delete: { type: boolean, in: body }
+      pagination: none
+
+    attach_load_balancer_to_network:
+      method: POST
+      path: /load_balancers/{id}/actions/attach_to_network
+      access: write
+      description: "Attach a load balancer to a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        network: { type: integer, in: body, required: true }
+        ip: { type: string, in: body }
+      pagination: none
+
+    detach_load_balancer_from_network:
+      method: POST
+      path: /load_balancers/{id}/actions/detach_from_network
+      access: write
+      description: "Detach a load balancer from a network"
+      params:
+        id: { type: integer, in: path, required: true }
+        network: { type: integer, in: body, required: true }
+      pagination: none
+
+    change_load_balancer_algorithm:
+      method: POST
+      path: /load_balancers/{id}/actions/change_algorithm
+      access: write
+      description: "Change the balancing algorithm"
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "round_robin or least_connections" }
+      pagination: none
+
+    change_load_balancer_dns_ptr:
+      method: POST
+      path: /load_balancers/{id}/actions/change_dns_ptr
+      access: write
+      description: "Change reverse DNS entry for a load balancer IP"
+      params:
+        id: { type: integer, in: path, required: true }
+        ip: { type: string, in: body, required: true }
+        dns_ptr: { type: string, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # FLOATING IPS -- Static IPs (assignable between servers)
+    # =========================================================================
+
+    list_floating_ips:
+      method: GET
+      path: /floating_ips
+      access: read
+      description: "List all floating IPs"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+
+    get_floating_ip:
+      method: GET
+      path: /floating_ips/{id}
+      access: read
+      description: "Get details of a specific floating IP"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_floating_ip:
+      method: POST
+      path: /floating_ips
+      access: write
+      description: "Create a new floating IP"
+      params:
+        type: { type: string, in: body, required: true, description: "ipv4 or ipv6" }
+        home_location: { type: string, in: body, description: "Home location (required if server is not set)" }
+        server: { type: integer, in: body, description: "Server ID to assign to" }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_floating_ip:
+      method: PUT
+      path: /floating_ips/{id}
+      access: write
+      description: "Update a floating IP's name, description, or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_floating_ip:
+      method: DELETE
+      path: /floating_ips/{id}
+      access: dangerous
+      description: "Delete a floating IP. Must be unassigned first."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    assign_floating_ip:
+      method: POST
+      path: /floating_ips/{id}/actions/assign
+      access: write
+      description: "Assign a floating IP to a server"
+      params:
+        id: { type: integer, in: path, required: true }
+        server: { type: integer, in: body, required: true }
+      pagination: none
+
+    unassign_floating_ip:
+      method: POST
+      path: /floating_ips/{id}/actions/unassign
+      access: write
+      description: "Unassign a floating IP from a server"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    change_floating_ip_protection:
+      method: POST
+      path: /floating_ips/{id}/actions/change_protection
+      access: admin
+      description: "Change delete protection for a floating IP"
+      params:
+        id: { type: integer, in: path, required: true }
+        delete: { type: boolean, in: body }
+      pagination: none
+
+    change_floating_ip_dns_ptr:
+      method: POST
+      path: /floating_ips/{id}/actions/change_dns_ptr
+      access: write
+      description: "Change reverse DNS entry for a floating IP"
+      params:
+        id: { type: integer, in: path, required: true }
+        ip: { type: string, in: body, required: true }
+        dns_ptr: { type: string, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # PRIMARY IPS -- Main server IPs (reservable)
+    # =========================================================================
+
+    list_primary_ips:
+      method: GET
+      path: /primary_ips
+      access: read
+      description: "List all primary IPs"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+        ip: { type: string, in: query, description: "Filter by IP address" }
+
+    get_primary_ip:
+      method: GET
+      path: /primary_ips/{id}
+      access: read
+      description: "Get details of a specific primary IP"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_primary_ip:
+      method: POST
+      path: /primary_ips
+      access: write
+      description: "Create a new primary IP"
+      params:
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "ipv4 or ipv6" }
+        assignee_type: { type: string, in: body, required: true, description: "server" }
+        assignee_id: { type: integer, in: body, description: "Server ID to assign to" }
+        datacenter: { type: string, in: body, description: "Datacenter ID (required if assignee_id is not set)" }
+        auto_delete: { type: boolean, in: body, description: "Delete IP when assigned server is deleted" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_primary_ip:
+      method: PUT
+      path: /primary_ips/{id}
+      access: write
+      description: "Update a primary IP's name, labels, or auto_delete setting"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+        auto_delete: { type: boolean, in: body }
+      pagination: none
+
+    delete_primary_ip:
+      method: DELETE
+      path: /primary_ips/{id}
+      access: dangerous
+      description: "Delete a primary IP. Must be unassigned first."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    assign_primary_ip:
+      method: POST
+      path: /primary_ips/{id}/actions/assign
+      access: write
+      description: "Assign a primary IP to a server"
+      params:
+        id: { type: integer, in: path, required: true }
+        assignee_id: { type: integer, in: body, required: true }
+        assignee_type: { type: string, in: body, required: true, description: "server" }
+      pagination: none
+
+    unassign_primary_ip:
+      method: POST
+      path: /primary_ips/{id}/actions/unassign
+      access: write
+      description: "Unassign a primary IP from a server"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    change_primary_ip_protection:
+      method: POST
+      path: /primary_ips/{id}/actions/change_protection
+      access: admin
+      description: "Change delete protection for a primary IP"
+      params:
+        id: { type: integer, in: path, required: true }
+        delete: { type: boolean, in: body }
+      pagination: none
+
+    change_primary_ip_dns_ptr:
+      method: POST
+      path: /primary_ips/{id}/actions/change_dns_ptr
+      access: write
+      description: "Change reverse DNS entry for a primary IP"
+      params:
+        id: { type: integer, in: path, required: true }
+        ip: { type: string, in: body, required: true }
+        dns_ptr: { type: string, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # IMAGES -- Snapshots, Backups, System Images
+    # =========================================================================
+
+    list_images:
+      method: GET
+      path: /images
+      access: read
+      description: "List all images (system, snapshot, backup, app)"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+        type: { type: string, in: query, description: "Filter: system, snapshot, backup, app" }
+        status: { type: string, in: query, description: "Filter: available, creating, unavailable" }
+        architecture: { type: string, in: query, description: "Filter: x86, arm" }
+
+    get_image:
+      method: GET
+      path: /images/{id}
+      access: read
+      description: "Get details of a specific image"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_image:
+      method: PUT
+      path: /images/{id}
+      access: write
+      description: "Update an image's description, type, or labels. Only for snapshot/backup images."
+      params:
+        id: { type: integer, in: path, required: true }
+        description: { type: string, in: body }
+        type: { type: string, in: body, description: "snapshot (convert backup to snapshot)" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_image:
+      method: DELETE
+      path: /images/{id}
+      access: dangerous
+      description: "Delete an image. Only snapshot and backup images can be deleted."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    change_image_protection:
+      method: POST
+      path: /images/{id}/actions/change_protection
+      access: admin
+      description: "Change delete protection for an image"
+      params:
+        id: { type: integer, in: path, required: true }
+        delete: { type: boolean, in: body }
+      pagination: none
+
+    # =========================================================================
+    # SSH KEYS
+    # =========================================================================
+
+    list_ssh_keys:
+      method: GET
+      path: /ssh_keys
+      access: read
+      description: "List all SSH keys"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+        fingerprint: { type: string, in: query, description: "Filter by fingerprint" }
+
+    get_ssh_key:
+      method: GET
+      path: /ssh_keys/{id}
+      access: read
+      description: "Get details of a specific SSH key"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_ssh_key:
+      method: POST
+      path: /ssh_keys
+      access: write
+      description: "Create (upload) a new SSH key"
+      params:
+        name: { type: string, in: body, required: true }
+        public_key: { type: string, in: body, required: true, description: "Full SSH public key string" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_ssh_key:
+      method: PUT
+      path: /ssh_keys/{id}
+      access: write
+      description: "Update an SSH key's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_ssh_key:
+      method: DELETE
+      path: /ssh_keys/{id}
+      access: dangerous
+      description: "Delete an SSH key"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # CERTIFICATES -- TLS/SSL Certificates
+    # =========================================================================
+
+    list_certificates:
+      method: GET
+      path: /certificates
+      access: read
+      description: "List all certificates"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+        type: { type: string, in: query, description: "Filter: uploaded, managed" }
+
+    get_certificate:
+      method: GET
+      path: /certificates/{id}
+      access: read
+      description: "Get details of a specific certificate"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_certificate:
+      method: POST
+      path: /certificates
+      access: write
+      description: "Create a certificate (upload or request managed via Let's Encrypt)"
+      params:
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, description: "uploaded (default) or managed" }
+        certificate: { type: string, in: body, description: "PEM certificate (required for uploaded)" }
+        private_key: { type: string, in: body, description: "PEM private key (required for uploaded)" }
+        domain_names: { type: array, in: body, description: "Domain names (required for managed)" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_certificate:
+      method: PUT
+      path: /certificates/{id}
+      access: write
+      description: "Update a certificate's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_certificate:
+      method: DELETE
+      path: /certificates/{id}
+      access: dangerous
+      description: "Delete a certificate"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # PLACEMENT GROUPS
+    # =========================================================================
+
+    list_placement_groups:
+      method: GET
+      path: /placement_groups
+      access: read
+      description: "List all placement groups"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        label_selector: { type: string, in: query }
+        type: { type: string, in: query, description: "Filter: spread" }
+
+    get_placement_group:
+      method: GET
+      path: /placement_groups/{id}
+      access: read
+      description: "Get details of a specific placement group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_placement_group:
+      method: POST
+      path: /placement_groups
+      access: write
+      description: "Create a new placement group"
+      params:
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "spread (ensures servers are on different hosts)" }
+        labels: { type: object, in: body }
+      pagination: none
+
+    update_placement_group:
+      method: PUT
+      path: /placement_groups/{id}
+      access: write
+      description: "Update a placement group's name or labels"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        labels: { type: object, in: body }
+      pagination: none
+
+    delete_placement_group:
+      method: DELETE
+      path: /placement_groups/{id}
+      access: dangerous
+      description: "Delete a placement group. Must have no servers assigned."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ACTIONS -- Global Action Log
+    # =========================================================================
+
+    list_actions:
+      method: GET
+      path: /actions
+      access: read
+      description: "List all actions across all resources"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        id: { type: integer, in: query, description: "Filter by action ID" }
+        status: { type: string, in: query, description: "Filter: running, success, error" }
+
+    get_action:
+      method: GET
+      path: /actions/{id}
+      access: read
+      description: "Get details of a specific action"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # INFRASTRUCTURE METADATA (read-only)
+    # =========================================================================
+
+    # --- Server Types ---
+    list_server_types:
+      method: GET
+      path: /server_types
+      access: read
+      description: "List all available server types with specs and pricing"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        name: { type: string, in: query }
+
+    get_server_type:
+      method: GET
+      path: /server_types/{id}
+      access: read
+      description: "Get details of a specific server type"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- Locations ---
+    list_locations:
+      method: GET
+      path: /locations
+      access: read
+      description: "List all available locations"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+
+    get_location:
+      method: GET
+      path: /locations/{id}
+      access: read
+      description: "Get details of a specific location"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- Datacenters ---
+    list_datacenters:
+      method: GET
+      path: /datacenters
+      access: read
+      description: "List all available datacenters"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+
+    get_datacenter:
+      method: GET
+      path: /datacenters/{id}
+      access: read
+      description: "Get details of a specific datacenter"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- ISOs ---
+    list_isos:
+      method: GET
+      path: /isos
+      access: read
+      description: "List all available ISO images"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        sort: { type: string, in: query }
+        name: { type: string, in: query }
+        architecture: { type: string, in: query, description: "Filter: x86, arm" }
+
+    get_iso:
+      method: GET
+      path: /isos/{id}
+      access: read
+      description: "Get details of a specific ISO image"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- Load Balancer Types ---
+    list_load_balancer_types:
+      method: GET
+      path: /load_balancer_types
+      access: read
+      description: "List all available load balancer types"
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+        name: { type: string, in: query }
+
+    get_load_balancer_type:
+      method: GET
+      path: /load_balancer_types/{id}
+      access: read
+      description: "Get details of a specific load balancer type"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # --- Pricing ---
+    get_pricing:
+      method: GET
+      path: /pricing
+      access: read
+      description: "Get all pricing information for server types, images, volumes, floating IPs, load balancers, and traffic"
+      pagination: none
+
+  # ===========================================================================
+  # EXAMPLES -- Few-shot prompts for LLM
+  # ===========================================================================
+
+  examples:
+    - name: "Create server with SSH key"
+      description: "Create a server in Falkenstein with an existing SSH key and cloud-init user data"
+      code: |
+        const keys = await api.list_ssh_keys({ name: "my-key" });
+        const server = await api.create_server({
+          name: "web-01",
+          server_type: "cx22",
+          image: "ubuntu-22.04",
+          location: "fsn1",
+          ssh_keys: [keys.ssh_keys[0].id],
+          labels: { env: "prod", role: "web" }
+        });
+        return { server: server.server, action: server.action };
+
+    - name: "Setup private network"
+      description: "Create a network, add a subnet, and attach a server"
+      code: |
+        const net = await api.create_network({
+          name: "internal",
+          ip_range: "10.0.0.0/16"
+        });
+        await api.add_subnet_to_network({
+          id: net.network.id,
+          type: "cloud",
+          ip_range: "10.0.1.0/24",
+          network_zone: "eu-central"
+        });
+        await api.attach_server_to_network({
+          id: 12345,
+          network: net.network.id
+        });
+        return net.network;
+
+    - name: "Create firewall and apply"
+      description: "Create a firewall with SSH and HTTP rules and apply to servers by label"
+      code: |
+        const fw = await api.create_firewall({
+          name: "web-firewall",
+          rules: [
+            { direction: "in", protocol: "tcp", port: "22", source_ips: ["0.0.0.0/0", "::/0"] },
+            { direction: "in", protocol: "tcp", port: "80", source_ips: ["0.0.0.0/0", "::/0"] },
+            { direction: "in", protocol: "tcp", port: "443", source_ips: ["0.0.0.0/0", "::/0"] }
+          ],
+          apply_to: [{ type: "label_selector", label_selector: { selector: "role=web" } }]
+        });
+        return fw.firewall;
