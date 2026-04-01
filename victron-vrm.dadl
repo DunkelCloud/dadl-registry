@@ -1,0 +1,752 @@
+# victron-vrm.dadl -- Victron Energy VRM REST API v2
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - VRM = Victron Remote Management portal for solar/battery/inverter systems.
+# - An "installation" (idSite) is a physical site with Victron hardware (e.g. a house with solar panels).
+# - A "user" (idUser) owns one or more installations. Use /users/me to get the current user's ID.
+# - Widget endpoints return real-time and historical data for specific device categories.
+#   Available widget types: Graph, VeBusState, InverterChargerState, ChargerRelay,
+#   SolarChargerRelay, GatewayRelay, GatewayRelayTwo, Status, BatterySummary,
+#   SolarChargerSummary, EVChargerSummary, GlobalLinkSummary, MotorSummary,
+#   PVInverterStatus, TankSummary, TemperatureSummary, DCMeterSummary,
+#   VeBusWarningsAndAlarms, InverterWarningsAndAlarms, BMSDiagnostics,
+#   LithiumBMS, HistoricData, IOExtenderInOut, GPS, CustomWidget.
+# - Stats types: "venus", "live_feed", "consumption", "kwh", "solar_yield", "forecast".
+# - The "instance" param on widget endpoints filters by device instance (e.g. multiple MPPT chargers).
+# - All timestamps are Unix epoch seconds unless noted otherwise.
+# - Personal Access Tokens are preferred over username/password login for automation.
+# - idSite is the numeric ID visible in the VRM portal URL: vrm.victronenergy.com/installation/{idSite}.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+# ──────────────────────────────────────────────
+# Reusable response transforms (YAML anchors)
+# ──────────────────────────────────────────────
+_widget_response: &widget-response
+  result_path: "$.records"
+  transform: |
+    {
+      data: (.data // {}),
+      attributes: [.meta // {} | to_entries[] | {
+        code: .value.code,
+        description: .value.description,
+        unit: .value.formatWithUnit
+      }]
+    }
+
+_diagnostics_response: &diagnostics-response
+  result_path: "$.records"
+  max_items: 100
+  transform: |
+    map({
+      Device, code, description, instance,
+      formattedValue
+    })
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Victron Energy VRM REST API v2"
+source_url: "https://vrm-api-docs.victronenergy.com/"
+date: "2026-03-31"
+
+backend:
+  name: victron-vrm
+  type: rest
+  version: "1.0"
+  base_url: https://vrmapi.victronenergy.com/v2
+  description: "Victron Energy VRM API -- monitor and control solar installations, batteries, inverters, and energy systems via the Victron Remote Management portal"
+
+  auth:
+    type: bearer
+    credential: victron_vrm_token
+    header_name: X-Authorization
+    prefix: "Token "
+    # Personal Access Token: sent as "X-Authorization: Token <pat>"
+
+  defaults:
+    headers:
+      Content-Type: application/json
+      Accept: application/json
+    pagination:
+      strategy: page
+      request:
+        cursor_param: page
+        limit_param: count
+        limit_default: 50
+      response:
+        next_cursor: "$.page"
+        has_more: "$.pages > $.page"
+      behavior: expose
+      max_pages: 20
+    errors:
+      format: json
+      message_path: "$.errors"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+      terminal: [400, 401, 403, 404]
+    response:
+      result_path: "$.records"
+      max_items: 200
+
+  coverage:
+    endpoints: 41
+    total_endpoints: 50
+    percentage: 82
+    focus: "auth, users, installations, stats, widgets, diagnostics, alarms, data export, GPS, tags, dynamic ESS, firmware, data attributes"
+    missing: "admin endpoints, access token CRUD, installation settings write, alarm acknowledgement"
+    last_reviewed: "2026-03-31"
+
+  setup:
+    credential_steps:
+      - "Log in to the VRM Portal at https://vrm.victronenergy.com"
+      - "Navigate to Preferences → Integrations → Access tokens"
+      - "Click 'New token', give it a descriptive name"
+      - "Copy the generated token immediately -- it is shown only once"
+      - "Store the token prefixed with 'Token ' (e.g. 'Token abc123def456') in the credential store"
+    env_var: CREDENTIAL_VICTRON_VRM_TOKEN
+    backends_yaml: |
+      - name: victron-vrm
+        transport: rest
+        dadl: /app/dadl/victron-vrm.dadl
+    docs_url: "https://vrm-api-docs.victronenergy.com/"
+    notes: "Personal Access Tokens bypass the login flow entirely. Use /users/me to get your idUser, then /users/{idUser}/installations to discover your sites. The token has full access to all installations the VRM user can see."
+
+  hints:
+    get_stats:
+      stat_types: "venus, live_feed, consumption, kwh, solar_yield, forecast"
+      time_params: "start and end are Unix epoch seconds"
+      intervals: "15mins, hours, days, months"
+    get_widget:
+      widget_types: "Graph, VeBusState, InverterChargerState, Status, BatterySummary, SolarChargerSummary, EVChargerSummary, PVInverterStatus, GPS, HistoricData, BMSDiagnostics, LithiumBMS, MotorSummary, TankSummary, TemperatureSummary, DCMeterSummary, VeBusWarningsAndAlarms, InverterWarningsAndAlarms, IOExtenderInOut, CustomWidget, GlobalLinkSummary, ChargerRelay, SolarChargerRelay, GatewayRelay, GatewayRelayTwo"
+      instance_param: "use instance to target a specific device when multiple exist"
+    get_diagnostics:
+      count_note: "count controls number of data points, not pages"
+    search_installations:
+      search_note: "searches across installation name, notes, and address"
+
+  tools:
+
+    # ──────────────────────────────────────────────
+    # Authentication
+    # ──────────────────────────────────────────────
+
+    login:
+      method: POST
+      path: /auth/login
+      access: write
+      description: "Authenticate with username/password and receive a bearer token. Prefer Personal Access Tokens for automation."
+      params:
+        username: { type: string, in: body, required: true, description: "VRM account email" }
+        password: { type: string, in: body, required: true, description: "VRM account password" }
+        sms_token: { type: string, in: body, description: "Two-factor SMS code if enabled" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    login_as_demo:
+      method: GET
+      path: /auth/loginAsDemo
+      access: read
+      description: "Log in as the demo user to explore the API without credentials"
+      response:
+        result_path: "$"
+      pagination: none
+
+    logout:
+      method: GET
+      path: /auth/logout
+      access: write
+      description: "Invalidate the current session token"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Users
+    # ──────────────────────────────────────────────
+
+    get_current_user:
+      method: GET
+      path: /users/me
+      access: read
+      description: "Get the current authenticated user's profile and idUser. Essential first call when using Personal Access Tokens."
+      response:
+        result_path: "$.user"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Installations
+    # ──────────────────────────────────────────────
+
+    list_installations:
+      method: GET
+      path: /users/{idUser}/installations
+      access: read
+      description: "List all installations accessible to a user. Returns idSite, name, and system overview for each."
+      params:
+        idUser: { type: integer, in: path, required: true, description: "User ID from /users/me" }
+        extended: { type: integer, in: query, description: "Set to 1 for extended info (system overview, current power data)" }
+      response:
+        result_path: "$.records"
+        transform: |
+          map({
+            idSite, name, identifier,
+            timezone, owner, shared, accessLevel,
+            alarm, alarmMonitoring,
+            device_icon, hasMains, hasGenerator,
+            pvMax, realtimeUpdates,
+            current_time: .current_time,
+            current_alarms: (.current_alarms | length),
+            extended: [.extended // [] | .[] | {
+              code, description, formattedValue
+            }]
+          })
+
+    get_installation:
+      method: GET
+      path: /installations/{idSite}
+      access: read
+      description: "Get high-level system overview for a specific installation including current power flow"
+      params:
+        idSite: { type: integer, in: path, required: true, description: "Installation/site ID" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_installations:
+      method: GET
+      path: /users/{idUser}/installations/search
+      access: read
+      description: "Search through the user's installations by name, notes, or address"
+      params:
+        idUser: { type: integer, in: path, required: true }
+        query: { type: string, in: query, required: true, description: "Search string" }
+      response:
+        result_path: "$.records"
+
+    get_installation_tags:
+      method: GET
+      path: /installations/{idSite}/tags
+      access: read
+      description: "Get tags/labels assigned to an installation"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Statistics & Energy Data
+    # ──────────────────────────────────────────────
+
+    get_stats:
+      method: GET
+      path: /installations/{idSite}/stats
+      access: read
+      description: "Get time-series statistics for an installation. Types: venus, live_feed, consumption, kwh, solar_yield, forecast."
+      params:
+        idSite: { type: integer, in: path, required: true }
+        type: { type: string, in: query, description: "Stats type: consumption, kwh, solar_yield, forecast, venus, live_feed" }
+        start: { type: integer, in: query, description: "Start timestamp (Unix epoch seconds)" }
+        end: { type: integer, in: query, description: "End timestamp (Unix epoch seconds)" }
+        interval: { type: string, in: query, description: "Aggregation interval: 15mins, hours, days, months" }
+        attributeCodes[]: { type: array, in: query, description: "Filter by specific attribute codes" }
+      response:
+        result_path: "$.records"
+
+    get_overall_stats:
+      method: GET
+      path: /installations/{idSite}/overallstats
+      access: read
+      description: "Get aggregated lifetime totals for an installation (total kWh generated, consumed, etc.)"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        type: { type: string, in: query, description: "Stats type: consumption or kwh" }
+      response:
+        result_path: "$.records"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Data Export
+    # ──────────────────────────────────────────────
+
+    download_data:
+      method: GET
+      path: /installations/{idSite}/data-download
+      access: read
+      description: "Download historical data as CSV or Excel for an installation"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        start: { type: integer, in: query, description: "Start timestamp (Unix epoch seconds)" }
+        end: { type: integer, in: query, description: "End timestamp (Unix epoch seconds)" }
+        format: { type: string, in: query, description: "Export format: csv or xlsx" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    download_gps_data:
+      method: GET
+      path: /installations/{idSite}/gps-download
+      access: read
+      description: "Download GPS tracking data for a mobile installation (e.g. boat, RV)"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        start: { type: integer, in: query, description: "Start timestamp" }
+        end: { type: integer, in: query, description: "End timestamp" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Alarms
+    # ──────────────────────────────────────────────
+
+    get_alarms:
+      method: GET
+      path: /installations/{idSite}/alarms
+      access: read
+      description: "Get active and historical alarms for an installation. Also returns device list and user notification settings."
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        result_path: "$"
+        transform: |
+          {
+            alarms: (.alarms // [])[:50],
+            devices: [.devices // [] | .[] | {
+              instance, deviceName, productName,
+              firmwareVersion, customName,
+              secondsAgo, isValid
+            }],
+            rateLimited: .rateLimited
+          }
+
+    # ──────────────────────────────────────────────
+    # Diagnostics
+    # ──────────────────────────────────────────────
+
+    get_diagnostics:
+      method: GET
+      path: /installations/{idSite}/diagnostics
+      access: read
+      description: "Get the most recent diagnostic data points for all devices at an installation"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        count: { type: integer, in: query, default: 100, description: "Number of data points to return" }
+      response:
+        <<: *diagnostics-response
+
+    # ──────────────────────────────────────────────
+    # Widgets -- Real-time & Historical Device Data
+    # ──────────────────────────────────────────────
+
+    get_widget:
+      method: GET
+      path: /installations/{idSite}/widgets/{widgetType}
+      access: read
+      description: "Get widget data for a specific device category. See hints for available widget types."
+      params:
+        idSite: { type: integer, in: path, required: true }
+        widgetType: { type: string, in: path, required: true, description: "Widget type, e.g. BatterySummary, SolarChargerSummary, Graph, GPS, Status" }
+        instance: { type: integer, in: query, description: "Device instance number to filter (when multiple devices of same type exist)" }
+        start: { type: integer, in: query, description: "Start timestamp for historical widget data" }
+        end: { type: integer, in: query, description: "End timestamp for historical widget data" }
+        attributeCodes[]: { type: array, in: query, description: "Filter by specific attribute codes" }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_graph:
+      method: GET
+      path: /installations/{idSite}/widgets/Graph
+      access: read
+      description: "Get graph widget data with time-series values for specific device instances and attributes"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query, description: "Device instance number" }
+        start: { type: integer, in: query, required: true, description: "Start timestamp (Unix epoch seconds)" }
+        end: { type: integer, in: query, required: true, description: "End timestamp (Unix epoch seconds)" }
+        attributeCodes[]: { type: array, in: query, description: "Attribute codes to graph" }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_battery:
+      method: GET
+      path: /installations/{idSite}/widgets/BatterySummary
+      access: read
+      description: "Get battery summary: voltage, current, state of charge (SoC), temperature, and health"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_solar_charger:
+      method: GET
+      path: /installations/{idSite}/widgets/SolarChargerSummary
+      access: read
+      description: "Get MPPT solar charger data: PV voltage, current, yield, and charger state"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_vebus_state:
+      method: GET
+      path: /installations/{idSite}/widgets/VeBusState
+      access: read
+      description: "Get VE.Bus system state: inverter/charger mode, input voltage, output power"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_inverter_charger_state:
+      method: GET
+      path: /installations/{idSite}/widgets/InverterChargerState
+      access: read
+      description: "Get inverter/charger operational mode and status"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_status:
+      method: GET
+      path: /installations/{idSite}/widgets/Status
+      access: read
+      description: "Get general system status overview for the installation"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_pv_inverter:
+      method: GET
+      path: /installations/{idSite}/widgets/PVInverterStatus
+      access: read
+      description: "Get PV inverter AC output: power, voltage, current per phase"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_ev_charger:
+      method: GET
+      path: /installations/{idSite}/widgets/EVChargerSummary
+      access: read
+      description: "Get EV charger status: charging power, session energy, and state"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_tank:
+      method: GET
+      path: /installations/{idSite}/widgets/TankSummary
+      access: read
+      description: "Get tank level and capacity for fuel, water, or waste tanks"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_temperature:
+      method: GET
+      path: /installations/{idSite}/widgets/TemperatureSummary
+      access: read
+      description: "Get temperature sensor readings and graphical data"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_dc_meter:
+      method: GET
+      path: /installations/{idSite}/widgets/DCMeterSummary
+      access: read
+      description: "Get DC power meter readings (voltage, current, power)"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_motor:
+      method: GET
+      path: /installations/{idSite}/widgets/MotorSummary
+      access: read
+      description: "Get motor drive summary: RPM, power, and temperature"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_gps:
+      method: GET
+      path: /installations/{idSite}/widgets/GPS
+      access: read
+      description: "Get current GPS position for mobile installations (boats, RVs)"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_global_link:
+      method: GET
+      path: /installations/{idSite}/widgets/GlobalLinkSummary
+      access: read
+      description: "Get GlobalLink 520 device summary and connectivity status"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Widget -- Warnings & Alarms
+    # ──────────────────────────────────────────────
+
+    get_widget_vebus_warnings:
+      method: GET
+      path: /installations/{idSite}/widgets/VeBusWarningsAndAlarms
+      access: read
+      description: "Get VE.Bus system warnings and alarm conditions"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_inverter_warnings:
+      method: GET
+      path: /installations/{idSite}/widgets/InverterWarningsAndAlarms
+      access: read
+      description: "Get inverter/charger warning and alarm conditions"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Widget -- Advanced Diagnostics
+    # ──────────────────────────────────────────────
+
+    get_widget_bms_diagnostics:
+      method: GET
+      path: /installations/{idSite}/widgets/BMSDiagnostics
+      access: read
+      description: "Get BMS cell voltages, balancing data, and battery management diagnostics"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_lithium_bms:
+      method: GET
+      path: /installations/{idSite}/widgets/LithiumBMS
+      access: read
+      description: "Get lithium battery BMS details: cell voltages, temperatures, and balancing"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_historic_data:
+      method: GET
+      path: /installations/{idSite}/widgets/HistoricData
+      access: read
+      description: "Get historic data trend analysis for device performance over time"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+        start: { type: integer, in: query }
+        end: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_io_extender:
+      method: GET
+      path: /installations/{idSite}/widgets/IOExtenderInOut
+      access: read
+      description: "Get IO extender digital and analog input/output signals"
+      params:
+        idSite: { type: integer, in: path, required: true }
+        instance: { type: integer, in: query }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Widget -- Relay State
+    # ──────────────────────────────────────────────
+
+    get_widget_charger_relay:
+      method: GET
+      path: /installations/{idSite}/widgets/ChargerRelay
+      access: read
+      description: "Get charger relay switching status"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_solar_charger_relay:
+      method: GET
+      path: /installations/{idSite}/widgets/SolarChargerRelay
+      access: read
+      description: "Get solar charger relay state"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_gateway_relay:
+      method: GET
+      path: /installations/{idSite}/widgets/GatewayRelay
+      access: read
+      description: "Get primary gateway (GX device) relay state"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_gateway_relay_two:
+      method: GET
+      path: /installations/{idSite}/widgets/GatewayRelayTwo
+      access: read
+      description: "Get secondary gateway (GX device) relay state"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    get_widget_custom:
+      method: GET
+      path: /installations/{idSite}/widgets/CustomWidget
+      access: read
+      description: "Get custom widget configuration and data"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        <<: *widget-response
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Dynamic ESS
+    # ──────────────────────────────────────────────
+
+    get_dynamic_ess:
+      method: GET
+      path: /installations/{idSite}/dynamic-ess
+      access: read
+      description: "Get Dynamic ESS (Energy Storage System) settings and schedule for optimized battery usage"
+      params:
+        idSite: { type: integer, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System-wide Reference Data
+    # ──────────────────────────────────────────────
+
+    get_data_attributes:
+      method: GET
+      path: /data-attributes
+      access: read
+      description: "Get all available data attribute definitions (codes, labels, units) used across the VRM API"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firmwares:
+      method: GET
+      path: /firmwares
+      access: read
+      description: "List available firmware versions for Victron devices"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reset_forecasts:
+      method: GET
+      path: /reset-forecasts
+      access: read
+      description: "Get forecast reset timestamps for recalculation scheduling"
+      response:
+        result_path: "$"
+      pagination: none
+
+  # ──────────────────────────────────────────────
+  # Examples
+  # ──────────────────────────────────────────────
+
+  examples:
+    - name: "Discover installations"
+      description: "Get current user, list all installations, and fetch battery status for the first one"
+      code: |
+        const me = await api.get_current_user();
+        const sites = await api.list_installations({ idUser: me.id, extended: 1 });
+        const firstSite = sites[0];
+        const battery = await api.get_widget_battery({ idSite: firstSite.idSite });
+        return { site: firstSite.name, battery };
+
+    - name: "Daily energy summary"
+      description: "Get today's energy consumption and solar yield for an installation"
+      code: |
+        const now = Math.floor(Date.now() / 1000);
+        const startOfDay = now - (now % 86400);
+        const stats = await api.get_stats({
+          idSite: 12345,
+          type: "kwh",
+          start: startOfDay,
+          end: now,
+          interval: "hours"
+        });
+        return stats;
+
+    - name: "Check alarms and diagnostics"
+      description: "Get active alarms and latest diagnostics for a site"
+      code: |
+        const alarms = await api.get_alarms({ idSite: 12345 });
+        const diag = await api.get_diagnostics({ idSite: 12345, count: 50 });
+        return { alarms, diagnostics: diag };
