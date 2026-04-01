@@ -20,30 +20,6 @@
 
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
 
-# ──────────────────────────────────────────────
-# Reusable response transforms (YAML anchors)
-# ──────────────────────────────────────────────
-_widget_response: &widget-response
-  result_path: "$.records"
-  transform: |
-    {
-      data: (.data // {}),
-      attributes: [.meta // {} | to_entries[] | {
-        code: .value.code,
-        description: .value.description,
-        unit: .value.formatWithUnit
-      }]
-    }
-
-_diagnostics_response: &diagnostics-response
-  result_path: "$.records"
-  max_items: 100
-  transform: |
-    map({
-      Device, code, description, instance,
-      formattedValue
-    })
-
 credits:
   - "Dunkel Cloud GmbH -- maintainer"
 
@@ -339,7 +315,13 @@ backend:
         idSite: { type: integer, in: path, required: true }
         count: { type: integer, in: query, default: 100, description: "Number of data points to return" }
       response:
-        <<: *diagnostics-response
+        result_path: "$.records"
+        max_items: 100
+        transform: |
+          map({
+            Device, code, description, instance,
+            formattedValue
+          })
 
     # ──────────────────────────────────────────────
     # Widgets -- Real-time & Historical Device Data
@@ -358,7 +340,16 @@ backend:
         end: { type: integer, in: query, description: "End timestamp for historical widget data" }
         attributeCodes[]: { type: array, in: query, description: "Filter by specific attribute codes" }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_graph:
@@ -373,7 +364,16 @@ backend:
         end: { type: integer, in: query, required: true, description: "End timestamp (Unix epoch seconds)" }
         attributeCodes[]: { type: array, in: query, description: "Attribute codes to graph" }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_battery:
@@ -385,7 +385,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_solar_charger:
@@ -397,7 +406,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_vebus_state:
@@ -409,7 +427,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_inverter_charger_state:
@@ -421,7 +448,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_status:
@@ -432,7 +468,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_pv_inverter:
@@ -444,7 +489,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_ev_charger:
@@ -456,7 +510,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_tank:
@@ -468,7 +531,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_temperature:
@@ -480,7 +552,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_dc_meter:
@@ -492,7 +573,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_motor:
@@ -504,7 +594,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_gps:
@@ -515,7 +614,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_global_link:
@@ -526,7 +634,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     # ──────────────────────────────────────────────
@@ -542,7 +659,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_inverter_warnings:
@@ -554,7 +680,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     # ──────────────────────────────────────────────
@@ -570,7 +705,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_lithium_bms:
@@ -582,7 +726,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_historic_data:
@@ -596,7 +749,16 @@ backend:
         start: { type: integer, in: query }
         end: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_io_extender:
@@ -608,7 +770,16 @@ backend:
         idSite: { type: integer, in: path, required: true }
         instance: { type: integer, in: query }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     # ──────────────────────────────────────────────
@@ -623,7 +794,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_solar_charger_relay:
@@ -634,7 +814,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_gateway_relay:
@@ -645,7 +834,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_gateway_relay_two:
@@ -656,7 +854,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     get_widget_custom:
@@ -667,7 +874,16 @@ backend:
       params:
         idSite: { type: integer, in: path, required: true }
       response:
-        <<: *widget-response
+        result_path: "$.records"
+        transform: |
+          {
+            data: (.data // {}),
+            attributes: [.meta // {} | to_entries[] | {
+              code: .value.code,
+              description: .value.description,
+              unit: .value.formatWithUnit
+            }]
+          }
       pagination: none
 
     # ──────────────────────────────────────────────
