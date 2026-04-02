@@ -1,0 +1,1539 @@
+# stripe.dadl — Stripe REST API for ToolMesh
+# Payment processing, billing, subscriptions, and financial infrastructure
+#
+# ⚠ EARLY DEVELOPMENT — This DADL file is in an early development stage and has not yet been
+# fully tested with real Stripe Sandbox keys. Before using in production, thoroughly test all
+# endpoints (especially POST/write operations) with a Stripe test-mode Secret Key (sk_test_...).
+# Report any issues at https://github.com/DunkelCloud/toolmesh-community (or equivalent).
+#
+# Domain Notes for LLM consumers:
+# - Stripe uses Secret API Keys (sk_test_... / sk_live_...) as Bearer tokens
+# - All request bodies use application/x-www-form-urlencoded, NOT JSON
+# - Nested params use bracket notation: metadata[key]=value, items[0][price]=price_xxx
+# - All monetary amounts are in smallest currency unit (cents for USD): $10.00 = 1000
+# - Stripe IDs are prefixed: cus_ (customer), pi_ (payment intent), sub_ (subscription),
+#   in_ (invoice), prod_ (product), price_ (price), ch_ (charge), re_ (refund),
+#   cs_ (checkout session), seti_ (setup intent), pm_ (payment method), dp_ (dispute),
+#   po_ (payout), evt_ (event), we_ (webhook endpoint), txn_ (balance transaction)
+# - Pagination is cursor-based: use starting_after=<last_id> and has_more to iterate
+# - Search endpoints use Stripe Query Language (not standard query params):
+#   e.g. query="email:'jane@example.com'" or query="status:'active' AND created>1609459200"
+# - Test mode vs live mode is determined by the API key (sk_test_ vs sk_live_)
+# - Expand nested objects with expand[]=field (e.g. expand[]=customer on a PaymentIntent)
+# - Idempotency: POST requests accept Idempotency-Key header to prevent duplicate operations
+# - Subscription cancel uses DELETE method; update uses POST
+# - Invoice lifecycle: draft → open (finalize) → paid/void/uncollectible
+# - PaymentIntent lifecycle: requires_payment_method → requires_confirmation → succeeded/canceled
+# - Webhook endpoints are for registering YOUR server URLs, not for reading events
+# - Events are read-only and retained for 30 days
+# - Charges are mostly legacy — prefer PaymentIntents for new integrations
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+credits:
+  - "Dunkel Cloud GmbH"
+source_name: "Stripe REST API"
+source_url: https://docs.stripe.com/api
+date: "2026-04-02"
+
+backend:
+  name: stripe
+  type: rest
+  version: "1.0"
+  base_url: https://api.stripe.com/v1
+  description: "Stripe REST API — payment processing, billing, subscriptions, invoices, products, and financial infrastructure"
+  openapi_source: https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.yaml
+
+  coverage:
+    endpoints: 78
+    total_endpoints: 350
+    percentage: 22
+    focus: "customers, payment intents, payment methods, charges, subscriptions, invoices, products, prices, refunds, checkout sessions, setup intents, disputes, coupons, payouts, balance, events, webhook endpoints"
+    missing: "Connect (accounts, transfers, application fees), Terminal, Identity, Issuing, Treasury, Tax, Sigma, Reporting, Radar, Climate, Financial Connections, forwarding"
+    last_reviewed: "2026-04-02"
+
+  setup:
+    credential_steps:
+      - "Log in to the Stripe Dashboard at https://dashboard.stripe.com"
+      - "Navigate to Developers → API keys"
+      - "Copy the Secret key (starts with sk_test_ for test mode or sk_live_ for live mode)"
+      - "NEVER use the Publishable key (pk_) — it cannot access server-side endpoints"
+    env_var: CREDENTIAL_STRIPE_SECRET_KEY
+    backends_yaml: |
+      - name: stripe
+        transport: rest
+        dadl: stripe.dadl
+        url: "https://api.stripe.com/v1"
+    required_scopes: []
+    docs_url: "https://docs.stripe.com/api"
+    notes: >
+      Stripe does not use OAuth scopes — the secret key grants full API access.
+      Use restricted keys (Dashboard → API keys → Create restricted key) to limit
+      access to specific resources and operations. Test mode keys (sk_test_) operate
+      on test data only and never affect real charges. Rate limits: 100 read/s and
+      100 write/s in live mode, 25 read/s and 25 write/s in test mode.
+
+  auth:
+    type: bearer
+    credential: stripe_secret_key
+
+  defaults:
+    # No Content-Type override — ToolMesh defaults to application/json, which Stripe accepts since 2019.
+    # Do NOT set Content-Type: application/x-www-form-urlencoded here: it would conflict with
+    # ToolMesh's JSON body serialization and cause Stripe to reject all body params.
+    pagination:
+      strategy: cursor
+      request:
+        cursor_param: starting_after
+        limit_param: limit
+        limit_default: 100
+      response:
+        next_cursor: "$.data[-1].id"
+        has_more: "$.has_more"
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      message_path: "$.error.message"
+      code_path: "$.error.type"
+      retry_on: [429, 502, 503]
+      terminal: [400, 401, 402, 403, 404, 409]
+      # 402 = card declined / payment required (Stripe-specific)
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      rate_limit:
+        header: X-RateLimit-Remaining
+        retry_after_header: Retry-After
+    response:
+      result_path: "$.data"
+      allow_jq_override: true
+
+  hints:
+    create_payment_intent:
+      amount_unit: "smallest currency unit (cents for USD, so $10.00 = 1000)"
+      confirm_note: "set confirm=true to immediately attempt payment, otherwise confirm separately"
+    create_subscription:
+      items_format: "items[0][price]=price_xxx — use bracket notation for nested arrays"
+      trial_note: "trial_period_days OR trial_end, not both"
+    create_checkout_session:
+      line_items_format: "line_items[0][price]=price_xxx&line_items[0][quantity]=1"
+      mode_values: "payment (one-time), subscription (recurring), setup (save payment method)"
+    search_customers:
+      query_syntax: "Stripe Query Language: email:'jane@example.com', created>1609459200, metadata['key']:'value'"
+    create_price:
+      recurring_format: "recurring[interval]=month, recurring[interval_count]=1"
+      amount_unit: "smallest currency unit (cents for USD)"
+    finalize_invoice:
+      lifecycle: "draft → open (finalize) → paid/void/uncollectible"
+    create_refund:
+      partial_refund: "set amount for partial refund, omit for full refund of the PaymentIntent"
+
+  tools:
+    # ──────────────────────────────────────────────
+    # Customers
+    # ──────────────────────────────────────────────
+    list_customers:
+      method: GET
+      path: /customers
+      access: read
+      description: "List all customers, optionally filtered by email or creation date"
+      params:
+        email: { type: string, in: query, description: "Filter by exact email address" }
+        created: { type: object, in: query, description: "Filter by creation date (gt, gte, lt, lte as Unix timestamps)" }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query, description: "Cursor for pagination (customer ID)" }
+        ending_before: { type: string, in: query, description: "Cursor for backward pagination" }
+
+    get_customer:
+      method: GET
+      path: /customers/{id}
+      access: read
+      description: "Retrieve a single customer by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_customer:
+      method: POST
+      path: /customers
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a new customer"
+      params:
+        email: { type: string, in: body }
+        name: { type: string, in: body }
+        phone: { type: string, in: body }
+        description: { type: string, in: body }
+        payment_method: { type: string, in: body, description: "ID of payment method to attach" }
+        metadata: { type: object, in: body, description: "Key-value metadata (max 50 keys)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_customer:
+      method: POST
+      path: /customers/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update an existing customer"
+      params:
+        id: { type: string, in: path, required: true }
+        email: { type: string, in: body }
+        name: { type: string, in: body }
+        phone: { type: string, in: body }
+        description: { type: string, in: body }
+        default_source: { type: string, in: body, description: "Default payment source ID" }
+        invoice_settings: { type: object, in: body, description: "Invoice settings (default_payment_method, etc.)" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_customer:
+      method: DELETE
+      path: /customers/{id}
+      access: dangerous
+      description: "Permanently delete a customer and cancel active subscriptions"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_customers:
+      method: GET
+      path: /customers/search
+      access: read
+      description: "Search customers using Stripe Query Language"
+      params:
+        query: { type: string, in: query, required: true, description: "Stripe query string, e.g. email:'jane@example.com'" }
+        limit: { type: integer, in: query, default: 10 }
+        page: { type: string, in: query, description: "Pagination cursor from next_page in previous response" }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Payment Intents
+    # ──────────────────────────────────────────────
+    list_payment_intents:
+      method: GET
+      path: /payment_intents
+      access: read
+      description: "List all payment intents, optionally filtered by customer or status"
+      params:
+        customer: { type: string, in: query, description: "Filter by customer ID" }
+        created: { type: object, in: query, description: "Filter by creation date" }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_payment_intent:
+      method: GET
+      path: /payment_intents/{id}
+      access: read
+      description: "Retrieve a payment intent by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_payment_intent:
+      method: POST
+      path: /payment_intents
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a new payment intent to collect a payment"
+      params:
+        amount: { type: integer, in: body, required: true, description: "Amount in smallest currency unit (e.g. cents)" }
+        currency: { type: string, in: body, required: true, description: "Three-letter ISO currency code (lowercase)" }
+        customer: { type: string, in: body, description: "Customer ID to associate" }
+        payment_method: { type: string, in: body, description: "Payment method ID" }
+        description: { type: string, in: body }
+        confirm: { type: boolean, in: body, description: "Set true to immediately attempt payment" }
+        automatic_payment_methods: { type: object, in: body, description: "Enable automatic payment methods" }
+        receipt_email: { type: string, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_payment_intent:
+      method: POST
+      path: /payment_intents/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a payment intent (only before confirmation)"
+      params:
+        id: { type: string, in: path, required: true }
+        amount: { type: integer, in: body }
+        currency: { type: string, in: body }
+        customer: { type: string, in: body }
+        payment_method: { type: string, in: body }
+        description: { type: string, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    confirm_payment_intent:
+      method: POST
+      path: /payment_intents/{id}/confirm
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Confirm a payment intent to proceed with the payment"
+      params:
+        id: { type: string, in: path, required: true }
+        payment_method: { type: string, in: body, description: "Payment method to use for confirmation" }
+        return_url: { type: string, in: body, description: "URL to redirect after payment requiring action" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    capture_payment_intent:
+      method: POST
+      path: /payment_intents/{id}/capture
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Capture a previously authorized payment intent"
+      params:
+        id: { type: string, in: path, required: true }
+        amount_to_capture: { type: integer, in: body, description: "Amount to capture (for partial capture)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_payment_intent:
+      method: POST
+      path: /payment_intents/{id}/cancel
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Cancel a payment intent"
+      params:
+        id: { type: string, in: path, required: true }
+        cancellation_reason: { type: string, in: body, description: "Reason: duplicate, fraudulent, requested_by_customer, abandoned" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_payment_intents:
+      method: GET
+      path: /payment_intents/search
+      access: read
+      description: "Search payment intents using Stripe Query Language"
+      params:
+        query: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 10 }
+        page: { type: string, in: query }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Payment Methods
+    # ──────────────────────────────────────────────
+    list_payment_methods:
+      method: GET
+      path: /payment_methods
+      access: read
+      description: "List payment methods for a customer"
+      params:
+        customer: { type: string, in: query, required: true, description: "Customer ID" }
+        type: { type: string, in: query, description: "Filter by type: card, bank_account, etc." }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_payment_method:
+      method: GET
+      path: /payment_methods/{id}
+      access: read
+      description: "Retrieve a payment method by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_payment_method:
+      method: POST
+      path: /payment_methods
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a payment method"
+      params:
+        type: { type: string, in: body, required: true, description: "Type: card, us_bank_account, sepa_debit, etc." }
+        card: { type: object, in: body, description: "Card details (number, exp_month, exp_year, cvc) — use Stripe.js in production" }
+        billing_details: { type: object, in: body, description: "Billing details (name, email, phone, address)" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_payment_method:
+      method: POST
+      path: /payment_methods/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update payment method details"
+      params:
+        id: { type: string, in: path, required: true }
+        billing_details: { type: object, in: body }
+        card: { type: object, in: body, description: "Card update: exp_month, exp_year only" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    attach_payment_method:
+      method: POST
+      path: /payment_methods/{id}/attach
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Attach a payment method to a customer"
+      params:
+        id: { type: string, in: path, required: true }
+        customer: { type: string, in: body, required: true, description: "Customer ID to attach to" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    detach_payment_method:
+      method: POST
+      path: /payment_methods/{id}/detach
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Detach a payment method from its customer"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Charges (legacy — prefer PaymentIntents)
+    # ──────────────────────────────────────────────
+    list_charges:
+      method: GET
+      path: /charges
+      access: read
+      description: "List all charges, optionally filtered by customer or payment intent"
+      params:
+        customer: { type: string, in: query }
+        payment_intent: { type: string, in: query }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_charge:
+      method: GET
+      path: /charges/{id}
+      access: read
+      description: "Retrieve a charge by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_charge:
+      method: POST
+      path: /charges
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a charge (legacy — prefer create_payment_intent)"
+      params:
+        amount: { type: integer, in: body, required: true, description: "Amount in smallest currency unit" }
+        currency: { type: string, in: body, required: true }
+        customer: { type: string, in: body }
+        source: { type: string, in: body, description: "Payment source ID or token" }
+        description: { type: string, in: body }
+        capture: { type: boolean, in: body, description: "Set false for auth-only (default true)" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_charge:
+      method: POST
+      path: /charges/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a charge (description, metadata, fraud details)"
+      params:
+        id: { type: string, in: path, required: true }
+        description: { type: string, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    capture_charge:
+      method: POST
+      path: /charges/{id}/capture
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Capture a previously authorized charge"
+      params:
+        id: { type: string, in: path, required: true }
+        amount: { type: integer, in: body, description: "Amount to capture (partial capture)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_charges:
+      method: GET
+      path: /charges/search
+      access: read
+      description: "Search charges using Stripe Query Language"
+      params:
+        query: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 10 }
+        page: { type: string, in: query }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Subscriptions
+    # ──────────────────────────────────────────────
+    list_subscriptions:
+      method: GET
+      path: /subscriptions
+      access: read
+      description: "List all subscriptions, optionally filtered by customer or status"
+      params:
+        customer: { type: string, in: query }
+        price: { type: string, in: query, description: "Filter by price ID" }
+        status: { type: string, in: query, description: "Filter: active, past_due, canceled, unpaid, trialing, all" }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_subscription:
+      method: GET
+      path: /subscriptions/{id}
+      access: read
+      description: "Retrieve a subscription by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_subscription:
+      method: POST
+      path: /subscriptions
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a subscription for a customer"
+      params:
+        customer: { type: string, in: body, required: true }
+        items: { type: array, in: body, required: true, description: "Subscription items: [{price: 'price_xxx', quantity: 1}]" }
+        default_payment_method: { type: string, in: body }
+        trial_period_days: { type: integer, in: body, description: "Number of trial days (mutually exclusive with trial_end)" }
+        trial_end: { type: integer, in: body, description: "Unix timestamp for trial end" }
+        cancel_at_period_end: { type: boolean, in: body }
+        collection_method: { type: string, in: body, description: "charge_automatically or send_invoice" }
+        proration_behavior: { type: string, in: body, description: "create_prorations, none, always_invoice" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_subscription:
+      method: POST
+      path: /subscriptions/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a subscription (change plan, quantity, trial, etc.)"
+      params:
+        id: { type: string, in: path, required: true }
+        items: { type: array, in: body, description: "Updated subscription items" }
+        default_payment_method: { type: string, in: body }
+        cancel_at_period_end: { type: boolean, in: body }
+        proration_behavior: { type: string, in: body }
+        trial_end: { type: integer, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_subscription:
+      method: DELETE
+      path: /subscriptions/{id}
+      access: dangerous
+      description: "Cancel a subscription immediately or at period end"
+      params:
+        id: { type: string, in: path, required: true }
+        cancellation_details: { type: object, in: body, description: "Cancellation reason details" }
+        invoice_now: { type: boolean, in: body, description: "Generate a final invoice" }
+        prorate: { type: boolean, in: body, description: "Prorate the final invoice" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    resume_subscription:
+      method: POST
+      path: /subscriptions/{id}/resume
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Resume a paused subscription"
+      params:
+        id: { type: string, in: path, required: true }
+        billing_cycle_anchor: { type: string, in: body, description: "now or unchanged" }
+        proration_behavior: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_subscriptions:
+      method: GET
+      path: /subscriptions/search
+      access: read
+      description: "Search subscriptions using Stripe Query Language"
+      params:
+        query: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 10 }
+        page: { type: string, in: query }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Invoices
+    # ──────────────────────────────────────────────
+    list_invoices:
+      method: GET
+      path: /invoices
+      access: read
+      description: "List all invoices, optionally filtered by customer or status"
+      params:
+        customer: { type: string, in: query }
+        subscription: { type: string, in: query }
+        status: { type: string, in: query, description: "draft, open, paid, void, uncollectible" }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_invoice:
+      method: GET
+      path: /invoices/{id}
+      access: read
+      description: "Retrieve an invoice by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_invoice:
+      method: POST
+      path: /invoices
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a draft invoice for a customer"
+      params:
+        customer: { type: string, in: body, required: true }
+        subscription: { type: string, in: body }
+        collection_method: { type: string, in: body, description: "charge_automatically or send_invoice" }
+        days_until_due: { type: integer, in: body, description: "Days until due (for send_invoice)" }
+        description: { type: string, in: body }
+        auto_advance: { type: boolean, in: body, description: "Auto-finalize draft invoices" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_invoice:
+      method: POST
+      path: /invoices/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a draft or open invoice"
+      params:
+        id: { type: string, in: path, required: true }
+        description: { type: string, in: body }
+        collection_method: { type: string, in: body }
+        days_until_due: { type: integer, in: body }
+        auto_advance: { type: boolean, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_invoice:
+      method: DELETE
+      path: /invoices/{id}
+      access: dangerous
+      description: "Delete a draft invoice (only draft invoices can be deleted)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    finalize_invoice:
+      method: POST
+      path: /invoices/{id}/finalize
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Finalize a draft invoice (transitions to open status)"
+      params:
+        id: { type: string, in: path, required: true }
+        auto_advance: { type: boolean, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    pay_invoice:
+      method: POST
+      path: /invoices/{id}/pay
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Pay an open invoice using the customer's default payment method"
+      params:
+        id: { type: string, in: path, required: true }
+        payment_method: { type: string, in: body, description: "Specific payment method to use" }
+        source: { type: string, in: body, description: "Legacy payment source ID" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    send_invoice:
+      method: POST
+      path: /invoices/{id}/send
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Send a finalized invoice to the customer by email"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    void_invoice:
+      method: POST
+      path: /invoices/{id}/void
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Void a finalized invoice (marks as uncollectable, no refund)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    mark_invoice_uncollectible:
+      method: POST
+      path: /invoices/{id}/mark_uncollectible
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Mark an invoice as uncollectible"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_invoices:
+      method: GET
+      path: /invoices/search
+      access: read
+      description: "Search invoices using Stripe Query Language"
+      params:
+        query: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 10 }
+        page: { type: string, in: query }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Products
+    # ──────────────────────────────────────────────
+    list_products:
+      method: GET
+      path: /products
+      access: read
+      description: "List all products"
+      params:
+        active: { type: boolean, in: query, description: "Filter by active status" }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_product:
+      method: GET
+      path: /products/{id}
+      access: read
+      description: "Retrieve a product by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_product:
+      method: POST
+      path: /products
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a new product"
+      params:
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        default_price_data: { type: object, in: body, description: "Create a default price inline (unit_amount, currency, recurring)" }
+        images: { type: array, in: body, description: "Product image URLs (max 8)" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_product:
+      method: POST
+      path: /products/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a product"
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        active: { type: boolean, in: body }
+        default_price: { type: string, in: body, description: "Default price ID" }
+        images: { type: array, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_product:
+      method: DELETE
+      path: /products/{id}
+      access: dangerous
+      description: "Delete a product (must have no prices attached)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_products:
+      method: GET
+      path: /products/search
+      access: read
+      description: "Search products using Stripe Query Language"
+      params:
+        query: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 10 }
+        page: { type: string, in: query }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Prices
+    # ──────────────────────────────────────────────
+    list_prices:
+      method: GET
+      path: /prices
+      access: read
+      description: "List all prices, optionally filtered by product or active status"
+      params:
+        product: { type: string, in: query, description: "Filter by product ID" }
+        active: { type: boolean, in: query }
+        type: { type: string, in: query, description: "one_time or recurring" }
+        currency: { type: string, in: query }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_price:
+      method: GET
+      path: /prices/{id}
+      access: read
+      description: "Retrieve a price by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_price:
+      method: POST
+      path: /prices
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a new price for a product"
+      params:
+        product: { type: string, in: body, required: true, description: "Product ID" }
+        unit_amount: { type: integer, in: body, description: "Price in smallest currency unit (e.g. cents)" }
+        currency: { type: string, in: body, required: true, description: "Three-letter ISO currency code" }
+        recurring: { type: object, in: body, description: "Recurring billing config: {interval: month|year|week|day, interval_count: 1}" }
+        nickname: { type: string, in: body, description: "Internal nickname for the price" }
+        active: { type: boolean, in: body, default: true }
+        billing_scheme: { type: string, in: body, description: "per_unit or tiered" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_price:
+      method: POST
+      path: /prices/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a price (most fields are immutable — create a new price instead)"
+      params:
+        id: { type: string, in: path, required: true }
+        active: { type: boolean, in: body }
+        nickname: { type: string, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_prices:
+      method: GET
+      path: /prices/search
+      access: read
+      description: "Search prices using Stripe Query Language"
+      params:
+        query: { type: string, in: query, required: true }
+        limit: { type: integer, in: query, default: 10 }
+        page: { type: string, in: query }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Refunds
+    # ──────────────────────────────────────────────
+    list_refunds:
+      method: GET
+      path: /refunds
+      access: read
+      description: "List all refunds, optionally filtered by charge or payment intent"
+      params:
+        charge: { type: string, in: query, description: "Filter by charge ID" }
+        payment_intent: { type: string, in: query, description: "Filter by payment intent ID" }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_refund:
+      method: GET
+      path: /refunds/{id}
+      access: read
+      description: "Retrieve a refund by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_refund:
+      method: POST
+      path: /refunds
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a refund for a charge or payment intent"
+      params:
+        payment_intent: { type: string, in: body, description: "Payment intent ID to refund (preferred)" }
+        charge: { type: string, in: body, description: "Charge ID to refund (legacy)" }
+        amount: { type: integer, in: body, description: "Amount to refund in smallest currency unit (omit for full refund)" }
+        reason: { type: string, in: body, description: "duplicate, fraudulent, or requested_by_customer" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_refund:
+      method: POST
+      path: /refunds/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a refund (metadata only)"
+      params:
+        id: { type: string, in: path, required: true }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_refund:
+      method: POST
+      path: /refunds/{id}/cancel
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Cancel a refund that has not yet been processed"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Checkout Sessions
+    # ──────────────────────────────────────────────
+    list_checkout_sessions:
+      method: GET
+      path: /checkout/sessions
+      access: read
+      description: "List all checkout sessions"
+      params:
+        customer: { type: string, in: query }
+        payment_intent: { type: string, in: query }
+        subscription: { type: string, in: query }
+        status: { type: string, in: query, description: "open, complete, expired" }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_checkout_session:
+      method: GET
+      path: /checkout/sessions/{id}
+      access: read
+      description: "Retrieve a checkout session by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_checkout_session:
+      method: POST
+      path: /checkout/sessions
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a Stripe Checkout session for hosted payment page"
+      params:
+        mode: { type: string, in: body, required: true, description: "payment, subscription, or setup" }
+        success_url: { type: string, in: body, required: true, description: "URL to redirect after successful payment" }
+        cancel_url: { type: string, in: body, description: "URL to redirect on cancel" }
+        line_items: { type: array, in: body, description: "Items: [{price: 'price_xxx', quantity: 1}]" }
+        customer: { type: string, in: body, description: "Existing customer ID" }
+        customer_email: { type: string, in: body, description: "Pre-fill customer email" }
+        payment_method_types: { type: array, in: body, description: "Allowed payment methods: [card, ideal, sepa_debit, ...]" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    expire_checkout_session:
+      method: POST
+      path: /checkout/sessions/{id}/expire
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Expire a checkout session (cannot be completed after expiry)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_checkout_session_line_items:
+      method: GET
+      path: /checkout/sessions/{id}/line_items
+      access: read
+      description: "List line items for a checkout session"
+      params:
+        id: { type: string, in: path, required: true }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    # ──────────────────────────────────────────────
+    # Setup Intents
+    # ──────────────────────────────────────────────
+    list_setup_intents:
+      method: GET
+      path: /setup_intents
+      access: read
+      description: "List all setup intents"
+      params:
+        customer: { type: string, in: query }
+        payment_method: { type: string, in: query }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_setup_intent:
+      method: GET
+      path: /setup_intents/{id}
+      access: read
+      description: "Retrieve a setup intent by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_setup_intent:
+      method: POST
+      path: /setup_intents
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a setup intent to save payment credentials for future use"
+      params:
+        customer: { type: string, in: body, description: "Customer to attach the payment method to" }
+        payment_method: { type: string, in: body }
+        payment_method_types: { type: array, in: body, description: "Allowed payment method types" }
+        confirm: { type: boolean, in: body, description: "Immediately confirm the setup intent" }
+        usage: { type: string, in: body, description: "on_session or off_session" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_setup_intent:
+      method: POST
+      path: /setup_intents/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a setup intent"
+      params:
+        id: { type: string, in: path, required: true }
+        customer: { type: string, in: body }
+        payment_method: { type: string, in: body }
+        payment_method_types: { type: array, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    confirm_setup_intent:
+      method: POST
+      path: /setup_intents/{id}/confirm
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Confirm a setup intent to complete payment method setup"
+      params:
+        id: { type: string, in: path, required: true }
+        payment_method: { type: string, in: body }
+        return_url: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_setup_intent:
+      method: POST
+      path: /setup_intents/{id}/cancel
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Cancel a setup intent"
+      params:
+        id: { type: string, in: path, required: true }
+        cancellation_reason: { type: string, in: body, description: "abandoned, requested_by_customer, duplicate" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Disputes
+    # ──────────────────────────────────────────────
+    list_disputes:
+      method: GET
+      path: /disputes
+      access: read
+      description: "List all disputes"
+      params:
+        charge: { type: string, in: query }
+        payment_intent: { type: string, in: query }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_dispute:
+      method: GET
+      path: /disputes/{id}
+      access: read
+      description: "Retrieve a dispute by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_dispute:
+      method: POST
+      path: /disputes/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a dispute with evidence"
+      params:
+        id: { type: string, in: path, required: true }
+        evidence: { type: object, in: body, description: "Evidence fields (customer_name, product_description, etc.)" }
+        submit: { type: boolean, in: body, description: "Set true to submit evidence and close the dispute for review" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    close_dispute:
+      method: POST
+      path: /disputes/{id}/close
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Close a dispute — accepts the dispute and refunds the customer"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Coupons
+    # ──────────────────────────────────────────────
+    list_coupons:
+      method: GET
+      path: /coupons
+      access: read
+      description: "List all coupons"
+      params:
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_coupon:
+      method: GET
+      path: /coupons/{id}
+      access: read
+      description: "Retrieve a coupon by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_coupon:
+      method: POST
+      path: /coupons
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a coupon for discounts on subscriptions or invoices"
+      params:
+        percent_off: { type: number, in: body, description: "Percentage discount (mutually exclusive with amount_off)" }
+        amount_off: { type: integer, in: body, description: "Fixed discount in smallest currency unit (mutually exclusive with percent_off)" }
+        currency: { type: string, in: body, description: "Required if amount_off is set" }
+        duration: { type: string, in: body, required: true, description: "forever, once, or repeating" }
+        duration_in_months: { type: integer, in: body, description: "Required if duration=repeating" }
+        id: { type: string, in: body, description: "Custom coupon code (auto-generated if omitted)" }
+        name: { type: string, in: body, description: "Display name shown to customers" }
+        max_redemptions: { type: integer, in: body }
+        redeem_by: { type: integer, in: body, description: "Unix timestamp deadline for redemption" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_coupon:
+      method: POST
+      path: /coupons/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a coupon (name and metadata only)"
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_coupon:
+      method: DELETE
+      path: /coupons/{id}
+      access: dangerous
+      description: "Delete a coupon (existing discounts remain active)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Payouts
+    # ──────────────────────────────────────────────
+    list_payouts:
+      method: GET
+      path: /payouts
+      access: read
+      description: "List all payouts"
+      params:
+        status: { type: string, in: query, description: "pending, paid, failed, canceled" }
+        arrival_date: { type: object, in: query }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_payout:
+      method: GET
+      path: /payouts/{id}
+      access: read
+      description: "Retrieve a payout by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_payout:
+      method: POST
+      path: /payouts
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Create a payout to your bank account or debit card"
+      params:
+        amount: { type: integer, in: body, required: true, description: "Amount in smallest currency unit" }
+        currency: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        destination: { type: string, in: body, description: "Bank account or card ID (uses default if omitted)" }
+        method: { type: string, in: body, description: "standard or instant" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_payout:
+      method: POST
+      path: /payouts/{id}
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Update a payout (metadata only)"
+      params:
+        id: { type: string, in: path, required: true }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_payout:
+      method: POST
+      path: /payouts/{id}/cancel
+      access: write
+      content_type: application/x-www-form-urlencoded
+      description: "Cancel a pending payout"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reverse_payout:
+      method: POST
+      path: /payouts/{id}/reverse
+      access: dangerous
+      content_type: application/x-www-form-urlencoded
+      description: "Reverse a completed payout (returns funds to Stripe balance)"
+      params:
+        id: { type: string, in: path, required: true }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Balance
+    # ──────────────────────────────────────────────
+    get_balance:
+      method: GET
+      path: /balance
+      access: read
+      description: "Retrieve the current account balance (available and pending)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_balance_transactions:
+      method: GET
+      path: /balance_transactions
+      access: read
+      description: "List balance transactions (all account activity)"
+      params:
+        type: { type: string, in: query, description: "Filter by type: charge, refund, payout, adjustment, etc." }
+        source: { type: string, in: query, description: "Filter by source ID (charge, refund, etc.)" }
+        payout: { type: string, in: query, description: "Filter by payout ID" }
+        created: { type: object, in: query }
+        currency: { type: string, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_balance_transaction:
+      method: GET
+      path: /balance_transactions/{id}
+      access: read
+      description: "Retrieve a balance transaction by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Events
+    # ──────────────────────────────────────────────
+    list_events:
+      method: GET
+      path: /events
+      access: read
+      description: "List all events (retained for 30 days)"
+      params:
+        type: { type: string, in: query, description: "Filter by event type, e.g. payment_intent.succeeded" }
+        created: { type: object, in: query }
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_event:
+      method: GET
+      path: /events/{id}
+      access: read
+      description: "Retrieve a specific event by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Webhook Endpoints
+    # ──────────────────────────────────────────────
+    list_webhook_endpoints:
+      method: GET
+      path: /webhook_endpoints
+      access: read
+      description: "List all webhook endpoint configurations"
+      params:
+        limit: { type: integer, in: query, default: 10 }
+        starting_after: { type: string, in: query }
+        ending_before: { type: string, in: query }
+
+    get_webhook_endpoint:
+      method: GET
+      path: /webhook_endpoints/{id}
+      access: read
+      description: "Retrieve a webhook endpoint by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_webhook_endpoint:
+      method: POST
+      path: /webhook_endpoints
+      access: admin
+      content_type: application/x-www-form-urlencoded
+      description: "Create a webhook endpoint to receive events"
+      params:
+        url: { type: string, in: body, required: true, description: "HTTPS URL that receives webhook events" }
+        enabled_events: { type: array, in: body, required: true, description: "Events to subscribe to, e.g. ['payment_intent.succeeded', 'invoice.paid'] or ['*'] for all" }
+        description: { type: string, in: body }
+        api_version: { type: string, in: body, description: "API version for events (defaults to account default)" }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_webhook_endpoint:
+      method: POST
+      path: /webhook_endpoints/{id}
+      access: admin
+      content_type: application/x-www-form-urlencoded
+      description: "Update a webhook endpoint"
+      params:
+        id: { type: string, in: path, required: true }
+        url: { type: string, in: body }
+        enabled_events: { type: array, in: body }
+        description: { type: string, in: body }
+        disabled: { type: boolean, in: body }
+        metadata: { type: object, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_webhook_endpoint:
+      method: DELETE
+      path: /webhook_endpoints/{id}
+      access: admin
+      description: "Delete a webhook endpoint"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+  examples:
+    - name: "Create customer and charge"
+      description: "Create a customer, create a payment intent, and confirm it"
+      code: |
+        const customer = await api.create_customer({
+          email: "jane@example.com",
+          name: "Jane Doe"
+        });
+        const pi = await api.create_payment_intent({
+          amount: 2000,
+          currency: "usd",
+          customer: customer.id,
+          confirm: false
+        });
+        return { customer: customer.id, payment_intent: pi.id, status: pi.status };
+
+    - name: "Create product with subscription"
+      description: "Create a product, price, and subscription for a customer"
+      code: |
+        const product = await api.create_product({ name: "Pro Plan" });
+        const price = await api.create_price({
+          product: product.id,
+          unit_amount: 1999,
+          currency: "usd",
+          recurring: { interval: "month" }
+        });
+        const sub = await api.create_subscription({
+          customer: "cus_xxx",
+          items: [{ price: price.id }]
+        });
+        return { product: product.id, price: price.id, subscription: sub.id };
+
+    - name: "Refund a payment"
+      description: "Find a payment intent and issue a partial refund"
+      code: |
+        const pi = await api.get_payment_intent({ id: "pi_xxx" });
+        const refund = await api.create_refund({
+          payment_intent: pi.id,
+          amount: 500,
+          reason: "requested_by_customer"
+        });
+        return { refund_id: refund.id, amount: refund.amount, status: refund.status };
+
+    - name: "List overdue invoices"
+      description: "Search for open invoices past their due date"
+      code: |
+        const now = Math.floor(Date.now() / 1000);
+        const invoices = await api.search_invoices({
+          query: `status:'open' AND due_date<${now}`
+        });
+        return invoices.map(inv => ({
+          id: inv.id,
+          customer: inv.customer,
+          amount_due: inv.amount_due,
+          due_date: inv.due_date
+        }));
