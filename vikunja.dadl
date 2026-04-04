@@ -135,7 +135,7 @@ backend:
         s: { type: string, in: query }
       response:
         transform: |
-          [.[] | {title: .title, tasks: [.tasks[]? | {id: .id, title: .title, priority: .priority, done: .done, due_date: .due_date, labels: [.labels[]?.title]}]}]
+          [.[] | {title: .title, tasks: [.tasks[]? | {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, labels: [.labels[]?.title]}]}]
         allow_jq_override: true
 
     get_task:
@@ -147,7 +147,7 @@ backend:
         id: { type: integer, in: path, required: true }
       response:
         transform: |
-          {id, title, description, done, priority, due_date, project_id, bucket_id, position, percent_done, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks}
+          {id, identifier, title, description, done, priority, due_date, project_id, bucket_id, position, percent_done, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks}
         allow_jq_override: true
       pagination: none
 
