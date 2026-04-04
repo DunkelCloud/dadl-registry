@@ -82,8 +82,8 @@ backend:
         limit_param: hitsPerPage
         limit_default: 20
       response:
-        total_pages: "$.nbPages"
-        current_page: "$.page"
+        total_pages_header: x-total-pages
+        current_page_header: x-current-page
       behavior: expose
       max_pages: 50
     errors:
