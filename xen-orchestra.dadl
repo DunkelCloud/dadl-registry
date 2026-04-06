@@ -1,0 +1,1212 @@
+# xen-orchestra.dadl -- Xen Orchestra REST API (XO 6.x)
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - Xen Orchestra (XO) is the web management UI for XCP-ng / XenServer hypervisors.
+# - The REST API is at /rest/v0/ and currently in beta (minor changes possible).
+# - Only admin users can use the REST API.
+# - A "pool" is a cluster of XCP-ng hosts sharing storage. Use /pools to discover them.
+# - A "host" is a physical XCP-ng hypervisor machine within a pool.
+# - A "VM" is a virtual machine identified by UUID.
+# - A "SR" (Storage Repository) is a storage backend (local disk, NFS, iSCSI, etc.).
+# - A "VDI" (Virtual Disk Image) is a virtual disk stored on an SR.
+# - A "VBD" (Virtual Block Device) connects a VDI to a VM (disk attachment).
+# - A "VIF" is a Virtual Interface (network adapter attached to a VM).
+# - A "PIF" is a Physical Interface (physical NIC on a host).
+# - A "PBD" (Physical Block Device) connects an SR to a host.
+# - A "PCI" is a PCI device passthrough object on a host.
+# - A "PGPU" is a physical GPU on a host (for GPU passthrough / vGPU).
+# - A "SM" (Storage Manager) describes an available SR driver/plugin.
+# - A "proxy" is an XO Proxy instance for distributed backups and remote pool management.
+# - A "message" is a XAPI alert/notification (e.g. HA alerts, license warnings).
+# - Collections return arrays of URLs by default. Use ?fields=name_label,uuid for objects.
+# - Use ?filter=<expression> with XO filter syntax (e.g. "power_state:Running").
+# - Use ?ndjson for newline-delimited JSON; add &watch for real-time streaming.
+# - Actions are async by default -- add ?sync to get the result directly.
+# - Tags: add with PUT /<type>/<uuid>/tags/<tag>, remove with DELETE.
+# - VM export: .xva (native), .ova. Compression: gzip (slow), zstd (fast, XCP-ng only).
+# - VDI export: .vhd (default), .raw. Import to existing VDI requires exact size match.
+# - UUID "_" means "any/default" for collection-level actions (e.g. /pools/_/actions).
+# - Backup jobs use /backup-jobs (not deprecated /backup/jobs/vm).
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Xen Orchestra REST API"
+source_url: "https://docs.xen-orchestra.com/restapi"
+date: "2026-04-06"
+
+backend:
+  name: xen-orchestra
+  type: rest
+  version: "2.0"
+  # base_url is intentionally omitted -- must be provided via backends.yaml url field,
+  # because each deployment has its own Xen Orchestra instance address.
+  description: "Xen Orchestra REST API -- manage XCP-ng/XenServer virtualization: VMs, hosts, pools, storage, networks, snapshots, backups, tasks, and live monitoring"
+
+  auth:
+    type: bearer
+    credential: xen_orchestra_token
+    inject_into: header
+    header_name: Cookie
+    prefix: "authenticationToken="
+
+  defaults:
+    headers:
+      Content-Type: application/json
+      Accept: application/json
+    pagination:
+      strategy: offset
+      request:
+        limit_param: limit
+        limit_default: 100
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      message_path: "$.message"
+      code_path: "$.code"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+      terminal: [400, 401, 403, 404]
+    response:
+      max_items: 500
+
+  coverage:
+    endpoints: 93
+    total_endpoints: 93
+    percentage: 100
+    focus: "VMs (CRUD, lifecycle, suspend/resume/pause, export/import, snapshots, migration, cloning), hosts (enable/disable), pools (VM creation, network creation, emergency shutdown, rolling reboot/update, VM import), SRs (scan, forget, reclaim space, VDI import), VDIs (CRUD, export/import, migration), VBDs (create/delete, connect/disconnect), VIFs (create/delete), PIFs, PBDs (plug/unplug), PCIs, PGPUs, SMs, networks, tasks (CRUD, abort), backups (archives, jobs, logs, restore logs), proxies, messages, servers, dashboards, auth tokens, health check"
+    missing: "ACLv2 management (preview), plugin-specific endpoints (SDN controller VIF rules), XOSAN"
+    last_reviewed: "2026-04-06"
+
+  setup:
+    credential_steps:
+      - "Deploy Xen Orchestra from sources or use XOA (Xen Orchestra Appliance)"
+      - "Log in to the XO web UI as an admin user"
+      - "Navigate to Settings -> Users to confirm admin access"
+      - "Generate an auth token via CLI: xo-cli --createToken xo.example.com <user> <password>"
+      - "Or via API: POST /rest/v0/users/me/authentication_tokens with Basic auth"
+      - "Copy the returned token value -- use it as the authenticationToken cookie"
+    env_var: CREDENTIAL_XEN_ORCHESTRA_TOKEN
+    backends_yaml: |
+      - name: xen-orchestra
+        transport: rest
+        dadl: xen-orchestra.dadl
+        url: "https://xo.example.com/rest/v0"
+    required_scopes:
+      - "Admin user (only admin users can access the REST API)"
+    docs_url: "https://docs.xen-orchestra.com/restapi"
+    notes: "The url in backends.yaml must point to your XO instance including /rest/v0. Generate a token via xo-cli --createToken or POST /rest/v0/users/me/authentication_tokens with Basic auth. Swagger docs at /rest/v0/docs."
+
+  hints:
+    list_vms:
+      filter_syntax: "XO filter: power_state:Running, name_label:my-vm, tags:production"
+      fields_param: "Use fields=name_label,power_state,uuid for compact results"
+      ndjson: "Use ndjson=true for streaming; combine with watch=true for live updates"
+    create_vm:
+      required: "name_label + template UUID are minimum required params"
+      memory: "Memory in bytes (e.g. 2147483648 = 2 GB)"
+      cloud_config: "Cloud-init config as string for automatic guest setup"
+      note: "CPU settings not yet available via REST API"
+    snapshot_vm:
+      note: "Returns a task reference by default; use ?sync for direct result"
+    export_vm_xva:
+      compression: "zstd is fastest (XCP-ng only), gzip is universal but slow"
+    import_vm_xva:
+      sr_param: "If sr is omitted, the pool's default SR is used"
+    import_vdi_to_sr:
+      size_match: "When importing to existing VDI (PUT), size must match exactly"
+      formats: "VHD is default; set raw query param for raw disk images"
+    list_tasks:
+      watch_mode: "Use ndjson=true&watch=true for real-time task monitoring"
+      wait: "On single task: ?wait=result blocks until completion"
+    create_vbd:
+      note: "Connects a VDI to a VM. Use connect_vbd/disconnect_vbd for hotplug."
+    migrate_vdi:
+      note: "Moves a VDI between SRs without VM downtime (live storage migration)"
+    emergency_shutdown_pool:
+      warning: "Shuts down ALL VMs and hosts in the pool. Use only in emergencies."
+    rolling_reboot_pool:
+      note: "Reboots each host sequentially, migrating VMs automatically. No downtime."
+    rolling_update_pool:
+      note: "Applies pending updates to each host sequentially with live migration."
+
+  tools:
+
+    # =========================================================================
+    # HEALTH CHECK
+    # =========================================================================
+
+    ping:
+      method: GET
+      path: /ping
+      access: read
+      description: "Health check. Unauthenticated. Returns pong if XO is running."
+      pagination: none
+
+    # =========================================================================
+    # AUTHENTICATION -- Token Management
+    # =========================================================================
+
+    create_auth_token:
+      method: POST
+      path: /users/{user_id}/authentication_tokens
+      access: admin
+      description: "Create an authentication token. Use 'me' as user_id for current user."
+      params:
+        user_id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+      pagination: none
+
+    list_auth_tokens:
+      method: GET
+      path: /users/{user_id}/authentication_tokens
+      access: admin
+      description: "List all authentication tokens for a user"
+      params:
+        user_id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+      pagination: none
+
+    # =========================================================================
+    # VMs -- Core CRUD
+    # =========================================================================
+
+    list_vms:
+      method: GET
+      path: /vms
+      access: read
+      description: "List all VMs. Returns URLs by default; use fields for objects."
+      params:
+        fields: { type: string, in: query, description: "Comma-separated fields" }
+        filter: { type: string, in: query, description: "XO filter (e.g. power_state:Running)" }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_vm:
+      method: GET
+      path: /vms/{uuid}
+      access: read
+      description: "Get full details of a VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    update_vm:
+      method: PATCH
+      path: /vms/{uuid}
+      access: write
+      description: "Update VM properties (name_label, name_description, tags)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        name_label: { type: string, in: body }
+        name_description: { type: string, in: body }
+      pagination: none
+
+    delete_vm:
+      method: DELETE
+      path: /vms/{uuid}
+      access: dangerous
+      description: "Destroy a VM and its VDIs. Irreversible."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # VM ACTIONS -- Power Management
+    # =========================================================================
+
+    start_vm:
+      method: POST
+      path: /vms/{uuid}/actions/start
+      access: write
+      description: "Start a halted VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    clean_shutdown_vm:
+      method: POST
+      path: /vms/{uuid}/actions/clean_shutdown
+      access: write
+      description: "Gracefully shut down a VM (ACPI shutdown)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    hard_shutdown_vm:
+      method: POST
+      path: /vms/{uuid}/actions/hard_shutdown
+      access: write
+      description: "Force shutdown a VM immediately"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    clean_reboot_vm:
+      method: POST
+      path: /vms/{uuid}/actions/clean_reboot
+      access: write
+      description: "Gracefully reboot a VM (ACPI reboot)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    hard_reboot_vm:
+      method: POST
+      path: /vms/{uuid}/actions/hard_reboot
+      access: write
+      description: "Force reboot a VM immediately"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    pause_vm:
+      method: POST
+      path: /vms/{uuid}/actions/pause
+      access: write
+      description: "Pause a running VM (freezes CPU, keeps memory)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    unpause_vm:
+      method: POST
+      path: /vms/{uuid}/actions/unpause
+      access: write
+      description: "Unpause a paused VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    suspend_vm:
+      method: POST
+      path: /vms/{uuid}/actions/suspend
+      access: write
+      description: "Suspend a VM to disk (saves memory state, frees RAM)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    resume_vm:
+      method: POST
+      path: /vms/{uuid}/actions/resume
+      access: write
+      description: "Resume a suspended VM from disk"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # VM ACTIONS -- Snapshots, Cloning, Migration
+    # =========================================================================
+
+    snapshot_vm:
+      method: POST
+      path: /vms/{uuid}/actions/snapshot
+      access: write
+      description: "Create a snapshot of a VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        name_label: { type: string, in: body, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    clone_vm:
+      method: POST
+      path: /vms/{uuid}/actions/clone
+      access: write
+      description: "Clone a VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        name_label: { type: string, in: body, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    migrate_vm:
+      method: POST
+      path: /vms/{uuid}/actions/migrate
+      access: write
+      description: "Live-migrate a VM to another host"
+      params:
+        uuid: { type: string, in: path, required: true }
+        target_host: { type: string, in: body, description: "Target host UUID" }
+        sr: { type: string, in: body, description: "Target SR for storage migration" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # VM EXPORT & IMPORT
+    # =========================================================================
+
+    export_vm_xva:
+      method: GET
+      path: /vms/{uuid}.xva
+      access: read
+      description: "Export a VM as XVA"
+      params:
+        uuid: { type: string, in: path, required: true }
+        compress: { type: string, in: query, description: "gzip or zstd" }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    export_vm_ova:
+      method: GET
+      path: /vms/{uuid}.ova
+      access: read
+      description: "Export a VM as OVA"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    import_vm_xva:
+      method: POST
+      path: /pools/{pool_id}/vms
+      access: write
+      description: "Import a VM from XVA upload into a pool"
+      params:
+        pool_id: { type: string, in: path, required: true }
+        sr: { type: string, in: query, description: "Target SR (pool default if omitted)" }
+      content_type: application/octet-stream
+      pagination: none
+
+    # =========================================================================
+    # VM SUB-RESOURCES -- Tags, VDIs, Dashboard, Actions
+    # =========================================================================
+
+    add_vm_tag:
+      method: PUT
+      path: /vms/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_vm_tag:
+      method: DELETE
+      path: /vms/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    list_vm_vdis:
+      method: GET
+      path: /vms/{uuid}/vdis
+      access: read
+      description: "List all VDIs attached to a VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+      pagination: none
+
+    get_vm_dashboard:
+      method: GET
+      path: /vms/{uuid}/dashboard
+      access: read
+      description: "Get dashboard/statistics for a VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_vm_actions:
+      method: GET
+      path: /vms/_/actions
+      access: read
+      description: "Discover all available VM actions"
+      pagination: none
+
+    # =========================================================================
+    # HOSTS
+    # =========================================================================
+
+    list_hosts:
+      method: GET
+      path: /hosts
+      access: read
+      description: "List all XCP-ng/XenServer hosts"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_host:
+      method: GET
+      path: /hosts/{uuid}
+      access: read
+      description: "Get details of a host"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    disable_host:
+      method: POST
+      path: /hosts/{uuid}/actions/disable
+      access: admin
+      description: "Disable a host (prepare for maintenance)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    enable_host:
+      method: POST
+      path: /hosts/{uuid}/actions/enable
+      access: admin
+      description: "Re-enable a disabled host"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    list_host_actions:
+      method: GET
+      path: /hosts/_/actions
+      access: read
+      description: "Discover all available host actions"
+      pagination: none
+
+    # =========================================================================
+    # POOLS
+    # =========================================================================
+
+    list_pools:
+      method: GET
+      path: /pools
+      access: read
+      description: "List all pools"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_pool:
+      method: GET
+      path: /pools/{uuid}
+      access: read
+      description: "Get details of a pool"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_pool_actions:
+      method: GET
+      path: /pools/_/actions
+      access: read
+      description: "Discover all available pool actions"
+      pagination: none
+
+    create_vm:
+      method: POST
+      path: /pools/{pool_id}/actions/create_vm
+      access: write
+      description: "Create a new VM from a template"
+      params:
+        pool_id: { type: string, in: path, required: true, description: "Pool UUID or '_'" }
+        name_label: { type: string, in: body, required: true }
+        template: { type: string, in: body, required: true, description: "Template UUID" }
+        name_description: { type: string, in: body }
+        memory: { type: integer, in: body, description: "Memory in bytes" }
+        boot: { type: boolean, in: body, description: "Start after creation" }
+        auto_poweron: { type: boolean, in: body }
+        clone: { type: boolean, in: body, description: "Full clone (default true)" }
+        cloud_config: { type: string, in: body }
+        network_config: { type: string, in: body }
+        vdis: { type: array, in: body }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    emergency_shutdown_pool:
+      method: POST
+      path: /pools/{pool_id}/actions/emergency_shutdown
+      access: dangerous
+      description: "Emergency shutdown of all VMs and hosts in a pool"
+      params:
+        pool_id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    rolling_reboot_pool:
+      method: POST
+      path: /pools/{pool_id}/actions/rolling_reboot
+      access: admin
+      description: "Sequentially reboot hosts with automatic VM migration. Zero downtime."
+      params:
+        pool_id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    rolling_update_pool:
+      method: POST
+      path: /pools/{pool_id}/actions/rolling_update
+      access: admin
+      description: "Apply updates to hosts sequentially with live migration"
+      params:
+        pool_id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    create_bonded_network:
+      method: POST
+      path: /pools/{pool_id}/actions/create_bonded_network
+      access: write
+      description: "Create a bonded network across pool hosts"
+      params:
+        pool_id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    create_internal_network:
+      method: POST
+      path: /pools/{pool_id}/actions/create_internal_network
+      access: write
+      description: "Create an internal-only network"
+      params:
+        pool_id: { type: string, in: path, required: true }
+        name_label: { type: string, in: body, required: true }
+        name_description: { type: string, in: body }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # STORAGE REPOSITORIES (SRs)
+    # =========================================================================
+
+    list_srs:
+      method: GET
+      path: /srs
+      access: read
+      description: "List all storage repositories"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_sr:
+      method: GET
+      path: /srs/{uuid}
+      access: read
+      description: "Get details of an SR"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    scan_sr:
+      method: POST
+      path: /srs/{uuid}/actions/scan
+      access: write
+      description: "Scan an SR to refresh its VDI list"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    forget_sr:
+      method: POST
+      path: /srs/{uuid}/actions/forget
+      access: dangerous
+      description: "Forget an SR (detach without destroying data)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    reclaim_space_sr:
+      method: POST
+      path: /srs/{uuid}/actions/reclaim_space
+      access: write
+      description: "Reclaim unused space on a thin-provisioned SR"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    list_sr_actions:
+      method: GET
+      path: /srs/_/actions
+      access: read
+      description: "Discover all available SR actions"
+      pagination: none
+
+    # =========================================================================
+    # VDIs -- Virtual Disk Images
+    # =========================================================================
+
+    list_vdis:
+      method: GET
+      path: /vdis
+      access: read
+      description: "List all virtual disk images"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_vdi:
+      method: GET
+      path: /vdis/{uuid}
+      access: read
+      description: "Get details of a VDI"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    create_vdi:
+      method: POST
+      path: /vdis
+      access: write
+      description: "Create a new VDI"
+      params:
+        sr: { type: string, in: body, required: true, description: "SR UUID" }
+        name_label: { type: string, in: body, required: true }
+        name_description: { type: string, in: body }
+        size: { type: integer, in: body, required: true, description: "Size in bytes" }
+      pagination: none
+
+    delete_vdi:
+      method: DELETE
+      path: /vdis/{uuid}
+      access: dangerous
+      description: "Delete a VDI. Irreversible."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    update_vdi:
+      method: PATCH
+      path: /vdis/{uuid}
+      access: write
+      description: "Update VDI properties (name_label, name_description)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        name_label: { type: string, in: body }
+        name_description: { type: string, in: body }
+      pagination: none
+
+    migrate_vdi:
+      method: POST
+      path: /vdis/{uuid}/actions/migrate
+      access: write
+      description: "Migrate a VDI to a different SR (live storage migration)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sr: { type: string, in: body, required: true, description: "Target SR UUID" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    export_vdi_vhd:
+      method: GET
+      path: /vdis/{uuid}.vhd
+      access: read
+      description: "Export a VDI as VHD"
+      params:
+        uuid: { type: string, in: path, required: true }
+        preferNbd: { type: boolean, in: query }
+        nbdConcurrency: { type: integer, in: query }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    export_vdi_raw:
+      method: GET
+      path: /vdis/{uuid}.raw
+      access: read
+      description: "Export a VDI as raw disk image"
+      params:
+        uuid: { type: string, in: path, required: true }
+        preferNbd: { type: boolean, in: query }
+        nbdConcurrency: { type: integer, in: query }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    import_vdi_to_sr:
+      method: POST
+      path: /srs/{sr_uuid}/vdis
+      access: write
+      description: "Import a VDI from VHD/raw upload into an SR"
+      params:
+        sr_uuid: { type: string, in: path, required: true }
+        name_label: { type: string, in: query }
+        name_description: { type: string, in: query }
+        raw: { type: boolean, in: query, description: "True for raw images" }
+      content_type: application/octet-stream
+      pagination: none
+
+    import_vdi_to_existing:
+      method: PUT
+      path: /vdis/{uuid}.vhd
+      access: write
+      description: "Replace existing VDI contents. Size must match."
+      params:
+        uuid: { type: string, in: path, required: true }
+      content_type: application/octet-stream
+      pagination: none
+
+    # =========================================================================
+    # VBDs -- Virtual Block Devices
+    # =========================================================================
+
+    create_vbd:
+      method: POST
+      path: /vbds
+      access: write
+      description: "Create a VBD to attach a VDI to a VM"
+      params:
+        vm: { type: string, in: body, required: true, description: "VM UUID" }
+        vdi: { type: string, in: body, required: true, description: "VDI UUID" }
+      pagination: none
+
+    delete_vbd:
+      method: DELETE
+      path: /vbds/{uuid}
+      access: write
+      description: "Delete a VBD (detach disk)"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    connect_vbd:
+      method: POST
+      path: /vbds/{uuid}/actions/connect
+      access: write
+      description: "Hotplug a VBD to a running VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    disconnect_vbd:
+      method: POST
+      path: /vbds/{uuid}/actions/disconnect
+      access: write
+      description: "Hot-unplug a VBD from a running VM"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # NETWORKS
+    # =========================================================================
+
+    list_networks:
+      method: GET
+      path: /networks
+      access: read
+      description: "List all networks"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_network:
+      method: GET
+      path: /networks/{uuid}
+      access: read
+      description: "Get details of a network"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_network:
+      method: DELETE
+      path: /networks/{uuid}
+      access: dangerous
+      description: "Delete a network"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # VIFs -- Virtual Network Interfaces
+    # =========================================================================
+
+    create_vif:
+      method: POST
+      path: /vifs
+      access: write
+      description: "Create a virtual network interface on a VM"
+      params:
+        vm: { type: string, in: body, required: true }
+        network: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_vif:
+      method: DELETE
+      path: /vifs/{uuid}
+      access: write
+      description: "Delete a virtual network interface"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # PIFs -- Physical Network Interfaces
+    # =========================================================================
+
+    list_pifs:
+      method: GET
+      path: /pifs
+      access: read
+      description: "List all physical network interfaces"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_pif:
+      method: GET
+      path: /pifs/{uuid}
+      access: read
+      description: "Get details of a PIF"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # PBDs -- Physical Block Devices
+    # =========================================================================
+
+    list_pbds:
+      method: GET
+      path: /pbds
+      access: read
+      description: "List all PBDs (SR-to-host connections)"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_pbd:
+      method: GET
+      path: /pbds/{uuid}
+      access: read
+      description: "Get details of a PBD"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    plug_pbd:
+      method: POST
+      path: /pbds/{uuid}/actions/plug
+      access: write
+      description: "Plug a PBD to connect an SR to a host"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    unplug_pbd:
+      method: POST
+      path: /pbds/{uuid}/actions/unplug
+      access: write
+      description: "Unplug a PBD to disconnect an SR from a host"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # PCIs, PGPUs, SMs -- Hardware & Drivers
+    # =========================================================================
+
+    list_pcis:
+      method: GET
+      path: /pcis
+      access: read
+      description: "List all PCI devices (for passthrough)"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_pci:
+      method: GET
+      path: /pcis/{uuid}
+      access: read
+      description: "Get details of a PCI device"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_pgpus:
+      method: GET
+      path: /pgpus
+      access: read
+      description: "List all physical GPUs"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_pgpu:
+      method: GET
+      path: /pgpus/{uuid}
+      access: read
+      description: "Get details of a physical GPU"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_sms:
+      method: GET
+      path: /sms
+      access: read
+      description: "List all storage manager plugins/drivers"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_sm:
+      method: GET
+      path: /sms/{uuid}
+      access: read
+      description: "Get details of a storage manager plugin"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # TASKS
+    # =========================================================================
+
+    list_tasks:
+      method: GET
+      path: /tasks
+      access: read
+      description: "List all tasks. Use ndjson+watch for real-time streaming."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        ndjson: { type: boolean, in: query }
+        watch: { type: boolean, in: query, description: "Watch mode (requires ndjson)" }
+
+    get_task:
+      method: GET
+      path: /tasks/{id}
+      access: read
+      description: "Get a task. Use wait=result to block until completion."
+      params:
+        id: { type: string, in: path, required: true }
+        wait: { type: string, in: query, description: "'result' to wait" }
+      pagination: none
+
+    delete_task:
+      method: DELETE
+      path: /tasks/{id}
+      access: write
+      description: "Delete a completed or failed task"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    abort_task:
+      method: POST
+      path: /tasks/{id}/actions/abort
+      access: write
+      description: "Abort a running task"
+      params:
+        id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # BACKUPS
+    # =========================================================================
+
+    list_backups:
+      method: GET
+      path: /backups
+      access: read
+      description: "List all backup archives"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    list_backup_jobs:
+      method: GET
+      path: /backup-jobs
+      access: read
+      description: "List all configured backup jobs"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    list_backup_logs:
+      method: GET
+      path: /backup-log
+      access: read
+      description: "List backup execution logs"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    list_restore_logs:
+      method: GET
+      path: /restore-logs
+      access: read
+      description: "List restore execution logs"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    # =========================================================================
+    # MESSAGES, PROXIES, SERVERS, DASHBOARDS
+    # =========================================================================
+
+    list_messages:
+      method: GET
+      path: /messages
+      access: read
+      description: "List XAPI messages/alerts"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_message:
+      method: GET
+      path: /messages/{uuid}
+      access: read
+      description: "Get details of a XAPI message"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_proxies:
+      method: GET
+      path: /proxies
+      access: read
+      description: "List all XO Proxy instances"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_proxy:
+      method: GET
+      path: /proxies/{id}
+      access: read
+      description: "Get details of an XO Proxy"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_server:
+      method: DELETE
+      path: /servers/{id}
+      access: admin
+      description: "Remove a XCP-ng/XenServer connection from XO"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_dashboards:
+      method: GET
+      path: /dashboards
+      access: read
+      description: "List dashboards with infrastructure overview"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+  examples:
+    - name: "List running VMs"
+      description: "Get all running VMs with names"
+      code: |
+        const vms = await api.list_vms({
+          fields: "name_label,power_state,uuid",
+          filter: "power_state:Running"
+        });
+        return vms;
+
+    - name: "Create and start a VM"
+      description: "Create a VM from template and boot it"
+      code: |
+        const pools = await api.list_pools({ fields: "uuid" });
+        const task = await api.create_vm({
+          pool_id: pools[0].uuid,
+          name_label: "my-new-vm",
+          template: "template-uuid-here",
+          memory: 2147483648,
+          boot: true
+        });
+        return await api.get_task({ id: task.id, wait: "result" });
+
+    - name: "Attach disk to running VM"
+      description: "Create VDI, create VBD, hotplug"
+      code: |
+        const vdi = await api.create_vdi({
+          sr: "sr-uuid", name_label: "data-disk", size: 53687091200
+        });
+        const vbd = await api.create_vbd({ vm: "vm-uuid", vdi: vdi.uuid });
+        await api.connect_vbd({ uuid: vbd.uuid, sync: true });
+        return vbd;
+
+    - name: "Host maintenance"
+      description: "Disable host, migrate VMs, re-enable"
+      code: |
+        await api.disable_host({ uuid: "host-uuid", sync: true });
+        const vms = await api.list_vms({
+          fields: "uuid,resident_on",
+          filter: "resident_on:host-uuid"
+        });
+        for (const vm of vms) {
+          await api.migrate_vm({ uuid: vm.uuid, sync: true });
+        }
+        await api.enable_host({ uuid: "host-uuid", sync: true });
+
+    - name: "Rolling pool update"
+      description: "Zero-downtime update of all hosts"
+      code: |
+        const pools = await api.list_pools({ fields: "uuid" });
+        const task = await api.rolling_update_pool({ pool_id: pools[0].uuid });
+        return await api.get_task({ id: task.id, wait: "result" });
