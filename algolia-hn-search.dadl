@@ -186,7 +186,8 @@ backend:
       timeout: 15s
       depends_on: [search]
       code: |
-        const filters = params.min_points > 0 ? `points>${params.min_points}` : undefined;
+        const mp = Number(params.min_points) || 0;
+        const filters = mp > 0 ? `points>${mp}` : undefined;
         const result = await api.search({
           query: params.query,
           tags: "story",
@@ -289,7 +290,8 @@ backend:
             text:         h.story_text   || h.comment_text || null
           };
         }
-        const numericFilters = params.min_points > 0 ? `points>${params.min_points}` : undefined;
+        const mp = Number(params.min_points) || 0;
+        const numericFilters = mp > 0 ? `points>${mp}` : undefined;
         const args = { query: params.query, tags: params.tags, hitsPerPage: params.limit, numericFilters };
         const hits = params.sort === "date"
           ? await api.search_by_date(args)
