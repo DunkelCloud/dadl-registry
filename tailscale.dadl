@@ -1,0 +1,831 @@
+# tailscale.dadl -- Tailscale REST API
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - Tailscale is a zero-config WireGuard mesh VPN (tailnet = your private network).
+# - A "tailnet" is a private network namespace. Use "-" as tailnet shorthand for
+#   the authenticated user's own tailnet in all API paths.
+# - "Device" = a node in the tailnet (laptop, server, phone, container).
+#   Devices have numeric IDs (nodeId) and Tailscale IPs (100.x.y.z / fd7a:...).
+# - "Auth key" = a pre-authentication key used to register devices without
+#   interactive login. Can be reusable, ephemeral, and/or preauthorized.
+#   Prefix: "tskey-auth-". Ephemeral keys auto-remove devices when they go offline.
+# - "API key" = token for API access. Prefix: "tskey-api-". Expires 1-90 days.
+# - ACL = Access Control List (policy file). Supports JSON and HuJSON format.
+#   Use If-Match/ETag for optimistic concurrency on ACL updates.
+# - Tags are ACL-managed labels (e.g. "tag:server") that replace user ownership
+#   on devices. Tag owners are defined in the ACL policy.
+# - Subnet routes: devices can advertise routes (e.g. "10.0.0.0/24") to make
+#   non-Tailscale networks reachable. Routes must be explicitly enabled via API.
+# - MagicDNS: automatic DNS for tailnet devices (device-name.tailnet-name.ts.net).
+# - Split DNS: forward specific domains to custom nameservers.
+# - Device posture: custom key-value attributes for device health checks.
+# - Webhook events: nodeCreated, nodeDeleted, nodeApproved, nodeNeedsApproval,
+#   nodeKeyExpiringInOneDay, subnetIPForwardingNotEnabled, exitNodeIPForwardingNotEnabled,
+#   userCreated, userDeleted, userApproved, userSuspended, userRestored, userRoleUpdated.
+# - All timestamps are ISO 8601 (RFC 3339).
+# - No cursor/offset pagination -- list endpoints return all results.
+# - The API has no publicly documented rate limits or rate-limit headers.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Tailscale REST API"
+source_url: "https://tailscale.com/api"
+date: "2026-04-06"
+
+backend:
+  name: tailscale
+  type: rest
+  version: "1.0"
+  base_url: https://api.tailscale.com/api/v2
+  description: "Tailscale API -- devices, users, auth keys, DNS, ACL/policy, webhooks, contacts, posture integrations, log streaming, and tailnet settings"
+
+  auth:
+    type: bearer
+    credential: tailscale_api_token
+
+  defaults:
+    headers:
+      Content-Type: application/json
+    pagination:
+      strategy: offset
+      behavior: expose
+      max_pages: 1
+    errors:
+      format: json
+      message_path: "$.message"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+      terminal: [400, 401, 403, 404, 409]
+    response:
+      max_items: 500
+
+  coverage:
+    endpoints: 58
+    total_endpoints: 70
+    percentage: 83
+    focus: "devices, device routes, device posture, users, auth keys, DNS (nameservers, search paths, preferences, split DNS), ACL/policy, webhooks, contacts, tailnet settings, posture integrations, log streaming"
+    missing: "OAuth token endpoint, device invites, user invites, services (beta)"
+    last_reviewed: "2026-04-06"
+
+  setup:
+    credential_steps:
+      - "Log in to the Tailscale admin console at https://login.tailscale.com/admin"
+      - "Navigate to Settings -> Keys"
+      - "Click 'Generate API key'"
+      - "Set expiry (1-90 days) and copy the key immediately -- it is shown only once"
+      - "Key prefix is tskey-api-. Requires Owner, Admin, IT admin, or Network admin role."
+      - "Alternative: create an OAuth client under Settings -> OAuth for long-lived automated access"
+    env_var: CREDENTIAL_TAILSCALE_API_TOKEN
+    backends_yaml: |
+      - name: tailscale
+        transport: rest
+        dadl: tailscale.dadl
+    required_scopes:
+      - "all (for full read/write access)"
+    optional_scopes:
+      - "all:read (read-only access)"
+      - "devices:core (manage devices)"
+      - "devices:routes (manage subnet routes)"
+      - "dns (manage DNS settings)"
+      - "policy_file (manage ACL/policy)"
+      - "users (manage users)"
+      - "auth_keys (manage auth keys)"
+      - "webhooks (manage webhooks)"
+      - "log_streaming (manage log streaming)"
+      - "feature_settings (manage posture integrations)"
+      - "account_settings (manage contacts)"
+    docs_url: "https://tailscale.com/kb/1101/api"
+    notes: "API keys expire after 1-90 days and cannot be renewed -- create a new one before expiry. For automation, prefer OAuth clients which support token refresh. Use '-' as the tailnet parameter to target your own tailnet."
+
+  hints:
+    list_devices:
+      fields_param: "Use fields=all for full details, or fields=default for a smaller response. Omit for default."
+      no_pagination: "Returns all devices in a single response. Response is pre-transformed to essential fields (id, name, hostname, os, tags, authorized, lastSeen, connectedToControl). Use get_device for full details on a specific device."
+      large_tailnets: "For tailnets with 200+ devices, filter results client-side by tag, os, or connectedToControl status."
+    authorize_device:
+      note: "Set authorized=true to approve a device waiting for admin approval. Set authorized=false to deauthorize."
+    set_device_tags:
+      acl_requirement: "Tags must be defined in the ACL policy under tagOwners before they can be applied."
+    set_device_routes:
+      routes_format: "Pass the full list of routes to enable. Omitted routes will be disabled. Only previously advertised routes can be enabled."
+    create_auth_key:
+      ephemeral: "Ephemeral keys create devices that are automatically removed when they disconnect."
+      preauthorized: "Preauthorized keys skip the admin approval step for new devices."
+      tags_required: "If the tailnet requires device approval, auth keys must include tags."
+    get_acl:
+      format: "Set Accept header to application/hujson for HuJSON format, or application/json for JSON."
+      etag: "Response includes ETag header. Use If-Match on updates for optimistic concurrency."
+    set_acl:
+      concurrency: "Always use If-Match with the ETag from get_acl to prevent overwriting concurrent changes."
+    set_dns_nameservers:
+      format: "Pass the full list of nameservers. This replaces the existing list."
+    set_dns_split:
+      replace_vs_merge: "PUT replaces the entire split DNS config. PATCH merges with existing config."
+
+  tools:
+
+    # ============================================================
+    # Devices
+    # ============================================================
+
+    list_devices:
+      method: GET
+      path: /tailnet/{tailnet}/devices
+      access: read
+      description: "List all devices in the tailnet"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        fields: { type: string, in: query, description: "'all' for full details or 'default' for basic info" }
+      response:
+        result_path: "$.devices"
+        transform: |
+          . | map({id, nodeId, name, hostname, os, addresses, tags, authorized, lastSeen, connectedToControl, clientVersion, updateAvailable, keyExpiryDisabled})
+        max_items: 500
+
+    get_device:
+      method: GET
+      path: /device/{deviceID}
+      access: read
+      description: "Get details of a specific device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_device:
+      method: DELETE
+      path: /device/{deviceID}
+      access: dangerous
+      description: "Remove a device from the tailnet"
+      params:
+        deviceID: { type: string, in: path, required: true }
+      pagination: none
+
+    authorize_device:
+      method: POST
+      path: /device/{deviceID}/authorized
+      access: write
+      description: "Authorize or deauthorize a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        authorized: { type: boolean, in: body, required: true }
+      pagination: none
+
+    expire_device_key:
+      method: POST
+      path: /device/{deviceID}/expire
+      access: write
+      description: "Expire a device's node key, forcing it to re-authenticate"
+      params:
+        deviceID: { type: string, in: path, required: true }
+      pagination: none
+
+    set_device_key:
+      method: POST
+      path: /device/{deviceID}/key
+      access: write
+      description: "Set device key properties (e.g. disable key expiry)"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        keyExpiryDisabled: { type: boolean, in: body }
+      pagination: none
+
+    set_device_name:
+      method: POST
+      path: /device/{deviceID}/name
+      access: write
+      description: "Set custom display name for a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+      pagination: none
+
+    set_device_tags:
+      method: POST
+      path: /device/{deviceID}/tags
+      access: write
+      description: "Set ACL tags on a device (replaces existing tags)"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        tags: { type: array, in: body, required: true, description: "Array of tag strings, e.g. ['tag:server', 'tag:prod']" }
+      pagination: none
+
+    set_device_ip:
+      method: POST
+      path: /device/{deviceID}/ip
+      access: write
+      description: "Set the Tailscale IPv4 address of a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        ipv4: { type: string, in: body, required: true }
+      pagination: none
+
+    # ============================================================
+    # Device Routes
+    # ============================================================
+
+    get_device_routes:
+      method: GET
+      path: /device/{deviceID}/routes
+      access: read
+      description: "Get advertised and enabled subnet routes for a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+      pagination: none
+
+    set_device_routes:
+      method: POST
+      path: /device/{deviceID}/routes
+      access: write
+      description: "Set which subnet routes are enabled for a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        routes: { type: array, in: body, required: true, description: "Array of CIDR routes to enable, e.g. ['10.0.0.0/24']" }
+      pagination: none
+
+    # ============================================================
+    # Device Posture Attributes
+    # ============================================================
+
+    get_device_posture_attributes:
+      method: GET
+      path: /device/{deviceID}/attributes
+      access: read
+      description: "Get custom posture attributes for a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+      pagination: none
+
+    set_device_posture_attribute:
+      method: POST
+      path: /device/{deviceID}/attributes/{attributeKey}
+      access: write
+      description: "Set a custom posture attribute on a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        attributeKey: { type: string, in: path, required: true, description: "Attribute key, must start with 'custom:'" }
+        value: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_device_posture_attribute:
+      method: DELETE
+      path: /device/{deviceID}/attributes/{attributeKey}
+      access: write
+      description: "Delete a custom posture attribute from a device"
+      params:
+        deviceID: { type: string, in: path, required: true }
+        attributeKey: { type: string, in: path, required: true }
+      pagination: none
+
+    # ============================================================
+    # Users
+    # ============================================================
+
+    list_users:
+      method: GET
+      path: /tailnet/{tailnet}/users
+      access: read
+      description: "List users in the tailnet"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        type: { type: string, in: query, description: "Filter by user type: 'member' or 'shared'" }
+        role: { type: string, in: query, description: "Filter by role: 'owner', 'admin', 'it-admin', 'network-admin', 'member'" }
+      response:
+        result_path: "$.users"
+        transform: |
+          . | map({id, displayName, loginName, role, status, type, deviceCount, lastSeen, currentlyConnected})
+        max_items: 500
+
+    get_user:
+      method: GET
+      path: /user/{userID}
+      access: read
+      description: "Get details of a specific user"
+      params:
+        userID: { type: string, in: path, required: true }
+      pagination: none
+
+    approve_user:
+      method: POST
+      path: /user/{userID}/approve
+      access: admin
+      description: "Approve a pending user"
+      params:
+        userID: { type: string, in: path, required: true }
+      pagination: none
+
+    suspend_user:
+      method: POST
+      path: /user/{userID}/suspend
+      access: admin
+      description: "Suspend a user (disables their access to the tailnet)"
+      params:
+        userID: { type: string, in: path, required: true }
+      pagination: none
+
+    restore_user:
+      method: POST
+      path: /user/{userID}/restore
+      access: admin
+      description: "Restore a previously suspended user"
+      params:
+        userID: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_user:
+      method: POST
+      path: /user/{userID}/delete
+      access: dangerous
+      description: "Delete a user from the tailnet"
+      params:
+        userID: { type: string, in: path, required: true }
+      pagination: none
+
+    set_user_role:
+      method: POST
+      path: /user/{userID}/role
+      access: admin
+      description: "Update a user's role in the tailnet"
+      params:
+        userID: { type: string, in: path, required: true }
+        role: { type: string, in: body, required: true, description: "Role: 'owner', 'admin', 'it-admin', 'network-admin', 'member'" }
+      pagination: none
+
+    # ============================================================
+    # Auth Keys
+    # ============================================================
+
+    list_keys:
+      method: GET
+      path: /tailnet/{tailnet}/keys
+      access: read
+      description: "List all auth keys and API access tokens in the tailnet"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        all: { type: boolean, in: query, description: "Include expired keys when true" }
+
+    get_key:
+      method: GET
+      path: /tailnet/{tailnet}/keys/{keyID}
+      access: read
+      description: "Get details of a specific key"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        keyID: { type: string, in: path, required: true }
+      pagination: none
+
+    create_auth_key:
+      method: POST
+      path: /tailnet/{tailnet}/keys
+      access: write
+      description: "Create a new auth key for device registration"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        capabilities: { type: object, in: body, required: true, description: "Key capabilities object with devices.create settings (reusable, ephemeral, preauthorized, tags)" }
+        expirySeconds: { type: integer, in: body, description: "Key expiry in seconds (default: 86400)" }
+        description: { type: string, in: body, description: "Human-readable description of the key" }
+      pagination: none
+
+    delete_key:
+      method: DELETE
+      path: /tailnet/{tailnet}/keys/{keyID}
+      access: write
+      description: "Revoke and delete a key"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        keyID: { type: string, in: path, required: true }
+      pagination: none
+
+    # ============================================================
+    # DNS
+    # ============================================================
+
+    get_dns_nameservers:
+      method: GET
+      path: /tailnet/{tailnet}/dns/nameservers
+      access: read
+      description: "Get the global DNS nameservers for the tailnet"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    set_dns_nameservers:
+      method: POST
+      path: /tailnet/{tailnet}/dns/nameservers
+      access: write
+      description: "Set the global DNS nameservers (replaces existing list)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        dns: { type: array, in: body, required: true, description: "Array of DNS nameserver IPs, e.g. ['8.8.8.8', '1.1.1.1']" }
+      pagination: none
+
+    get_dns_searchpaths:
+      method: GET
+      path: /tailnet/{tailnet}/dns/searchpaths
+      access: read
+      description: "Get DNS search paths for the tailnet"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    set_dns_searchpaths:
+      method: POST
+      path: /tailnet/{tailnet}/dns/searchpaths
+      access: write
+      description: "Set DNS search paths (replaces existing list)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        searchPaths: { type: array, in: body, required: true, description: "Array of search domains, e.g. ['corp.example.com']" }
+      pagination: none
+
+    get_dns_preferences:
+      method: GET
+      path: /tailnet/{tailnet}/dns/preferences
+      access: read
+      description: "Get DNS preferences (MagicDNS status)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    set_dns_preferences:
+      method: POST
+      path: /tailnet/{tailnet}/dns/preferences
+      access: write
+      description: "Set DNS preferences (enable/disable MagicDNS)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        magicDNS: { type: boolean, in: body, required: true }
+      pagination: none
+
+    get_dns_split:
+      method: GET
+      path: /tailnet/{tailnet}/dns/split-dns
+      access: read
+      description: "Get split DNS configuration"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    set_dns_split:
+      method: PUT
+      path: /tailnet/{tailnet}/dns/split-dns
+      access: write
+      description: "Replace the entire split DNS configuration"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      content_type: application/json
+      pagination: none
+
+    patch_dns_split:
+      method: PATCH
+      path: /tailnet/{tailnet}/dns/split-dns
+      access: write
+      description: "Merge updates into the split DNS configuration (existing entries preserved)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      content_type: application/json
+      pagination: none
+
+    # ============================================================
+    # ACL / Policy File
+    # ============================================================
+
+    get_acl:
+      method: GET
+      path: /tailnet/{tailnet}/acl
+      access: read
+      description: "Get the current ACL/policy file. Returns ETag header for concurrency control."
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    set_acl:
+      method: POST
+      path: /tailnet/{tailnet}/acl
+      access: admin
+      description: "Replace the ACL/policy file. Use If-Match header with ETag for optimistic concurrency."
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    preview_acl:
+      method: POST
+      path: /tailnet/{tailnet}/acl/preview
+      access: read
+      description: "Preview how ACL rules apply to a specific user or IP:port"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        type: { type: string, in: query, required: true, description: "'user' or 'ipport'" }
+        previewFor: { type: string, in: query, required: true, description: "User email or IP:port to preview rules for" }
+      pagination: none
+
+    validate_acl:
+      method: POST
+      path: /tailnet/{tailnet}/acl/validate
+      access: read
+      description: "Validate an ACL policy without applying it"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    test_acl:
+      method: POST
+      path: /tailnet/{tailnet}/acl/test
+      access: read
+      description: "Run the test cases defined in the ACL policy"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    # ============================================================
+    # Webhooks
+    # ============================================================
+
+    list_webhooks:
+      method: GET
+      path: /tailnet/{tailnet}/webhooks
+      access: read
+      description: "List all webhook endpoints in the tailnet"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+
+    create_webhook:
+      method: POST
+      path: /tailnet/{tailnet}/webhooks
+      access: write
+      description: "Create a new webhook endpoint"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        endpointUrl: { type: string, in: body, required: true, description: "URL to receive webhook events" }
+        providerType: { type: string, in: body, description: "Provider type, e.g. 'slack', 'discord', or empty for generic" }
+        subscriptions: { type: array, in: body, required: true, description: "Array of event types to subscribe to" }
+      pagination: none
+
+    get_webhook:
+      method: GET
+      path: /webhooks/{endpointID}
+      access: read
+      description: "Get details of a webhook endpoint"
+      params:
+        endpointID: { type: string, in: path, required: true }
+      pagination: none
+
+    update_webhook:
+      method: PATCH
+      path: /webhooks/{endpointID}
+      access: write
+      description: "Update a webhook endpoint's subscriptions"
+      params:
+        endpointID: { type: string, in: path, required: true }
+        subscriptions: { type: array, in: body, description: "Updated array of event types" }
+      pagination: none
+
+    delete_webhook:
+      method: DELETE
+      path: /webhooks/{endpointID}
+      access: write
+      description: "Delete a webhook endpoint"
+      params:
+        endpointID: { type: string, in: path, required: true }
+      pagination: none
+
+    test_webhook:
+      method: POST
+      path: /webhooks/{endpointID}/test
+      access: write
+      description: "Send a test event to a webhook endpoint"
+      params:
+        endpointID: { type: string, in: path, required: true }
+      pagination: none
+
+    rotate_webhook_secret:
+      method: POST
+      path: /webhooks/{endpointID}/rotate
+      access: admin
+      description: "Rotate the signing secret for a webhook endpoint"
+      params:
+        endpointID: { type: string, in: path, required: true }
+      pagination: none
+
+    # ============================================================
+    # Contacts
+    # ============================================================
+
+    get_contacts:
+      method: GET
+      path: /tailnet/{tailnet}/contacts
+      access: read
+      description: "Get tailnet contact emails (account, support, security)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    update_contact:
+      method: PATCH
+      path: /tailnet/{tailnet}/contacts/{contactType}
+      access: admin
+      description: "Update a contact email address"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        contactType: { type: string, in: path, required: true, description: "'account', 'support', or 'security'" }
+        email: { type: string, in: body, required: true }
+      pagination: none
+
+    resend_contact_verification:
+      method: POST
+      path: /tailnet/{tailnet}/contacts/{contactType}/resend-verification-email
+      access: admin
+      description: "Resend verification email for a contact"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        contactType: { type: string, in: path, required: true, description: "'account', 'support', or 'security'" }
+      pagination: none
+
+    # ============================================================
+    # Tailnet Settings
+    # ============================================================
+
+    get_tailnet_settings:
+      method: GET
+      path: /tailnet/{tailnet}/settings
+      access: read
+      description: "Get tailnet-wide settings (auto-updates, approval, key duration, etc.)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+      pagination: none
+
+    update_tailnet_settings:
+      method: PATCH
+      path: /tailnet/{tailnet}/settings
+      access: admin
+      description: "Update tailnet settings (partial update)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        devicesApprovalOn: { type: boolean, in: body }
+        devicesAutoUpdatesOn: { type: boolean, in: body }
+        devicesKeyDurationDays: { type: integer, in: body }
+        usersApprovalOn: { type: boolean, in: body }
+        usersRoleAllowedToJoinExternalTailnets: { type: string, in: body }
+        networkFlowLoggingOn: { type: boolean, in: body }
+        regionalRoutingOn: { type: boolean, in: body }
+        postureIdentityCollectionOn: { type: boolean, in: body }
+      pagination: none
+
+    # ============================================================
+    # Posture Integrations
+    # ============================================================
+
+    list_posture_integrations:
+      method: GET
+      path: /tailnet/{tailnet}/posture/integrations
+      access: read
+      description: "List device posture integrations (CrowdStrike, Intune, Jamf, etc.)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+
+    create_posture_integration:
+      method: POST
+      path: /tailnet/{tailnet}/posture/integrations
+      access: admin
+      description: "Create a new posture integration"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        provider: { type: string, in: body, required: true, description: "Provider: 'falcon', 'intune', 'jamfpro', 'kandji', 'kolide', 'sentinelone'" }
+        cloudId: { type: string, in: body }
+        clientId: { type: string, in: body }
+        tenantId: { type: string, in: body }
+        clientSecret: { type: string, in: body }
+      pagination: none
+
+    get_posture_integration:
+      method: GET
+      path: /posture/integrations/{integrationID}
+      access: read
+      description: "Get details of a posture integration"
+      params:
+        integrationID: { type: string, in: path, required: true }
+      pagination: none
+
+    update_posture_integration:
+      method: PATCH
+      path: /posture/integrations/{integrationID}
+      access: admin
+      description: "Update a posture integration"
+      params:
+        integrationID: { type: string, in: path, required: true }
+        cloudId: { type: string, in: body }
+        clientId: { type: string, in: body }
+        tenantId: { type: string, in: body }
+        clientSecret: { type: string, in: body }
+      pagination: none
+
+    delete_posture_integration:
+      method: DELETE
+      path: /posture/integrations/{integrationID}
+      access: admin
+      description: "Delete a posture integration"
+      params:
+        integrationID: { type: string, in: path, required: true }
+      pagination: none
+
+    # ============================================================
+    # Log Streaming
+    # ============================================================
+
+    get_log_stream_config:
+      method: GET
+      path: /tailnet/{tailnet}/logging/{logType}/stream
+      access: read
+      description: "Get log stream configuration for a log type"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        logType: { type: string, in: path, required: true, description: "'configuration' or 'network'" }
+      pagination: none
+
+    set_log_stream_config:
+      method: PUT
+      path: /tailnet/{tailnet}/logging/{logType}/stream
+      access: admin
+      description: "Set log stream destination (Splunk, Elastic, Datadog, S3, etc.)"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        logType: { type: string, in: path, required: true, description: "'configuration' or 'network'" }
+        destinationType: { type: string, in: body, required: true, description: "'splunk', 'elastic', 'panther', 'cribl', 'datadog', 'axiom', 's3'" }
+        url: { type: string, in: body, description: "Destination URL (for non-S3 destinations)" }
+        token: { type: string, in: body, description: "Auth token for the destination" }
+        s3Bucket: { type: string, in: body }
+        s3Region: { type: string, in: body }
+        s3KeyPrefix: { type: string, in: body }
+        s3AuthenticationType: { type: string, in: body }
+        s3AccessKeyId: { type: string, in: body }
+        s3SecretAccessKey: { type: string, in: body }
+        s3RoleArn: { type: string, in: body }
+        s3ExternalId: { type: string, in: body }
+      pagination: none
+
+    delete_log_stream_config:
+      method: DELETE
+      path: /tailnet/{tailnet}/logging/{logType}/stream
+      access: admin
+      description: "Delete log stream configuration"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        logType: { type: string, in: path, required: true, description: "'configuration' or 'network'" }
+      pagination: none
+
+    get_log_stream_status:
+      method: GET
+      path: /tailnet/{tailnet}/logging/{logType}/status
+      access: read
+      description: "Get current status of log streaming"
+      params:
+        tailnet: { type: string, in: path, required: true, default: "-" }
+        logType: { type: string, in: path, required: true, description: "'configuration' or 'network'" }
+      pagination: none
+
+  examples:
+    - name: "List and authorize pending devices"
+      description: "Get all devices and authorize any that are pending approval"
+      code: |
+        const devices = await api.list_devices({ tailnet: "-" });
+        const pending = devices.devices.filter(d => !d.authorized);
+        for (const d of pending) {
+          await api.authorize_device({ deviceID: d.id, authorized: true });
+        }
+        return { authorized: pending.map(d => d.name) };
+
+    - name: "Enable subnet routes"
+      description: "Get a device's advertised routes and enable all of them"
+      code: |
+        const routes = await api.get_device_routes({ deviceID: "12345" });
+        await api.set_device_routes({
+          deviceID: "12345",
+          routes: routes.advertisedRoutes
+        });
+        return routes.advertisedRoutes;
+
+    - name: "Create ephemeral auth key"
+      description: "Create an ephemeral, preauthorized auth key for CI/CD"
+      code: |
+        const key = await api.create_auth_key({
+          tailnet: "-",
+          capabilities: {
+            devices: {
+              create: {
+                reusable: false,
+                ephemeral: true,
+                preauthorized: true,
+                tags: ["tag:ci"]
+              }
+            }
+          },
+          expirySeconds: 3600,
+          description: "CI pipeline key"
+        });
+        return { keyId: key.id, key: key.key };
