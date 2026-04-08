@@ -1,0 +1,1600 @@
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH"
+source_name: "Mastodon REST API v1/v2"
+source_url: "https://docs.joinmastodon.org/api/"
+date: "2026-04-08"
+
+# ── Reusable response transforms (YAML anchors) ─────────────
+# Mastodon status objects are very large (~5-8 KB each) due to
+# embedded account, card, media, and emoji data. These transforms
+# strip HTML and reduce each status to ~300-500 bytes.
+
+_transforms:
+  status_compact: &status_compact
+    transform: |
+      [.[] | {id, created_at, visibility, language, reblogs_count, favourites_count, replies_count, spoiler_text, content: (.content | gsub("<[^>]*>"; "") | .[:300]), account: {id: .account.id, acct: .account.acct, display_name: .account.display_name}, tags: [.tags[].name], media: [.media_attachments[] | {id, type, description, url: .remote_url}], url}]
+    max_items: 40
+    allow_jq_override: true
+
+  account_compact: &account_compact
+    transform: |
+      [.[] | {id, acct, display_name, bot, locked, followers_count, following_count, statuses_count, note: (.note | gsub("<[^>]*>"; "") | .[:150]), url, fields: [.fields[] | {name, value: (.value | gsub("<[^>]*>"; ""))}]}]
+    max_items: 40
+    allow_jq_override: true
+
+  notification_compact: &notification_compact
+    transform: |
+      [.[] | {id, type, created_at, account: {id: .account.id, acct: .account.acct, display_name: .account.display_name}, status: (if .status then {id: .status.id, content: (.status.content | gsub("<[^>]*>"; "") | .[:200]), favourites_count: .status.favourites_count, reblogs_count: .status.reblogs_count} else null end)}]
+    max_items: 80
+    allow_jq_override: true
+
+  context_compact: &context_compact
+    transform: |
+      {ancestors: [.ancestors[] | {id, created_at, content: (.content | gsub("<[^>]*>"; "") | .[:300]), account: {acct: .account.acct, display_name: .account.display_name}, favourites_count, reblogs_count}], descendants: [.descendants[] | {id, created_at, content: (.content | gsub("<[^>]*>"; "") | .[:300]), account: {acct: .account.acct, display_name: .account.display_name}, favourites_count, reblogs_count, in_reply_to_id}]}
+    allow_jq_override: true
+
+  single_status_compact: &single_status_compact
+    transform: |
+      {id, created_at, visibility, language, reblogs_count, favourites_count, replies_count, spoiler_text, content: (.content | gsub("<[^>]*>"; "") | .[:500]), account: {id: .account.id, acct: .account.acct, display_name: .account.display_name}, tags: [.tags[].name], media: [.media_attachments[] | {id, type, description, url: .remote_url}], poll, url, in_reply_to_id, card: (if .card then {title: .card.title, url: .card.url, description: .card.description} else null end)}
+    allow_jq_override: true
+
+  search_compact: &search_compact
+    transform: |
+      {accounts: [.accounts[] | {id, acct, display_name, followers_count, note: (.note | gsub("<[^>]*>"; "") | .[:100])}], statuses: [.statuses[] | {id, created_at, content: (.content | gsub("<[^>]*>"; "") | .[:200]), account: {acct: .account.acct}, favourites_count, reblogs_count, tags: [.tags[].name], url}], hashtags: [.hashtags[] | {name, url, history: .history[:2]}]}
+    allow_jq_override: true
+
+  conversation_compact: &conversation_compact
+    transform: |
+      [.[] | {id, unread, last_status: (if .last_status then {id: .last_status.id, created_at: .last_status.created_at, content: (.last_status.content | gsub("<[^>]*>"; "") | .[:200])} else null end), accounts: [.accounts[] | {id, acct, display_name}]}]
+    max_items: 40
+    allow_jq_override: true
+
+backend:
+  name: mastodon
+  type: rest
+  version: "1.1"
+  base_url: "{INSTANCE_URL}"
+  description: "Mastodon REST API — statuses, timelines, accounts, notifications, search, media, lists, polls, conversations, trends, filters, and instance info. Base URL must be set to the target Mastodon instance (e.g. https://mastodon.social)."
+
+  coverage:
+    endpoints: 112
+    total_endpoints: 130
+    percentage: 86
+    focus: "accounts (lookup + verify + follow/unfollow + mute/block + relationships + search), statuses (CRUD + favourite + reblog + bookmark + pin + context + translate), timelines (home + public + hashtag + list), notifications (list + dismiss + clear + unread count), search (v2 full-text), media (upload + update), lists (CRUD + members), polls (view + vote), conversations (list + read + delete), trends (tags + statuses + links), filters v2 (CRUD + keywords), bookmarks, favourites, mutes, blocks, follow requests, suggestions, instance info, scheduled statuses (CRUD), markers (get + save), reports (create), featured tags (CRUD + suggestions), announcements (list + dismiss), endorsements, preferences, admin accounts (list + get + approve + reject + action + unsuspend + unsilence), admin domain blocks (CRUD)"
+    missing: "streaming WebSocket, email confirmations, canonical email blocks, ip blocks, dimensions, measures, retention, trends admin, admin reports, admin audit log"
+    last_reviewed: "2026-04-09"
+
+  setup:
+    credential_steps:
+      - "Open your Mastodon instance (e.g. https://mastodon.social)"
+      - "Go to Preferences → Development → New Application"
+      - "Enter an application name (e.g. 'ToolMesh')"
+      - "Select required scopes: read, write (or granular scopes as needed)"
+      - "Click 'Submit' to create the application"
+      - "Copy the 'Your access token' value — this is your Bearer token"
+    env_var: CREDENTIAL_MASTODON_ACCESS_TOKEN
+    backends_yaml: |
+      - name: mastodon
+        transport: rest
+        dadl: mastodon.dadl
+        url: "https://mastodon.social"
+    required_scopes:
+      - read
+      - write
+    optional_scopes:
+      - push
+      - "admin:read"
+      - "admin:write"
+      - "read:accounts"
+      - "read:blocks"
+      - "read:bookmarks"
+      - "read:favourites"
+      - "read:filters"
+      - "read:follows"
+      - "read:lists"
+      - "read:mutes"
+      - "read:notifications"
+      - "read:search"
+      - "read:statuses"
+      - "write:accounts"
+      - "write:blocks"
+      - "write:bookmarks"
+      - "write:conversations"
+      - "write:favourites"
+      - "write:filters"
+      - "write:follows"
+      - "write:lists"
+      - "write:media"
+      - "write:mutes"
+      - "write:notifications"
+      - "write:reports"
+      - "write:statuses"
+    docs_url: "https://docs.joinmastodon.org/client/token/"
+    notes: "The base_url must be set to the user's Mastodon instance. Each instance is independent — tokens from mastodon.social do not work on other instances. For app-level access (public data only), use OAuth2 client_credentials grant. For user-level access, use the authorization_code grant or generate a token via the web UI under Preferences → Development."
+
+  auth:
+    type: bearer
+    credential: mastodon_access_token
+
+  defaults:
+    headers:
+      Content-Type: application/json
+    pagination:
+      strategy: link_header
+      request:
+        limit_param: limit
+        limit_default: 20
+      behavior: expose
+      max_pages: 10
+    errors: &standard-errors
+      format: json
+      message_path: "$.error"
+      code_path: "$.error"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 410, 422]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      rate_limit:
+        header: X-RateLimit-Remaining
+        retry_after_header: X-RateLimit-Reset
+
+  # ──────────────────────────────────────────────────────────────
+  # Domain notes (for LLM consumers of these tools)
+  #
+  # Instance-specific:
+  #   Mastodon is federated — each instance has its own base URL.
+  #   Tokens are instance-specific. Always confirm the instance URL
+  #   before making requests.
+  #
+  # IDs:
+  #   All entity IDs are strings (internally cast from large integers).
+  #   Treat them as opaque — never parse or cast to numbers.
+  #
+  # Pagination:
+  #   Uses Link headers (RFC 8288) with max_id/since_id/min_id params.
+  #   max_id = older than, since_id = newer than, min_id = forward cursor.
+  #   Default limit is 20 for most endpoints, 40 for notifications.
+  #   Always prefer Link header URLs over constructing params manually.
+  #
+  # Visibility:
+  #   Statuses have visibility: public, unlisted, private, direct.
+  #   - public: visible on timelines and profiles
+  #   - unlisted: visible on profiles, not on timelines
+  #   - private: followers-only
+  #   - direct: mentioned users only (essentially a DM)
+  #
+  # Rate limits:
+  #   300 requests per 5 minutes for most endpoints.
+  #   Media uploads: 30 per 30 minutes.
+  #   Status deletions: 30 per 30 minutes.
+  #   Response headers: X-RateLimit-Limit, X-RateLimit-Remaining,
+  #   X-RateLimit-Reset (ISO 8601 timestamp).
+  #
+  # Content format:
+  #   Statuses return HTML in the 'content' field. The 'text' field
+  #   in status source contains the raw plaintext/markdown input.
+  #   Use get_status_source before editing a status.
+  #
+  # Media workflow:
+  #   1. Upload via upload_media (async, may return 202)
+  #   2. Poll get_media until processing completes (200)
+  #   3. Attach media_ids when creating a status
+  #   Max 4 images, or 1 video/audio per status.
+  #
+  # Idempotency:
+  #   POST /api/v1/statuses supports Idempotency-Key header
+  #   to prevent duplicate posts on retries.
+  # ──────────────────────────────────────────────────────────────
+
+  hints:
+    create_status:
+      idempotency: "Set Idempotency-Key header to prevent duplicate posts on retry"
+      visibility_values: "public | unlisted | private | direct"
+      poll_note: "poll params and media_ids are mutually exclusive"
+    upload_media:
+      async_processing: "Returns 202 if still processing — poll get_media until 200"
+      limits: "Max 4 images OR 1 video/audio per status. Images max 16MB, video max 99MB."
+    search_v2:
+      resolve_note: "Set resolve=true to WebFinger-resolve remote accounts/URLs (requires auth token)"
+      type_filter: "Without type param, returns results across accounts, statuses, and hashtags"
+      federation_scope: "Search only indexes statuses your instance knows about (local + federated). To find more: (1) use resolve=true to look up remote URLs/accounts, (2) follow more accounts in the target niche, (3) use a relay or a larger instance"
+    timeline_hashtag:
+      federation_scope: "Hashtag timelines only show posts from accounts your instance has seen (local + federated). Small instances see fewer results. For broader coverage, consider searching on a larger instance or using the Fediverse-wide search at instances like mastodon.social."
+    get_account_statuses:
+      pagination: "Use max_id for backward (older), min_id for forward (newer) pagination"
+      filters: "Combine exclude_replies, exclude_reblogs, only_media, pinned, tagged for filtering"
+    timeline_home:
+      includes: "Returns statuses from followed accounts AND followed hashtags"
+    timeline_public:
+      local_vs_remote: "local=true for instance-only, remote=true for federated-only, neither for all"
+    follow_account:
+      notify: "Set notify=true to get push notifications when this account posts"
+
+  tools:
+
+    # ════════════════════════════════════════════════════════════
+    # INSTANCE
+    # ════════════════════════════════════════════════════════════
+
+    get_instance:
+      method: GET
+      path: /api/v2/instance
+      access: read
+      description: "Get server information including version, configuration, usage stats, rules, and supported features"
+      pagination: none
+
+    get_instance_peers:
+      method: GET
+      path: /api/v1/instance/peers
+      access: read
+      description: "List domains that this instance is aware of (connected via federation)"
+      pagination: none
+
+    get_instance_activity:
+      method: GET
+      path: /api/v1/instance/activity
+      access: read
+      description: "Get weekly activity statistics (statuses, logins, registrations)"
+      pagination: none
+
+    get_instance_rules:
+      method: GET
+      path: /api/v1/instance/rules
+      access: read
+      description: "List server rules displayed on the about page"
+      pagination: none
+
+    get_instance_extended_description:
+      method: GET
+      path: /api/v1/instance/extended_description
+      access: read
+      description: "Get the extended description of the instance (admin-defined HTML)"
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # ACCOUNTS
+    # ════════════════════════════════════════════════════════════
+
+    verify_credentials:
+      method: GET
+      path: /api/v1/accounts/verify_credentials
+      access: read
+      description: "Verify the access token and get the authenticated user's account"
+      pagination: none
+
+    update_credentials:
+      method: PATCH
+      path: /api/v1/accounts/update_credentials
+      access: write
+      description: "Update the authenticated user's display name, bio, avatar, header, fields, and privacy settings"
+      params:
+        display_name: { type: string, in: body, description: "Display name" }
+        note: { type: string, in: body, description: "Bio / description (plaintext or HTML)" }
+        locked: { type: boolean, in: body, description: "Require follow approval" }
+        bot: { type: boolean, in: body, description: "Mark account as a bot" }
+        discoverable: { type: boolean, in: body, description: "Appear in profile directory" }
+        indexable: { type: boolean, in: body, description: "Allow indexing by search engines" }
+        source_privacy: { type: string, in: body, description: "Default post visibility: public, unlisted, private" }
+        source_sensitive: { type: boolean, in: body, description: "Mark posts sensitive by default" }
+        source_language: { type: string, in: body, description: "Default post language (ISO 639-1)" }
+      pagination: none
+
+    get_account:
+      method: GET
+      path: /api/v1/accounts/{id}
+      access: read
+      description: "View a profile by account ID"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    lookup_account:
+      method: GET
+      path: /api/v1/accounts/lookup
+      access: read
+      description: "Lookup an account by WebFinger address (user@domain or local username)"
+      params:
+        acct: { type: string, in: query, required: true, description: "WebFinger address e.g. user@mastodon.social or local username" }
+      pagination: none
+
+    get_account_statuses:
+      method: GET
+      path: /api/v1/accounts/{id}/statuses
+      access: read
+      description: "Get statuses posted by the given account"
+      params:
+        id: { type: string, in: path, required: true }
+        max_id: { type: string, in: query, description: "Return results older than this ID" }
+        since_id: { type: string, in: query, description: "Return results newer than this ID" }
+        min_id: { type: string, in: query, description: "Return results immediately newer than this ID" }
+        limit: { type: integer, in: query, default: 20, description: "Max results (max 40)" }
+        only_media: { type: boolean, in: query, description: "Only statuses with media attachments" }
+        exclude_replies: { type: boolean, in: query, description: "Exclude replies" }
+        exclude_reblogs: { type: boolean, in: query, description: "Exclude boosts/reblogs" }
+        pinned: { type: boolean, in: query, description: "Only pinned statuses" }
+        tagged: { type: string, in: query, description: "Filter by hashtag" }
+      response:
+        <<: *status_compact
+
+    get_account_followers:
+      method: GET
+      path: /api/v1/accounts/{id}/followers
+      access: read
+      description: "List accounts that follow the given account"
+      params:
+        id: { type: string, in: path, required: true }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    get_account_following:
+      method: GET
+      path: /api/v1/accounts/{id}/following
+      access: read
+      description: "List accounts that the given account follows"
+      params:
+        id: { type: string, in: path, required: true }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    get_relationships:
+      method: GET
+      path: /api/v1/accounts/relationships
+      access: read
+      description: "Check relationship (following, blocked, muted, etc.) with one or more accounts"
+      params:
+        "id[]": { type: array, in: query, required: true, description: "Array of account IDs to check" }
+        with_suspended: { type: boolean, in: query, description: "Include suspended accounts" }
+      pagination: none
+
+    get_familiar_followers:
+      method: GET
+      path: /api/v1/accounts/familiar_followers
+      access: read
+      description: "Find mutual followers between you and given accounts"
+      params:
+        "id[]": { type: array, in: query, required: true, description: "Array of account IDs" }
+      pagination: none
+
+    search_accounts:
+      method: GET
+      path: /api/v1/accounts/search
+      access: read
+      description: "Search for accounts by username or display name"
+      params:
+        q: { type: string, in: query, required: true, description: "Search query" }
+        limit: { type: integer, in: query, default: 40, description: "Max results (max 80)" }
+        offset: { type: integer, in: query, description: "Skip first n results" }
+        resolve: { type: boolean, in: query, description: "Attempt WebFinger lookup for remote accounts" }
+        following: { type: boolean, in: query, description: "Limit to accounts you follow" }
+      response:
+        <<: *account_compact
+      pagination: none
+
+    follow_account:
+      method: POST
+      path: /api/v1/accounts/{id}/follow
+      access: write
+      description: "Follow an account"
+      params:
+        id: { type: string, in: path, required: true }
+        reblogs: { type: boolean, in: body, description: "Show boosts in home timeline (default true)" }
+        notify: { type: boolean, in: body, description: "Receive notifications when this account posts" }
+        languages: { type: array, in: body, description: "Filter by ISO 639-1 language codes" }
+      pagination: none
+
+    unfollow_account:
+      method: POST
+      path: /api/v1/accounts/{id}/unfollow
+      access: write
+      description: "Unfollow an account"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_follower:
+      method: POST
+      path: /api/v1/accounts/{id}/remove_from_followers
+      access: write
+      description: "Remove an account from your followers"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    block_account:
+      method: POST
+      path: /api/v1/accounts/{id}/block
+      access: write
+      description: "Block an account"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    unblock_account:
+      method: POST
+      path: /api/v1/accounts/{id}/unblock
+      access: write
+      description: "Unblock an account"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    mute_account:
+      method: POST
+      path: /api/v1/accounts/{id}/mute
+      access: write
+      description: "Mute an account (hide from timelines and optionally notifications)"
+      params:
+        id: { type: string, in: path, required: true }
+        notifications: { type: boolean, in: body, description: "Also mute notifications (default true)" }
+        duration: { type: integer, in: body, description: "Duration in seconds (0 = indefinite)" }
+      pagination: none
+
+    unmute_account:
+      method: POST
+      path: /api/v1/accounts/{id}/unmute
+      access: write
+      description: "Unmute an account"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    set_account_note:
+      method: POST
+      path: /api/v1/accounts/{id}/note
+      access: write
+      description: "Set a private note on an account (only visible to you)"
+      params:
+        id: { type: string, in: path, required: true }
+        comment: { type: string, in: body, description: "Note text (empty string to clear)" }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # STATUSES
+    # ════════════════════════════════════════════════════════════
+
+    create_status:
+      method: POST
+      path: /api/v1/statuses
+      access: write
+      description: "Create a new status (post/toot). Requires status text or media_ids."
+      params:
+        status: { type: string, in: body, description: "Text content of the status" }
+        "media_ids[]": { type: array, in: body, description: "Array of media attachment IDs (max 4 images or 1 video)" }
+        in_reply_to_id: { type: string, in: body, description: "ID of the status to reply to" }
+        sensitive: { type: boolean, in: body, description: "Mark as sensitive content" }
+        spoiler_text: { type: string, in: body, description: "Content warning text" }
+        visibility: { type: string, in: body, description: "public, unlisted, private, or direct" }
+        language: { type: string, in: body, description: "ISO 639-1 language code" }
+        scheduled_at: { type: string, in: body, description: "ISO 8601 datetime (must be 5+ min in future)" }
+        "poll[options][]": { type: array, in: body, description: "Poll choices (2-4 options)" }
+        "poll[expires_in]": { type: integer, in: body, description: "Poll duration in seconds" }
+        "poll[multiple]": { type: boolean, in: body, description: "Allow multiple poll choices" }
+        "poll[hide_totals]": { type: boolean, in: body, description: "Hide vote counts until poll ends" }
+      pagination: none
+
+    get_status:
+      method: GET
+      path: /api/v1/statuses/{id}
+      access: read
+      description: "View a single status by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        <<: *single_status_compact
+      pagination: none
+
+    edit_status:
+      method: PUT
+      path: /api/v1/statuses/{id}
+      access: write
+      description: "Edit an existing status"
+      params:
+        id: { type: string, in: path, required: true }
+        status: { type: string, in: body, description: "New text content" }
+        spoiler_text: { type: string, in: body, description: "New content warning" }
+        sensitive: { type: boolean, in: body }
+        language: { type: string, in: body }
+        "media_ids[]": { type: array, in: body, description: "New media attachment IDs" }
+        "poll[options][]": { type: array, in: body }
+        "poll[expires_in]": { type: integer, in: body }
+        "poll[multiple]": { type: boolean, in: body }
+        "poll[hide_totals]": { type: boolean, in: body }
+      pagination: none
+
+    delete_status:
+      method: DELETE
+      path: /api/v1/statuses/{id}
+      access: dangerous
+      description: "Delete a status. Returns the deleted status with a text field for redraft."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_status_context:
+      method: GET
+      path: /api/v1/statuses/{id}/context
+      access: read
+      description: "Get the thread context — ancestors (parents) and descendants (replies) of a status"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        <<: *context_compact
+      pagination: none
+
+    get_status_source:
+      method: GET
+      path: /api/v1/statuses/{id}/source
+      access: read
+      description: "Get the plaintext source of a status for editing"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_status_history:
+      method: GET
+      path: /api/v1/statuses/{id}/history
+      access: read
+      description: "Get the edit history of a status"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    translate_status:
+      method: POST
+      path: /api/v1/statuses/{id}/translate
+      access: read
+      description: "Translate a status into the user's language (if translation is supported by the instance)"
+      params:
+        id: { type: string, in: path, required: true }
+        lang: { type: string, in: body, description: "Target ISO 639 language code (defaults to user's locale)" }
+      pagination: none
+
+    get_reblogged_by:
+      method: GET
+      path: /api/v1/statuses/{id}/reblogged_by
+      access: read
+      description: "List accounts that boosted/reblogged a status"
+      params:
+        id: { type: string, in: path, required: true }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    get_favourited_by:
+      method: GET
+      path: /api/v1/statuses/{id}/favourited_by
+      access: read
+      description: "List accounts that favourited a status"
+      params:
+        id: { type: string, in: path, required: true }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    favourite_status:
+      method: POST
+      path: /api/v1/statuses/{id}/favourite
+      access: write
+      description: "Favourite/like a status"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    unfavourite_status:
+      method: POST
+      path: /api/v1/statuses/{id}/unfavourite
+      access: write
+      description: "Undo favourite on a status"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    reblog_status:
+      method: POST
+      path: /api/v1/statuses/{id}/reblog
+      access: write
+      description: "Boost/reblog a status to your followers"
+      params:
+        id: { type: string, in: path, required: true }
+        visibility: { type: string, in: body, description: "Reblog visibility: public, unlisted, or private" }
+      pagination: none
+
+    unreblog_status:
+      method: POST
+      path: /api/v1/statuses/{id}/unreblog
+      access: write
+      description: "Undo a boost/reblog"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    bookmark_status:
+      method: POST
+      path: /api/v1/statuses/{id}/bookmark
+      access: write
+      description: "Bookmark a status (private, only visible to you)"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    unbookmark_status:
+      method: POST
+      path: /api/v1/statuses/{id}/unbookmark
+      access: write
+      description: "Remove a status from your bookmarks"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    mute_status:
+      method: POST
+      path: /api/v1/statuses/{id}/mute
+      access: write
+      description: "Mute notifications for a status thread"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    unmute_status:
+      method: POST
+      path: /api/v1/statuses/{id}/unmute
+      access: write
+      description: "Unmute notifications for a status thread"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    pin_status:
+      method: POST
+      path: /api/v1/statuses/{id}/pin
+      access: write
+      description: "Pin a status to your profile"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    unpin_status:
+      method: POST
+      path: /api/v1/statuses/{id}/unpin
+      access: write
+      description: "Unpin a status from your profile"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # TIMELINES
+    # ════════════════════════════════════════════════════════════
+
+    timeline_home:
+      method: GET
+      path: /api/v1/timelines/home
+      access: read
+      description: "Get home timeline (statuses from followed accounts and hashtags)"
+      params:
+        max_id: { type: string, in: query, description: "Return results older than this ID" }
+        since_id: { type: string, in: query, description: "Return results newer than this ID" }
+        min_id: { type: string, in: query, description: "Forward pagination cursor" }
+        limit: { type: integer, in: query, default: 20, description: "Max results (max 40)" }
+      response:
+        <<: *status_compact
+
+    timeline_public:
+      method: GET
+      path: /api/v1/timelines/public
+      access: read
+      description: "Get public timeline (federated or local)"
+      params:
+        local: { type: boolean, in: query, description: "Only local statuses" }
+        remote: { type: boolean, in: query, description: "Only remote/federated statuses" }
+        only_media: { type: boolean, in: query, description: "Only statuses with media" }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20 }
+      response:
+        <<: *status_compact
+
+    timeline_hashtag:
+      method: GET
+      path: /api/v1/timelines/tag/{hashtag}
+      access: read
+      description: "Get statuses with the given hashtag"
+      params:
+        hashtag: { type: string, in: path, required: true, description: "Hashtag name (without #)" }
+        local: { type: boolean, in: query, description: "Only local statuses" }
+        remote: { type: boolean, in: query, description: "Only remote statuses" }
+        only_media: { type: boolean, in: query, description: "Only statuses with media" }
+        "any[]": { type: array, in: query, description: "Also include statuses with any of these tags" }
+        "all[]": { type: array, in: query, description: "Must also include all of these tags" }
+        "none[]": { type: array, in: query, description: "Must not include any of these tags" }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20 }
+      response:
+        <<: *status_compact
+
+    timeline_list:
+      method: GET
+      path: /api/v1/timelines/list/{list_id}
+      access: read
+      description: "Get timeline for a specific list"
+      params:
+        list_id: { type: string, in: path, required: true }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20 }
+      response:
+        <<: *status_compact
+
+    # ════════════════════════════════════════════════════════════
+    # NOTIFICATIONS
+    # ════════════════════════════════════════════════════════════
+
+    list_notifications:
+      method: GET
+      path: /api/v1/notifications
+      access: read
+      description: "List notifications (mentions, favourites, boosts, follows, polls, etc.)"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40, description: "Max results (max 80)" }
+        "types[]": { type: array, in: query, description: "Include only these types: mention, status, reblog, follow, follow_request, favourite, poll, update" }
+        "exclude_types[]": { type: array, in: query, description: "Exclude these notification types" }
+        account_id: { type: string, in: query, description: "Only notifications from this account" }
+      response:
+        <<: *notification_compact
+
+    get_notification:
+      method: GET
+      path: /api/v1/notifications/{id}
+      access: read
+      description: "Get a single notification by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    dismiss_notification:
+      method: POST
+      path: /api/v1/notifications/{id}/dismiss
+      access: write
+      description: "Dismiss a single notification"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    clear_notifications:
+      method: POST
+      path: /api/v1/notifications/clear
+      access: dangerous
+      description: "Dismiss all notifications (irreversible)"
+      pagination: none
+
+    get_unread_notification_count:
+      method: GET
+      path: /api/v1/notifications/unread_count
+      access: read
+      description: "Get count of unread notifications"
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # SEARCH
+    # ════════════════════════════════════════════════════════════
+
+    search_v2:
+      method: GET
+      path: /api/v2/search
+      access: read
+      description: "Full-text search across accounts, statuses, and hashtags. Returns { accounts, statuses, hashtags } arrays."
+      params:
+        q: { type: string, in: query, required: true, description: "Search query" }
+        type: { type: string, in: query, description: "Limit to: accounts, hashtags, or statuses" }
+        resolve: { type: boolean, in: query, description: "WebFinger lookup for remote accounts/URLs" }
+        following: { type: boolean, in: query, description: "Only accounts you follow" }
+        account_id: { type: string, in: query, description: "Only statuses by this author" }
+        exclude_unreviewed: { type: boolean, in: query, description: "Filter unreviewed hashtags" }
+        max_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20, description: "Max results per type (max 40)" }
+        offset: { type: integer, in: query, description: "Skip first n results (only when type is set)" }
+      response:
+        <<: *search_compact
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # MEDIA
+    # ════════════════════════════════════════════════════════════
+
+    upload_media:
+      method: POST
+      path: /api/v2/media
+      access: write
+      description: "Upload a media attachment (image, video, audio). Returns 200 or 202 (processing). Attach to a status via media_ids."
+      content_type: multipart/form-data
+      max_body_size: 99MB
+      params:
+        file: { type: file_url, in: body, required: true, description: "Media file to upload" }
+        thumbnail: { type: file_url, in: body, description: "Custom thumbnail image" }
+        description: { type: string, in: body, description: "Alt text for accessibility" }
+        focus: { type: string, in: body, description: "Focal point as 'x,y' (-1.0 to 1.0 each)" }
+      pagination: none
+
+    get_media:
+      method: GET
+      path: /api/v1/media/{id}
+      access: read
+      description: "Check media attachment processing status. Returns 200 when ready, 206 when still processing."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_media:
+      method: PUT
+      path: /api/v1/media/{id}
+      access: write
+      description: "Update media description or focal point (before attaching to a status)"
+      params:
+        id: { type: string, in: path, required: true }
+        description: { type: string, in: body, description: "Alt text" }
+        focus: { type: string, in: body, description: "Focal point as 'x,y'" }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # POLLS
+    # ════════════════════════════════════════════════════════════
+
+    get_poll:
+      method: GET
+      path: /api/v1/polls/{id}
+      access: read
+      description: "View a poll and its current results"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    vote_poll:
+      method: POST
+      path: /api/v1/polls/{id}/votes
+      access: write
+      description: "Vote on a poll"
+      params:
+        id: { type: string, in: path, required: true }
+        "choices[]": { type: array, in: body, required: true, description: "Array of 0-based option indices to vote for" }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # LISTS
+    # ════════════════════════════════════════════════════════════
+
+    list_lists:
+      method: GET
+      path: /api/v1/lists
+      access: read
+      description: "Get all lists created by the authenticated user"
+      pagination: none
+
+    get_list:
+      method: GET
+      path: /api/v1/lists/{id}
+      access: read
+      description: "Get a single list by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_list:
+      method: POST
+      path: /api/v1/lists
+      access: write
+      description: "Create a new list"
+      params:
+        title: { type: string, in: body, required: true, description: "List name" }
+        replies_policy: { type: string, in: body, description: "Show replies: followed, list, or none" }
+        exclusive: { type: boolean, in: body, description: "Remove list members from home feed" }
+      pagination: none
+
+    update_list:
+      method: PUT
+      path: /api/v1/lists/{id}
+      access: write
+      description: "Update a list's title or settings"
+      params:
+        id: { type: string, in: path, required: true }
+        title: { type: string, in: body, description: "New list name" }
+        replies_policy: { type: string, in: body }
+        exclusive: { type: boolean, in: body }
+      pagination: none
+
+    delete_list:
+      method: DELETE
+      path: /api/v1/lists/{id}
+      access: dangerous
+      description: "Delete a list"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_list_accounts:
+      method: GET
+      path: /api/v1/lists/{id}/accounts
+      access: read
+      description: "List accounts that are members of a list"
+      params:
+        id: { type: string, in: path, required: true }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    add_list_accounts:
+      method: POST
+      path: /api/v1/lists/{id}/accounts
+      access: write
+      description: "Add accounts to a list (must be accounts you already follow)"
+      params:
+        id: { type: string, in: path, required: true }
+        "account_ids[]": { type: array, in: body, required: true, description: "Array of account IDs to add" }
+      pagination: none
+
+    remove_list_accounts:
+      method: DELETE
+      path: /api/v1/lists/{id}/accounts
+      access: write
+      description: "Remove accounts from a list"
+      params:
+        id: { type: string, in: path, required: true }
+        "account_ids[]": { type: array, in: body, required: true, description: "Array of account IDs to remove" }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # CONVERSATIONS
+    # ════════════════════════════════════════════════════════════
+
+    list_conversations:
+      method: GET
+      path: /api/v1/conversations
+      access: read
+      description: "List direct message conversations"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20 }
+      response:
+        <<: *conversation_compact
+
+    delete_conversation:
+      method: DELETE
+      path: /api/v1/conversations/{id}
+      access: write
+      description: "Remove a conversation from your list (does not delete messages)"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    mark_conversation_read:
+      method: POST
+      path: /api/v1/conversations/{id}/read
+      access: write
+      description: "Mark a conversation as read"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # TRENDS
+    # ════════════════════════════════════════════════════════════
+
+    trending_tags:
+      method: GET
+      path: /api/v1/trends/tags
+      access: read
+      description: "Get trending hashtags over the past week"
+      params:
+        limit: { type: integer, in: query, default: 10 }
+        offset: { type: integer, in: query }
+      pagination: none
+
+    trending_statuses:
+      method: GET
+      path: /api/v1/trends/statuses
+      access: read
+      description: "Get trending statuses"
+      params:
+        limit: { type: integer, in: query, default: 20 }
+        offset: { type: integer, in: query }
+      response:
+        <<: *status_compact
+      pagination: none
+
+    trending_links:
+      method: GET
+      path: /api/v1/trends/links
+      access: read
+      description: "Get trending links (news articles shared frequently)"
+      params:
+        limit: { type: integer, in: query, default: 10 }
+        offset: { type: integer, in: query }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # BOOKMARKS / FAVOURITES
+    # ════════════════════════════════════════════════════════════
+
+    list_bookmarks:
+      method: GET
+      path: /api/v1/bookmarks
+      access: read
+      description: "List bookmarked statuses"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20 }
+      response:
+        <<: *status_compact
+
+    list_favourites:
+      method: GET
+      path: /api/v1/favourites
+      access: read
+      description: "List favourited statuses"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20 }
+      response:
+        <<: *status_compact
+
+    # ════════════════════════════════════════════════════════════
+    # MUTES / BLOCKS
+    # ════════════════════════════════════════════════════════════
+
+    list_muted_accounts:
+      method: GET
+      path: /api/v1/mutes
+      access: read
+      description: "List muted accounts"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    list_blocked_accounts:
+      method: GET
+      path: /api/v1/blocks
+      access: read
+      description: "List blocked accounts"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    # ════════════════════════════════════════════════════════════
+    # FOLLOW REQUESTS
+    # ════════════════════════════════════════════════════════════
+
+    list_follow_requests:
+      method: GET
+      path: /api/v1/follow_requests
+      access: read
+      description: "List pending follow requests"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    authorize_follow_request:
+      method: POST
+      path: /api/v1/follow_requests/{account_id}/authorize
+      access: write
+      description: "Accept a pending follow request"
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    reject_follow_request:
+      method: POST
+      path: /api/v1/follow_requests/{account_id}/reject
+      access: write
+      description: "Reject a pending follow request"
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # SUGGESTIONS
+    # ════════════════════════════════════════════════════════════
+
+    get_suggestions:
+      method: GET
+      path: /api/v2/suggestions
+      access: read
+      description: "Get follow suggestions (staff picks and accounts based on past interactions)"
+      params:
+        limit: { type: integer, in: query, default: 40 }
+      pagination: none
+
+    remove_suggestion:
+      method: DELETE
+      path: /api/v1/suggestions/{account_id}
+      access: write
+      description: "Remove an account from follow suggestions"
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # FILTERS (v2)
+    # ════════════════════════════════════════════════════════════
+
+    list_filters:
+      method: GET
+      path: /api/v2/filters
+      access: read
+      description: "List all content filters"
+      pagination: none
+
+    get_filter:
+      method: GET
+      path: /api/v2/filters/{id}
+      access: read
+      description: "Get a single filter by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_filter:
+      method: POST
+      path: /api/v2/filters
+      access: write
+      description: "Create a content filter with keywords"
+      params:
+        title: { type: string, in: body, required: true, description: "Filter name" }
+        "context[]": { type: array, in: body, required: true, description: "Where to apply: home, notifications, public, thread, account" }
+        filter_action: { type: string, in: body, description: "Action: warn, hide, or blur" }
+        expires_in: { type: integer, in: body, description: "Seconds until expiration (omit for permanent)" }
+        "keywords_attributes[][keyword]": { type: string, in: body, description: "Keyword text to filter" }
+        "keywords_attributes[][whole_word]": { type: boolean, in: body, description: "Match whole word only" }
+      pagination: none
+
+    update_filter:
+      method: PUT
+      path: /api/v2/filters/{id}
+      access: write
+      description: "Update a content filter"
+      params:
+        id: { type: string, in: path, required: true }
+        title: { type: string, in: body }
+        "context[]": { type: array, in: body }
+        filter_action: { type: string, in: body }
+        expires_in: { type: integer, in: body }
+        "keywords_attributes[][keyword]": { type: string, in: body }
+        "keywords_attributes[][whole_word]": { type: boolean, in: body }
+      pagination: none
+
+    delete_filter:
+      method: DELETE
+      path: /api/v2/filters/{id}
+      access: dangerous
+      description: "Delete a content filter"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # APPS / OAUTH
+    # ════════════════════════════════════════════════════════════
+
+    create_app:
+      method: POST
+      path: /api/v1/apps
+      access: write
+      description: "Register a new OAuth application. Returns client_id and client_secret."
+      params:
+        client_name: { type: string, in: body, required: true, description: "Application name" }
+        redirect_uris: { type: string, in: body, required: true, description: "Callback URI(s). Use 'urn:ietf:wg:oauth:2.0:oob' for CLI/desktop apps." }
+        scopes: { type: string, in: body, description: "Space-separated list of scopes (default: read)" }
+        website: { type: string, in: body, description: "Application website URL" }
+      pagination: none
+
+    verify_app_credentials:
+      method: GET
+      path: /api/v1/apps/verify_credentials
+      access: read
+      description: "Verify that the app token is valid and get application info"
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # SCHEDULED STATUSES
+    # ════════════════════════════════════════════════════════════
+
+    list_scheduled_statuses:
+      method: GET
+      path: /api/v1/scheduled_statuses
+      access: read
+      description: "List scheduled statuses (posts queued for future publication via scheduled_at)"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 20 }
+
+    get_scheduled_status:
+      method: GET
+      path: /api/v1/scheduled_statuses/{id}
+      access: read
+      description: "Get a single scheduled status by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_scheduled_status:
+      method: PUT
+      path: /api/v1/scheduled_statuses/{id}
+      access: write
+      description: "Update the scheduled publication time of a status"
+      params:
+        id: { type: string, in: path, required: true }
+        scheduled_at: { type: string, in: body, description: "New ISO 8601 datetime (must be 5+ min in future)" }
+      pagination: none
+
+    delete_scheduled_status:
+      method: DELETE
+      path: /api/v1/scheduled_statuses/{id}
+      access: write
+      description: "Cancel and delete a scheduled status"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # MARKERS
+    # ════════════════════════════════════════════════════════════
+
+    get_markers:
+      method: GET
+      path: /api/v1/markers
+      access: read
+      description: "Get saved reading positions for home timeline and/or notifications"
+      params:
+        "timeline[]": { type: array, in: query, required: true, description: "Array of: home, notifications" }
+      pagination: none
+
+    save_markers:
+      method: POST
+      path: /api/v1/markers
+      access: write
+      description: "Save reading positions for home timeline and/or notifications"
+      params:
+        "home[last_read_id]": { type: string, in: body, description: "ID of last read status in home timeline" }
+        "notifications[last_read_id]": { type: string, in: body, description: "ID of last read notification" }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # REPORTS
+    # ════════════════════════════════════════════════════════════
+
+    create_report:
+      method: POST
+      path: /api/v1/reports
+      access: write
+      description: "Report an account to instance moderators"
+      params:
+        account_id: { type: string, in: body, required: true, description: "ID of the account to report" }
+        "status_ids[]": { type: array, in: body, description: "Array of status IDs to attach as evidence" }
+        comment: { type: string, in: body, description: "Reason for the report (max 1000 chars)" }
+        forward: { type: boolean, in: body, description: "Forward report to the remote instance if account is remote" }
+        category: { type: string, in: body, description: "Category: spam, legal, violation, other" }
+        "rule_ids[]": { type: array, in: body, description: "Array of rule IDs that were violated" }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # FEATURED TAGS
+    # ════════════════════════════════════════════════════════════
+
+    list_featured_tags:
+      method: GET
+      path: /api/v1/featured_tags
+      access: read
+      description: "List hashtags featured on your profile"
+      pagination: none
+
+    create_featured_tag:
+      method: POST
+      path: /api/v1/featured_tags
+      access: write
+      description: "Feature a hashtag on your profile"
+      params:
+        name: { type: string, in: body, required: true, description: "Hashtag name (without #)" }
+      pagination: none
+
+    delete_featured_tag:
+      method: DELETE
+      path: /api/v1/featured_tags/{id}
+      access: write
+      description: "Remove a featured hashtag from your profile"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_featured_tag_suggestions:
+      method: GET
+      path: /api/v1/featured_tags/suggestions
+      access: read
+      description: "Get suggested hashtags to feature (based on your most used tags)"
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # ANNOUNCEMENTS
+    # ════════════════════════════════════════════════════════════
+
+    list_announcements:
+      method: GET
+      path: /api/v1/announcements
+      access: read
+      description: "List server announcements (active and recent)"
+      params:
+        with_dismissed: { type: boolean, in: query, description: "Include dismissed announcements" }
+      pagination: none
+
+    dismiss_announcement:
+      method: POST
+      path: /api/v1/announcements/{id}/dismiss
+      access: write
+      description: "Mark an announcement as read/dismissed"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # ENDORSEMENTS / PREFERENCES
+    # ════════════════════════════════════════════════════════════
+
+    list_endorsements:
+      method: GET
+      path: /api/v1/endorsements
+      access: read
+      description: "List accounts endorsed (featured) on your profile"
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+      response:
+        <<: *account_compact
+
+    get_preferences:
+      method: GET
+      path: /api/v1/preferences
+      access: read
+      description: "Get user preferences (default visibility, language, sensitive flag, expand media, expand spoilers)"
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # ADMIN — ACCOUNTS
+    # ════════════════════════════════════════════════════════════
+
+    admin_list_accounts:
+      method: GET
+      path: /api/v1/admin/accounts
+      access: admin
+      description: "List accounts with admin-level detail (email, IP, status). Requires admin:read:accounts scope."
+      params:
+        local: { type: boolean, in: query, description: "Only local accounts" }
+        remote: { type: boolean, in: query, description: "Only remote accounts" }
+        active: { type: boolean, in: query, description: "Only active accounts" }
+        pending: { type: boolean, in: query, description: "Only pending accounts" }
+        disabled: { type: boolean, in: query, description: "Only disabled accounts" }
+        silenced: { type: boolean, in: query, description: "Only silenced accounts" }
+        suspended: { type: boolean, in: query, description: "Only suspended accounts" }
+        sensitized: { type: boolean, in: query, description: "Only sensitized accounts" }
+        username: { type: string, in: query, description: "Filter by username" }
+        display_name: { type: string, in: query, description: "Filter by display name" }
+        by_domain: { type: string, in: query, description: "Filter by domain" }
+        email: { type: string, in: query, description: "Filter by email (local only)" }
+        ip: { type: string, in: query, description: "Filter by IP address (local only)" }
+        staff: { type: boolean, in: query, description: "Only staff accounts" }
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+
+    admin_get_account:
+      method: GET
+      path: /api/v1/admin/accounts/{id}
+      access: admin
+      description: "Get admin-level detail for a single account"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    admin_approve_account:
+      method: POST
+      path: /api/v1/admin/accounts/{id}/approve
+      access: admin
+      description: "Approve a pending account registration"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    admin_reject_account:
+      method: POST
+      path: /api/v1/admin/accounts/{id}/reject
+      access: admin
+      description: "Reject a pending account registration"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    admin_disable_account:
+      method: POST
+      path: /api/v1/admin/accounts/{id}/action
+      access: admin
+      description: "Perform a moderation action on an account (disable, silence, suspend, none)"
+      params:
+        id: { type: string, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "Action: none, disable, silence, suspend" }
+        report_id: { type: string, in: body, description: "Associated report ID" }
+        warning_preset_id: { type: string, in: body, description: "Preset warning message ID" }
+        text: { type: string, in: body, description: "Custom warning text" }
+        send_email_notification: { type: boolean, in: body, description: "Notify user via email" }
+      pagination: none
+
+    admin_unsuspend_account:
+      method: POST
+      path: /api/v1/admin/accounts/{id}/unsuspend
+      access: admin
+      description: "Unsuspend a suspended account"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    admin_unsilence_account:
+      method: POST
+      path: /api/v1/admin/accounts/{id}/unsilence
+      access: admin
+      description: "Unsilence a silenced account"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ════════════════════════════════════════════════════════════
+    # ADMIN — DOMAIN BLOCKS
+    # ════════════════════════════════════════════════════════════
+
+    admin_list_domain_blocks:
+      method: GET
+      path: /api/v1/admin/domain_blocks
+      access: admin
+      description: "List blocked domains. Requires admin:read:domain_blocks scope."
+      params:
+        max_id: { type: string, in: query }
+        since_id: { type: string, in: query }
+        min_id: { type: string, in: query }
+        limit: { type: integer, in: query, default: 40 }
+
+    admin_get_domain_block:
+      method: GET
+      path: /api/v1/admin/domain_blocks/{id}
+      access: admin
+      description: "Get a single domain block by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    admin_create_domain_block:
+      method: POST
+      path: /api/v1/admin/domain_blocks
+      access: admin
+      description: "Block a domain from federating. Requires admin:write:domain_blocks scope."
+      params:
+        domain: { type: string, in: body, required: true, description: "Domain to block" }
+        severity: { type: string, in: body, description: "Action: silence, suspend, noop" }
+        reject_media: { type: boolean, in: body, description: "Reject media from this domain" }
+        reject_reports: { type: boolean, in: body, description: "Reject reports from this domain" }
+        private_comment: { type: string, in: body, description: "Internal note (staff only)" }
+        public_comment: { type: string, in: body, description: "Public reason shown on about page" }
+        obfuscate: { type: boolean, in: body, description: "Partially obfuscate domain name in public list" }
+      pagination: none
+
+    admin_update_domain_block:
+      method: PUT
+      path: /api/v1/admin/domain_blocks/{id}
+      access: admin
+      description: "Update a domain block"
+      params:
+        id: { type: string, in: path, required: true }
+        severity: { type: string, in: body }
+        reject_media: { type: boolean, in: body }
+        reject_reports: { type: boolean, in: body }
+        private_comment: { type: string, in: body }
+        public_comment: { type: string, in: body }
+        obfuscate: { type: boolean, in: body }
+      pagination: none
+
+    admin_delete_domain_block:
+      method: DELETE
+      path: /api/v1/admin/domain_blocks/{id}
+      access: admin
+      description: "Remove a domain block (re-enable federation)"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+  examples:
+    - name: "Post a status"
+      description: "Create a new public post with a content warning"
+      code: |
+        const status = await api.create_status({
+          status: "Hello Fediverse! 🐘",
+          visibility: "public",
+          spoiler_text: "Greeting"
+        });
+        return status;
+
+    - name: "Search and follow"
+      description: "Search for an account by username and follow them"
+      code: |
+        const results = await api.search_v2({ q: "user@mastodon.social", type: "accounts", resolve: true });
+        if (results.accounts.length > 0) {
+          const account = results.accounts[0];
+          await api.follow_account({ id: account.id, notify: true });
+          return { followed: account.acct };
+        }
+        return { error: "Account not found" };
+
+    - name: "Read home timeline"
+      description: "Get the latest 10 posts from the home timeline"
+      code: |
+        const statuses = await api.timeline_home({ limit: 10 });
+        return statuses.map(s => ({
+          id: s.id,
+          author: s.account.acct,
+          content: s.content,
+          created_at: s.created_at,
+          favourites: s.favourites_count,
+          reblogs: s.reblogs_count
+        }));
+
+    - name: "Thread context"
+      description: "Get a status and its full thread (ancestors + descendants)"
+      code: |
+        const status = await api.get_status({ id: "123456789" });
+        const context = await api.get_status_context({ id: status.id });
+        return {
+          ancestors: context.ancestors.length,
+          status: { author: status.account.acct, content: status.content },
+          replies: context.descendants.length
+        };
