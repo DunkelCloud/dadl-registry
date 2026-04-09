@@ -317,8 +317,7 @@ backend:
         exclude_reblogs: { type: boolean, in: query, description: "Exclude boosts/reblogs" }
         pinned: { type: boolean, in: query, description: "Only pinned statuses" }
         tagged: { type: string, in: query, description: "Filter by hashtag" }
-      response:
-        <<: *status_compact
+      response: *status_compact
 
     get_account_followers:
       method: GET
@@ -331,8 +330,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     get_account_following:
       method: GET
@@ -345,8 +343,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     get_relationships:
       method: GET
@@ -378,8 +375,7 @@ backend:
         offset: { type: integer, in: query, description: "Skip first n results" }
         resolve: { type: boolean, in: query, description: "Attempt WebFinger lookup for remote accounts" }
         following: { type: boolean, in: query, description: "Limit to accounts you follow" }
-      response:
-        <<: *account_compact
+      response: *account_compact
       pagination: none
 
     follow_account:
@@ -491,8 +487,7 @@ backend:
       description: "View a single status by ID"
       params:
         id: { type: string, in: path, required: true }
-      response:
-        <<: *single_status_compact
+      response: *single_status_compact
       pagination: none
 
     edit_status:
@@ -529,8 +524,7 @@ backend:
       description: "Get the thread context — ancestors (parents) and descendants (replies) of a status"
       params:
         id: { type: string, in: path, required: true }
-      response:
-        <<: *context_compact
+      response: *context_compact
       pagination: none
 
     get_status_source:
@@ -571,8 +565,7 @@ backend:
         max_id: { type: string, in: query }
         since_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     get_favourited_by:
       method: GET
@@ -584,8 +577,7 @@ backend:
         max_id: { type: string, in: query }
         since_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     favourite_status:
       method: POST
@@ -692,8 +684,7 @@ backend:
         since_id: { type: string, in: query, description: "Return results newer than this ID" }
         min_id: { type: string, in: query, description: "Forward pagination cursor" }
         limit: { type: integer, in: query, default: 20, description: "Max results (max 40)" }
-      response:
-        <<: *status_compact
+      response: *status_compact
 
     timeline_public:
       method: GET
@@ -708,8 +699,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 20 }
-      response:
-        <<: *status_compact
+      response: *status_compact
 
     timeline_hashtag:
       method: GET
@@ -728,8 +718,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 20 }
-      response:
-        <<: *status_compact
+      response: *status_compact
 
     timeline_list:
       method: GET
@@ -742,8 +731,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 20 }
-      response:
-        <<: *status_compact
+      response: *status_compact
 
     # ════════════════════════════════════════════════════════════
     # NOTIFICATIONS
@@ -762,8 +750,7 @@ backend:
         "types[]": { type: array, in: query, description: "Include only these types: mention, status, reblog, follow, follow_request, favourite, poll, update" }
         "exclude_types[]": { type: array, in: query, description: "Exclude these notification types" }
         account_id: { type: string, in: query, description: "Only notifications from this account" }
-      response:
-        <<: *notification_compact
+      response: *notification_compact
 
     get_notification:
       method: GET
@@ -817,8 +804,7 @@ backend:
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 20, description: "Max results per type (max 40)" }
         offset: { type: integer, in: query, description: "Skip first n results (only when type is set)" }
-      response:
-        <<: *search_compact
+      response: *search_compact
       pagination: none
 
     # ════════════════════════════════════════════════════════════
@@ -945,8 +931,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     add_list_accounts:
       method: POST
@@ -982,8 +967,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 20 }
-      response:
-        <<: *conversation_compact
+      response: *conversation_compact
 
     delete_conversation:
       method: DELETE
@@ -1025,8 +1009,7 @@ backend:
       params:
         limit: { type: integer, in: query, default: 20 }
         offset: { type: integer, in: query }
-      response:
-        <<: *status_compact
+      response: *status_compact
       pagination: none
 
     trending_links:
@@ -1053,8 +1036,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 20 }
-      response:
-        <<: *status_compact
+      response: *status_compact
 
     list_favourites:
       method: GET
@@ -1066,8 +1048,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 20 }
-      response:
-        <<: *status_compact
+      response: *status_compact
 
     # ════════════════════════════════════════════════════════════
     # MUTES / BLOCKS
@@ -1083,8 +1064,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     list_blocked_accounts:
       method: GET
@@ -1096,8 +1076,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     # ════════════════════════════════════════════════════════════
     # FOLLOW REQUESTS
@@ -1113,8 +1092,7 @@ backend:
         since_id: { type: string, in: query }
         min_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     authorize_follow_request:
       method: POST
@@ -1392,8 +1370,7 @@ backend:
         max_id: { type: string, in: query }
         since_id: { type: string, in: query }
         limit: { type: integer, in: query, default: 40 }
-      response:
-        <<: *account_compact
+      response: *account_compact
 
     get_preferences:
       method: GET
