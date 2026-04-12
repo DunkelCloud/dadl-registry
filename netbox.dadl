@@ -1,0 +1,2846 @@
+# netbox.dadl -- NetBox REST API (v4.x)
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - NetBox is an open-source DCIM (Data Center Infrastructure Management) and IPAM
+#   (IP Address Management) tool. It models the physical and logical network.
+# - Objects are identified by numeric IDs (not UUIDs). Use ?brief=true for compact responses.
+# - All list endpoints support filtering: ?name=foo, ?site=site-slug, ?status=active,
+#   ?tag=mytag, ?q=search-term. Negation: ?status__n=decommissioned.
+# - Ordering: ?ordering=name (asc), ?ordering=-created (desc).
+# - Field selection: ?fields=id,name,status or ?omit=config_context (v4.5.2+).
+# - Related objects are set by ID (e.g. "site": 5) or nested unique set
+#   (e.g. "site": {"name": "DC1"}).
+# - "Slug" fields are URL-safe identifiers (lowercase, hyphens). Most models have name + slug.
+# - Bulk operations: POST/PATCH/DELETE accept arrays. All-or-none — one error aborts all.
+# - Tags are many-to-many: pass as array of {name, slug, color} or {id} objects.
+# - Custom fields: stored under "custom_fields" dict on each object.
+# - Status values vary per model: "active", "planned", "staged", "decommissioning", etc.
+# - A "prefix" in IPAM is a CIDR block (e.g. 10.0.0.0/24). A "VRF" is a routing domain.
+# - A "VLAN" has a numeric vid (1-4094) and belongs to a VLAN group and optional site.
+# - Devices have components: interfaces, console-ports, power-ports, etc.
+# - Virtual machines live in clusters and have interfaces and virtual-disks.
+# - The API root at /api/ lists all available app endpoints.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "NetBox REST API"
+source_url: "https://netboxlabs.com/docs/netbox/integrations/rest-api/"
+date: "2026-04-12"
+
+backend:
+  name: netbox
+  type: rest
+  version: "1.0"
+  # base_url is intentionally omitted -- must be provided via backends.yaml url field,
+  # because each deployment has its own NetBox instance address.
+  description: "NetBox DCIM/IPAM API -- sites, racks, devices, interfaces, cables, IP addresses, prefixes, VLANs, VRFs, virtual machines, clusters, circuits, tenants, contacts, and network documentation"
+
+  auth:
+    type: bearer
+    credential: netbox_token
+    # NetBox v2 tokens: "Authorization: Bearer nbt_xxx"
+    # NetBox v1 tokens: "Authorization: Token xxx" (legacy)
+
+  defaults:
+    headers:
+      Content-Type: application/json
+      Accept: application/json
+    pagination:
+      strategy: offset
+      request:
+        cursor_param: offset
+        limit_param: limit
+        limit_default: 50
+      response:
+        next_cursor: "$.next"
+        has_more: "$.next != null"
+      behavior: expose
+      max_pages: 20
+    errors:
+      format: json
+      message_path: "$.detail"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      terminal: [400, 401, 403, 404]
+      rate_limit:
+        header: X-RateLimit-Remaining
+        retry_after_header: X-RateLimit-Reset
+    response:
+      result_path: "$.results"
+      max_items: 500
+
+  coverage:
+    endpoints: 233
+    total_endpoints: 250
+    percentage: 93
+    focus: "DCIM (sites, locations, racks, devices, interfaces, cables, manufacturers, device-types, device-roles, platforms, power), IPAM (prefixes, ip-addresses, vlans, vlan-groups, vrfs, aggregates, rirs, asns, roles, services, ip-ranges), Virtualization (clusters, cluster-types, cluster-groups, virtual-machines, vm-interfaces, virtual-disks), Tenancy (tenants, tenant-groups, contacts, contact-roles), Circuits (providers, circuits, circuit-types, circuit-terminations), Wireless (wireless-lans, wireless-links), VPN (tunnels, l2vpns), Extras (tags, custom-fields, custom-field-choice-sets, journal-entries, config-contexts)"
+    missing: "device component templates, module types/bays, inventory items, power panels/feeds, rack reservations, virtual-chassis, front/rear-ports, console-server-ports, power-outlets, FHRP groups, VLAN translations, IKE/IPSec policies, event rules, webhooks, scripts, export templates, users/groups/permissions, bookmarks, notifications"
+    last_reviewed: "2026-04-12"
+
+  setup:
+    credential_steps:
+      - "Log in to your NetBox instance as an admin user"
+      - "Navigate to your user profile (top-right) -> API Tokens"
+      - "Click 'Add a token' and configure permissions"
+      - "For full access: leave 'Write enabled' checked, no IP restrictions"
+      - "Copy the generated token -- it is shown only once (v2 tokens)"
+      - "v2 tokens start with 'nbt_' -- enter only the token value, ToolMesh adds the auth header automatically"
+    env_var: CREDENTIAL_NETBOX_TOKEN
+    backends_yaml: |
+      - name: netbox
+        transport: rest
+        dadl: netbox.dadl
+        url: "https://netbox.example.com/api"
+    required_scopes:
+      - "Read/Write token for full functionality"
+    optional_scopes:
+      - "Read-only token for safe exploration"
+    docs_url: "https://netboxlabs.com/docs/netbox/integrations/rest-api/"
+    notes: "The url in backends.yaml must include /api (e.g. https://netbox.example.com/api). Enter only the raw token value (e.g. nbt_xxx) -- ToolMesh handles the Authorization header. Swagger docs at /api/schema/swagger-ui/."
+
+  hints:
+    list_devices:
+      filtering: "Filter by site, rack, role, manufacturer, model, status, tag, etc. E.g. ?site=dc1&status=active&role=server"
+      brief: "Use ?brief=true for compact results with just id, url, display, name"
+    list_ip_addresses:
+      filtering: "Filter by address, vrf, interface, device, vm, status, role, tenant"
+      parent_lookup: "?parent=10.0.0.0/16 returns all IPs within that prefix"
+    list_prefixes:
+      filtering: "?within=10.0.0.0/8 returns all sub-prefixes. ?contains=10.0.1.50 finds the prefix."
+      available: "GET /api/ipam/prefixes/{id}/available-ips/ shows free IPs"
+    list_interfaces:
+      filtering: "?device=hostname or ?device_id=123. ?type=1000base-t for specific types."
+    list_vlans:
+      filtering: "?vid=100, ?group=my-group, ?site=dc1"
+    create_device:
+      required: "name, role (id or nested), device_type (id or nested), site (id or nested)"
+      note: "After creating a device, interfaces are auto-created from the device type template"
+    create_virtual_machine:
+      required: "name, cluster (id or nested)"
+    create_ip_address:
+      required: "address (CIDR notation, e.g. '10.0.0.1/24')"
+      assign: "Set assigned_object_type='dcim.interface' and assigned_object_id=<id> to bind to an interface"
+    create_service:
+      netbox_4x: "NetBox 4.x replaced device/virtual_machine with GenericForeignKey: use parent_object_type ('dcim.device' or 'virtualization.virtualmachine') + parent_object_id"
+      custom_fields: "Pass custom_fields as key-value object, e.g. {prom_http_url: 'http://...:9090/metrics'}"
+    create_custom_field_choice_set:
+      extra_choices: "Array of [value, label] pairs, e.g. [['tcp','TCP'],['udp','UDP']]"
+
+  tools:
+
+    # =========================================================================
+    # DCIM -- Sites & Locations
+    # =========================================================================
+
+    list_sites:
+      method: GET
+      path: /dcim/sites/
+      access: read
+      description: "List all sites (data centers, offices, PoPs)"
+      params:
+        name: { type: string, in: query }
+        slug: { type: string, in: query }
+        status: { type: string, in: query, description: "planned, staging, active, decommissioning, retired" }
+        region: { type: string, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query, description: "Full-text search" }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+        ordering: { type: string, in: query }
+
+    get_site:
+      method: GET
+      path: /dcim/sites/{id}/
+      access: read
+      description: "Get a specific site"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_site:
+      method: POST
+      path: /dcim/sites/
+      access: write
+      description: "Create a new site"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        status: { type: string, in: body, description: "planned, staging, active, decommissioning, retired" }
+        region: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        facility: { type: string, in: body }
+        description: { type: string, in: body }
+        physical_address: { type: string, in: body }
+        shipping_address: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    update_site:
+      method: PATCH
+      path: /dcim/sites/{id}/
+      access: write
+      description: "Update a site"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        status: { type: string, in: body }
+        region: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        facility: { type: string, in: body }
+        physical_address: { type: string, in: body }
+        shipping_address: { type: string, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    delete_site:
+      method: DELETE
+      path: /dcim/sites/{id}/
+      access: dangerous
+      description: "Delete a site"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_regions:
+      method: GET
+      path: /dcim/regions/
+      access: read
+      description: "List all regions (geographic grouping of sites)"
+      params:
+        name: { type: string, in: query }
+        slug: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_region:
+      method: POST
+      path: /dcim/regions/
+      access: write
+      description: "Create a region"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        parent: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_region:
+      method: GET
+      path: /dcim/regions/{id}/
+      access: read
+      description: "Get a specific region"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_region:
+      method: PATCH
+      path: /dcim/regions/{id}/
+      access: write
+      description: "Update a region"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_region:
+      method: DELETE
+      path: /dcim/regions/{id}/
+      access: dangerous
+      description: "Delete a region"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_locations:
+      method: GET
+      path: /dcim/locations/
+      access: read
+      description: "List locations within sites (rooms, floors, cages)"
+      params:
+        site: { type: string, in: query }
+        site_id: { type: integer, in: query }
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_location:
+      method: POST
+      path: /dcim/locations/
+      access: write
+      description: "Create a location within a site"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        site: { type: integer, in: body, required: true }
+        parent: { type: integer, in: body }
+        status: { type: string, in: body, description: "planned, staging, active, decommissioning, retired" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_location:
+      method: GET
+      path: /dcim/locations/{id}/
+      access: read
+      description: "Get a specific location"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_location:
+      method: PATCH
+      path: /dcim/locations/{id}/
+      access: write
+      description: "Update a location"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        site: { type: integer, in: body }
+        parent: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        facility: { type: string, in: body }
+        status: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_location:
+      method: DELETE
+      path: /dcim/locations/{id}/
+      access: dangerous
+      description: "Delete a location"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DCIM -- Racks
+    # =========================================================================
+
+    list_racks:
+      method: GET
+      path: /dcim/racks/
+      access: read
+      description: "List all racks"
+      params:
+        site: { type: string, in: query }
+        site_id: { type: integer, in: query }
+        location: { type: string, in: query }
+        name: { type: string, in: query }
+        status: { type: string, in: query }
+        role: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_rack:
+      method: GET
+      path: /dcim/racks/{id}/
+      access: read
+      description: "Get a specific rack"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_rack:
+      method: POST
+      path: /dcim/racks/
+      access: write
+      description: "Create a rack"
+      params:
+        name: { type: string, in: body, required: true }
+        site: { type: integer, in: body, required: true }
+        status: { type: string, in: body }
+        role: { type: integer, in: body }
+        location: { type: integer, in: body }
+        u_height: { type: integer, in: body, description: "Rack height in units (default 42)" }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_rack:
+      method: PATCH
+      path: /dcim/racks/{id}/
+      access: write
+      description: "Update a rack"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        site: { type: integer, in: body }
+        location: { type: integer, in: body }
+        role: { type: integer, in: body }
+        u_height: { type: integer, in: body, description: "Rack height in units (default 42)" }
+        tenant: { type: integer, in: body }
+        status: { type: string, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_rack:
+      method: DELETE
+      path: /dcim/racks/{id}/
+      access: dangerous
+      description: "Delete a rack"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DCIM -- Devices
+    # =========================================================================
+
+    list_manufacturers:
+      method: GET
+      path: /dcim/manufacturers/
+      access: read
+      description: "List hardware manufacturers"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_manufacturer:
+      method: POST
+      path: /dcim/manufacturers/
+      access: write
+      description: "Create a hardware manufacturer"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_manufacturer:
+      method: GET
+      path: /dcim/manufacturers/{id}/
+      access: read
+      description: "Get a specific manufacturer"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_manufacturer:
+      method: PATCH
+      path: /dcim/manufacturers/{id}/
+      access: write
+      description: "Update a manufacturer"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_manufacturer:
+      method: DELETE
+      path: /dcim/manufacturers/{id}/
+      access: dangerous
+      description: "Delete a manufacturer"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_device_types:
+      method: GET
+      path: /dcim/device-types/
+      access: read
+      description: "List device types (hardware models)"
+      params:
+        manufacturer: { type: string, in: query }
+        model: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_device_type:
+      method: POST
+      path: /dcim/device-types/
+      access: write
+      description: "Create a device type (hardware model)"
+      params:
+        manufacturer: { type: integer, in: body, required: true }
+        model: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        u_height: { type: number, in: body, description: "Height in rack units (default 1)" }
+        is_full_depth: { type: boolean, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_device_type:
+      method: GET
+      path: /dcim/device-types/{id}/
+      access: read
+      description: "Get a specific device type"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_device_type:
+      method: PATCH
+      path: /dcim/device-types/{id}/
+      access: write
+      description: "Update a device type"
+      params:
+        id: { type: integer, in: path, required: true }
+        model: { type: string, in: body }
+        u_height: { type: number, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_device_type:
+      method: DELETE
+      path: /dcim/device-types/{id}/
+      access: dangerous
+      description: "Delete a device type"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_device_roles:
+      method: GET
+      path: /dcim/device-roles/
+      access: read
+      description: "List device roles (server, switch, router, firewall, etc.)"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_device_role:
+      method: POST
+      path: /dcim/device-roles/
+      access: write
+      description: "Create a device role"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        color: { type: string, in: body, description: "6-char hex color (e.g. aa1409)" }
+        vm_role: { type: boolean, in: body, description: "Allow assignment to virtual machines" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_device_role:
+      method: GET
+      path: /dcim/device-roles/{id}/
+      access: read
+      description: "Get a specific device role"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_device_role:
+      method: PATCH
+      path: /dcim/device-roles/{id}/
+      access: write
+      description: "Update a device role"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        color: { type: string, in: body }
+        vm_role: { type: boolean, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_device_role:
+      method: DELETE
+      path: /dcim/device-roles/{id}/
+      access: dangerous
+      description: "Delete a device role"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_platforms:
+      method: GET
+      path: /dcim/platforms/
+      access: read
+      description: "List platforms (OS/firmware: Cisco IOS, Junos, Linux, etc.)"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_platform:
+      method: POST
+      path: /dcim/platforms/
+      access: write
+      description: "Create a platform (OS/firmware type)"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        manufacturer: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_platform:
+      method: GET
+      path: /dcim/platforms/{id}/
+      access: read
+      description: "Get a specific platform"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_platform:
+      method: PATCH
+      path: /dcim/platforms/{id}/
+      access: write
+      description: "Update a platform"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_platform:
+      method: DELETE
+      path: /dcim/platforms/{id}/
+      access: dangerous
+      description: "Delete a platform"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_devices:
+      method: GET
+      path: /dcim/devices/
+      access: read
+      description: "List all devices (servers, switches, routers, firewalls, etc.)"
+      params:
+        name: { type: string, in: query }
+        site: { type: string, in: query }
+        site_id: { type: integer, in: query }
+        rack_id: { type: integer, in: query }
+        role: { type: string, in: query }
+        manufacturer: { type: string, in: query }
+        device_type: { type: string, in: query }
+        platform: { type: string, in: query }
+        status: { type: string, in: query, description: "offline, active, planned, staged, failed, decommissioning" }
+        location: { type: string, in: query }
+        cluster_id: { type: integer, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+        ordering: { type: string, in: query }
+
+    get_device:
+      method: GET
+      path: /dcim/devices/{id}/
+      access: read
+      description: "Get a specific device with all details"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_device:
+      method: POST
+      path: /dcim/devices/
+      access: write
+      description: "Create a new device"
+      params:
+        name: { type: string, in: body, required: true }
+        device_type: { type: integer, in: body, required: true }
+        role: { type: integer, in: body, required: true }
+        site: { type: integer, in: body, required: true }
+        location: { type: integer, in: body, description: "ID of the location (room/floor)" }
+        rack: { type: integer, in: body }
+        position: { type: number, in: body, description: "Rack unit position" }
+        face: { type: string, in: body, description: "front or rear" }
+        status: { type: string, in: body }
+        platform: { type: integer, in: body }
+        serial: { type: string, in: body }
+        tenant: { type: integer, in: body }
+        cluster: { type: integer, in: body, description: "ID of the virtualization cluster" }
+        asset_tag: { type: string, in: body, description: "Unique asset tag" }
+        airflow: { type: string, in: body, description: "front-to-rear, rear-to-front, left-to-right, right-to-left, side-to-rear, passive, mixed" }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    update_device:
+      method: PATCH
+      path: /dcim/devices/{id}/
+      access: write
+      description: "Update a device"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        status: { type: string, in: body }
+        platform: { type: integer, in: body }
+        serial: { type: string, in: body }
+        rack: { type: integer, in: body }
+        position: { type: number, in: body, description: "Rack unit position" }
+        face: { type: string, in: body, description: "front or rear" }
+        asset_tag: { type: string, in: body, description: "Unique asset tag" }
+        airflow: { type: string, in: body, description: "front-to-rear, rear-to-front, left-to-right, right-to-left, side-to-rear, passive, mixed" }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+        device_type: { type: integer, in: body, description: "ID of the device type" }
+        role: { type: integer, in: body, description: "ID of the device role" }
+        site: { type: integer, in: body, description: "ID of the site" }
+        location: { type: integer, in: body, description: "ID of the location (room/floor)" }
+        cluster: { type: integer, in: body, description: "ID of the virtualization cluster" }
+        tenant: { type: integer, in: body, description: "ID of the tenant" }
+        primary_ip4: { type: integer, in: body, description: "ID of the primary IPv4 address" }
+        primary_ip6: { type: integer, in: body, description: "ID of the primary IPv6 address" }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    delete_device:
+      method: DELETE
+      path: /dcim/devices/{id}/
+      access: dangerous
+      description: "Delete a device"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DCIM -- Interfaces & Cables
+    # =========================================================================
+
+    list_interfaces:
+      method: GET
+      path: /dcim/interfaces/
+      access: read
+      description: "List device interfaces (physical and logical)"
+      params:
+        device: { type: string, in: query, description: "Device name" }
+        device_id: { type: integer, in: query }
+        name: { type: string, in: query }
+        type: { type: string, in: query }
+        enabled: { type: boolean, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_interface:
+      method: GET
+      path: /dcim/interfaces/{id}/
+      access: read
+      description: "Get a specific interface"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_interface:
+      method: POST
+      path: /dcim/interfaces/
+      access: write
+      description: "Create a device interface"
+      params:
+        device: { type: integer, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "e.g. 1000base-t, 10gbase-x-sfpp, 25gbase-x-sfp28, virtual, lag" }
+        enabled: { type: boolean, in: body }
+        mtu: { type: integer, in: body }
+        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        mgmt_only: { type: boolean, in: body, description: "Management-only interface" }
+        label: { type: string, in: body, description: "Physical label" }
+        speed: { type: integer, in: body, description: "Speed in Kbps" }
+        duplex: { type: string, in: body, description: "half, full, auto" }
+        parent: { type: integer, in: body, description: "Parent interface ID" }
+        bridge: { type: integer, in: body, description: "Bridge interface ID" }
+        lag: { type: integer, in: body, description: "LAG interface ID" }
+        vrf: { type: integer, in: body, description: "VRF assignment" }
+        description: { type: string, in: body }
+        mode: { type: string, in: body, description: "access, tagged, tagged-all" }
+        untagged_vlan: { type: integer, in: body }
+        tagged_vlans: { type: array, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_interface:
+      method: PATCH
+      path: /dcim/interfaces/{id}/
+      access: write
+      description: "Update a device interface"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        type: { type: string, in: body, description: "e.g. 1000base-t, 10gbase-x-sfpp, 25gbase-x-sfp28, virtual, lag" }
+        enabled: { type: boolean, in: body }
+        mtu: { type: integer, in: body }
+        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        mgmt_only: { type: boolean, in: body, description: "Management-only interface" }
+        label: { type: string, in: body, description: "Physical label" }
+        speed: { type: integer, in: body, description: "Speed in Kbps" }
+        duplex: { type: string, in: body, description: "half, full, auto" }
+        parent: { type: integer, in: body, description: "Parent interface ID" }
+        bridge: { type: integer, in: body, description: "Bridge interface ID" }
+        lag: { type: integer, in: body, description: "LAG interface ID" }
+        vrf: { type: integer, in: body, description: "VRF assignment" }
+        description: { type: string, in: body }
+        mode: { type: string, in: body }
+        untagged_vlan: { type: integer, in: body }
+        tagged_vlans: { type: array, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_interface:
+      method: DELETE
+      path: /dcim/interfaces/{id}/
+      access: write
+      description: "Delete a device interface"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_cables:
+      method: GET
+      path: /dcim/cables/
+      access: read
+      description: "List all cables connecting device components"
+      params:
+        site: { type: string, in: query }
+        device: { type: string, in: query }
+        type: { type: string, in: query }
+        status: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_cable:
+      method: GET
+      path: /dcim/cables/{id}/
+      access: read
+      description: "Get a specific cable"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_cable:
+      method: POST
+      path: /dcim/cables/
+      access: write
+      description: "Create a cable connection between device components"
+      params:
+        a_terminations: { type: array, in: body, required: true, description: "Array of {object_type, object_id}" }
+        b_terminations: { type: array, in: body, required: true, description: "Array of {object_type, object_id}" }
+        type: { type: string, in: body, description: "cat5e, cat6, cat6a, fiber-om3, fiber-sm, power, etc." }
+        status: { type: string, in: body, description: "connected, planned, decommissioning" }
+        label: { type: string, in: body }
+        length: { type: number, in: body }
+        length_unit: { type: string, in: body, description: "m, cm, ft, in" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_cable:
+      method: PATCH
+      path: /dcim/cables/{id}/
+      access: write
+      description: "Update a cable"
+      params:
+        id: { type: integer, in: path, required: true }
+        type: { type: string, in: body }
+        status: { type: string, in: body }
+        label: { type: string, in: body }
+        length: { type: number, in: body }
+        length_unit: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_cable:
+      method: DELETE
+      path: /dcim/cables/{id}/
+      access: dangerous
+      description: "Delete a cable"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_console_ports:
+      method: GET
+      path: /dcim/console-ports/
+      access: read
+      description: "List device console ports"
+      params:
+        device: { type: string, in: query }
+        device_id: { type: integer, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_console_port:
+      method: POST
+      path: /dcim/console-ports/
+      access: write
+      description: "Create a console port on a device"
+      params:
+        device: { type: integer, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, description: "de-9, db-25, rj-45, usb-a, usb-c, other" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_power_ports:
+      method: GET
+      path: /dcim/power-ports/
+      access: read
+      description: "List device power ports"
+      params:
+        device: { type: string, in: query }
+        device_id: { type: integer, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_power_port:
+      method: POST
+      path: /dcim/power-ports/
+      access: write
+      description: "Create a power port on a device"
+      params:
+        device: { type: integer, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, description: "iec-60320-c14, iec-60320-c16, nema-5-15p, etc." }
+        maximum_draw: { type: integer, in: body, description: "Maximum power draw in watts" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_mac_addresses:
+      method: GET
+      path: /dcim/mac-addresses/
+      access: read
+      description: "List MAC addresses"
+      params:
+        device: { type: string, in: query }
+        interface: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_mac_address:
+      method: POST
+      path: /dcim/mac-addresses/
+      access: write
+      description: "Create a MAC address entry"
+      params:
+        mac_address: { type: string, in: body, required: true, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        assigned_object_type: { type: string, in: body, description: "dcim.interface or virtualization.vminterface" }
+        assigned_object_id: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_mac_address:
+      method: GET
+      path: /dcim/mac-addresses/{id}/
+      access: read
+      description: "Get a specific MAC address entry"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_mac_address:
+      method: PATCH
+      path: /dcim/mac-addresses/{id}/
+      access: write
+      description: "Update a MAC address entry (reassign to different interface, change description)"
+      params:
+        id: { type: integer, in: path, required: true }
+        mac_address: { type: string, in: body }
+        assigned_object_type: { type: string, in: body, description: "dcim.interface or virtualization.vminterface" }
+        assigned_object_id: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_mac_address:
+      method: DELETE
+      path: /dcim/mac-addresses/{id}/
+      access: dangerous
+      description: "Delete a MAC address entry"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # IPAM -- Prefixes & IP Addresses
+    # =========================================================================
+
+    list_prefixes:
+      method: GET
+      path: /ipam/prefixes/
+      access: read
+      description: "List IP prefixes (subnets)"
+      params:
+        prefix: { type: string, in: query, description: "Exact CIDR match" }
+        within: { type: string, in: query, description: "CIDR supernet (e.g. 10.0.0.0/8)" }
+        contains: { type: string, in: query, description: "IP or prefix contained" }
+        site: { type: string, in: query }
+        vrf: { type: string, in: query }
+        vlan_id: { type: integer, in: query }
+        status: { type: string, in: query, description: "container, active, reserved, deprecated" }
+        role: { type: string, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_prefix:
+      method: GET
+      path: /ipam/prefixes/{id}/
+      access: read
+      description: "Get a specific prefix"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_prefix:
+      method: POST
+      path: /ipam/prefixes/
+      access: write
+      description: "Create an IP prefix"
+      params:
+        prefix: { type: string, in: body, required: true, description: "CIDR notation (e.g. 10.0.1.0/24)" }
+        site: { type: integer, in: body }
+        vrf: { type: integer, in: body }
+        vlan: { type: integer, in: body }
+        status: { type: string, in: body }
+        role: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_prefix:
+      method: PATCH
+      path: /ipam/prefixes/{id}/
+      access: write
+      description: "Update a prefix"
+      params:
+        id: { type: integer, in: path, required: true }
+        prefix: { type: string, in: body, description: "CIDR notation (e.g. 10.0.1.0/24)" }
+        site: { type: integer, in: body }
+        vrf: { type: integer, in: body }
+        vlan: { type: integer, in: body }
+        status: { type: string, in: body }
+        role: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_prefix:
+      method: DELETE
+      path: /ipam/prefixes/{id}/
+      access: dangerous
+      description: "Delete a prefix"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_available_ips:
+      method: GET
+      path: /ipam/prefixes/{id}/available-ips/
+      access: read
+      description: "List available (unallocated) IPs within a prefix"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_ip_addresses:
+      method: GET
+      path: /ipam/ip-addresses/
+      access: read
+      description: "List all IP addresses"
+      params:
+        address: { type: string, in: query, description: "Exact IP (e.g. 10.0.0.1/24)" }
+        parent: { type: string, in: query, description: "Parent prefix CIDR" }
+        device: { type: string, in: query }
+        virtual_machine: { type: string, in: query }
+        interface: { type: string, in: query }
+        vrf: { type: string, in: query }
+        status: { type: string, in: query, description: "active, reserved, deprecated, dhcp, slaac" }
+        role: { type: string, in: query }
+        tenant: { type: string, in: query }
+        assigned: { type: boolean, in: query, description: "Filter by assigned (true) or unassigned (false)" }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_ip_address:
+      method: GET
+      path: /ipam/ip-addresses/{id}/
+      access: read
+      description: "Get a specific IP address"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_ip_address:
+      method: POST
+      path: /ipam/ip-addresses/
+      access: write
+      description: "Create an IP address"
+      params:
+        address: { type: string, in: body, required: true, description: "CIDR (e.g. 10.0.0.1/24)" }
+        vrf: { type: integer, in: body }
+        status: { type: string, in: body }
+        role: { type: string, in: body }
+        tenant: { type: integer, in: body }
+        assigned_object_type: { type: string, in: body, description: "dcim.interface or virtualization.vminterface" }
+        assigned_object_id: { type: integer, in: body }
+        dns_name: { type: string, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_ip_address:
+      method: PATCH
+      path: /ipam/ip-addresses/{id}/
+      access: write
+      description: "Update an IP address"
+      params:
+        id: { type: integer, in: path, required: true }
+        address: { type: string, in: body, description: "CIDR (e.g. 10.0.0.1/24)" }
+        vrf: { type: integer, in: body }
+        status: { type: string, in: body }
+        role: { type: string, in: body }
+        tenant: { type: integer, in: body }
+        dns_name: { type: string, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        assigned_object_type: { type: string, in: body }
+        assigned_object_id: { type: integer, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_ip_address:
+      method: DELETE
+      path: /ipam/ip-addresses/{id}/
+      access: dangerous
+      description: "Delete an IP address"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_ip_ranges:
+      method: GET
+      path: /ipam/ip-ranges/
+      access: read
+      description: "List IP ranges (continuous address ranges, e.g. DHCP pools)"
+      params:
+        vrf: { type: string, in: query }
+        status: { type: string, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_ip_range:
+      method: POST
+      path: /ipam/ip-ranges/
+      access: write
+      description: "Create an IP range"
+      params:
+        start_address: { type: string, in: body, required: true, description: "Start IP (CIDR, e.g. 10.0.0.100/24)" }
+        end_address: { type: string, in: body, required: true, description: "End IP (CIDR, e.g. 10.0.0.200/24)" }
+        vrf: { type: integer, in: body }
+        status: { type: string, in: body }
+        role: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    # =========================================================================
+    # IPAM -- VLANs & VRFs
+    # =========================================================================
+
+    list_vlans:
+      method: GET
+      path: /ipam/vlans/
+      access: read
+      description: "List all VLANs"
+      params:
+        vid: { type: integer, in: query, description: "VLAN ID (1-4094)" }
+        name: { type: string, in: query }
+        site: { type: string, in: query }
+        group: { type: string, in: query }
+        status: { type: string, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_vlan:
+      method: GET
+      path: /ipam/vlans/{id}/
+      access: read
+      description: "Get a specific VLAN"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_vlan:
+      method: POST
+      path: /ipam/vlans/
+      access: write
+      description: "Create a VLAN"
+      params:
+        vid: { type: integer, in: body, required: true, description: "VLAN ID (1-4094)" }
+        name: { type: string, in: body, required: true }
+        site: { type: integer, in: body }
+        group: { type: integer, in: body }
+        status: { type: string, in: body }
+        role: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_vlan:
+      method: PATCH
+      path: /ipam/vlans/{id}/
+      access: write
+      description: "Update a VLAN"
+      params:
+        id: { type: integer, in: path, required: true }
+        vid: { type: integer, in: body, description: "VLAN ID (1-4094)" }
+        name: { type: string, in: body }
+        site: { type: integer, in: body }
+        group: { type: integer, in: body }
+        status: { type: string, in: body }
+        role: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_vlan:
+      method: DELETE
+      path: /ipam/vlans/{id}/
+      access: dangerous
+      description: "Delete a VLAN"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_vlan_groups:
+      method: GET
+      path: /ipam/vlan-groups/
+      access: read
+      description: "List VLAN groups"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_vlan_group:
+      method: POST
+      path: /ipam/vlan-groups/
+      access: write
+      description: "Create a VLAN group"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        min_vid: { type: integer, in: body, description: "Minimum VLAN ID (default 1)" }
+        max_vid: { type: integer, in: body, description: "Maximum VLAN ID (default 4094)" }
+        scope_type: { type: string, in: body, description: "dcim.site, dcim.location, dcim.rack, etc." }
+        scope_id: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_vlan_group:
+      method: GET
+      path: /ipam/vlan-groups/{id}/
+      access: read
+      description: "Get a specific VLAN group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_vlan_group:
+      method: PATCH
+      path: /ipam/vlan-groups/{id}/
+      access: write
+      description: "Update a VLAN group"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        min_vid: { type: integer, in: body }
+        max_vid: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_vlan_group:
+      method: DELETE
+      path: /ipam/vlan-groups/{id}/
+      access: dangerous
+      description: "Delete a VLAN group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_vrfs:
+      method: GET
+      path: /ipam/vrfs/
+      access: read
+      description: "List all VRFs (Virtual Routing and Forwarding instances)"
+      params:
+        name: { type: string, in: query }
+        rd: { type: string, in: query, description: "Route distinguisher" }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_vrf:
+      method: GET
+      path: /ipam/vrfs/{id}/
+      access: read
+      description: "Get a specific VRF"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_vrf:
+      method: POST
+      path: /ipam/vrfs/
+      access: write
+      description: "Create a VRF"
+      params:
+        name: { type: string, in: body, required: true }
+        rd: { type: string, in: body, description: "Route distinguisher" }
+        tenant: { type: integer, in: body }
+        enforce_unique: { type: boolean, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_vrf:
+      method: PATCH
+      path: /ipam/vrfs/{id}/
+      access: write
+      description: "Update a VRF"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        rd: { type: string, in: body }
+        enforce_unique: { type: boolean, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_vrf:
+      method: DELETE
+      path: /ipam/vrfs/{id}/
+      access: dangerous
+      description: "Delete a VRF"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # IPAM -- RIRs, Aggregates, ASNs, Roles, Services
+    # =========================================================================
+
+    list_rirs:
+      method: GET
+      path: /ipam/rirs/
+      access: read
+      description: "List Regional Internet Registries (RIPE, ARIN, etc.)"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_rir:
+      method: POST
+      path: /ipam/rirs/
+      access: write
+      description: "Create a Regional Internet Registry"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        is_private: { type: boolean, in: body, description: "Private RIR (e.g. RFC 1918)" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_aggregates:
+      method: GET
+      path: /ipam/aggregates/
+      access: read
+      description: "List aggregate prefixes (top-level allocations from RIRs)"
+      params:
+        rir: { type: string, in: query }
+        prefix: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_aggregate:
+      method: POST
+      path: /ipam/aggregates/
+      access: write
+      description: "Create an aggregate prefix (top-level RIR allocation)"
+      params:
+        prefix: { type: string, in: body, required: true, description: "CIDR notation (e.g. 10.0.0.0/8)" }
+        rir: { type: integer, in: body, required: true }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_asns:
+      method: GET
+      path: /ipam/asns/
+      access: read
+      description: "List Autonomous System Numbers"
+      params:
+        asn: { type: integer, in: query }
+        rir: { type: string, in: query }
+        tenant: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_asn:
+      method: POST
+      path: /ipam/asns/
+      access: write
+      description: "Create an Autonomous System Number"
+      params:
+        asn: { type: integer, in: body, required: true, description: "32-bit ASN" }
+        rir: { type: integer, in: body, required: true }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_ipam_roles:
+      method: GET
+      path: /ipam/roles/
+      access: read
+      description: "List IPAM roles for prefixes and VLANs"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_ipam_role:
+      method: POST
+      path: /ipam/roles/
+      access: write
+      description: "Create an IPAM role for prefixes and VLANs"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_services:
+      method: GET
+      path: /ipam/services/
+      access: read
+      description: "List services running on devices or VMs (DNS, HTTP, SSH, etc.). NetBox 4.x uses parent_object filters."
+      params:
+        device: { type: string, in: query, description: "Filter by device name (legacy, may not work on 4.x)" }
+        device_id: { type: integer, in: query, description: "Filter by device ID" }
+        virtual_machine: { type: string, in: query, description: "Filter by VM name (legacy, may not work on 4.x)" }
+        virtual_machine_id: { type: integer, in: query, description: "Filter by VM ID" }
+        name: { type: string, in: query }
+        protocol: { type: string, in: query }
+        port: { type: integer, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_service:
+      method: POST
+      path: /ipam/services/
+      access: write
+      description: "Create a service entry on a device or VM. NetBox 4.x uses GenericForeignKey: set parent_object_type and parent_object_id instead of device/virtual_machine."
+      params:
+        parent_object_type: { type: string, in: body, required: true, description: "Content type: 'dcim.device' or 'virtualization.virtualmachine'" }
+        parent_object_id: { type: integer, in: body, required: true, description: "ID of the parent device or VM" }
+        name: { type: string, in: body, required: true }
+        protocol: { type: string, in: body, required: true, description: "tcp or udp" }
+        ports: { type: array, in: body, required: true, description: "Array of port numbers" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    get_service:
+      method: GET
+      path: /ipam/services/{id}/
+      access: read
+      description: "Get a specific service"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_service:
+      method: PATCH
+      path: /ipam/services/{id}/
+      access: write
+      description: "Update a service. Use parent_object_type + parent_object_id to reassign (NetBox 4.x GenericForeignKey)."
+      params:
+        id: { type: integer, in: path, required: true }
+        parent_object_type: { type: string, in: body, description: "Content type: 'dcim.device' or 'virtualization.virtualmachine'" }
+        parent_object_id: { type: integer, in: body, description: "ID of the parent device or VM" }
+        name: { type: string, in: body }
+        protocol: { type: string, in: body }
+        ports: { type: array, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    delete_service:
+      method: DELETE
+      path: /ipam/services/{id}/
+      access: write
+      description: "Delete a service"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # VIRTUALIZATION -- Clusters & VMs
+    # =========================================================================
+
+    list_cluster_types:
+      method: GET
+      path: /virtualization/cluster-types/
+      access: read
+      description: "List cluster types (VMware, Proxmox, XCP-ng, etc.)"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_cluster_type:
+      method: POST
+      path: /virtualization/cluster-types/
+      access: write
+      description: "Create a cluster type (e.g. VMware, Proxmox, Linode, XCP-ng)"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_cluster_groups:
+      method: GET
+      path: /virtualization/cluster-groups/
+      access: read
+      description: "List cluster groups"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_cluster_group:
+      method: POST
+      path: /virtualization/cluster-groups/
+      access: write
+      description: "Create a cluster group"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_cluster_group:
+      method: GET
+      path: /virtualization/cluster-groups/{id}/
+      access: read
+      description: "Get a specific cluster group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_cluster_group:
+      method: PATCH
+      path: /virtualization/cluster-groups/{id}/
+      access: write
+      description: "Update a cluster group"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_cluster_group:
+      method: DELETE
+      path: /virtualization/cluster-groups/{id}/
+      access: dangerous
+      description: "Delete a cluster group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_clusters:
+      method: GET
+      path: /virtualization/clusters/
+      access: read
+      description: "List all virtualization clusters"
+      params:
+        name: { type: string, in: query }
+        type: { type: string, in: query }
+        group: { type: string, in: query }
+        site: { type: string, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_cluster:
+      method: GET
+      path: /virtualization/clusters/{id}/
+      access: read
+      description: "Get a specific cluster"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_cluster:
+      method: POST
+      path: /virtualization/clusters/
+      access: write
+      description: "Create a virtualization cluster"
+      params:
+        name: { type: string, in: body, required: true }
+        type: { type: integer, in: body, required: true }
+        group: { type: integer, in: body }
+        site: { type: integer, in: body }
+        status: { type: string, in: body, description: "active, planned, decommissioning, offline" }
+        scope_type: { type: string, in: body, description: "Scope type: dcim.site, dcim.location, dcim.region, etc." }
+        scope_id: { type: integer, in: body, description: "ID of the scoped object" }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_cluster:
+      method: PATCH
+      path: /virtualization/clusters/{id}/
+      access: write
+      description: "Update a cluster"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        group: { type: integer, in: body }
+        site: { type: integer, in: body }
+        status: { type: string, in: body, description: "active, planned, decommissioning, offline" }
+        scope_type: { type: string, in: body, description: "Scope type: dcim.site, dcim.location, dcim.region, etc." }
+        scope_id: { type: integer, in: body, description: "ID of the scoped object" }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_cluster:
+      method: DELETE
+      path: /virtualization/clusters/{id}/
+      access: dangerous
+      description: "Delete a cluster"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_virtual_machines:
+      method: GET
+      path: /virtualization/virtual-machines/
+      access: read
+      description: "List all virtual machines"
+      params:
+        name: { type: string, in: query }
+        cluster: { type: string, in: query }
+        site: { type: string, in: query }
+        status: { type: string, in: query, description: "offline, active, planned, staged, failed, decommissioning" }
+        device: { type: string, in: query }
+        role: { type: string, in: query }
+        platform: { type: string, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_virtual_machine:
+      method: GET
+      path: /virtualization/virtual-machines/{id}/
+      access: read
+      description: "Get a specific virtual machine"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_virtual_machine:
+      method: POST
+      path: /virtualization/virtual-machines/
+      access: write
+      description: "Create a virtual machine"
+      params:
+        name: { type: string, in: body, required: true }
+        cluster: { type: integer, in: body, required: true }
+        status: { type: string, in: body }
+        role: { type: integer, in: body }
+        platform: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        vcpus: { type: number, in: body }
+        memory: { type: integer, in: body, description: "Memory in MB" }
+        disk: { type: integer, in: body, description: "Disk size in GB" }
+        site: { type: integer, in: body }
+        device: { type: integer, in: body, description: "ID of the host device" }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    update_virtual_machine:
+      method: PATCH
+      path: /virtualization/virtual-machines/{id}/
+      access: write
+      description: "Update a virtual machine"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        cluster: { type: integer, in: body }
+        site: { type: integer, in: body }
+        device: { type: integer, in: body, description: "ID of the host device" }
+        status: { type: string, in: body }
+        vcpus: { type: number, in: body }
+        memory: { type: integer, in: body }
+        disk: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        platform: { type: integer, in: body }
+        role: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        primary_ip4: { type: integer, in: body, description: "ID of the primary IPv4 address" }
+        primary_ip6: { type: integer, in: body, description: "ID of the primary IPv6 address" }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
+      pagination: none
+
+    delete_virtual_machine:
+      method: DELETE
+      path: /virtualization/virtual-machines/{id}/
+      access: dangerous
+      description: "Delete a virtual machine"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_vm_interfaces:
+      method: GET
+      path: /virtualization/interfaces/
+      access: read
+      description: "List virtual machine interfaces"
+      params:
+        virtual_machine: { type: string, in: query }
+        virtual_machine_id: { type: integer, in: query }
+        name: { type: string, in: query }
+        enabled: { type: boolean, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_vm_interface:
+      method: POST
+      path: /virtualization/interfaces/
+      access: write
+      description: "Create a VM interface"
+      params:
+        virtual_machine: { type: integer, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        enabled: { type: boolean, in: body }
+        mtu: { type: integer, in: body }
+        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        parent: { type: integer, in: body, description: "Parent interface ID" }
+        bridge: { type: integer, in: body, description: "Bridge interface ID" }
+        vrf: { type: integer, in: body, description: "VRF assignment" }
+        description: { type: string, in: body }
+        mode: { type: string, in: body }
+        untagged_vlan: { type: integer, in: body }
+        tagged_vlans: { type: array, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_vm_interface:
+      method: GET
+      path: /virtualization/interfaces/{id}/
+      access: read
+      description: "Get a specific VM interface"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_vm_interface:
+      method: PATCH
+      path: /virtualization/interfaces/{id}/
+      access: write
+      description: "Update a VM interface"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        enabled: { type: boolean, in: body }
+        mtu: { type: integer, in: body }
+        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        parent: { type: integer, in: body, description: "Parent interface ID" }
+        bridge: { type: integer, in: body, description: "Bridge interface ID" }
+        vrf: { type: integer, in: body, description: "VRF assignment" }
+        description: { type: string, in: body }
+        mode: { type: string, in: body }
+        untagged_vlan: { type: integer, in: body }
+        tagged_vlans: { type: array, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_vm_interface:
+      method: DELETE
+      path: /virtualization/interfaces/{id}/
+      access: write
+      description: "Delete a VM interface"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_virtual_disks:
+      method: GET
+      path: /virtualization/virtual-disks/
+      access: read
+      description: "List virtual disks"
+      params:
+        virtual_machine: { type: string, in: query }
+        virtual_machine_id: { type: integer, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_virtual_disk:
+      method: POST
+      path: /virtualization/virtual-disks/
+      access: write
+      description: "Create a virtual disk"
+      params:
+        virtual_machine: { type: integer, in: body, required: true }
+        name: { type: string, in: body, required: true }
+        size: { type: integer, in: body, required: true, description: "Disk size in GB" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    # =========================================================================
+    # TENANCY
+    # =========================================================================
+
+    list_tenants:
+      method: GET
+      path: /tenancy/tenants/
+      access: read
+      description: "List all tenants (customers, departments, teams)"
+      params:
+        name: { type: string, in: query }
+        group: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_tenant:
+      method: GET
+      path: /tenancy/tenants/{id}/
+      access: read
+      description: "Get a specific tenant"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_tenant:
+      method: POST
+      path: /tenancy/tenants/
+      access: write
+      description: "Create a tenant"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        group: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_tenant:
+      method: PATCH
+      path: /tenancy/tenants/{id}/
+      access: write
+      description: "Update a tenant"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        group: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_tenant:
+      method: DELETE
+      path: /tenancy/tenants/{id}/
+      access: dangerous
+      description: "Delete a tenant"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_tenant_groups:
+      method: GET
+      path: /tenancy/tenant-groups/
+      access: read
+      description: "List tenant groups"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_tenant_group:
+      method: POST
+      path: /tenancy/tenant-groups/
+      access: write
+      description: "Create a tenant group"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        parent: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_tenant_group:
+      method: GET
+      path: /tenancy/tenant-groups/{id}/
+      access: read
+      description: "Get a specific tenant group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_tenant_group:
+      method: PATCH
+      path: /tenancy/tenant-groups/{id}/
+      access: write
+      description: "Update a tenant group"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_tenant_group:
+      method: DELETE
+      path: /tenancy/tenant-groups/{id}/
+      access: dangerous
+      description: "Delete a tenant group"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_contacts:
+      method: GET
+      path: /tenancy/contacts/
+      access: read
+      description: "List all contacts"
+      params:
+        name: { type: string, in: query }
+        group: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_contact:
+      method: POST
+      path: /tenancy/contacts/
+      access: write
+      description: "Create a contact"
+      params:
+        name: { type: string, in: body, required: true }
+        group: { type: integer, in: body }
+        title: { type: string, in: body }
+        phone: { type: string, in: body }
+        email: { type: string, in: body }
+        address: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_contact:
+      method: GET
+      path: /tenancy/contacts/{id}/
+      access: read
+      description: "Get a specific contact"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_contact:
+      method: PATCH
+      path: /tenancy/contacts/{id}/
+      access: write
+      description: "Update a contact"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        title: { type: string, in: body }
+        phone: { type: string, in: body }
+        email: { type: string, in: body }
+        address: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_contact:
+      method: DELETE
+      path: /tenancy/contacts/{id}/
+      access: dangerous
+      description: "Delete a contact"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_contact_roles:
+      method: GET
+      path: /tenancy/contact-roles/
+      access: read
+      description: "List contact roles (admin, NOC, billing, etc.)"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_contact_role:
+      method: POST
+      path: /tenancy/contact-roles/
+      access: write
+      description: "Create a contact role"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_contact_role:
+      method: GET
+      path: /tenancy/contact-roles/{id}/
+      access: read
+      description: "Get a specific contact role"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_contact_role:
+      method: PATCH
+      path: /tenancy/contact-roles/{id}/
+      access: write
+      description: "Update a contact role"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_contact_role:
+      method: DELETE
+      path: /tenancy/contact-roles/{id}/
+      access: dangerous
+      description: "Delete a contact role"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # CIRCUITS
+    # =========================================================================
+
+    list_providers:
+      method: GET
+      path: /circuits/providers/
+      access: read
+      description: "List circuit providers (ISPs, carriers)"
+      params:
+        name: { type: string, in: query }
+        slug: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_provider:
+      method: POST
+      path: /circuits/providers/
+      access: write
+      description: "Create a circuit provider"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        asns: { type: array, in: body, description: "Array of ASN IDs" }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_provider:
+      method: GET
+      path: /circuits/providers/{id}/
+      access: read
+      description: "Get a specific provider"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_provider:
+      method: PATCH
+      path: /circuits/providers/{id}/
+      access: write
+      description: "Update a provider"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_provider:
+      method: DELETE
+      path: /circuits/providers/{id}/
+      access: dangerous
+      description: "Delete a provider"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_circuit_types:
+      method: GET
+      path: /circuits/circuit-types/
+      access: read
+      description: "List circuit types (Internet, MPLS, dark fiber, etc.)"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_circuit_type:
+      method: POST
+      path: /circuits/circuit-types/
+      access: write
+      description: "Create a circuit type"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_circuit_type:
+      method: GET
+      path: /circuits/circuit-types/{id}/
+      access: read
+      description: "Get a specific circuit type"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_circuit_type:
+      method: PATCH
+      path: /circuits/circuit-types/{id}/
+      access: write
+      description: "Update a circuit type"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_circuit_type:
+      method: DELETE
+      path: /circuits/circuit-types/{id}/
+      access: dangerous
+      description: "Delete a circuit type"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_circuits:
+      method: GET
+      path: /circuits/circuits/
+      access: read
+      description: "List all circuits"
+      params:
+        cid: { type: string, in: query, description: "Circuit ID" }
+        provider: { type: string, in: query }
+        type: { type: string, in: query }
+        site: { type: string, in: query }
+        status: { type: string, in: query }
+        tenant: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        brief: { type: boolean, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_circuit:
+      method: GET
+      path: /circuits/circuits/{id}/
+      access: read
+      description: "Get a specific circuit"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_circuit:
+      method: POST
+      path: /circuits/circuits/
+      access: write
+      description: "Create a circuit"
+      params:
+        cid: { type: string, in: body, required: true, description: "Circuit ID (provider's reference)" }
+        provider: { type: integer, in: body, required: true }
+        type: { type: integer, in: body, required: true }
+        status: { type: string, in: body }
+        tenant: { type: integer, in: body }
+        commit_rate: { type: integer, in: body, description: "Committed rate in Kbps" }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    update_circuit:
+      method: PATCH
+      path: /circuits/circuits/{id}/
+      access: write
+      description: "Update a circuit"
+      params:
+        id: { type: integer, in: path, required: true }
+        cid: { type: string, in: body }
+        status: { type: string, in: body }
+        commit_rate: { type: integer, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_circuit:
+      method: DELETE
+      path: /circuits/circuits/{id}/
+      access: dangerous
+      description: "Delete a circuit"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_circuit_terminations:
+      method: GET
+      path: /circuits/circuit-terminations/
+      access: read
+      description: "List circuit terminations (A-side and Z-side endpoints)"
+      params:
+        circuit_id: { type: integer, in: query }
+        site: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_circuit_termination:
+      method: POST
+      path: /circuits/circuit-terminations/
+      access: write
+      description: "Create a circuit termination (A or Z side)"
+      params:
+        circuit: { type: integer, in: body, required: true }
+        term_side: { type: string, in: body, required: true, description: "A or Z" }
+        site: { type: integer, in: body }
+        port_speed: { type: integer, in: body, description: "Port speed in Kbps" }
+        upstream_speed: { type: integer, in: body, description: "Upstream speed in Kbps" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    get_circuit_termination:
+      method: GET
+      path: /circuits/circuit-terminations/{id}/
+      access: read
+      description: "Get a specific circuit termination"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_circuit_termination:
+      method: PATCH
+      path: /circuits/circuit-terminations/{id}/
+      access: write
+      description: "Update a circuit termination"
+      params:
+        id: { type: integer, in: path, required: true }
+        site: { type: integer, in: body }
+        port_speed: { type: integer, in: body }
+        upstream_speed: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    delete_circuit_termination:
+      method: DELETE
+      path: /circuits/circuit-terminations/{id}/
+      access: dangerous
+      description: "Delete a circuit termination"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # WIRELESS
+    # =========================================================================
+
+    list_wireless_lans:
+      method: GET
+      path: /wireless/wireless-lans/
+      access: read
+      description: "List wireless LANs (SSIDs)"
+      params:
+        ssid: { type: string, in: query }
+        group: { type: string, in: query }
+        status: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_wireless_lan:
+      method: POST
+      path: /wireless/wireless-lans/
+      access: write
+      description: "Create a wireless LAN (SSID)"
+      params:
+        ssid: { type: string, in: body, required: true }
+        status: { type: string, in: body, description: "active, reserved, disabled" }
+        group: { type: integer, in: body }
+        vlan: { type: integer, in: body }
+        auth_type: { type: string, in: body, description: "open, wep, wpa-personal, wpa-enterprise" }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_wireless_links:
+      method: GET
+      path: /wireless/wireless-links/
+      access: read
+      description: "List wireless point-to-point links"
+      params:
+        status: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_wireless_link:
+      method: POST
+      path: /wireless/wireless-links/
+      access: write
+      description: "Create a wireless point-to-point link"
+      params:
+        interface_a: { type: integer, in: body, required: true }
+        interface_b: { type: integer, in: body, required: true }
+        ssid: { type: string, in: body }
+        status: { type: string, in: body, description: "connected, planned, decommissioning" }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    # =========================================================================
+    # VPN
+    # =========================================================================
+
+    list_tunnels:
+      method: GET
+      path: /vpn/tunnels/
+      access: read
+      description: "List VPN tunnels"
+      params:
+        name: { type: string, in: query }
+        status: { type: string, in: query }
+        group: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_tunnel:
+      method: POST
+      path: /vpn/tunnels/
+      access: write
+      description: "Create a VPN tunnel"
+      params:
+        name: { type: string, in: body, required: true }
+        status: { type: string, in: body, description: "planned, active, disabled" }
+        group: { type: integer, in: body }
+        encapsulation: { type: string, in: body, required: true, description: "ipsec-transport, ipsec-tunnel, ip-ip, gre, wireguard" }
+        tunnel_id: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_l2vpns:
+      method: GET
+      path: /vpn/l2vpns/
+      access: read
+      description: "List L2VPN instances (VPLS, VXLAN, etc.)"
+      params:
+        name: { type: string, in: query }
+        type: { type: string, in: query }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_l2vpn:
+      method: POST
+      path: /vpn/l2vpns/
+      access: write
+      description: "Create an L2VPN instance"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "vpls, vxlan, vpws, epl, evpl, ep-lan, evp-lan, ep-tree, evp-tree" }
+        identifier: { type: integer, in: body }
+        tenant: { type: integer, in: body }
+        description: { type: string, in: body }
+        tags: { type: array, in: body }
+      pagination: none
+
+    # =========================================================================
+    # EXTRAS -- Tags, Journal, Config Contexts
+    # =========================================================================
+
+    list_tags:
+      method: GET
+      path: /extras/tags/
+      access: read
+      description: "List all tags"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_tag:
+      method: POST
+      path: /extras/tags/
+      access: write
+      description: "Create a tag"
+      params:
+        name: { type: string, in: body, required: true }
+        slug: { type: string, in: body, required: true }
+        color: { type: string, in: body, description: "6-char hex color (e.g. aa1409)" }
+        description: { type: string, in: body }
+      pagination: none
+
+    get_tag:
+      method: GET
+      path: /extras/tags/{id}/
+      access: read
+      description: "Get a specific tag"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_tag:
+      method: PATCH
+      path: /extras/tags/{id}/
+      access: write
+      description: "Update a tag"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        slug: { type: string, in: body }
+        color: { type: string, in: body }
+        description: { type: string, in: body }
+      pagination: none
+
+    delete_tag:
+      method: DELETE
+      path: /extras/tags/{id}/
+      access: dangerous
+      description: "Delete a tag"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # EXTRAS -- Custom Fields
+    # =========================================================================
+
+    list_custom_fields:
+      method: GET
+      path: /extras/custom-fields/
+      access: read
+      description: "List all custom field definitions"
+      params:
+        name: { type: string, in: query }
+        content_types: { type: string, in: query, description: "Filter by content type (e.g. dcim.device)" }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_custom_field:
+      method: GET
+      path: /extras/custom-fields/{id}/
+      access: read
+      description: "Get a specific custom field definition"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_custom_field:
+      method: POST
+      path: /extras/custom-fields/
+      access: admin
+      description: "Create a custom field definition. Assign to object types via object_types array."
+      params:
+        name: { type: string, in: body, required: true, description: "Internal field name (snake_case)" }
+        label: { type: string, in: body, description: "Human-readable label" }
+        type: { type: string, in: body, required: true, description: "text, longtext, integer, decimal, boolean, date, datetime, url, json, select, multiselect, object, multiobject" }
+        object_types: { type: array, in: body, required: true, description: "Content types: ['dcim.device', 'virtualization.virtualmachine', etc.]" }
+        group_name: { type: string, in: body, description: "Group label for UI grouping" }
+        description: { type: string, in: body }
+        required: { type: boolean, in: body }
+        search_weight: { type: integer, in: body, description: "Search weight (0=disabled, 1000=default, higher=more weight)" }
+        filter_logic: { type: string, in: body, description: "disabled, loose, exact" }
+        ui_visible: { type: string, in: body, description: "always, if-set, hidden" }
+        ui_editable: { type: string, in: body, description: "yes, no, hidden" }
+        weight: { type: integer, in: body, description: "Display order (lower=first)" }
+        default: { type: string, in: body, description: "Default value" }
+        choice_set: { type: integer, in: body, description: "ID of a custom field choice set (for select/multiselect)" }
+        validation_minimum: { type: integer, in: body }
+        validation_maximum: { type: integer, in: body }
+        validation_regex: { type: string, in: body }
+      pagination: none
+
+    update_custom_field:
+      method: PATCH
+      path: /extras/custom-fields/{id}/
+      access: admin
+      description: "Update a custom field definition"
+      params:
+        id: { type: integer, in: path, required: true }
+        label: { type: string, in: body }
+        description: { type: string, in: body }
+        required: { type: boolean, in: body }
+        ui_visible: { type: string, in: body }
+        ui_editable: { type: string, in: body }
+        weight: { type: integer, in: body }
+        default: { type: string, in: body }
+        object_types: { type: array, in: body }
+      pagination: none
+
+    delete_custom_field:
+      method: DELETE
+      path: /extras/custom-fields/{id}/
+      access: dangerous
+      description: "Delete a custom field definition. WARNING: deletes all stored values."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # EXTRAS -- Custom Field Choice Sets
+    # =========================================================================
+
+    list_custom_field_choice_sets:
+      method: GET
+      path: /extras/custom-field-choice-sets/
+      access: read
+      description: "List all custom field choice sets"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_custom_field_choice_set:
+      method: GET
+      path: /extras/custom-field-choice-sets/{id}/
+      access: read
+      description: "Get a specific custom field choice set"
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_custom_field_choice_set:
+      method: POST
+      path: /extras/custom-field-choice-sets/
+      access: admin
+      description: "Create a custom field choice set for select/multiselect custom fields"
+      params:
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        base_choices: { type: string, in: body, description: "Optional base choice set to extend (e.g. 'IATA')" }
+        extra_choices: { type: array, in: body, required: true, description: "Array of [value, label] pairs, e.g. [['a','Alpha'],['b','Beta']]" }
+        order_alphabetically: { type: boolean, in: body, description: "Sort choices alphabetically (default: false)" }
+      pagination: none
+
+    update_custom_field_choice_set:
+      method: PATCH
+      path: /extras/custom-field-choice-sets/{id}/
+      access: admin
+      description: "Update a custom field choice set"
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        extra_choices: { type: array, in: body, description: "Array of [value, label] pairs" }
+        order_alphabetically: { type: boolean, in: body }
+      pagination: none
+
+    delete_custom_field_choice_set:
+      method: DELETE
+      path: /extras/custom-field-choice-sets/{id}/
+      access: dangerous
+      description: "Delete a custom field choice set. WARNING: breaks any custom fields referencing this set."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_journal_entries:
+      method: GET
+      path: /extras/journal-entries/
+      access: read
+      description: "List journal entries (change notes on objects)"
+      params:
+        assigned_object_type: { type: string, in: query }
+        assigned_object_id: { type: integer, in: query }
+        kind: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_journal_entry:
+      method: POST
+      path: /extras/journal-entries/
+      access: write
+      description: "Create a journal entry on an object"
+      params:
+        assigned_object_type: { type: string, in: body, required: true }
+        assigned_object_id: { type: integer, in: body, required: true }
+        kind: { type: string, in: body, description: "info, success, warning, danger" }
+        comments: { type: string, in: body, required: true }
+        tags: { type: array, in: body }
+      pagination: none
+
+    list_config_contexts:
+      method: GET
+      path: /extras/config-contexts/
+      access: read
+      description: "List configuration contexts (rendered config data for devices/VMs)"
+      params:
+        name: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    create_config_context:
+      method: POST
+      path: /extras/config-contexts/
+      access: write
+      description: "Create a configuration context"
+      params:
+        name: { type: string, in: body, required: true }
+        data: { type: object, in: body, required: true, description: "JSON config data" }
+        regions: { type: array, in: body, description: "Array of region IDs" }
+        sites: { type: array, in: body, description: "Array of site IDs" }
+        roles: { type: array, in: body, description: "Array of role IDs" }
+        platforms: { type: array, in: body, description: "Array of platform IDs" }
+        cluster_groups: { type: array, in: body }
+        clusters: { type: array, in: body }
+        tenants: { type: array, in: body }
+        tags: { type: array, in: body }
+        description: { type: string, in: body }
+      pagination: none
+
+  examples:
+    - name: "Sync VMs from XCP-ng to NetBox"
+      description: "List XO VMs and compare with NetBox virtual machines"
+      code: |
+        const xoVms = await api.list_virtual_machines({ cluster: "xcp-ng" });
+        return xoVms;
+
+    - name: "Find free IPs in a subnet"
+      description: "Get a prefix by CIDR and list available IPs"
+      code: |
+        const prefixes = await api.list_prefixes({ prefix: "10.0.1.0/24" });
+        if (prefixes.length > 0) {
+          return await api.list_available_ips({ id: prefixes[0].id });
+        }
+
+    - name: "Document a new server"
+      description: "Create device, assign IP, add journal entry"
+      code: |
+        const device = await api.create_device({
+          name: "web-prod-01",
+          device_type: 5,
+          role: 2,
+          site: 1,
+          status: "active"
+        });
+        const iface = await api.list_interfaces({ device_id: device.id });
+        await api.create_ip_address({
+          address: "10.0.1.50/24",
+          assigned_object_type: "dcim.interface",
+          assigned_object_id: iface[0].id,
+          status: "active"
+        });
+        await api.create_journal_entry({
+          assigned_object_type: "dcim.device",
+          assigned_object_id: device.id,
+          kind: "success",
+          comments: "Server provisioned and IP assigned"
+        });
+        return device;
+
+    - name: "Network audit"
+      description: "List all active devices at a site with their interfaces"
+      code: |
+        const devices = await api.list_devices({
+          site: "dc1", status: "active", brief: true
+        });
+        const results = [];
+        for (const d of devices.slice(0, 10)) {
+          const ifaces = await api.list_interfaces({
+            device_id: d.id, brief: true
+          });
+          results.push({ device: d.name, interfaces: ifaces.length });
+        }
+        return results;
