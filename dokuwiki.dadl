@@ -8,7 +8,7 @@ date: "2026-03-29"
 backend:
   name: dokuwiki
   type: rest
-  version: "1.0"
+  version: "1.1"
   # base_url is intentionally omitted — must be provided via backends.yaml url field,
   # because each deployment has its own DokuWiki instance URL.
   # The url should point to: https://your-wiki.example.com/lib/exe/jsonrpc.php
@@ -408,6 +408,140 @@ backend:
       params:
         users: { type: array, in: body, required: true, description: "Array of usernames to delete" }
       pagination: none
+
+  # ── Composite tools ────────────────────────────────────────
+  # Server-side helpers that chain get_page → mutate → save_page.
+  # The raw page content never leaves the ToolMesh server — callers
+  # only receive a small result object ({ success, replacements, ... }).
+
+  composites:
+    page_search_and_replace:
+      description: >
+        Replace all occurrences of a literal substring in a wiki page and save it.
+        Internally: get_page → string replace → save_page. The full page content
+        never leaves the ToolMesh server; only { success, replacements } is returned.
+        The search is a literal match (no regex).
+      params:
+        page:
+          type: string
+          required: true
+          description: "Page ID (e.g. 'wiki:syntax')"
+        search:
+          type: string
+          required: true
+          description: "Literal substring to find (no regex)"
+        replace:
+          type: string
+          required: true
+          description: "Replacement string"
+        summary:
+          type: string
+          description: "Edit summary for the revision log (default: auto-generated)"
+      timeout: 30s
+      depends_on: [get_page, save_page]
+      code: |
+        // get_page returns { result: "<page text>", error: {...} } — unwrap .result.
+        const text = (await api.get_page({ page: params.page })).result;
+        if (text === null || text === undefined || text === "") {
+          return { success: false, replacements: 0, error: "page_empty_or_missing" };
+        }
+        if (params.search === "") {
+          return { success: false, replacements: 0, error: "empty_search_string" };
+        }
+        const parts = text.split(params.search);
+        const replacements = parts.length - 1;
+        if (replacements === 0) {
+          return { success: true, replacements: 0 };
+        }
+        const updated = parts.join(params.replace);
+        await api.save_page({
+          page: params.page,
+          text: updated,
+          summary: params.summary || ("search-and-replace: " + replacements + " occurrence(s)")
+        });
+        return { success: true, replacements };
+
+    page_append_section:
+      description: >
+        Insert content at the end of an existing section, before the next heading
+        of equal or higher level. Useful for adding material between e.g. section
+        6.2 and 7 — which append_page cannot do because it only appends to EOF.
+        Internally: get_page → parse headings → splice → save_page. The full
+        page content never leaves the ToolMesh server.
+      params:
+        page:
+          type: string
+          required: true
+          description: "Page ID (e.g. 'wiki:syntax')"
+        after_heading:
+          type: string
+          required: true
+          description: >
+            Exact heading text (without the surrounding '=' markers). The first
+            matching heading determines the target section.
+        content:
+          type: string
+          required: true
+          description: "DokuWiki syntax to insert at the end of that section"
+        summary:
+          type: string
+          description: "Edit summary for the revision log (default: auto-generated)"
+      timeout: 30s
+      depends_on: [get_page, save_page]
+      code: |
+        // get_page returns { result: "<page text>", error: {...} } — unwrap .result.
+        const text = (await api.get_page({ page: params.page })).result;
+        if (text === null || text === undefined || text === "") {
+          return { success: false, error: "page_empty_or_missing" };
+        }
+        const target = params.after_heading.trim();
+        if (target === "") {
+          return { success: false, error: "empty_after_heading" };
+        }
+        // DokuWiki heading: "==+ text ==+" with matching '=' counts on both sides.
+        // More '=' = higher-level heading (====== is h1, == is h5).
+        const headingRe = /^(={2,6})\s*(.+?)\s*\1\s*$/;
+        const lines = text.split("\n");
+        let sectionIdx = -1;
+        let sectionLevel = 0;
+        for (let i = 0; i < lines.length; i++) {
+          const m = lines[i].match(headingRe);
+          if (m && m[2].trim() === target) {
+            sectionIdx = i;
+            sectionLevel = m[1].length;
+            break;
+          }
+        }
+        if (sectionIdx === -1) {
+          return { success: false, error: "heading_not_found", heading: target };
+        }
+        // End of section = next heading with the same or higher level
+        // (i.e. '=' count >= sectionLevel), else EOF.
+        let insertIdx = lines.length;
+        for (let i = sectionIdx + 1; i < lines.length; i++) {
+          const m = lines[i].match(headingRe);
+          if (m && m[1].length >= sectionLevel) {
+            insertIdx = i;
+            break;
+          }
+        }
+        const before = lines.slice(0, insertIdx);
+        const after = lines.slice(insertIdx);
+        const contentLines = params.content.split("\n");
+        // Ensure a blank line separates inserted content from its surroundings.
+        if (before.length > 0 && before[before.length - 1].trim() !== "") {
+          contentLines.unshift("");
+        }
+        if (after.length > 0 && contentLines[contentLines.length - 1].trim() !== "") {
+          contentLines.push("");
+        }
+        const newText = before.concat(contentLines).concat(after).join("\n");
+        await api.save_page({
+          page: params.page,
+          text: newText,
+          summary: params.summary || ("append after section: " + target)
+        });
+        return { success: true, heading: target, inserted_at_line: insertIdx };
 
   examples:
     - name: "Find and read a page"
