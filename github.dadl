@@ -4,7 +4,7 @@ credits:
   - "Dunkel Cloud GmbH"
 source_name: "GitHub REST API v3"
 source_url: "https://docs.github.com/en/rest"
-date: "2026-03-29"
+date: "2026-04-02"
 
 backend:
   name: github
@@ -13,12 +13,12 @@ backend:
   description: "GitHub REST API — repositories, issues, pull requests, commits, and code search"
 
   coverage:
-    endpoints: 204
+    endpoints: 205
     total_endpoints: 900
     percentage: 23
     focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + artifacts + dispatch), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions)"
     missing: "projects v2, codespaces, copilot, security advisories, rate limit API, git LFS, autolinks, repository rulesets"
-    last_reviewed: "2026-03-28"
+    last_reviewed: "2026-04-02"
 
   setup:
     credential_steps:
@@ -30,7 +30,7 @@ backend:
     backends_yaml: |
       - name: github
         transport: rest
-        dadl: /app/dadl/github.dadl
+        dadl: github.dadl
         url: "https://api.github.com"
     required_scopes:
       - repo
@@ -2289,6 +2289,18 @@ backend:
         check_name: { type: string, in: query }
         status: { type: string, in: query }
         filter: { type: string, in: query, default: "latest" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    list_check_run_annotations:
+      method: GET
+      path: /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations
+      access: read
+      description: "List annotations for a check run. Returns inline lint/test errors with file path, line number, and message. Use this to inspect CI failure details programmatically."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        check_run_id: { type: integer, in: path, required: true }
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 30 }
 
