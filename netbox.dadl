@@ -18,6 +18,15 @@
 # - Status values vary per model: "active", "planned", "staged", "decommissioning", etc.
 # - A "prefix" in IPAM is a CIDR block (e.g. 10.0.0.0/24). A "VRF" is a routing domain.
 # - A "VLAN" has a numeric vid (1-4094) and belongs to a VLAN group and optional site.
+# - FHRP (First Hop Redundancy Protocol) groups model virtual IP failover (VRRP, HSRP, CARP, GLBP).
+#   Each group has a protocol + group_id. Assign interfaces via fhrp-group-assignments with priority 0-255.
+# - Field selection: use ?fields=id,name,status to limit returned fields, or ?omit=config_context
+#   to exclude specific fields. Available on all endpoints. Drastically reduces response size.
+# - Custom field filters: list endpoints accept ?cf_<field_name>=<value> for exact match,
+#   ?cf_<field_name>__n=null for "is set", ?cf_<field_name>__ic=term for case-insensitive contains.
+#   These are deployment-specific — add cf_* params to tools as needed for your instance.
+# - List responses are wrapped: {count, next, previous, results}. result_path extracts results only.
+#   Use limit/offset params for pagination. allow_jq_override is enabled for custom transforms.
 # - Devices have components: interfaces, console-ports, power-ports, etc.
 # - Virtual machines live in clusters and have interfaces and virtual-disks.
 # - The API root at /api/ lists all available app endpoints.
@@ -29,12 +38,17 @@ credits:
 
 source_name: "NetBox REST API"
 source_url: "https://netboxlabs.com/docs/netbox/integrations/rest-api/"
-date: "2026-04-12"
+date: "2026-04-13"
+
+_params:
+  field_select: &field_select
+    fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status). Drastically reduces response size." }
+    omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
 
 backend:
   name: netbox
   type: rest
-  version: "1.0"
+  version: "1.2"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own NetBox instance address.
   description: "NetBox DCIM/IPAM API -- sites, racks, devices, interfaces, cables, IP addresses, prefixes, VLANs, VRFs, virtual machines, clusters, circuits, tenants, contacts, and network documentation"
@@ -75,14 +89,15 @@ backend:
     response:
       result_path: "$.results"
       max_items: 500
+      allow_jq_override: true
 
   coverage:
-    endpoints: 233
+    endpoints: 244
     total_endpoints: 250
-    percentage: 93
-    focus: "DCIM (sites, locations, racks, devices, interfaces, cables, manufacturers, device-types, device-roles, platforms, power), IPAM (prefixes, ip-addresses, vlans, vlan-groups, vrfs, aggregates, rirs, asns, roles, services, ip-ranges), Virtualization (clusters, cluster-types, cluster-groups, virtual-machines, vm-interfaces, virtual-disks), Tenancy (tenants, tenant-groups, contacts, contact-roles), Circuits (providers, circuits, circuit-types, circuit-terminations), Wireless (wireless-lans, wireless-links), VPN (tunnels, l2vpns), Extras (tags, custom-fields, custom-field-choice-sets, journal-entries, config-contexts)"
-    missing: "device component templates, module types/bays, inventory items, power panels/feeds, rack reservations, virtual-chassis, front/rear-ports, console-server-ports, power-outlets, FHRP groups, VLAN translations, IKE/IPSec policies, event rules, webhooks, scripts, export templates, users/groups/permissions, bookmarks, notifications"
-    last_reviewed: "2026-04-12"
+    percentage: 98
+    focus: "DCIM (sites, locations, racks, devices, interfaces, cables, manufacturers, device-types, device-roles, platforms, power), IPAM (prefixes, ip-addresses, vlans, vlan-groups, vrfs, aggregates, rirs, asns, roles, services, ip-ranges, fhrp-groups, fhrp-group-assignments), Virtualization (clusters, cluster-types, cluster-groups, virtual-machines, vm-interfaces, virtual-disks), Tenancy (tenants, tenant-groups, contacts, contact-roles), Circuits (providers, circuits, circuit-types, circuit-terminations), Wireless (wireless-lans, wireless-links), VPN (tunnels, l2vpns), Extras (tags, custom-fields, custom-field-choice-sets, journal-entries, object-changes, config-contexts)"
+    missing: "device component templates, module types/bays, inventory items, power panels/feeds, rack reservations, virtual-chassis, front/rear-ports, console-server-ports, power-outlets, VLAN translations, IKE/IPSec policies, event rules, webhooks, scripts, export templates, users/groups/permissions, bookmarks, notifications"
+    last_reviewed: "2026-04-16"
 
   setup:
     credential_steps:
@@ -145,6 +160,7 @@ backend:
       access: read
       description: "List all sites (data centers, offices, PoPs)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         slug: { type: string, in: query }
         status: { type: string, in: query, description: "planned, staging, active, decommissioning, retired" }
@@ -163,6 +179,7 @@ backend:
       access: read
       description: "Get a specific site"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -222,6 +239,7 @@ backend:
       access: read
       description: "List all regions (geographic grouping of sites)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         slug: { type: string, in: query }
         q: { type: string, in: query }
@@ -248,6 +266,7 @@ backend:
       access: read
       description: "Get a specific region"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -279,6 +298,7 @@ backend:
       access: read
       description: "List locations within sites (rooms, floors, cages)"
       params:
+        <<: *field_select
         site: { type: string, in: query }
         site_id: { type: integer, in: query }
         name: { type: string, in: query }
@@ -308,6 +328,7 @@ backend:
       access: read
       description: "Get a specific location"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -348,6 +369,7 @@ backend:
       access: read
       description: "List all racks"
       params:
+        <<: *field_select
         site: { type: string, in: query }
         site_id: { type: integer, in: query }
         location: { type: string, in: query }
@@ -366,6 +388,7 @@ backend:
       access: read
       description: "Get a specific rack"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -425,6 +448,7 @@ backend:
       access: read
       description: "List hardware manufacturers"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -449,6 +473,7 @@ backend:
       access: read
       description: "Get a specific manufacturer"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -480,6 +505,7 @@ backend:
       access: read
       description: "List device types (hardware models)"
       params:
+        <<: *field_select
         manufacturer: { type: string, in: query }
         model: { type: string, in: query }
         q: { type: string, in: query }
@@ -508,6 +534,7 @@ backend:
       access: read
       description: "Get a specific device type"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -539,6 +566,7 @@ backend:
       access: read
       description: "List device roles (server, switch, router, firewall, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -565,6 +593,7 @@ backend:
       access: read
       description: "Get a specific device role"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -598,6 +627,7 @@ backend:
       access: read
       description: "List platforms (OS/firmware: Cisco IOS, Junos, Linux, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -623,6 +653,7 @@ backend:
       access: read
       description: "Get a specific platform"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -654,6 +685,7 @@ backend:
       access: read
       description: "List all devices (servers, switches, routers, firewalls, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         site: { type: string, in: query }
         site_id: { type: integer, in: query }
@@ -679,6 +711,7 @@ backend:
       access: read
       description: "Get a specific device with all details"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -758,6 +791,7 @@ backend:
       access: read
       description: "List device interfaces (physical and logical)"
       params:
+        <<: *field_select
         device: { type: string, in: query, description: "Device name" }
         device_id: { type: integer, in: query }
         name: { type: string, in: query }
@@ -775,6 +809,7 @@ backend:
       access: read
       description: "Get a specific interface"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -790,6 +825,7 @@ backend:
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
         mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x)" }
         mgmt_only: { type: boolean, in: body, description: "Management-only interface" }
         label: { type: string, in: body, description: "Physical label" }
         speed: { type: integer, in: body, description: "Speed in Kbps" }
@@ -817,6 +853,7 @@ backend:
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
         mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x)" }
         mgmt_only: { type: boolean, in: body, description: "Management-only interface" }
         label: { type: string, in: body, description: "Physical label" }
         speed: { type: integer, in: body, description: "Speed in Kbps" }
@@ -847,6 +884,7 @@ backend:
       access: read
       description: "List all cables connecting device components"
       params:
+        <<: *field_select
         site: { type: string, in: query }
         device: { type: string, in: query }
         type: { type: string, in: query }
@@ -863,6 +901,7 @@ backend:
       access: read
       description: "Get a specific cable"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -914,6 +953,7 @@ backend:
       access: read
       description: "List device console ports"
       params:
+        <<: *field_select
         device: { type: string, in: query }
         device_id: { type: integer, in: query }
         q: { type: string, in: query }
@@ -940,6 +980,7 @@ backend:
       access: read
       description: "List device power ports"
       params:
+        <<: *field_select
         device: { type: string, in: query }
         device_id: { type: integer, in: query }
         q: { type: string, in: query }
@@ -967,6 +1008,7 @@ backend:
       access: read
       description: "List MAC addresses"
       params:
+        <<: *field_select
         device: { type: string, in: query }
         interface: { type: string, in: query }
         q: { type: string, in: query }
@@ -992,6 +1034,7 @@ backend:
       access: read
       description: "Get a specific MAC address entry"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1028,6 +1071,7 @@ backend:
       access: read
       description: "List IP prefixes (subnets)"
       params:
+        <<: *field_select
         prefix: { type: string, in: query, description: "Exact CIDR match" }
         within: { type: string, in: query, description: "CIDR supernet (e.g. 10.0.0.0/8)" }
         contains: { type: string, in: query, description: "IP or prefix contained" }
@@ -1049,6 +1093,7 @@ backend:
       access: read
       description: "Get a specific prefix"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1104,6 +1149,7 @@ backend:
       access: read
       description: "List available (unallocated) IPs within a prefix"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1113,6 +1159,7 @@ backend:
       access: read
       description: "List all IP addresses"
       params:
+        <<: *field_select
         address: { type: string, in: query, description: "Exact IP (e.g. 10.0.0.1/24)" }
         parent: { type: string, in: query, description: "Parent prefix CIDR" }
         device: { type: string, in: query }
@@ -1135,6 +1182,7 @@ backend:
       access: read
       description: "Get a specific IP address"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1192,6 +1240,7 @@ backend:
       access: read
       description: "List IP ranges (continuous address ranges, e.g. DHCP pools)"
       params:
+        <<: *field_select
         vrf: { type: string, in: query }
         status: { type: string, in: query }
         tenant: { type: string, in: query }
@@ -1226,6 +1275,7 @@ backend:
       access: read
       description: "List all VLANs"
       params:
+        <<: *field_select
         vid: { type: integer, in: query, description: "VLAN ID (1-4094)" }
         name: { type: string, in: query }
         site: { type: string, in: query }
@@ -1244,6 +1294,7 @@ backend:
       access: read
       description: "Get a specific VLAN"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1299,6 +1350,7 @@ backend:
       access: read
       description: "List VLAN groups"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1327,6 +1379,7 @@ backend:
       access: read
       description: "Get a specific VLAN group"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1360,6 +1413,7 @@ backend:
       access: read
       description: "List all VRFs (Virtual Routing and Forwarding instances)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         rd: { type: string, in: query, description: "Route distinguisher" }
         tenant: { type: string, in: query }
@@ -1375,6 +1429,7 @@ backend:
       access: read
       description: "Get a specific VRF"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1427,6 +1482,7 @@ backend:
       access: read
       description: "List Regional Internet Registries (RIPE, ARIN, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1452,6 +1508,7 @@ backend:
       access: read
       description: "List aggregate prefixes (top-level allocations from RIRs)"
       params:
+        <<: *field_select
         rir: { type: string, in: query }
         prefix: { type: string, in: query }
         tag: { type: string, in: query }
@@ -1479,6 +1536,7 @@ backend:
       access: read
       description: "List Autonomous System Numbers"
       params:
+        <<: *field_select
         asn: { type: integer, in: query }
         rir: { type: string, in: query }
         tenant: { type: string, in: query }
@@ -1505,6 +1563,7 @@ backend:
       access: read
       description: "List IPAM roles for prefixes and VLANs"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1529,6 +1588,7 @@ backend:
       access: read
       description: "List services running on devices or VMs (DNS, HTTP, SSH, etc.). NetBox 4.x uses parent_object filters."
       params:
+        <<: *field_select
         device: { type: string, in: query, description: "Filter by device name (legacy, may not work on 4.x)" }
         device_id: { type: integer, in: query, description: "Filter by device ID" }
         virtual_machine: { type: string, in: query, description: "Filter by VM name (legacy, may not work on 4.x)" }
@@ -1563,6 +1623,7 @@ backend:
       access: read
       description: "Get a specific service"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1593,6 +1654,141 @@ backend:
       pagination: none
 
     # =========================================================================
+    # IPAM -- FHRP Groups & Assignments
+    # =========================================================================
+
+    list_fhrp_groups:
+      method: GET
+      path: /ipam/fhrp-groups/
+      access: read
+      description: "List FHRP (First Hop Redundancy Protocol) groups. FHRP groups represent virtual IP failover configurations using VRRP, HSRP, GLBP, or CARP. Each group has a protocol, numeric group_id, and optional name. IP addresses are assigned to groups separately."
+      params:
+        <<: *field_select
+        name: { type: string, in: query }
+        protocol: { type: string, in: query, description: "Filter by protocol: vrrp2, vrrp3, hsrp, carp, glbp" }
+        group_id: { type: integer, in: query, description: "Filter by numeric group identifier" }
+        auth_type: { type: string, in: query, description: "Filter by authentication type: plaintext, md5" }
+        tag: { type: string, in: query }
+        q: { type: string, in: query }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_fhrp_group:
+      method: GET
+      path: /ipam/fhrp-groups/{id}/
+      access: read
+      description: "Get a specific FHRP group by ID. Returns protocol, group_id, name, auth_type, auth_key, and assigned IP addresses."
+      params:
+        <<: *field_select
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_fhrp_group:
+      method: POST
+      path: /ipam/fhrp-groups/
+      access: write
+      description: "Create an FHRP group. Requires protocol and group_id. Virtual IP addresses can be created alongside the group or assigned afterward via IP address objects."
+      params:
+        protocol: { type: string, in: body, required: true, description: "FHRP protocol: vrrp2, vrrp3, hsrp, carp, glbp" }
+        group_id: { type: integer, in: body, required: true, description: "Numeric group identifier (e.g. VRID for VRRP)" }
+        name: { type: string, in: body, description: "Optional display name for the group" }
+        auth_type: { type: string, in: body, description: "Authentication type: plaintext, md5. Leave empty for none." }
+        auth_key: { type: string, in: body, description: "Shared authentication key (stored in plaintext in NetBox DB)" }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body }
+      pagination: none
+
+    update_fhrp_group:
+      method: PATCH
+      path: /ipam/fhrp-groups/{id}/
+      access: write
+      description: "Update an FHRP group."
+      params:
+        id: { type: integer, in: path, required: true }
+        protocol: { type: string, in: body, description: "FHRP protocol: vrrp2, vrrp3, hsrp, carp, glbp" }
+        group_id: { type: integer, in: body, description: "Numeric group identifier" }
+        name: { type: string, in: body }
+        auth_type: { type: string, in: body, description: "Authentication type: plaintext, md5" }
+        auth_key: { type: string, in: body }
+        description: { type: string, in: body }
+        comments: { type: string, in: body }
+        tags: { type: array, in: body }
+        custom_fields: { type: object, in: body }
+      pagination: none
+
+    delete_fhrp_group:
+      method: DELETE
+      path: /ipam/fhrp-groups/{id}/
+      access: dangerous
+      description: "Delete an FHRP group. This also removes all group assignments."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_fhrp_group_assignments:
+      method: GET
+      path: /ipam/fhrp-group-assignments/
+      access: read
+      description: "List FHRP group assignments — links between FHRP groups and device/VM interfaces. Each assignment has a priority (0-255) determining master/primary election."
+      params:
+        <<: *field_select
+        group_id: { type: integer, in: query, description: "Filter by FHRP group ID" }
+        interface_type: { type: string, in: query, description: "Content type filter: dcim.interface or virtualization.vminterface" }
+        interface_id: { type: integer, in: query, description: "Filter by interface ID" }
+        device: { type: string, in: query, description: "Filter by device name (via interface)" }
+        device_id: { type: integer, in: query, description: "Filter by device ID (via interface)" }
+        virtual_machine: { type: string, in: query, description: "Filter by VM name (via interface)" }
+        virtual_machine_id: { type: integer, in: query, description: "Filter by VM ID (via interface)" }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
+    get_fhrp_group_assignment:
+      method: GET
+      path: /ipam/fhrp-group-assignments/{id}/
+      access: read
+      description: "Get a specific FHRP group assignment by ID."
+      params:
+        <<: *field_select
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_fhrp_group_assignment:
+      method: POST
+      path: /ipam/fhrp-group-assignments/
+      access: write
+      description: "Assign an FHRP group to a device or VM interface. Priority (0-255) determines master/primary election — higher priority = more likely to be elected master."
+      params:
+        group: { type: integer, in: body, required: true, description: "FHRP group ID" }
+        interface_type: { type: string, in: body, required: true, description: "Content type: 'dcim.interface' or 'virtualization.vminterface'" }
+        interface_id: { type: integer, in: body, required: true, description: "ID of the device or VM interface" }
+        priority: { type: integer, in: body, required: true, description: "Election priority 0-255 (higher = more likely master)" }
+      pagination: none
+
+    update_fhrp_group_assignment:
+      method: PATCH
+      path: /ipam/fhrp-group-assignments/{id}/
+      access: write
+      description: "Update an FHRP group assignment (e.g. change priority or reassign to a different interface)."
+      params:
+        id: { type: integer, in: path, required: true }
+        group: { type: integer, in: body, description: "FHRP group ID" }
+        interface_type: { type: string, in: body, description: "Content type: 'dcim.interface' or 'virtualization.vminterface'" }
+        interface_id: { type: integer, in: body, description: "ID of the device or VM interface" }
+        priority: { type: integer, in: body, description: "Election priority 0-255" }
+      pagination: none
+
+    delete_fhrp_group_assignment:
+      method: DELETE
+      path: /ipam/fhrp-group-assignments/{id}/
+      access: dangerous
+      description: "Delete an FHRP group assignment — removes the interface from the FHRP group."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
     # VIRTUALIZATION -- Clusters & VMs
     # =========================================================================
 
@@ -1602,6 +1798,7 @@ backend:
       access: read
       description: "List cluster types (VMware, Proxmox, XCP-ng, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1626,6 +1823,7 @@ backend:
       access: read
       description: "List cluster groups"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1650,6 +1848,7 @@ backend:
       access: read
       description: "Get a specific cluster group"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1681,6 +1880,7 @@ backend:
       access: read
       description: "List all virtualization clusters"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         type: { type: string, in: query }
         group: { type: string, in: query }
@@ -1698,6 +1898,7 @@ backend:
       access: read
       description: "Get a specific cluster"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1754,6 +1955,7 @@ backend:
       access: read
       description: "List all virtual machines"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         cluster: { type: string, in: query }
         site: { type: string, in: query }
@@ -1774,6 +1976,7 @@ backend:
       access: read
       description: "Get a specific virtual machine"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1841,6 +2044,7 @@ backend:
       access: read
       description: "List virtual machine interfaces"
       params:
+        <<: *field_select
         virtual_machine: { type: string, in: query }
         virtual_machine_id: { type: integer, in: query }
         name: { type: string, in: query }
@@ -1861,6 +2065,7 @@ backend:
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
         mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x)" }
         parent: { type: integer, in: body, description: "Parent interface ID" }
         bridge: { type: integer, in: body, description: "Bridge interface ID" }
         vrf: { type: integer, in: body, description: "VRF assignment" }
@@ -1877,6 +2082,7 @@ backend:
       access: read
       description: "Get a specific VM interface"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1891,6 +2097,7 @@ backend:
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
         mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x)" }
         parent: { type: integer, in: body, description: "Parent interface ID" }
         bridge: { type: integer, in: body, description: "Bridge interface ID" }
         vrf: { type: integer, in: body, description: "VRF assignment" }
@@ -1916,6 +2123,7 @@ backend:
       access: read
       description: "List virtual disks"
       params:
+        <<: *field_select
         virtual_machine: { type: string, in: query }
         virtual_machine_id: { type: integer, in: query }
         q: { type: string, in: query }
@@ -1945,6 +2153,7 @@ backend:
       access: read
       description: "List all tenants (customers, departments, teams)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         group: { type: string, in: query }
         tag: { type: string, in: query }
@@ -1959,6 +2168,7 @@ backend:
       access: read
       description: "Get a specific tenant"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2006,6 +2216,7 @@ backend:
       access: read
       description: "List tenant groups"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -2031,6 +2242,7 @@ backend:
       access: read
       description: "Get a specific tenant group"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2062,6 +2274,7 @@ backend:
       access: read
       description: "List all contacts"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         group: { type: string, in: query }
         q: { type: string, in: query }
@@ -2091,6 +2304,7 @@ backend:
       access: read
       description: "Get a specific contact"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2125,6 +2339,7 @@ backend:
       access: read
       description: "List contact roles (admin, NOC, billing, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -2149,6 +2364,7 @@ backend:
       access: read
       description: "Get a specific contact role"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2184,6 +2400,7 @@ backend:
       access: read
       description: "List circuit providers (ISPs, carriers)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         slug: { type: string, in: query }
         tag: { type: string, in: query }
@@ -2212,6 +2429,7 @@ backend:
       access: read
       description: "Get a specific provider"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2244,6 +2462,7 @@ backend:
       access: read
       description: "List circuit types (Internet, MPLS, dark fiber, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -2268,6 +2487,7 @@ backend:
       access: read
       description: "Get a specific circuit type"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2299,6 +2519,7 @@ backend:
       access: read
       description: "List all circuits"
       params:
+        <<: *field_select
         cid: { type: string, in: query, description: "Circuit ID" }
         provider: { type: string, in: query }
         type: { type: string, in: query }
@@ -2317,6 +2538,7 @@ backend:
       access: read
       description: "Get a specific circuit"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2367,6 +2589,7 @@ backend:
       access: read
       description: "List circuit terminations (A-side and Z-side endpoints)"
       params:
+        <<: *field_select
         circuit_id: { type: integer, in: query }
         site: { type: string, in: query }
         q: { type: string, in: query }
@@ -2394,6 +2617,7 @@ backend:
       access: read
       description: "Get a specific circuit termination"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2430,6 +2654,7 @@ backend:
       access: read
       description: "List wireless LANs (SSIDs)"
       params:
+        <<: *field_select
         ssid: { type: string, in: query }
         group: { type: string, in: query }
         status: { type: string, in: query }
@@ -2460,6 +2685,7 @@ backend:
       access: read
       description: "List wireless point-to-point links"
       params:
+        <<: *field_select
         status: { type: string, in: query }
         tag: { type: string, in: query }
         q: { type: string, in: query }
@@ -2490,6 +2716,7 @@ backend:
       access: read
       description: "List VPN tunnels"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         status: { type: string, in: query }
         group: { type: string, in: query }
@@ -2519,6 +2746,7 @@ backend:
       access: read
       description: "List L2VPN instances (VPLS, VXLAN, etc.)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         type: { type: string, in: query }
         tag: { type: string, in: query }
@@ -2551,6 +2779,7 @@ backend:
       access: read
       description: "List all tags"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         limit: { type: integer, in: query }
@@ -2574,6 +2803,7 @@ backend:
       access: read
       description: "Get a specific tag"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2609,6 +2839,7 @@ backend:
       access: read
       description: "List all custom field definitions"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         content_types: { type: string, in: query, description: "Filter by content type (e.g. dcim.device)" }
         q: { type: string, in: query }
@@ -2621,6 +2852,7 @@ backend:
       access: read
       description: "Get a specific custom field definition"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2685,6 +2917,7 @@ backend:
       access: read
       description: "List all custom field choice sets"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         limit: { type: integer, in: query }
@@ -2696,6 +2929,7 @@ backend:
       access: read
       description: "Get a specific custom field choice set"
       params:
+        <<: *field_select
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2734,12 +2968,33 @@ backend:
         id: { type: integer, in: path, required: true }
       pagination: none
 
+    list_object_changes:
+      method: GET
+      path: /core/object-changes/
+      access: read
+      description: "List the change log — every create/update/delete on any NetBox object is recorded with timestamp, user, action, and pre/post-change snapshots. Use to audit who changed what and when."
+      params:
+        <<: *field_select
+        user_id: { type: integer, in: query, description: "Filter by user ID who made the change" }
+        user_name: { type: string, in: query, description: "Filter by username" }
+        action: { type: string, in: query, description: "create, update, or delete" }
+        changed_object_type: { type: string, in: query, description: "Content type, e.g. ipam.service, dcim.device, virtualization.virtualmachine" }
+        changed_object_id: { type: integer, in: query, description: "Filter by the changed object's ID" }
+        request_id: { type: string, in: query, description: "Filter by request UUID (groups changes from one API call)" }
+        time_before: { type: string, in: query, description: "ISO 8601 timestamp upper bound" }
+        time_after: { type: string, in: query, description: "ISO 8601 timestamp lower bound" }
+        q: { type: string, in: query, description: "Search object representation" }
+        ordering: { type: string, in: query, description: "e.g. -time (newest first)" }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+
     list_journal_entries:
       method: GET
       path: /extras/journal-entries/
       access: read
       description: "List journal entries (change notes on objects)"
       params:
+        <<: *field_select
         assigned_object_type: { type: string, in: query }
         assigned_object_id: { type: integer, in: query }
         kind: { type: string, in: query }
@@ -2766,6 +3021,7 @@ backend:
       access: read
       description: "List configuration contexts (rendered config data for devices/VMs)"
       params:
+        <<: *field_select
         name: { type: string, in: query }
         q: { type: string, in: query }
         limit: { type: integer, in: query }
