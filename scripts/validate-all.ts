@@ -3,6 +3,21 @@ import { join, basename } from "path";
 import Ajv from "ajv";
 import { parse as parseYaml } from "yaml";
 
+function findMergeKeys(obj: any, path = ""): string[] {
+  const found: string[] = [];
+  if (obj && typeof obj === "object") {
+    for (const key of Object.keys(obj)) {
+      const p = path ? `${path}/${key}` : `/${key}`;
+      if (key === "<<") {
+        found.push(p);
+      } else {
+        found.push(...findMergeKeys(obj[key], p));
+      }
+    }
+  }
+  return found;
+}
+
 const ROOT_DIR = join(import.meta.dirname, "..");
 const SCHEMA_PATH = join(ROOT_DIR, "schema", "dadl-v1.schema.json");
 const MAX_FILE_SIZE = 500 * 1024; // 500 KB
@@ -40,6 +55,14 @@ for (const file of files) {
     errors.forEach((e) => console.error(`   ${e}`));
     hasErrors = true;
     continue;
+  }
+
+  // Reject YAML merge keys (<<: *anchor) — they make files harder for LLMs to consume
+  const mergeKeys = findMergeKeys(doc);
+  if (mergeKeys.length > 0) {
+    for (const path of mergeKeys) {
+      errors.push(`Merge key "<<" at ${path} is not allowed — inline the values instead`);
+    }
   }
 
   // Schema validation
