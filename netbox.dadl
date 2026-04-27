@@ -20,13 +20,6 @@
 # - A "VLAN" has a numeric vid (1-4094) and belongs to a VLAN group and optional site.
 # - FHRP (First Hop Redundancy Protocol) groups model virtual IP failover (VRRP, HSRP, CARP, GLBP).
 #   Each group has a protocol + group_id. Assign interfaces via fhrp-group-assignments with priority 0-255.
-# - Field selection: use ?fields=id,name,status to limit returned fields, or ?omit=config_context
-#   to exclude specific fields. Available on all endpoints. Drastically reduces response size.
-# - Custom field filters: list endpoints accept ?cf_<field_name>=<value> for exact match,
-#   ?cf_<field_name>__n=null for "is set", ?cf_<field_name>__ic=term for case-insensitive contains.
-#   These are deployment-specific — add cf_* params to tools as needed for your instance.
-# - List responses are wrapped: {count, next, previous, results}. result_path extracts results only.
-#   Use limit/offset params for pagination. allow_jq_override is enabled for custom transforms.
 # - Devices have components: interfaces, console-ports, power-ports, etc.
 # - Virtual machines live in clusters and have interfaces and virtual-disks.
 # - The API root at /api/ lists all available app endpoints.
@@ -39,7 +32,6 @@ credits:
 source_name: "NetBox REST API"
 source_url: "https://netboxlabs.com/docs/netbox/integrations/rest-api/"
 date: "2026-04-13"
-
 
 backend:
   name: netbox
@@ -85,7 +77,6 @@ backend:
     response:
       result_path: "$.results"
       max_items: 500
-      allow_jq_override: true
 
   coverage:
     endpoints: 244
@@ -156,8 +147,6 @@ backend:
       access: read
       description: "List all sites (data centers, offices, PoPs)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         slug: { type: string, in: query }
         status: { type: string, in: query, description: "planned, staging, active, decommissioning, retired" }
@@ -176,8 +165,6 @@ backend:
       access: read
       description: "Get a specific site"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -237,8 +224,6 @@ backend:
       access: read
       description: "List all regions (geographic grouping of sites)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         slug: { type: string, in: query }
         q: { type: string, in: query }
@@ -265,8 +250,6 @@ backend:
       access: read
       description: "Get a specific region"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -298,8 +281,6 @@ backend:
       access: read
       description: "List locations within sites (rooms, floors, cages)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         site: { type: string, in: query }
         site_id: { type: integer, in: query }
         name: { type: string, in: query }
@@ -329,8 +310,6 @@ backend:
       access: read
       description: "Get a specific location"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -371,8 +350,6 @@ backend:
       access: read
       description: "List all racks"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         site: { type: string, in: query }
         site_id: { type: integer, in: query }
         location: { type: string, in: query }
@@ -391,8 +368,6 @@ backend:
       access: read
       description: "Get a specific rack"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -452,8 +427,6 @@ backend:
       access: read
       description: "List hardware manufacturers"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -478,8 +451,6 @@ backend:
       access: read
       description: "Get a specific manufacturer"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -511,8 +482,6 @@ backend:
       access: read
       description: "List device types (hardware models)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         manufacturer: { type: string, in: query }
         model: { type: string, in: query }
         q: { type: string, in: query }
@@ -541,8 +510,6 @@ backend:
       access: read
       description: "Get a specific device type"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -574,8 +541,6 @@ backend:
       access: read
       description: "List device roles (server, switch, router, firewall, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -602,8 +567,6 @@ backend:
       access: read
       description: "Get a specific device role"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -637,8 +600,6 @@ backend:
       access: read
       description: "List platforms (OS/firmware: Cisco IOS, Junos, Linux, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -664,8 +625,6 @@ backend:
       access: read
       description: "Get a specific platform"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -697,8 +656,6 @@ backend:
       access: read
       description: "List all devices (servers, switches, routers, firewalls, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         site: { type: string, in: query }
         site_id: { type: integer, in: query }
@@ -724,8 +681,6 @@ backend:
       access: read
       description: "Get a specific device with all details"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -805,8 +760,6 @@ backend:
       access: read
       description: "List device interfaces (physical and logical)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         device: { type: string, in: query, description: "Device name" }
         device_id: { type: integer, in: query }
         name: { type: string, in: query }
@@ -824,8 +777,6 @@ backend:
       access: read
       description: "Get a specific interface"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -900,8 +851,6 @@ backend:
       access: read
       description: "List all cables connecting device components"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         site: { type: string, in: query }
         device: { type: string, in: query }
         type: { type: string, in: query }
@@ -918,8 +867,6 @@ backend:
       access: read
       description: "Get a specific cable"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -971,8 +918,6 @@ backend:
       access: read
       description: "List device console ports"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         device: { type: string, in: query }
         device_id: { type: integer, in: query }
         q: { type: string, in: query }
@@ -999,8 +944,6 @@ backend:
       access: read
       description: "List device power ports"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         device: { type: string, in: query }
         device_id: { type: integer, in: query }
         q: { type: string, in: query }
@@ -1028,8 +971,6 @@ backend:
       access: read
       description: "List MAC addresses"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         device: { type: string, in: query }
         interface: { type: string, in: query }
         q: { type: string, in: query }
@@ -1055,8 +996,6 @@ backend:
       access: read
       description: "Get a specific MAC address entry"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1093,8 +1032,6 @@ backend:
       access: read
       description: "List IP prefixes (subnets)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         prefix: { type: string, in: query, description: "Exact CIDR match" }
         within: { type: string, in: query, description: "CIDR supernet (e.g. 10.0.0.0/8)" }
         contains: { type: string, in: query, description: "IP or prefix contained" }
@@ -1116,8 +1053,6 @@ backend:
       access: read
       description: "Get a specific prefix"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1173,8 +1108,6 @@ backend:
       access: read
       description: "List available (unallocated) IPs within a prefix"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1184,8 +1117,6 @@ backend:
       access: read
       description: "List all IP addresses"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         address: { type: string, in: query, description: "Exact IP (e.g. 10.0.0.1/24)" }
         parent: { type: string, in: query, description: "Parent prefix CIDR" }
         device: { type: string, in: query }
@@ -1208,8 +1139,6 @@ backend:
       access: read
       description: "Get a specific IP address"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1267,8 +1196,6 @@ backend:
       access: read
       description: "List IP ranges (continuous address ranges, e.g. DHCP pools)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         vrf: { type: string, in: query }
         status: { type: string, in: query }
         tenant: { type: string, in: query }
@@ -1303,8 +1230,6 @@ backend:
       access: read
       description: "List all VLANs"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         vid: { type: integer, in: query, description: "VLAN ID (1-4094)" }
         name: { type: string, in: query }
         site: { type: string, in: query }
@@ -1323,8 +1248,6 @@ backend:
       access: read
       description: "Get a specific VLAN"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1380,8 +1303,6 @@ backend:
       access: read
       description: "List VLAN groups"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1410,8 +1331,6 @@ backend:
       access: read
       description: "Get a specific VLAN group"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1445,8 +1364,6 @@ backend:
       access: read
       description: "List all VRFs (Virtual Routing and Forwarding instances)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         rd: { type: string, in: query, description: "Route distinguisher" }
         tenant: { type: string, in: query }
@@ -1462,8 +1379,6 @@ backend:
       access: read
       description: "Get a specific VRF"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1516,8 +1431,6 @@ backend:
       access: read
       description: "List Regional Internet Registries (RIPE, ARIN, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1543,8 +1456,6 @@ backend:
       access: read
       description: "List aggregate prefixes (top-level allocations from RIRs)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         rir: { type: string, in: query }
         prefix: { type: string, in: query }
         tag: { type: string, in: query }
@@ -1572,8 +1483,6 @@ backend:
       access: read
       description: "List Autonomous System Numbers"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         asn: { type: integer, in: query }
         rir: { type: string, in: query }
         tenant: { type: string, in: query }
@@ -1600,8 +1509,6 @@ backend:
       access: read
       description: "List IPAM roles for prefixes and VLANs"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1626,8 +1533,6 @@ backend:
       access: read
       description: "List services running on devices or VMs (DNS, HTTP, SSH, etc.). NetBox 4.x uses parent_object filters."
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         device: { type: string, in: query, description: "Filter by device name (legacy, may not work on 4.x)" }
         device_id: { type: integer, in: query, description: "Filter by device ID" }
         virtual_machine: { type: string, in: query, description: "Filter by VM name (legacy, may not work on 4.x)" }
@@ -1662,8 +1567,6 @@ backend:
       access: read
       description: "Get a specific service"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1703,8 +1606,6 @@ backend:
       access: read
       description: "List FHRP (First Hop Redundancy Protocol) groups. FHRP groups represent virtual IP failover configurations using VRRP, HSRP, GLBP, or CARP. Each group has a protocol, numeric group_id, and optional name. IP addresses are assigned to groups separately."
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         protocol: { type: string, in: query, description: "Filter by protocol: vrrp2, vrrp3, hsrp, carp, glbp" }
         group_id: { type: integer, in: query, description: "Filter by numeric group identifier" }
@@ -1720,8 +1621,6 @@ backend:
       access: read
       description: "Get a specific FHRP group by ID. Returns protocol, group_id, name, auth_type, auth_key, and assigned IP addresses."
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1775,8 +1674,6 @@ backend:
       access: read
       description: "List FHRP group assignments — links between FHRP groups and device/VM interfaces. Each assignment has a priority (0-255) determining master/primary election."
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         group_id: { type: integer, in: query, description: "Filter by FHRP group ID" }
         interface_type: { type: string, in: query, description: "Content type filter: dcim.interface or virtualization.vminterface" }
         interface_id: { type: integer, in: query, description: "Filter by interface ID" }
@@ -1793,8 +1690,6 @@ backend:
       access: read
       description: "Get a specific FHRP group assignment by ID."
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1842,8 +1737,6 @@ backend:
       access: read
       description: "List cluster types (VMware, Proxmox, XCP-ng, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1868,8 +1761,6 @@ backend:
       access: read
       description: "List cluster groups"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -1894,8 +1785,6 @@ backend:
       access: read
       description: "Get a specific cluster group"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -1927,8 +1816,6 @@ backend:
       access: read
       description: "List all virtualization clusters"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         type: { type: string, in: query }
         group: { type: string, in: query }
@@ -1946,8 +1833,6 @@ backend:
       access: read
       description: "Get a specific cluster"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2004,8 +1889,6 @@ backend:
       access: read
       description: "List all virtual machines"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         cluster: { type: string, in: query }
         site: { type: string, in: query }
@@ -2026,8 +1909,6 @@ backend:
       access: read
       description: "Get a specific virtual machine"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2095,8 +1976,6 @@ backend:
       access: read
       description: "List virtual machine interfaces"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         virtual_machine: { type: string, in: query }
         virtual_machine_id: { type: integer, in: query }
         name: { type: string, in: query }
@@ -2134,8 +2013,6 @@ backend:
       access: read
       description: "Get a specific VM interface"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2176,8 +2053,6 @@ backend:
       access: read
       description: "List virtual disks"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         virtual_machine: { type: string, in: query }
         virtual_machine_id: { type: integer, in: query }
         q: { type: string, in: query }
@@ -2207,8 +2082,6 @@ backend:
       access: read
       description: "List all tenants (customers, departments, teams)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         group: { type: string, in: query }
         tag: { type: string, in: query }
@@ -2223,8 +2096,6 @@ backend:
       access: read
       description: "Get a specific tenant"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2272,8 +2143,6 @@ backend:
       access: read
       description: "List tenant groups"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -2299,8 +2168,6 @@ backend:
       access: read
       description: "Get a specific tenant group"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2332,8 +2199,6 @@ backend:
       access: read
       description: "List all contacts"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         group: { type: string, in: query }
         q: { type: string, in: query }
@@ -2363,8 +2228,6 @@ backend:
       access: read
       description: "Get a specific contact"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2399,8 +2262,6 @@ backend:
       access: read
       description: "List contact roles (admin, NOC, billing, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -2425,8 +2286,6 @@ backend:
       access: read
       description: "Get a specific contact role"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2462,8 +2321,6 @@ backend:
       access: read
       description: "List circuit providers (ISPs, carriers)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         slug: { type: string, in: query }
         tag: { type: string, in: query }
@@ -2492,8 +2349,6 @@ backend:
       access: read
       description: "Get a specific provider"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2526,8 +2381,6 @@ backend:
       access: read
       description: "List circuit types (Internet, MPLS, dark fiber, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         brief: { type: boolean, in: query }
@@ -2552,8 +2405,6 @@ backend:
       access: read
       description: "Get a specific circuit type"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2585,8 +2436,6 @@ backend:
       access: read
       description: "List all circuits"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         cid: { type: string, in: query, description: "Circuit ID" }
         provider: { type: string, in: query }
         type: { type: string, in: query }
@@ -2605,8 +2454,6 @@ backend:
       access: read
       description: "Get a specific circuit"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2657,8 +2504,6 @@ backend:
       access: read
       description: "List circuit terminations (A-side and Z-side endpoints)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         circuit_id: { type: integer, in: query }
         site: { type: string, in: query }
         q: { type: string, in: query }
@@ -2686,8 +2531,6 @@ backend:
       access: read
       description: "Get a specific circuit termination"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2724,8 +2567,6 @@ backend:
       access: read
       description: "List wireless LANs (SSIDs)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         ssid: { type: string, in: query }
         group: { type: string, in: query }
         status: { type: string, in: query }
@@ -2756,8 +2597,6 @@ backend:
       access: read
       description: "List wireless point-to-point links"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         status: { type: string, in: query }
         tag: { type: string, in: query }
         q: { type: string, in: query }
@@ -2788,8 +2627,6 @@ backend:
       access: read
       description: "List VPN tunnels"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         status: { type: string, in: query }
         group: { type: string, in: query }
@@ -2819,8 +2656,6 @@ backend:
       access: read
       description: "List L2VPN instances (VPLS, VXLAN, etc.)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         type: { type: string, in: query }
         tag: { type: string, in: query }
@@ -2853,8 +2688,6 @@ backend:
       access: read
       description: "List all tags"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         limit: { type: integer, in: query }
@@ -2878,8 +2711,6 @@ backend:
       access: read
       description: "Get a specific tag"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2915,8 +2746,6 @@ backend:
       access: read
       description: "List all custom field definitions"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         content_types: { type: string, in: query, description: "Filter by content type (e.g. dcim.device)" }
         q: { type: string, in: query }
@@ -2929,8 +2758,6 @@ backend:
       access: read
       description: "Get a specific custom field definition"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -2995,8 +2822,6 @@ backend:
       access: read
       description: "List all custom field choice sets"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         limit: { type: integer, in: query }
@@ -3008,8 +2833,6 @@ backend:
       access: read
       description: "Get a specific custom field choice set"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         id: { type: integer, in: path, required: true }
       pagination: none
 
@@ -3054,8 +2877,6 @@ backend:
       access: read
       description: "List the change log — every create/update/delete on any NetBox object is recorded with timestamp, user, action, and pre/post-change snapshots. Use to audit who changed what and when."
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         user_id: { type: integer, in: query, description: "Filter by user ID who made the change" }
         user_name: { type: string, in: query, description: "Filter by username" }
         action: { type: string, in: query, description: "create, update, or delete" }
@@ -3075,8 +2896,6 @@ backend:
       access: read
       description: "List journal entries (change notes on objects)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         assigned_object_type: { type: string, in: query }
         assigned_object_id: { type: integer, in: query }
         kind: { type: string, in: query }
@@ -3103,8 +2922,6 @@ backend:
       access: read
       description: "List configuration contexts (rendered config data for devices/VMs)"
       params:
-        fields: { type: string, in: query, description: "Comma-separated list of fields to include in response (e.g. id,name,status)" }
-        omit: { type: string, in: query, description: "Comma-separated list of fields to exclude from response (e.g. config_context,custom_fields)" }
         name: { type: string, in: query }
         q: { type: string, in: query }
         limit: { type: integer, in: query }
