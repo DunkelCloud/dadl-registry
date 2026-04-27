@@ -129,7 +129,9 @@ backend:
     create_vbd:
       note: "Connects a VDI to a VM. Use connect_vbd/disconnect_vbd for hotplug."
     migrate_vdi:
-      note: "Moves a VDI between SRs without VM downtime (live storage migration)"
+      note: "Moves a VDI between SRs without VM downtime (live storage migration). Large disks can take minutes — avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
+    migrate_vm:
+      note: "Live-migrates a VM to another host, optionally with storage migration. For large VMs avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
     emergency_shutdown_pool:
       warning: "Shuts down ALL VMs and hosts in the pool. Use only in emergencies."
     rolling_reboot_pool:
@@ -325,6 +327,36 @@ backend:
         sync: { type: boolean, in: query }
       pagination: none
 
+    delete_snapshot:
+      method: DELETE
+      path: /vm-snapshots/{uuid}
+      access: dangerous
+      description: "Delete a VM snapshot. Irreversible."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_vm_snapshots:
+      method: GET
+      path: /vm-snapshots
+      access: read
+      description: "List all VM snapshots"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+      pagination: none
+
+    get_vm_snapshot:
+      method: GET
+      path: /vm-snapshots/{uuid}
+      access: read
+      description: "Get details of a VM snapshot"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
     clone_vm:
       method: POST
       path: /vms/{uuid}/actions/clone
@@ -343,8 +375,8 @@ backend:
       description: "Live-migrate a VM to another host"
       params:
         uuid: { type: string, in: path, required: true }
-        target_host: { type: string, in: body, description: "Target host UUID" }
-        sr: { type: string, in: body, description: "Target SR for storage migration" }
+        hostId: { type: string, in: body, description: "Target host UUID" }
+        srId: { type: string, in: body, description: "Target SR for storage migration" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -716,7 +748,7 @@ backend:
       description: "Migrate a VDI to a different SR (live storage migration)"
       params:
         uuid: { type: string, in: path, required: true }
-        sr: { type: string, in: body, required: true, description: "Target SR UUID" }
+        srId: { type: string, in: body, required: true, description: "Target SR UUID" }
         sync: { type: boolean, in: query }
       pagination: none
 
