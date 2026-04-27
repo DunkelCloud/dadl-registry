@@ -1,0 +1,276 @@
+# alertmanager.dadl -- Prometheus Alertmanager REST API (v2)
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - Alertmanager handles alert deduplication, grouping, silencing, inhibition, and routing to receivers.
+# - API v2 is the current stable API (v1 was removed in Alertmanager 0.27, returns HTTP 410).
+# - No built-in authentication by default. Auth is typically handled via reverse proxy or --web.config.file
+#   (basic auth + TLS). Configure auth type below based on your deployment.
+# - No pagination: all matching results are returned in a single response. Use filter params to limit scope.
+# - Alerts are identified by label fingerprint. Posting an alert with the same labels updates the existing one.
+# - To resolve an alert: POST it again with endsAt set to a time in the past (or current time).
+# - Silences suppress matching alerts for a time window. They use matchers (label name/value/regex).
+#   To update a silence: POST with the existing silence ID. To expire: DELETE by ID.
+# - Matcher syntax in filter params: label=value (exact), label=~regex (regex match),
+#   label!=value (not equal), label!~regex (not regex match). Example: ["alertname=Watchdog", "severity=~crit.*"]
+# - Alert states: unprocessed (just received), active (firing), suppressed (silenced or inhibited).
+# - Silence states: active (currently suppressing), pending (startsAt in the future), expired (endsAt passed).
+# - Cluster status: ready (HA cluster operational), settling (peers joining), disabled (standalone mode).
+# - GET concurrency is limited via --web.get-concurrency flag. Exceeding returns HTTP 503.
+# - /-/reload triggers config reload (same as SIGHUP). /-/healthy and /-/ready are liveness/readiness probes.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Prometheus Alertmanager API v2"
+source_url: "https://prometheus.io/docs/alerting/latest/clients/"
+date: "2026-04-13"
+
+backend:
+  name: alertmanager
+  type: rest
+  version: "1.0"
+  base_url: "{ALERTMANAGER_URL}/api/v2"
+  description: "Prometheus Alertmanager API v2 -- alerts, silences, receivers, alert groups, status, and operational health"
+
+  auth:
+    type: basic
+    username_credential: alertmanager_username
+    password_credential: alertmanager_password
+
+  defaults:
+    headers:
+      Content-Type: application/json
+      Accept: application/json
+    errors:
+      format: json
+      message_path: "$"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      terminal: [400, 404, 410]
+    response:
+      max_items: 500
+
+  coverage:
+    endpoints: 14
+    total_endpoints: 14
+    percentage: 100
+    focus: "alerts (list, create/update, groups), silences (CRUD), receivers (list), status, health/ready/reload"
+    missing: "metrics and pprof debug endpoints (not useful for API consumers)"
+    last_reviewed: "2026-04-13"
+
+  setup:
+    credential_steps:
+      - "Alertmanager has no built-in auth by default. If --web.config.file is configured with basic_auth_users:"
+      - "1. Open the web.config.yml used by your Alertmanager instance"
+      - "2. Find or add your username under basic_auth_users"
+      - "3. Generate a bcrypt hash of your password: htpasswd -nBC 10 '' | tr -d ':\\n'"
+      - "4. Add the username: bcrypt_hash pair to basic_auth_users"
+      - "5. Reload Alertmanager config (POST /-/reload or send SIGHUP)"
+      - "If no auth is configured, leave credentials empty or use a reverse proxy for auth"
+    env_var: ALERTMANAGER_URL
+    backends_yaml: "alertmanager.dadl"
+    docs_url: "https://prometheus.io/docs/alerting/latest/https/"
+    notes: "Default port is 9093. Set ALERTMANAGER_URL to http(s)://host:9093. For HA setups, point to any cluster member or a load balancer."
+
+  hints:
+    post_alerts:
+      resolve_pattern: "set endsAt to current or past time to resolve an alert"
+      fingerprint: "alerts are deduplicated by label set fingerprint — same labels = same alert"
+    list_alerts:
+      filter_syntax: "PromQL-style matchers: alertname=Watchdog, severity=~crit.*, job!=prometheus"
+    post_silence:
+      update_pattern: "include existing silence id to update; omit id to create new"
+      matcher_types: "isRegex=false + isEqual=true → =, isRegex=true + isEqual=true → =~, isRegex=false + isEqual=false → !=, isRegex=true + isEqual=false → !~"
+
+  tools:
+    # ── Status & Health ────────────────────────────────────────────────
+
+    get_status:
+      method: GET
+      path: /status
+      access: read
+      description: "Get Alertmanager status including version, config, uptime, and cluster state"
+      pagination: none
+
+    get_health:
+      method: GET
+      path: /-/healthy
+      access: read
+      description: "Health check — returns 200 if Alertmanager is running (liveness probe)"
+      pagination: none
+      response:
+        result_path: "$"
+
+    get_ready:
+      method: GET
+      path: /-/ready
+      access: read
+      description: "Readiness check — returns 200 when Alertmanager is ready to serve traffic"
+      pagination: none
+      response:
+        result_path: "$"
+
+    # ── Alerts ─────────────────────────────────────────────────────────
+
+    list_alerts:
+      method: GET
+      path: /alerts
+      access: read
+      description: "List alerts with optional filters by state, receiver, and label matchers"
+      params:
+        active:      { type: boolean, in: query, default: true, description: "Show active (firing) alerts" }
+        silenced:    { type: boolean, in: query, default: true, description: "Show silenced alerts" }
+        inhibited:   { type: boolean, in: query, default: true, description: "Show inhibited alerts" }
+        unprocessed: { type: boolean, in: query, default: true, description: "Show unprocessed alerts" }
+        filter:      { type: array, in: query, description: "Label matchers, e.g. [\"alertname=Watchdog\", \"severity=~crit.*\"]" }
+        receiver:    { type: string, in: query, description: "Regex to filter by receiver name" }
+      pagination: none
+
+    post_alerts:
+      method: POST
+      path: /alerts
+      access: write
+      description: "Create new alerts or update existing ones. Alerts are matched by label fingerprint. Set endsAt to resolve."
+      params:
+        alerts:
+          type: array
+          in: body
+          required: true
+          description: "Array of alert objects with labels (required), annotations, startsAt, endsAt, generatorURL"
+      pagination: none
+
+    list_alert_groups:
+      method: GET
+      path: /alerts/groups
+      access: read
+      description: "Get alerts grouped by the routing tree configuration"
+      params:
+        active:    { type: boolean, in: query, default: true, description: "Show active alerts" }
+        silenced:  { type: boolean, in: query, default: true, description: "Show silenced alerts" }
+        inhibited: { type: boolean, in: query, default: true, description: "Show inhibited alerts" }
+        muted:     { type: boolean, in: query, default: true, description: "Show muted alert groups" }
+        filter:    { type: array, in: query, description: "Label matchers to filter alerts" }
+        receiver:  { type: string, in: query, description: "Regex to filter by receiver name" }
+      pagination: none
+
+    # ── Silences ───────────────────────────────────────────────────────
+
+    list_silences:
+      method: GET
+      path: /silences
+      access: read
+      description: "List all silences, optionally filtered by label matchers"
+      params:
+        filter: { type: array, in: query, description: "Label matchers to filter silences, e.g. [\"alertname=Watchdog\"]" }
+      pagination: none
+
+    get_silence:
+      method: GET
+      path: /silence/{silenceID}
+      access: read
+      description: "Get a single silence by its ID"
+      params:
+        silenceID: { type: string, in: path, required: true, description: "UUID of the silence" }
+      pagination: none
+
+    post_silence:
+      method: POST
+      path: /silences
+      access: write
+      description: "Create a new silence or update an existing one. Include id to update, omit to create."
+      params:
+        id:        { type: string, in: body, description: "Silence ID — include to update existing, omit to create new" }
+        matchers:
+          type: array
+          in: body
+          required: true
+          description: "Array of matcher objects: {name, value, isRegex (required), isEqual (default true)}"
+        startsAt:  { type: string, in: body, required: true, description: "Start time in ISO 8601 format" }
+        endsAt:    { type: string, in: body, required: true, description: "End time in ISO 8601 format" }
+        createdBy: { type: string, in: body, required: true, description: "Author of the silence" }
+        comment:   { type: string, in: body, required: true, description: "Reason for the silence" }
+      pagination: none
+
+    delete_silence:
+      method: DELETE
+      path: /silence/{silenceID}
+      access: dangerous
+      description: "Expire (delete) a silence by its ID. This immediately stops the silence from suppressing alerts."
+      params:
+        silenceID: { type: string, in: path, required: true, description: "UUID of the silence to expire" }
+      pagination: none
+
+    # ── Receivers ──────────────────────────────────────────────────────
+
+    list_receivers:
+      method: GET
+      path: /receivers
+      access: read
+      description: "List all configured notification receiver names"
+      pagination: none
+
+    # ── Operations ─────────────────────────────────────────────────────
+
+    reload_config:
+      method: POST
+      path: /-/reload
+      access: admin
+      description: "Trigger a configuration reload (equivalent to sending SIGHUP to the process)"
+      pagination: none
+
+  examples:
+    - name: "Fire and resolve an alert"
+      description: "Create a test alert, then resolve it by setting endsAt"
+      code: |
+        // Fire a test alert
+        await api.post_alerts({ alerts: [{
+          labels: { alertname: "TestAlert", severity: "warning", instance: "localhost:9090" },
+          annotations: { summary: "Test alert from ToolMesh" },
+          generatorURL: "https://toolmesh.io"
+        }] });
+
+        // Resolve it by setting endsAt to now
+        await api.post_alerts({ alerts: [{
+          labels: { alertname: "TestAlert", severity: "warning", instance: "localhost:9090" },
+          endsAt: new Date().toISOString()
+        }] });
+
+    - name: "Silence an alert for 2 hours"
+      description: "Create a silence for all critical alerts matching a specific alertname"
+      code: |
+        const now = new Date();
+        const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+        const result = await api.post_silence({
+          matchers: [
+            { name: "alertname", value: "HighMemoryUsage", isRegex: false, isEqual: true },
+            { name: "severity", value: "critical", isRegex: false, isEqual: true }
+          ],
+          startsAt: now.toISOString(),
+          endsAt: twoHoursLater.toISOString(),
+          createdBy: "oncall-engineer",
+          comment: "Silencing during planned maintenance window"
+        });
+        return result;
+
+    - name: "Get active firing alerts"
+      description: "List only active alerts that are not silenced or inhibited"
+      code: |
+        const alerts = await api.list_alerts({
+          active: true,
+          silenced: false,
+          inhibited: false,
+          unprocessed: false
+        });
+        return alerts.map(a => ({
+          alertname: a.labels.alertname,
+          severity: a.labels.severity,
+          instance: a.labels.instance,
+          state: a.status.state,
+          startsAt: a.startsAt
+        }));
