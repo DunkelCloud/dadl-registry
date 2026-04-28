@@ -1,0 +1,3358 @@
+# graylog.dadl -- Graylog REST API for ToolMesh
+# Log management, search, streams, pipelines, inputs, alerts, and cluster administration
+#
+# Domain Notes for LLM consumers:
+# - Graylog is a centralized log management platform. The REST API is served at /api/ on port 9000 by default.
+# - Authentication: HTTP Basic Auth using access tokens. Username = token string, password = literal "token".
+#   Create tokens via System > Users and Teams > Edit Tokens in the UI, or via the API.
+# - CSRF protection: all POST/PUT/DELETE requests MUST include header "X-Requested-By: ToolMesh" (any non-empty value).
+# - No API versioning -- all endpoints are directly under /api/ with no /v1/ prefix.
+# - Search query syntax: Lucene-based. Examples: "source:myserver AND level:3", "http_response_code:[500 TO 599]".
+# - Time ranges come in three flavors and follow the Views/Search shape:
+#   - Absolute: { type: "absolute", from: "yyyy-MM-ddTHH:mm:ss.SSSZ", to: "..." }
+#   - Relative: { type: "relative", range: 3600 }   (seconds from now)
+#   - Keyword:  { type: "keyword",  keyword: "last 5 minutes" }   (Natty parser, OPEN-ended forms only)
+# - Aggregations (terms, histogram, stats, pivot, source x level matrix) live exclusively
+#   on the Views/Search API in Graylog 6+. Use the composites aggregate_by_field,
+#   aggregate_pivot, histogram_grouped, field_stats -- the legacy
+#   /search/universal/{relative,absolute,keyword}/{terms,histogram,stats,fieldhistogram}
+#   endpoints were removed in Graylog 6.0 and are no longer surfaced here.
+# - Plain message retrieval is still available via search_relative (legacy, working in 6.x)
+#   and search_keyword (open-ended Natty phrases). For absolute windows or projected fields
+#   use views_search_sync / search_messages_compact.
+# - CSV export endpoints (/search/universal/relative/export, /views/search/messages) are
+#   not surfaced -- they require an Accept: text/csv override that the registry schema
+#   does not currently allow. Pull JSON via views_search_sync and convert client-side.
+# - Search results are limited to 10,000 by default (Elasticsearch result window).
+# - Pagination uses offset/limit pattern. Response includes "total" for total count.
+# - Stream filtering in search: use filter param "streams:STREAM_ID" to scope queries.
+# - IDs are MongoDB ObjectIDs (24-char hex strings) for most resources.
+# - Pipeline rules use Graylog's own rule language (not Lucene). Parse/validate via dedicated endpoints.
+# - Sidecar = agent-based log collector management (Filebeat, Winlogbeat, NXLog configs).
+# - No built-in rate limiting on the REST API.
+# - Index sets control retention, rotation, and sharding. Each stream maps to one index set.
+# - The "Default Stream" (id: "000000000000000000000001") cannot be deleted.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Graylog REST API"
+source_url: "https://go2docs.graylog.org/current/setting_up_graylog/rest_api.html"
+date: "2026-04-26"
+
+backend:
+  name: graylog
+  type: rest
+  version: "1.0"
+  # base_url intentionally omitted -- self-hosted, provided via backends.yaml
+  description: "Graylog REST API -- log search (Views/Search + legacy universal), streams, pipelines, inputs, alerts, events, dashboards, users, roles, sidecars, index management, and cluster administration. Targets Graylog 6.x."
+
+  auth:
+    type: basic
+    username_credential: graylog_token
+    password_credential: graylog_token_password  # literal value "token" -- set in credential store
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+      X-Requested-By: ToolMesh
+    pagination:
+      strategy: offset
+      request:
+        cursor_param: offset
+        limit_param: limit
+        limit_default: 50
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      message_path: "$.message"
+      code_path: "$.type"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      terminal: [400, 401, 403, 404]
+    response:
+      max_items: 500
+      allow_jq_override: true
+
+  coverage:
+    endpoints: 232
+    total_endpoints: 320
+    percentage: 72
+    focus: "Views/Search API (sync, messages, pivot/histogram/stats via composites), legacy relative + keyword search, streams, stream rules, pipelines, pipeline rules, inputs, extractors, events, notifications, dashboards, users, roles, tokens, index sets, indices, grok patterns, lookup tables, sidecars, sidecar configurations, collectors, content packs, outputs, metrics, system info, cluster, processing control, loggers, sources, forensic incident_window composite"
+    missing: "enterprise-only plugins (archives, audit log, reports, license, data lake), Views CRUD (saved views, dashboard widgets), alert callbacks (legacy), message decorators, debug events, codec types, retention/rotation strategy config, LDAP config, async Views/Search (poll-based)"
+    last_reviewed: "2026-04-26"
+
+  setup:
+    credential_steps:
+      - "1. Log into your Graylog web interface (default: http://<host>:9000)"
+      - "2. Navigate to System > Users and Teams"
+      - "3. Click your username, then 'Edit Tokens'"
+      - "4. Enter a token name (e.g., 'toolmesh') and click 'Create Token'"
+      - "5. Copy the generated token -- it is shown only once"
+      - "6. Set CREDENTIAL_GRAYLOG_TOKEN to the token string"
+      - "7. Set CREDENTIAL_GRAYLOG_TOKEN_PASSWORD to the literal string 'token'"
+    env_var: CREDENTIAL_GRAYLOG_TOKEN, CREDENTIAL_GRAYLOG_TOKEN_PASSWORD
+    backends_yaml: |
+      - name: graylog
+        transport: rest
+        dadl: graylog.dadl
+        url: "https://graylog.example.com/api"
+    required_scopes:
+      - "reader"
+    optional_scopes:
+      - "admin"
+    docs_url: "https://go2docs.graylog.org/current/setting_up_graylog/rest_api.html"
+    notes: >
+      Graylog uses HTTP Basic Auth with access tokens. The username is the token string,
+      the password is the literal word "token". Tokens have configurable TTL (default 30 days).
+      Self-hosted: adjust the url in backends.yaml to match your Graylog server address.
+
+  tools:
+
+    # ──────────────────────────────────────────────
+    # Search -- Relative Time Range
+    # ──────────────────────────────────────────────
+
+    search_relative:
+      method: GET
+      path: /search/universal/relative
+      access: read
+      description: >
+        Search messages with a relative time range (seconds from now).
+        Query uses Lucene syntax. Returns messages with id, timestamp, source, and all fields.
+        Default limit 150, max 10000. Use filter "streams:STREAM_ID" to scope to a stream.
+      params:
+        query: { type: string, in: query, required: true, description: "Lucene query string, e.g. 'source:myserver AND level:3'" }
+        range: { type: integer, in: query, required: true, description: "Relative timeframe in seconds from now (e.g. 3600 = last hour)" }
+        limit: { type: integer, in: query, default: 150, description: "Max messages to return (max 10000)" }
+        offset: { type: integer, in: query, default: 0, description: "Pagination offset" }
+        filter: { type: string, in: query, description: "Stream filter, e.g. 'streams:000000000000000000000001'" }
+        fields: { type: string, in: query, description: "Comma-separated list of fields to return" }
+        sort: { type: string, in: query, description: "Sort field and order, e.g. 'timestamp:desc'" }
+        decorate: { type: boolean, in: query, default: true, description: "Run decorators on results" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Search -- Keyword Time Range
+    # ──────────────────────────────────────────────
+
+    search_keyword:
+      method: GET
+      path: /search/universal/keyword
+      access: read
+      description: >
+        Search messages with a Natty-parsed open-ended time range like
+        "last 5 minutes", "last 7 hours", "yesterday", "last week".
+        WARNING: closed/relative phrases like "7 hours ago" are rejected with HTTP 400.
+        For closed absolute windows or aggregation use the views_search_sync /
+        aggregate_pivot composites instead.
+      params:
+        query: { type: string, in: query, required: true }
+        keyword: { type: string, in: query, required: true, description: "Open-ended Natty phrase, e.g. 'last 5 minutes', 'yesterday'" }
+        limit: { type: integer, in: query, default: 150 }
+        offset: { type: integer, in: query, default: 0 }
+        filter: { type: string, in: query }
+        fields: { type: string, in: query }
+        sort: { type: string, in: query }
+        decorate: { type: boolean, in: query, default: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Views / Search API (Graylog 4+ canonical aggregation)
+    # ──────────────────────────────────────────────
+
+    views_search_sync:
+      method: POST
+      path: /views/search/sync
+      access: read
+      description: >
+        Execute a Views/Search query synchronously and return results inline.
+        Body shape: { id?, queries: [...], parameters: [], skip_no_streams_check? }.
+        NOTE: there is no top-level "streams" field -- Graylog rejects it with
+        HTTP 400. Scope to streams via query.filter (e.g.
+        { type: "or", filters: [{ type: "stream", id: STREAM_ID }] }) on the
+        individual query object. Each query has id, query.query_string, timerange
+        (absolute / relative / keyword), optional filter, and search_types[]
+        (pivot, messages, events, ...). For everyday forensic work prefer the
+        higher-level composites: aggregate_by_field, aggregate_pivot,
+        histogram_grouped, field_stats, search_messages_compact, incident_window.
+        Server-side timeout via ?timeout=<seconds>, default 60.
+      params:
+        queries:                 { type: array,   in: body, required: true,  description: "Array of query objects" }
+        parameters:              { type: array,   in: body, default: [],     description: "Declared parameters (usually [])" }
+        skip_no_streams_check:   { type: boolean, in: body, description: "Skip the safety check that requires at least one stream filter (admin-only)" }
+        timeout:                 { type: integer, in: query, default: 60,    description: "Server-side timeout in seconds" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Messages
+    # ──────────────────────────────────────────────
+
+    get_message:
+      method: GET
+      path: /messages/{index}/{messageId}
+      access: read
+      description: "Retrieve a single message by its ID and index name. Returns all message fields."
+      params:
+        index: { type: string, in: path, required: true, description: "Index name the message is stored in" }
+        messageId: { type: string, in: path, required: true, description: "Message ID" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    parse_message:
+      method: POST
+      path: /messages/parse
+      access: read
+      description: "Parse a raw message string using Graylog's message parsing pipeline. Useful for testing extractors."
+      params:
+        message: { type: string, in: body, required: true }
+        codec: { type: string, in: body, required: true, description: "Codec to use, e.g. 'syslog'" }
+        remote_address: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    analyze_message_field:
+      method: GET
+      path: /messages/{index}/analyze
+      access: read
+      description: "Analyze a message field value to show how Elasticsearch tokenizes it."
+      params:
+        index: { type: string, in: path, required: true }
+        string: { type: string, in: query, required: true, description: "Field value to analyze" }
+        field: { type: string, in: query, required: true, description: "Field name" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Saved Searches
+    # ──────────────────────────────────────────────
+
+    list_saved_searches:
+      method: GET
+      path: /search/saved
+      access: read
+      description: "List all saved searches."
+      response:
+        result_path: "$.searches"
+
+    get_saved_search:
+      method: GET
+      path: /search/saved/{searchId}
+      access: read
+      description: "Get a saved search by ID."
+      params:
+        searchId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_saved_search:
+      method: POST
+      path: /search/saved
+      access: write
+      description: "Create a saved search."
+      params:
+        title: { type: string, in: body, required: true }
+        query: { type: object, in: body, required: true, description: "Search query object with query string and timerange" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_saved_search:
+      method: DELETE
+      path: /search/saved/{searchId}
+      access: dangerous
+      description: "Delete a saved search."
+      params:
+        searchId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Streams
+    # ──────────────────────────────────────────────
+
+    list_streams:
+      method: GET
+      path: /streams
+      access: read
+      description: >
+        List all streams. Returns stream id, title, description, rules, matching_type,
+        disabled status, and index_set_id. The Default Stream ID is "000000000000000000000001".
+      response:
+        result_path: "$.streams"
+
+    get_stream:
+      method: GET
+      path: /streams/{streamId}
+      access: read
+      description: "Get a single stream by ID with its configuration and rules."
+      params:
+        streamId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_stream:
+      method: POST
+      path: /streams
+      access: write
+      description: >
+        Create a new stream. matching_type: AND (all rules must match) or OR (any rule matches).
+        The stream is created paused -- call resume_stream to start routing messages.
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        matching_type: { type: string, in: body, default: "AND", description: "AND or OR" }
+        rules: { type: array, in: body, description: "Array of stream rule objects" }
+        index_set_id: { type: string, in: body, description: "Index set ID for this stream" }
+        remove_matches_from_default_stream: { type: boolean, in: body, default: false }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_stream:
+      method: PUT
+      path: /streams/{streamId}
+      access: write
+      description: "Update a stream's title, description, matching type, or index set."
+      params:
+        streamId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        matching_type: { type: string, in: body }
+        index_set_id: { type: string, in: body }
+        remove_matches_from_default_stream: { type: boolean, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_stream:
+      method: DELETE
+      path: /streams/{streamId}
+      access: dangerous
+      description: "Delete a stream. The Default Stream cannot be deleted."
+      params:
+        streamId: { type: string, in: path, required: true }
+      pagination: none
+
+    clone_stream:
+      method: POST
+      path: /streams/{streamId}/clone
+      access: write
+      description: "Clone a stream including all its rules."
+      params:
+        streamId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    pause_stream:
+      method: POST
+      path: /streams/{streamId}/pause
+      access: write
+      description: "Pause a stream. Messages will no longer be routed to this stream."
+      params:
+        streamId: { type: string, in: path, required: true }
+      pagination: none
+
+    resume_stream:
+      method: POST
+      path: /streams/{streamId}/resume
+      access: write
+      description: "Resume a paused stream. Messages will start routing to this stream again."
+      params:
+        streamId: { type: string, in: path, required: true }
+      pagination: none
+
+    list_enabled_streams:
+      method: GET
+      path: /streams/enabled
+      access: read
+      description: "List only enabled (non-paused) streams."
+      response:
+        result_path: "$.streams"
+
+    test_stream_match:
+      method: POST
+      path: /streams/{streamId}/testMatch
+      access: read
+      description: "Test if a message would match the rules of a stream."
+      params:
+        streamId: { type: string, in: path, required: true }
+        message: { type: object, in: body, required: true, description: "Message object with fields to test" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Stream Rules
+    # ──────────────────────────────────────────────
+
+    list_stream_rules:
+      method: GET
+      path: /streams/{streamId}/rules
+      access: read
+      description: >
+        List all rules for a stream. Rule types: 1=exact match, 2=regex match,
+        3=greater than, 4=less than, 5=field presence, 6=contains, 7=always match,
+        8=match input.
+      params:
+        streamId: { type: string, in: path, required: true }
+      response:
+        result_path: "$.stream_rules"
+
+    get_stream_rule:
+      method: GET
+      path: /streams/{streamId}/rules/{ruleId}
+      access: read
+      description: "Get a single stream rule."
+      params:
+        streamId: { type: string, in: path, required: true }
+        ruleId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_stream_rule:
+      method: POST
+      path: /streams/{streamId}/rules
+      access: write
+      description: >
+        Create a stream rule. type is an integer: 1=exact, 2=regex, 3=greater_than,
+        4=less_than, 5=field_presence, 6=contains, 7=always_match, 8=match_input.
+      params:
+        streamId: { type: string, in: path, required: true }
+        field: { type: string, in: body, required: true, description: "Message field to match against" }
+        type: { type: integer, in: body, required: true, description: "Rule type (1-8)" }
+        value: { type: string, in: body, required: true, description: "Value to compare" }
+        inverted: { type: boolean, in: body, default: false, description: "Invert the rule match" }
+        description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_stream_rule:
+      method: PUT
+      path: /streams/{streamId}/rules/{ruleId}
+      access: write
+      description: "Update a stream rule."
+      params:
+        streamId: { type: string, in: path, required: true }
+        ruleId: { type: string, in: path, required: true }
+        field: { type: string, in: body, required: true }
+        type: { type: integer, in: body, required: true }
+        value: { type: string, in: body, required: true }
+        inverted: { type: boolean, in: body, default: false }
+        description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_stream_rule:
+      method: DELETE
+      path: /streams/{streamId}/rules/{ruleId}
+      access: dangerous
+      description: "Delete a stream rule."
+      params:
+        streamId: { type: string, in: path, required: true }
+        ruleId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Stream Outputs
+    # ──────────────────────────────────────────────
+
+    list_stream_outputs:
+      method: GET
+      path: /streams/{streamId}/outputs
+      access: read
+      description: "List outputs assigned to a stream."
+      params:
+        streamId: { type: string, in: path, required: true }
+      response:
+        result_path: "$.outputs"
+
+    add_stream_output:
+      method: POST
+      path: /streams/{streamId}/outputs
+      access: write
+      description: "Add an existing output to a stream."
+      params:
+        streamId: { type: string, in: path, required: true }
+        outputs: { type: array, in: body, required: true, description: "Array of output IDs to add" }
+      pagination: none
+
+    remove_stream_output:
+      method: DELETE
+      path: /streams/{streamId}/outputs/{outputId}
+      access: write
+      description: "Remove an output from a stream."
+      params:
+        streamId: { type: string, in: path, required: true }
+        outputId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Pipelines
+    # ──────────────────────────────────────────────
+
+    list_pipelines:
+      method: GET
+      path: /system/pipelines/pipeline
+      access: read
+      description: >
+        List all processing pipelines. Each pipeline has stages with rules.
+        Pipeline source uses Graylog's pipeline rule language.
+      response:
+        result_path: "$"
+
+    get_pipeline:
+      method: GET
+      path: /system/pipelines/pipeline/{pipelineId}
+      access: read
+      description: "Get a single pipeline by ID, including its source code and stages."
+      params:
+        pipelineId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_pipeline:
+      method: POST
+      path: /system/pipelines/pipeline
+      access: write
+      description: >
+        Create a processing pipeline. The source field contains the pipeline definition
+        in Graylog pipeline language. Validate with parse_pipeline first.
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        source: { type: string, in: body, required: true, description: "Pipeline source in Graylog pipeline language" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_pipeline:
+      method: PUT
+      path: /system/pipelines/pipeline/{pipelineId}
+      access: write
+      description: "Update a pipeline's source, title, or description."
+      params:
+        pipelineId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        source: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_pipeline:
+      method: DELETE
+      path: /system/pipelines/pipeline/{pipelineId}
+      access: dangerous
+      description: "Delete a processing pipeline."
+      params:
+        pipelineId: { type: string, in: path, required: true }
+      pagination: none
+
+    parse_pipeline:
+      method: POST
+      path: /system/pipelines/pipeline/parse
+      access: read
+      description: "Parse and validate pipeline source without creating it. Returns parse errors if invalid."
+      params:
+        source: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    simulate_pipeline:
+      method: POST
+      path: /system/pipelines/simulate
+      access: read
+      description: "Simulate pipeline processing on a message to see which rules would match and what output would be produced."
+      params:
+        stream_id: { type: string, in: body, required: true }
+        message: { type: object, in: body, required: true, description: "Message fields to simulate with" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Pipeline Rules
+    # ──────────────────────────────────────────────
+
+    list_pipeline_rules:
+      method: GET
+      path: /system/pipelines/rule
+      access: read
+      description: "List all pipeline rules. Rules are written in Graylog's rule language."
+      response:
+        result_path: "$"
+
+    get_pipeline_rule:
+      method: GET
+      path: /system/pipelines/rule/{ruleId}
+      access: read
+      description: "Get a single pipeline rule by ID."
+      params:
+        ruleId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_pipeline_rule:
+      method: POST
+      path: /system/pipelines/rule
+      access: write
+      description: "Create a new pipeline rule. Validate with parse_pipeline_rule first."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        source: { type: string, in: body, required: true, description: "Rule source in Graylog rule language" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_pipeline_rule:
+      method: PUT
+      path: /system/pipelines/rule/{ruleId}
+      access: write
+      description: "Update a pipeline rule."
+      params:
+        ruleId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        source: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_pipeline_rule:
+      method: DELETE
+      path: /system/pipelines/rule/{ruleId}
+      access: dangerous
+      description: "Delete a pipeline rule."
+      params:
+        ruleId: { type: string, in: path, required: true }
+      pagination: none
+
+    parse_pipeline_rule:
+      method: POST
+      path: /system/pipelines/rule/parse
+      access: read
+      description: "Parse and validate a pipeline rule without creating it."
+      params:
+        source: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_pipeline_functions:
+      method: GET
+      path: /system/pipelines/rule/functions
+      access: read
+      description: "List all available functions that can be used in pipeline rules."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Pipeline Connections (Stream-Pipeline mapping)
+    # ──────────────────────────────────────────────
+
+    list_pipeline_connections:
+      method: GET
+      path: /system/pipelines/connections
+      access: read
+      description: "List all stream-to-pipeline connections."
+      response:
+        result_path: "$"
+
+    get_stream_pipeline_connections:
+      method: GET
+      path: /system/pipelines/connections/{streamId}
+      access: read
+      description: "Get pipeline connections for a specific stream."
+      params:
+        streamId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    connect_pipeline_to_stream:
+      method: POST
+      path: /system/pipelines/connections/to_stream
+      access: write
+      description: "Connect pipelines to a stream."
+      params:
+        stream_id: { type: string, in: body, required: true }
+        pipeline_ids: { type: array, in: body, required: true, description: "Array of pipeline IDs to connect" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    connect_stream_to_pipeline:
+      method: POST
+      path: /system/pipelines/connections/to_pipeline
+      access: write
+      description: "Connect streams to a pipeline."
+      params:
+        pipeline_id: { type: string, in: body, required: true }
+        stream_ids: { type: array, in: body, required: true, description: "Array of stream IDs to connect" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Inputs
+    # ──────────────────────────────────────────────
+
+    list_inputs:
+      method: GET
+      path: /system/inputs
+      access: read
+      description: >
+        List all configured inputs. Each input has a type (e.g. org.graylog2.inputs.syslog.udp.SyslogUDPInput),
+        title, global flag, and configuration.
+      response:
+        result_path: "$.inputs"
+
+    get_input:
+      method: GET
+      path: /system/inputs/{inputId}
+      access: read
+      description: "Get a single input by ID."
+      params:
+        inputId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_input:
+      method: POST
+      path: /system/inputs
+      access: admin
+      description: >
+        Create a new input. Use list_input_types to see available types and their configuration fields.
+        Set global=true for cluster-wide inputs, false for node-local.
+      params:
+        title: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "Input type class name" }
+        global: { type: boolean, in: body, required: true }
+        configuration: { type: object, in: body, required: true, description: "Type-specific configuration" }
+        node: { type: string, in: body, description: "Node ID for non-global inputs" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_input:
+      method: PUT
+      path: /system/inputs/{inputId}
+      access: admin
+      description: "Update an input's title, configuration, or global flag."
+      params:
+        inputId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        global: { type: boolean, in: body, required: true }
+        configuration: { type: object, in: body, required: true }
+        node: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_input:
+      method: DELETE
+      path: /system/inputs/{inputId}
+      access: dangerous
+      description: "Delete an input. This stops ingestion from this source."
+      params:
+        inputId: { type: string, in: path, required: true }
+      pagination: none
+
+    launch_input:
+      method: POST
+      path: /system/inputs/{inputId}/launch
+      access: admin
+      description: "Start/launch an existing input."
+      params:
+        inputId: { type: string, in: path, required: true }
+      pagination: none
+
+    stop_input:
+      method: POST
+      path: /system/inputs/{inputId}/stop
+      access: admin
+      description: "Stop a running input."
+      params:
+        inputId: { type: string, in: path, required: true }
+      pagination: none
+
+    list_input_types:
+      method: GET
+      path: /system/inputs/types
+      access: read
+      description: "List all available input types with their configuration schemas."
+      response:
+        result_path: "$.types"
+      pagination: none
+
+    get_input_type:
+      method: GET
+      path: /system/inputs/types/{inputType}
+      access: read
+      description: "Get details for a specific input type including all configuration fields."
+      params:
+        inputType: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_input_states:
+      method: GET
+      path: /system/inputstates
+      access: read
+      description: "List input states (running, stopped, failed) for all inputs on this node."
+      response:
+        result_path: "$.states"
+
+    # ──────────────────────────────────────────────
+    # Input Extractors
+    # ──────────────────────────────────────────────
+
+    list_extractors:
+      method: GET
+      path: /system/inputs/{inputId}/extractors
+      access: read
+      description: "List all extractors configured on an input."
+      params:
+        inputId: { type: string, in: path, required: true }
+      response:
+        result_path: "$.extractors"
+
+    get_extractor:
+      method: GET
+      path: /system/inputs/{inputId}/extractors/{extractorId}
+      access: read
+      description: "Get a single extractor."
+      params:
+        inputId: { type: string, in: path, required: true }
+        extractorId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_extractor:
+      method: POST
+      path: /system/inputs/{inputId}/extractors
+      access: write
+      description: >
+        Create an extractor on an input. Types: regex, substring, split_and_index,
+        copy_input, grok, json, lookup_table.
+      params:
+        inputId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "regex, substring, split_and_index, copy_input, grok, json, lookup_table" }
+        source_field: { type: string, in: body, required: true }
+        target_field: { type: string, in: body, required: true }
+        configuration: { type: object, in: body, required: true, description: "Type-specific configuration" }
+        cursor_strategy: { type: string, in: body, required: true, description: "copy or cut" }
+        condition_type: { type: string, in: body, default: "none", description: "none, string, regex" }
+        condition_value: { type: string, in: body }
+        converters: { type: array, in: body, description: "Array of converter configs" }
+        cut_or_copy: { type: string, in: body }
+        order: { type: integer, in: body, default: 0 }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_extractor:
+      method: PUT
+      path: /system/inputs/{inputId}/extractors/{extractorId}
+      access: write
+      description: "Update an extractor."
+      params:
+        inputId: { type: string, in: path, required: true }
+        extractorId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        source_field: { type: string, in: body, required: true }
+        target_field: { type: string, in: body, required: true }
+        configuration: { type: object, in: body, required: true }
+        cursor_strategy: { type: string, in: body, required: true }
+        condition_type: { type: string, in: body }
+        condition_value: { type: string, in: body }
+        converters: { type: array, in: body }
+        order: { type: integer, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_extractor:
+      method: DELETE
+      path: /system/inputs/{inputId}/extractors/{extractorId}
+      access: dangerous
+      description: "Delete an extractor from an input."
+      params:
+        inputId: { type: string, in: path, required: true }
+        extractorId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Input Static Fields
+    # ──────────────────────────────────────────────
+
+    list_static_fields:
+      method: GET
+      path: /system/inputs/{inputId}/staticfields
+      access: read
+      description: "List static fields added to all messages from this input."
+      params:
+        inputId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+
+    create_static_field:
+      method: POST
+      path: /system/inputs/{inputId}/staticfields
+      access: write
+      description: "Add a static field to all messages from this input."
+      params:
+        inputId: { type: string, in: path, required: true }
+        key: { type: string, in: body, required: true }
+        value: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_static_field:
+      method: DELETE
+      path: /system/inputs/{inputId}/staticfields/{key}
+      access: write
+      description: "Remove a static field from an input."
+      params:
+        inputId: { type: string, in: path, required: true }
+        key: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Events & Event Definitions
+    # ──────────────────────────────────────────────
+
+    list_event_definitions:
+      method: GET
+      path: /events/definitions
+      access: read
+      description: "List all event definitions (alert conditions in Graylog 3.1+)."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+        query: { type: string, in: query, description: "Filter by title" }
+      response:
+        result_path: "$.event_definitions"
+
+    get_event_definition:
+      method: GET
+      path: /events/definitions/{definitionId}
+      access: read
+      description: "Get a single event definition."
+      params:
+        definitionId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_event_definition:
+      method: POST
+      path: /events/definitions
+      access: write
+      description: >
+        Create an event definition. config contains the condition type and parameters.
+        notification_settings controls which notifications fire.
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        priority: { type: integer, in: body, default: 2, description: "1=low, 2=normal, 3=high" }
+        config: { type: object, in: body, required: true, description: "Event condition configuration" }
+        field_spec: { type: object, in: body }
+        key_spec: { type: array, in: body }
+        notification_settings: { type: object, in: body }
+        notifications: { type: array, in: body, description: "Array of notification references" }
+        alert: { type: boolean, in: body, default: false }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_event_definition:
+      method: PUT
+      path: /events/definitions/{definitionId}
+      access: write
+      description: "Update an event definition."
+      params:
+        definitionId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        priority: { type: integer, in: body }
+        config: { type: object, in: body, required: true }
+        field_spec: { type: object, in: body }
+        key_spec: { type: array, in: body }
+        notification_settings: { type: object, in: body }
+        notifications: { type: array, in: body }
+        alert: { type: boolean, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_event_definition:
+      method: DELETE
+      path: /events/definitions/{definitionId}
+      access: dangerous
+      description: "Delete an event definition."
+      params:
+        definitionId: { type: string, in: path, required: true }
+      pagination: none
+
+    execute_event_definition:
+      method: POST
+      path: /events/definitions/{definitionId}/execute
+      access: write
+      description: "Manually trigger an event definition to check for events now."
+      params:
+        definitionId: { type: string, in: path, required: true }
+      pagination: none
+
+    validate_event_definition:
+      method: POST
+      path: /events/definitions/validate
+      access: read
+      description: "Validate an event definition without creating it."
+      params:
+        title: { type: string, in: body, required: true }
+        config: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_events:
+      method: POST
+      path: /events/search
+      access: read
+      description: >
+        Search for triggered events. Supports filtering by event definition, timerange, and query.
+        Returns events with timestamp, priority, fields, and source.
+      params:
+        query: { type: string, in: body }
+        filter: { type: object, in: body }
+        timerange: { type: object, in: body, description: "Object with type (absolute/relative/keyword) and range params" }
+        page: { type: integer, in: body, default: 1 }
+        per_page: { type: integer, in: body, default: 50 }
+        sort_by: { type: string, in: body, default: "timestamp" }
+        sort_direction: { type: string, in: body, default: "desc" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Event Notifications
+    # ──────────────────────────────────────────────
+
+    list_event_notifications:
+      method: GET
+      path: /events/notifications
+      access: read
+      description: "List all event notifications (email, HTTP, Slack, etc.)."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+      response:
+        result_path: "$.notifications"
+
+    get_event_notification:
+      method: GET
+      path: /events/notifications/{notificationId}
+      access: read
+      description: "Get a single event notification."
+      params:
+        notificationId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_event_notification:
+      method: POST
+      path: /events/notifications
+      access: write
+      description: "Create an event notification. Config varies by type (email, http, slack, etc.)."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        config: { type: object, in: body, required: true, description: "Notification type-specific configuration" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_event_notification:
+      method: PUT
+      path: /events/notifications/{notificationId}
+      access: write
+      description: "Update an event notification."
+      params:
+        notificationId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        config: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_event_notification:
+      method: DELETE
+      path: /events/notifications/{notificationId}
+      access: dangerous
+      description: "Delete an event notification."
+      params:
+        notificationId: { type: string, in: path, required: true }
+      pagination: none
+
+    test_event_notification:
+      method: POST
+      path: /events/notifications/{notificationId}/test
+      access: write
+      description: "Send a test notification to verify the notification configuration works."
+      params:
+        notificationId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Dashboards (Legacy)
+    # ──────────────────────────────────────────────
+
+    list_dashboards:
+      method: GET
+      path: /dashboards
+      access: read
+      description: "List all dashboards."
+      response:
+        result_path: "$.dashboards"
+
+    get_dashboard:
+      method: GET
+      path: /dashboards/{dashboardId}
+      access: read
+      description: "Get a single dashboard with all its widgets."
+      params:
+        dashboardId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_dashboard:
+      method: POST
+      path: /dashboards
+      access: write
+      description: "Create a new dashboard."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_dashboard:
+      method: PUT
+      path: /dashboards/{dashboardId}
+      access: write
+      description: "Update a dashboard's title or description."
+      params:
+        dashboardId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_dashboard:
+      method: DELETE
+      path: /dashboards/{dashboardId}
+      access: dangerous
+      description: "Delete a dashboard and all its widgets."
+      params:
+        dashboardId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Users
+    # ──────────────────────────────────────────────
+
+    list_users:
+      method: GET
+      path: /users
+      access: admin
+      description: "List all users including their roles, permissions, and preferences."
+      response:
+        result_path: "$.users"
+
+    get_user:
+      method: GET
+      path: /users/{username}
+      access: read
+      description: "Get a user by username."
+      params:
+        username: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_user:
+      method: POST
+      path: /users
+      access: admin
+      description: "Create a new user."
+      params:
+        username: { type: string, in: body, required: true }
+        password: { type: string, in: body, required: true }
+        email: { type: string, in: body, required: true }
+        full_name: { type: string, in: body, required: true }
+        permissions: { type: array, in: body }
+        roles: { type: array, in: body, description: "Array of role names" }
+        timezone: { type: string, in: body }
+        session_timeout_ms: { type: integer, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_user:
+      method: PUT
+      path: /users/{username}
+      access: admin
+      description: "Update a user's details."
+      params:
+        username: { type: string, in: path, required: true }
+        email: { type: string, in: body }
+        full_name: { type: string, in: body }
+        permissions: { type: array, in: body }
+        roles: { type: array, in: body }
+        timezone: { type: string, in: body }
+        session_timeout_ms: { type: integer, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_user:
+      method: DELETE
+      path: /users/{username}
+      access: dangerous
+      description: "Delete a user. Built-in admin user cannot be deleted."
+      params:
+        username: { type: string, in: path, required: true }
+      pagination: none
+
+    change_user_password:
+      method: PUT
+      path: /users/{username}/password
+      access: admin
+      description: "Change a user's password."
+      params:
+        username: { type: string, in: path, required: true }
+        old_password: { type: string, in: body, required: true }
+        password: { type: string, in: body, required: true }
+      pagination: none
+
+    update_user_permissions:
+      method: PUT
+      path: /users/{username}/permissions
+      access: admin
+      description: "Update a user's permissions."
+      params:
+        username: { type: string, in: path, required: true }
+        permissions: { type: array, in: body, required: true }
+      pagination: none
+
+    update_user_preferences:
+      method: PUT
+      path: /users/{username}/preferences
+      access: write
+      description: "Update a user's UI preferences."
+      params:
+        username: { type: string, in: path, required: true }
+        preferences: { type: object, in: body, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # User Tokens
+    # ──────────────────────────────────────────────
+
+    list_user_tokens:
+      method: GET
+      path: /users/{username}/tokens
+      access: admin
+      description: "List all access tokens for a user. Token values are NOT returned -- only name, id, and last_access."
+      params:
+        username: { type: string, in: path, required: true }
+      response:
+        result_path: "$.tokens"
+
+    create_user_token:
+      method: POST
+      path: /users/{username}/tokens/{tokenName}
+      access: admin
+      description: >
+        Create a new access token for a user. The token value is returned ONLY in this response.
+        Store it immediately. Used for API auth: username=token_value, password="token".
+      params:
+        username: { type: string, in: path, required: true }
+        tokenName: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_user_token:
+      method: DELETE
+      path: /users/{username}/tokens/{tokenId}
+      access: admin
+      description: "Delete/revoke an access token."
+      params:
+        username: { type: string, in: path, required: true }
+        tokenId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Roles
+    # ──────────────────────────────────────────────
+
+    list_roles:
+      method: GET
+      path: /roles
+      access: admin
+      description: "List all roles with their permissions."
+      response:
+        result_path: "$.roles"
+
+    get_role:
+      method: GET
+      path: /roles/{rolename}
+      access: admin
+      description: "Get a role by name."
+      params:
+        rolename: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_role:
+      method: POST
+      path: /roles
+      access: admin
+      description: "Create a new role."
+      params:
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        permissions: { type: array, in: body, required: true, description: "Array of permission strings" }
+        read_only: { type: boolean, in: body, default: false }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_role:
+      method: PUT
+      path: /roles/{rolename}
+      access: admin
+      description: "Update a role."
+      params:
+        rolename: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        permissions: { type: array, in: body, required: true }
+        read_only: { type: boolean, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_role:
+      method: DELETE
+      path: /roles/{rolename}
+      access: dangerous
+      description: "Delete a role. Built-in roles (Admin, Reader) cannot be deleted."
+      params:
+        rolename: { type: string, in: path, required: true }
+      pagination: none
+
+    list_role_members:
+      method: GET
+      path: /roles/{rolename}/members
+      access: admin
+      description: "List all users assigned to a role."
+      params:
+        rolename: { type: string, in: path, required: true }
+      response:
+        result_path: "$.users"
+
+    add_role_member:
+      method: PUT
+      path: /roles/{rolename}/members/{username}
+      access: admin
+      description: "Add a user to a role."
+      params:
+        rolename: { type: string, in: path, required: true }
+        username: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_role_member:
+      method: DELETE
+      path: /roles/{rolename}/members/{username}
+      access: admin
+      description: "Remove a user from a role."
+      params:
+        rolename: { type: string, in: path, required: true }
+        username: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Index Sets
+    # ──────────────────────────────────────────────
+
+    list_index_sets:
+      method: GET
+      path: /system/indices/index_sets
+      access: read
+      description: >
+        List all index sets. Each index set defines retention, rotation, and sharding
+        for a group of indices. Every stream maps to one index set.
+      params:
+        skip: { type: integer, in: query, default: 0 }
+        limit: { type: integer, in: query, default: 50 }
+        stats: { type: boolean, in: query, default: false, description: "Include index statistics" }
+      response:
+        result_path: "$.index_sets"
+
+    get_index_set:
+      method: GET
+      path: /system/indices/index_sets/{indexSetId}
+      access: read
+      description: "Get a single index set."
+      params:
+        indexSetId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_index_set:
+      method: POST
+      path: /system/indices/index_sets
+      access: admin
+      description: "Create a new index set."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        index_prefix: { type: string, in: body, required: true, description: "Index name prefix, must be unique" }
+        shards: { type: integer, in: body, default: 4 }
+        replicas: { type: integer, in: body, default: 0 }
+        rotation_strategy_class: { type: string, in: body, required: true }
+        rotation_strategy: { type: object, in: body, required: true }
+        retention_strategy_class: { type: string, in: body, required: true }
+        retention_strategy: { type: object, in: body, required: true }
+        index_analyzer: { type: string, in: body, default: "standard" }
+        index_optimization_max_num_segments: { type: integer, in: body, default: 1 }
+        index_optimization_disabled: { type: boolean, in: body, default: false }
+        field_type_refresh_interval: { type: integer, in: body, default: 5000 }
+        writable: { type: boolean, in: body, default: true }
+        default: { type: boolean, in: body, default: false }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_index_set:
+      method: PUT
+      path: /system/indices/index_sets/{indexSetId}
+      access: admin
+      description: "Update an index set."
+      params:
+        indexSetId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        index_prefix: { type: string, in: body, required: true }
+        shards: { type: integer, in: body }
+        replicas: { type: integer, in: body }
+        rotation_strategy_class: { type: string, in: body, required: true }
+        rotation_strategy: { type: object, in: body, required: true }
+        retention_strategy_class: { type: string, in: body, required: true }
+        retention_strategy: { type: object, in: body, required: true }
+        index_analyzer: { type: string, in: body }
+        index_optimization_max_num_segments: { type: integer, in: body }
+        index_optimization_disabled: { type: boolean, in: body }
+        field_type_refresh_interval: { type: integer, in: body }
+        writable: { type: boolean, in: body }
+        default: { type: boolean, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_index_set:
+      method: DELETE
+      path: /system/indices/index_sets/{indexSetId}
+      access: dangerous
+      description: "Delete an index set. Optionally delete all associated indices."
+      params:
+        indexSetId: { type: string, in: path, required: true }
+        delete_indices: { type: boolean, in: query, default: false }
+      pagination: none
+
+    set_default_index_set:
+      method: PUT
+      path: /system/indices/index_sets/{indexSetId}/default
+      access: admin
+      description: "Set an index set as the default for new streams."
+      params:
+        indexSetId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_index_set_stats:
+      method: GET
+      path: /system/indices/index_sets/stats
+      access: read
+      description: "Get statistics for all index sets (document count, size, segments)."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Indices
+    # ──────────────────────────────────────────────
+
+    list_indices:
+      method: GET
+      path: /system/indexer/indices
+      access: read
+      description: "List all Elasticsearch/OpenSearch indices managed by Graylog."
+      response:
+        result_path: "$"
+
+    list_open_indices:
+      method: GET
+      path: /system/indexer/indices/open
+      access: read
+      description: "List all open (writable/searchable) indices."
+      response:
+        result_path: "$"
+
+    list_closed_indices:
+      method: GET
+      path: /system/indexer/indices/closed
+      access: read
+      description: "List all closed indices."
+      response:
+        result_path: "$"
+
+    get_index:
+      method: GET
+      path: /system/indexer/indices/{index}
+      access: read
+      description: "Get details for a specific index."
+      params:
+        index: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    close_index:
+      method: POST
+      path: /system/indexer/indices/{index}/close
+      access: admin
+      description: "Close an index. Closed indices cannot be searched but retain data."
+      params:
+        index: { type: string, in: path, required: true }
+      pagination: none
+
+    reopen_index:
+      method: POST
+      path: /system/indexer/indices/{index}/reopen
+      access: admin
+      description: "Reopen a closed index."
+      params:
+        index: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_index:
+      method: DELETE
+      path: /system/indexer/indices/{index}
+      access: dangerous
+      description: "Delete an index. This permanently removes all data in the index."
+      params:
+        index: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Index Ranges
+    # ──────────────────────────────────────────────
+
+    list_index_ranges:
+      method: GET
+      path: /system/indices/ranges
+      access: read
+      description: "List all index ranges (time boundaries for each index)."
+      response:
+        result_path: "$.ranges"
+
+    rebuild_all_index_ranges:
+      method: POST
+      path: /system/indices/ranges/rebuild
+      access: admin
+      description: "Trigger a rebuild of all index ranges. Long-running operation."
+
+    rebuild_index_range:
+      method: POST
+      path: /system/indices/ranges/{index}/rebuild
+      access: admin
+      description: "Rebuild index range for a specific index."
+      params:
+        index: { type: string, in: path, required: true }
+
+    # ──────────────────────────────────────────────
+    # Deflector (Active Write Index)
+    # ──────────────────────────────────────────────
+
+    get_deflector:
+      method: GET
+      path: /system/deflector
+      access: read
+      description: "Get the current deflector (active write index) status."
+      response:
+        result_path: "$"
+      pagination: none
+
+    cycle_deflector:
+      method: POST
+      path: /system/deflector/cycle
+      access: admin
+      description: "Cycle the deflector -- close the current write index and create a new one."
+
+    get_deflector_for_index_set:
+      method: GET
+      path: /system/deflector/{indexSetId}
+      access: read
+      description: "Get the deflector for a specific index set."
+      params:
+        indexSetId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cycle_deflector_for_index_set:
+      method: POST
+      path: /system/deflector/{indexSetId}/cycle
+      access: admin
+      description: "Cycle the deflector for a specific index set."
+      params:
+        indexSetId: { type: string, in: path, required: true }
+
+    # ──────────────────────────────────────────────
+    # Indexer Health & Failures
+    # ──────────────────────────────────────────────
+
+    get_indexer_overview:
+      method: GET
+      path: /system/indexer/overview
+      access: read
+      description: "Get indexing overview with processing rates and counts."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_indexer_cluster_health:
+      method: GET
+      path: /system/indexer/cluster/health
+      access: read
+      description: "Get Elasticsearch/OpenSearch cluster health (green/yellow/red)."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_indexer_cluster_name:
+      method: GET
+      path: /system/indexer/cluster/name
+      access: read
+      description: "Get the Elasticsearch/OpenSearch cluster name."
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_indexer_failures:
+      method: GET
+      path: /system/indexer/failures
+      access: read
+      description: "List indexer failures (messages that could not be indexed)."
+      params:
+        limit: { type: integer, in: query, default: 50 }
+        offset: { type: integer, in: query, default: 0 }
+      response:
+        result_path: "$"
+
+    count_indexer_failures:
+      method: GET
+      path: /system/indexer/failures/count
+      access: read
+      description: "Get the total count of indexer failures."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Grok Patterns
+    # ──────────────────────────────────────────────
+
+    list_grok_patterns:
+      method: GET
+      path: /system/grok
+      access: read
+      description: "List all grok patterns used for message extraction."
+      response:
+        result_path: "$.patterns"
+
+    get_grok_pattern:
+      method: GET
+      path: /system/grok/{patternId}
+      access: read
+      description: "Get a single grok pattern."
+      params:
+        patternId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_grok_pattern:
+      method: POST
+      path: /system/grok
+      access: write
+      description: "Create a new grok pattern."
+      params:
+        name: { type: string, in: body, required: true }
+        pattern: { type: string, in: body, required: true }
+        content_pack: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_grok_pattern:
+      method: PUT
+      path: /system/grok/{patternId}
+      access: write
+      description: "Update a grok pattern."
+      params:
+        patternId: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        pattern: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_grok_pattern:
+      method: DELETE
+      path: /system/grok/{patternId}
+      access: dangerous
+      description: "Delete a grok pattern."
+      params:
+        patternId: { type: string, in: path, required: true }
+      pagination: none
+
+    test_grok_pattern:
+      method: POST
+      path: /system/grok/test
+      access: read
+      description: "Test a grok pattern against a sample string."
+      params:
+        pattern: { type: string, in: body, required: true }
+        string: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Lookup Tables
+    # ──────────────────────────────────────────────
+
+    list_lookup_tables:
+      method: GET
+      path: /system/lookup/tables
+      access: read
+      description: "List all lookup tables with their data adapter and cache references."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+        sort: { type: string, in: query }
+        order: { type: string, in: query }
+        query: { type: string, in: query }
+        resolve: { type: boolean, in: query, default: false, description: "Resolve adapter and cache references" }
+      response:
+        result_path: "$.lookup_tables"
+
+    get_lookup_table:
+      method: GET
+      path: /system/lookup/tables/{idOrName}
+      access: read
+      description: "Get a lookup table by ID or name."
+      params:
+        idOrName: { type: string, in: path, required: true }
+        resolve: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_lookup_table:
+      method: POST
+      path: /system/lookup/tables
+      access: write
+      description: "Create a lookup table."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        name: { type: string, in: body, required: true, description: "Unique identifier (slug)" }
+        cache_id: { type: string, in: body, required: true }
+        data_adapter_id: { type: string, in: body, required: true }
+        default_single_value: { type: string, in: body }
+        default_single_value_type: { type: string, in: body, default: "NULL" }
+        default_multi_value: { type: string, in: body }
+        default_multi_value_type: { type: string, in: body, default: "NULL" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_lookup_table:
+      method: PUT
+      path: /system/lookup/tables/{idOrName}
+      access: write
+      description: "Update a lookup table."
+      params:
+        idOrName: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        name: { type: string, in: body, required: true }
+        cache_id: { type: string, in: body, required: true }
+        data_adapter_id: { type: string, in: body, required: true }
+        default_single_value: { type: string, in: body }
+        default_single_value_type: { type: string, in: body }
+        default_multi_value: { type: string, in: body }
+        default_multi_value_type: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_lookup_table:
+      method: DELETE
+      path: /system/lookup/tables/{idOrName}
+      access: dangerous
+      description: "Delete a lookup table."
+      params:
+        idOrName: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Lookup Data Adapters
+    # ──────────────────────────────────────────────
+
+    list_lookup_adapters:
+      method: GET
+      path: /system/lookup/adapters
+      access: read
+      description: "List all lookup data adapters."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+        sort: { type: string, in: query }
+        order: { type: string, in: query }
+        query: { type: string, in: query }
+      response:
+        result_path: "$.data_adapters"
+
+    get_lookup_adapter:
+      method: GET
+      path: /system/lookup/adapters/{idOrName}
+      access: read
+      description: "Get a lookup data adapter by ID or name."
+      params:
+        idOrName: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_lookup_adapter:
+      method: POST
+      path: /system/lookup/adapters
+      access: write
+      description: "Create a lookup data adapter."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        name: { type: string, in: body, required: true }
+        config: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_lookup_adapter:
+      method: PUT
+      path: /system/lookup/adapters/{idOrName}
+      access: write
+      description: "Update a lookup data adapter."
+      params:
+        idOrName: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        name: { type: string, in: body, required: true }
+        config: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_lookup_adapter:
+      method: DELETE
+      path: /system/lookup/adapters/{idOrName}
+      access: dangerous
+      description: "Delete a lookup data adapter."
+      params:
+        idOrName: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Lookup Caches
+    # ──────────────────────────────────────────────
+
+    list_lookup_caches:
+      method: GET
+      path: /system/lookup/caches
+      access: read
+      description: "List all lookup caches."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+        sort: { type: string, in: query }
+        order: { type: string, in: query }
+        query: { type: string, in: query }
+      response:
+        result_path: "$.caches"
+
+    get_lookup_cache:
+      method: GET
+      path: /system/lookup/caches/{idOrName}
+      access: read
+      description: "Get a lookup cache by ID or name."
+      params:
+        idOrName: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_lookup_cache:
+      method: POST
+      path: /system/lookup/caches
+      access: write
+      description: "Create a lookup cache."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        name: { type: string, in: body, required: true }
+        config: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_lookup_cache:
+      method: PUT
+      path: /system/lookup/caches/{idOrName}
+      access: write
+      description: "Update a lookup cache."
+      params:
+        idOrName: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        name: { type: string, in: body, required: true }
+        config: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_lookup_cache:
+      method: DELETE
+      path: /system/lookup/caches/{idOrName}
+      access: dangerous
+      description: "Delete a lookup cache."
+      params:
+        idOrName: { type: string, in: path, required: true }
+      pagination: none
+
+    list_lookup_adapter_types:
+      method: GET
+      path: /system/lookup/types/adapters
+      access: read
+      description: "List available data adapter types."
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_lookup_cache_types:
+      method: GET
+      path: /system/lookup/types/caches
+      access: read
+      description: "List available cache types."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Outputs
+    # ──────────────────────────────────────────────
+
+    list_outputs:
+      method: GET
+      path: /system/outputs
+      access: read
+      description: "List all configured outputs."
+      response:
+        result_path: "$.outputs"
+
+    get_output:
+      method: GET
+      path: /system/outputs/{outputId}
+      access: read
+      description: "Get a single output."
+      params:
+        outputId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_output:
+      method: POST
+      path: /system/outputs
+      access: admin
+      description: "Create a new output. Use list_output_types to see available types."
+      params:
+        title: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        configuration: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_output:
+      method: PUT
+      path: /system/outputs/{outputId}
+      access: admin
+      description: "Update an output."
+      params:
+        outputId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true }
+        configuration: { type: object, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_output:
+      method: DELETE
+      path: /system/outputs/{outputId}
+      access: dangerous
+      description: "Delete an output."
+      params:
+        outputId: { type: string, in: path, required: true }
+      pagination: none
+
+    list_output_types:
+      method: GET
+      path: /system/outputs/available
+      access: read
+      description: "List available output types with their configuration schemas."
+      response:
+        result_path: "$.types"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Content Packs
+    # ──────────────────────────────────────────────
+
+    list_content_packs:
+      method: GET
+      path: /system/content_packs
+      access: read
+      description: "List all content packs (bundles of inputs, streams, dashboards, etc.)."
+      response:
+        result_path: "$.content_packs"
+
+    get_content_pack:
+      method: GET
+      path: /system/content_packs/{contentPackId}
+      access: read
+      description: "Get a content pack with all its revisions."
+      params:
+        contentPackId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    upload_content_pack:
+      method: POST
+      path: /system/content_packs
+      access: admin
+      description: "Upload/create a content pack."
+      params:
+        name: { type: string, in: body, required: true }
+        summary: { type: string, in: body }
+        description: { type: string, in: body }
+        vendor: { type: string, in: body }
+        url: { type: string, in: body }
+        entities: { type: array, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_content_pack:
+      method: DELETE
+      path: /system/content_packs/{contentPackId}
+      access: dangerous
+      description: "Delete a content pack."
+      params:
+        contentPackId: { type: string, in: path, required: true }
+      pagination: none
+
+    install_content_pack:
+      method: POST
+      path: /system/content_packs/{contentPackId}/{revision}/installations
+      access: admin
+      description: "Install a specific revision of a content pack."
+      params:
+        contentPackId: { type: string, in: path, required: true }
+        revision: { type: integer, in: path, required: true }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_content_pack_installations:
+      method: GET
+      path: /system/content_packs/{contentPackId}/installations
+      access: read
+      description: "List all installations of a content pack."
+      params:
+        contentPackId: { type: string, in: path, required: true }
+      response:
+        result_path: "$.installations"
+
+    uninstall_content_pack:
+      method: DELETE
+      path: /system/content_packs/{contentPackId}/installations/{installationId}
+      access: admin
+      description: "Uninstall a content pack installation."
+      params:
+        contentPackId: { type: string, in: path, required: true }
+        installationId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Sidecars (Collector Management)
+    # ──────────────────────────────────────────────
+
+    list_sidecars:
+      method: GET
+      path: /sidecars
+      access: read
+      description: >
+        List all registered sidecars. Sidecars are agents running on hosts that manage
+        log collectors (Filebeat, Winlogbeat, NXLog).
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+        query: { type: string, in: query }
+        sort: { type: string, in: query }
+        order: { type: string, in: query }
+        only_active: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.sidecars"
+
+    get_sidecar:
+      method: GET
+      path: /sidecars/{sidecarId}
+      access: read
+      description: "Get a single sidecar by ID."
+      params:
+        sidecarId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    sidecar_administration:
+      method: GET
+      path: /sidecar/administration
+      access: read
+      description: "Get sidecar administration overview with collector statuses."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+        query: { type: string, in: query }
+      response:
+        result_path: "$"
+
+    bulk_sidecar_action:
+      method: POST
+      path: /sidecar/administration
+      access: admin
+      description: "Perform bulk actions on sidecars (assign configurations, restart collectors)."
+      params:
+        action: { type: string, in: body, required: true }
+        collector_id: { type: string, in: body }
+        sidecar_ids: { type: array, in: body }
+        configuration_id: { type: string, in: body }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Sidecar Collectors
+    # ──────────────────────────────────────────────
+
+    list_sidecar_collectors:
+      method: GET
+      path: /sidecar/collectors
+      access: read
+      description: "List all collector backends (Filebeat, Winlogbeat, NXLog definitions)."
+      response:
+        result_path: "$.collectors"
+
+    get_sidecar_collector:
+      method: GET
+      path: /sidecar/collectors/{collectorId}
+      access: read
+      description: "Get a collector backend definition."
+      params:
+        collectorId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_sidecar_collector:
+      method: POST
+      path: /sidecar/collectors
+      access: admin
+      description: "Create a new collector backend definition."
+      params:
+        name: { type: string, in: body, required: true }
+        service_type: { type: string, in: body, required: true, description: "exec or svc" }
+        node_operating_system: { type: string, in: body, required: true, description: "linux, windows, darwin" }
+        executable_path: { type: string, in: body, required: true }
+        execute_parameters: { type: string, in: body }
+        validation_parameters: { type: string, in: body }
+        default_template: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_sidecar_collector:
+      method: PUT
+      path: /sidecar/collectors/{collectorId}
+      access: admin
+      description: "Update a collector backend definition."
+      params:
+        collectorId: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        service_type: { type: string, in: body, required: true }
+        node_operating_system: { type: string, in: body, required: true }
+        executable_path: { type: string, in: body, required: true }
+        execute_parameters: { type: string, in: body }
+        validation_parameters: { type: string, in: body }
+        default_template: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_sidecar_collector:
+      method: DELETE
+      path: /sidecar/collectors/{collectorId}
+      access: dangerous
+      description: "Delete a collector backend definition."
+      params:
+        collectorId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Sidecar Configurations
+    # ──────────────────────────────────────────────
+
+    list_sidecar_configurations:
+      method: GET
+      path: /sidecar/configurations
+      access: read
+      description: "List all sidecar configurations (collector config templates)."
+      response:
+        result_path: "$.configurations"
+
+    get_sidecar_configuration:
+      method: GET
+      path: /sidecar/configurations/{configId}
+      access: read
+      description: "Get a sidecar configuration."
+      params:
+        configId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_sidecar_configuration:
+      method: POST
+      path: /sidecar/configurations
+      access: write
+      description: "Create a sidecar configuration."
+      params:
+        collector_id: { type: string, in: body, required: true }
+        title: { type: string, in: body, required: true }
+        color: { type: string, in: body, default: "#FFFFFF" }
+        template: { type: string, in: body, required: true, description: "Configuration template (e.g., Filebeat YAML)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_sidecar_configuration:
+      method: PUT
+      path: /sidecar/configurations/{configId}
+      access: write
+      description: "Update a sidecar configuration."
+      params:
+        configId: { type: string, in: path, required: true }
+        collector_id: { type: string, in: body, required: true }
+        title: { type: string, in: body, required: true }
+        color: { type: string, in: body }
+        template: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_sidecar_configuration:
+      method: DELETE
+      path: /sidecar/configurations/{configId}
+      access: dangerous
+      description: "Delete a sidecar configuration."
+      params:
+        configId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Blacklist Filters
+    # ──────────────────────────────────────────────
+
+    list_blacklist_filters:
+      method: GET
+      path: /filters/blacklist
+      access: read
+      description: "List all message blacklist filters."
+      response:
+        result_path: "$.filters"
+
+    get_blacklist_filter:
+      method: GET
+      path: /filters/blacklist/{filterId}
+      access: read
+      description: "Get a single blacklist filter."
+      params:
+        filterId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_blacklist_filter:
+      method: POST
+      path: /filters/blacklist
+      access: write
+      description: "Create a blacklist filter to drop matching messages."
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        pattern: { type: string, in: body, required: true }
+        field_name: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_blacklist_filter:
+      method: PUT
+      path: /filters/blacklist/{filterId}
+      access: write
+      description: "Update a blacklist filter."
+      params:
+        filterId: { type: string, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        pattern: { type: string, in: body, required: true }
+        field_name: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_blacklist_filter:
+      method: DELETE
+      path: /filters/blacklist/{filterId}
+      access: dangerous
+      description: "Delete a blacklist filter."
+      params:
+        filterId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- General Info
+    # ──────────────────────────────────────────────
+
+    get_system:
+      method: GET
+      path: /system
+      access: read
+      description: "Get system overview: node ID, hostname, version, lifecycle, LB status, timezone, OS info."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_stats:
+      method: GET
+      path: /system/stats
+      access: read
+      description: "Get node statistics (JVM memory, OS, process info)."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_throughput:
+      method: GET
+      path: /system/throughput
+      access: read
+      description: "Get current message throughput (messages per second)."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_total_message_count:
+      method: GET
+      path: /count/total
+      access: read
+      description: "Get the total number of messages stored."
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_message_fields:
+      method: GET
+      path: /system/fields
+      access: read
+      description: "List all known message field names across all indices."
+      response:
+        result_path: "$.fields"
+      pagination: none
+
+    list_system_permissions:
+      method: GET
+      path: /system/permissions
+      access: admin
+      description: "List all available system permission strings."
+      response:
+        result_path: "$.permissions"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Processing
+    # ──────────────────────────────────────────────
+
+    pause_processing:
+      method: POST
+      path: /system/processing/pause
+      access: admin
+      description: "Pause message processing on this node. Messages will queue in the journal."
+
+    resume_processing:
+      method: POST
+      path: /system/processing/resume
+      access: admin
+      description: "Resume message processing on this node."
+
+    get_message_processor_config:
+      method: GET
+      path: /system/messageprocessors/config
+      access: admin
+      description: "Get message processor ordering and configuration."
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_message_processor_config:
+      method: PUT
+      path: /system/messageprocessors/config
+      access: admin
+      description: "Update message processor ordering."
+      params:
+        processor_order: { type: array, in: body, required: true, description: "Ordered array of processor class names" }
+        disabled_processors: { type: array, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Journal
+    # ──────────────────────────────────────────────
+
+    get_journal:
+      method: GET
+      path: /system/journal
+      access: read
+      description: "Get journal (disk buffer) information: size, segments, uncommitted entries."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Load Balancer
+    # ──────────────────────────────────────────────
+
+    get_lb_status:
+      method: GET
+      path: /system/lbstatus
+      access: read
+      description: "Get the load balancer status (ALIVE or DEAD). Used by LB health checks."
+      response:
+        result_path: "$"
+      pagination: none
+
+    override_lb_status:
+      method: PUT
+      path: /system/lbstatus/override/{status}
+      access: admin
+      description: "Override the load balancer status. status must be ALIVE or DEAD."
+      params:
+        status: { type: string, in: path, required: true, description: "ALIVE or DEAD" }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Metrics
+    # ──────────────────────────────────────────────
+
+    list_metrics:
+      method: GET
+      path: /system/metrics
+      access: read
+      description: "List all internal metrics (JVM, processing, indexing, etc.)."
+      response:
+        result_path: "$.metrics"
+
+    get_metric:
+      method: GET
+      path: /system/metrics/{metricName}
+      access: read
+      description: "Get a specific metric by its full name."
+      params:
+        metricName: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_metric_names:
+      method: GET
+      path: /system/metrics/names
+      access: read
+      description: "List all metric names."
+      response:
+        result_path: "$.names"
+      pagination: none
+
+    get_metrics_by_namespace:
+      method: GET
+      path: /system/metrics/namespace/{namespace}
+      access: read
+      description: "Get all metrics in a namespace (e.g. org.graylog2.throughput)."
+      params:
+        namespace: { type: string, in: path, required: true }
+      response:
+        result_path: "$.metrics"
+
+    get_multiple_metrics:
+      method: POST
+      path: /system/metrics/multiple
+      access: read
+      description: "Get multiple metrics at once by their names."
+      params:
+        metrics: { type: array, in: body, required: true, description: "Array of metric name strings" }
+      response:
+        result_path: "$.metrics"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Notifications
+    # ──────────────────────────────────────────────
+
+    list_system_notifications:
+      method: GET
+      path: /system/notifications
+      access: read
+      description: "List system notifications (warnings about configuration issues, index problems, etc.)."
+      response:
+        result_path: "$.notifications"
+
+    dismiss_system_notification:
+      method: DELETE
+      path: /system/notifications/{notificationType}
+      access: admin
+      description: "Dismiss a system notification."
+      params:
+        notificationType: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Loggers
+    # ──────────────────────────────────────────────
+
+    list_loggers:
+      method: GET
+      path: /system/loggers
+      access: admin
+      description: "List all internal loggers and their current log levels."
+      response:
+        result_path: "$.loggers"
+
+    list_logger_subsystems:
+      method: GET
+      path: /system/loggers/subsystems
+      access: admin
+      description: "List logger subsystems (high-level components with adjustable levels)."
+      response:
+        result_path: "$.subsystems"
+
+    set_logger_level:
+      method: PUT
+      path: /system/loggers/{loggerName}/level/{level}
+      access: admin
+      description: "Set the log level for a specific logger. Levels: TRACE, DEBUG, INFO, WARN, ERROR."
+      params:
+        loggerName: { type: string, in: path, required: true }
+        level: { type: string, in: path, required: true, description: "TRACE, DEBUG, INFO, WARN, ERROR" }
+      pagination: none
+
+    set_subsystem_logger_level:
+      method: PUT
+      path: /system/loggers/subsystems/{subsystem}/level/{level}
+      access: admin
+      description: "Set the log level for a logger subsystem."
+      params:
+        subsystem: { type: string, in: path, required: true }
+        level: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Jobs
+    # ──────────────────────────────────────────────
+
+    list_system_jobs:
+      method: GET
+      path: /system/jobs
+      access: read
+      description: "List all running and completed system jobs."
+      response:
+        result_path: "$.jobs"
+
+    get_system_job:
+      method: GET
+      path: /system/jobs/{jobId}
+      access: read
+      description: "Get a system job by ID."
+      params:
+        jobId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_system_job:
+      method: DELETE
+      path: /system/jobs/{jobId}
+      access: admin
+      description: "Cancel a running system job."
+      params:
+        jobId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Plugins
+    # ──────────────────────────────────────────────
+
+    list_plugins:
+      method: GET
+      path: /system/plugins
+      access: read
+      description: "List all installed plugins with name, version, author, and URL."
+      response:
+        result_path: "$.plugins"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Sessions (Authentication)
+    # ──────────────────────────────────────────────
+
+    create_session:
+      method: POST
+      path: /system/sessions
+      access: read
+      description: >
+        Create a session (login). Returns session_id and valid_until.
+        For session-based auth: username=session_id, password="session".
+      params:
+        username: { type: string, in: body, required: true }
+        password: { type: string, in: body, required: true }
+        host: { type: string, in: body, default: "" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    terminate_session:
+      method: DELETE
+      path: /system/sessions/{sessionId}
+      access: write
+      description: "Terminate a session (logout)."
+      params:
+        sessionId: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # System -- Cluster Config
+    # ──────────────────────────────────────────────
+
+    get_cluster_config:
+      method: GET
+      path: /system/cluster_config/{configClass}
+      access: admin
+      description: "Get a cluster-wide configuration by class name."
+      params:
+        configClass: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_cluster_config:
+      method: PUT
+      path: /system/cluster_config/{configClass}
+      access: admin
+      description: "Update a cluster-wide configuration."
+      params:
+        configClass: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_cluster_config:
+      method: DELETE
+      path: /system/cluster_config/{configClass}
+      access: admin
+      description: "Delete a cluster-wide configuration (reset to default)."
+      params:
+        configClass: { type: string, in: path, required: true }
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Cluster
+    # ──────────────────────────────────────────────
+
+    get_cluster:
+      method: GET
+      path: /cluster
+      access: read
+      description: "Get system overview of all cluster nodes."
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_cluster_input_states:
+      method: GET
+      path: /cluster/inputstates
+      access: read
+      description: "Get input states across all cluster nodes."
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_cluster_jobs:
+      method: GET
+      path: /cluster/jobs
+      access: read
+      description: "List running system jobs across all cluster nodes."
+      response:
+        result_path: "$"
+
+    get_cluster_metrics:
+      method: POST
+      path: /cluster/metrics/multiple
+      access: read
+      description: "Get multiple metrics across all cluster nodes."
+      params:
+        metrics: { type: array, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_cluster_node_jvm:
+      method: GET
+      path: /cluster/{nodeId}/jvm
+      access: read
+      description: "Get JVM information for a specific cluster node."
+      params:
+        nodeId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_cluster_node_journal:
+      method: GET
+      path: /cluster/{nodeId}/journal
+      access: read
+      description: "Get journal info for a specific cluster node."
+      params:
+        nodeId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_cluster_node_thread_dump:
+      method: GET
+      path: /cluster/{nodeId}/threaddump
+      access: admin
+      description: "Get a thread dump for a specific cluster node."
+      params:
+        nodeId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    pause_cluster_node_processing:
+      method: POST
+      path: /cluster/{nodeId}/processing/pause
+      access: admin
+      description: "Pause message processing on a specific cluster node."
+      params:
+        nodeId: { type: string, in: path, required: true }
+
+    resume_cluster_node_processing:
+      method: POST
+      path: /cluster/{nodeId}/processing/resume
+      access: admin
+      description: "Resume message processing on a specific cluster node."
+      params:
+        nodeId: { type: string, in: path, required: true }
+
+    # ──────────────────────────────────────────────
+    # Sources
+    # ──────────────────────────────────────────────
+
+    list_sources:
+      method: GET
+      path: /sources
+      access: read
+      description: >
+        List active message sources with their message counts within the given
+        relative time window. NOTE: requires base_url that ends with /api -- if
+        backends.yaml has url: 'https://host' (no /api), this endpoint returns
+        the web UI HTML instead of JSON. Verify with get_system first when in doubt.
+      params:
+        range: { type: integer, in: query, required: true, description: "REQUIRED. Relative seconds, e.g. 3600 = last hour. 0 = all time." }
+        size:  { type: integer, in: query, default: 100, description: "Max number of sources to return" }
+      response:
+        result_path: "$.sources"
+      pagination: none
+
+    # ──────────────────────────────────────────────
+    # Stream Alerts (Legacy)
+    # ──────────────────────────────────────────────
+
+    list_all_alerts:
+      method: GET
+      path: /streams/alerts
+      access: read
+      description: "List recent alerts across all streams."
+      params:
+        since: { type: integer, in: query, default: 0, description: "Unix timestamp" }
+        limit: { type: integer, in: query, default: 300 }
+      response:
+        result_path: "$.alerts"
+
+    list_all_alerts_paginated:
+      method: GET
+      path: /streams/alerts/paginated
+      access: read
+      description: "List alerts across all streams with pagination."
+      params:
+        skip: { type: integer, in: query, default: 0 }
+        limit: { type: integer, in: query, default: 300 }
+        state: { type: string, in: query, description: "any, resolved, unresolved" }
+      response:
+        result_path: "$"
+
+    list_stream_alerts:
+      method: GET
+      path: /streams/{streamId}/alerts
+      access: read
+      description: "List alerts for a specific stream."
+      params:
+        streamId: { type: string, in: path, required: true }
+        since: { type: integer, in: query, default: 0 }
+        limit: { type: integer, in: query, default: 300 }
+      response:
+        result_path: "$.alerts"
+
+    get_alert:
+      method: GET
+      path: /streams/{streamId}/alerts/{alertId}
+      access: read
+      description: "Get a specific alert."
+      params:
+        streamId: { type: string, in: path, required: true }
+        alertId: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+  composites:
+
+    aggregate_by_field:
+      description: >
+        Top-N values for a single field within a time window. Returns
+        [{key, count}] sorted desc. Server-side replacement for the
+        deprecated search_relative_terms / search_absolute_terms endpoints
+        (removed in Graylog 6.0). time_range is one of:
+          {type:"absolute", from, to}
+          {type:"relative", range}
+          {type:"keyword",  keyword}
+      params:
+        query:      { type: string,  default: "*" }
+        time_range: { type: object,  required: true }
+        field:      { type: string,  required: true }
+        size:       { type: integer, default: 20 }
+        streams:    { type: array,   default: [] }
+      timeout: 60s
+      depends_on: [views_search_sync]
+      code: |
+        const body = {
+          queries: [{
+            id: "q",
+            query: { type: "elasticsearch", query_string: params.query || "*" },
+            timerange: params.time_range,
+            filter: (params.streams && params.streams.length)
+              ? { type: "or", filters: params.streams.map(s => ({ type: "stream", id: s })) }
+              : null,
+            search_types: [{
+              id: "st",
+              type: "pivot",
+              row_groups: [{ type: "values", field: params.field, limit: params.size || 20 }],
+              series: [{ type: "count", id: "c" }],
+              rollup: false,
+            }],
+          }],
+          parameters: [],
+        };
+        const r = await api.views_search_sync(body);
+        const rows = r.results?.q?.search_types?.st?.rows || [];
+        return rows
+          .filter(row => row.source === "leaf")
+          .map(row => ({ key: row.key[0], count: row.values?.[0]?.value || 0 }));
+
+    aggregate_pivot:
+      description: >
+        Multi-dimensional pivot (e.g. source x level). row_fields and
+        column_fields are arrays of field names. Returns flat array of
+        {row_keys, col_keys, count}. The canonical replacement for the
+        Source x Level forensic matrix workflow.
+      params:
+        query:         { type: string,  default: "*" }
+        time_range:    { type: object,  required: true }
+        row_fields:    { type: array,   required: true }
+        column_fields: { type: array,   default: [] }
+        row_limit:     { type: integer, default: 50 }
+        col_limit:     { type: integer, default: 20 }
+        streams:       { type: array,   default: [] }
+      timeout: 60s
+      depends_on: [views_search_sync]
+      code: |
+        const mkGroups = (fields, limit) =>
+          (fields || []).map(f => ({ type: "values", field: f, limit }));
+        const body = {
+          queries: [{
+            id: "q",
+            query: { type: "elasticsearch", query_string: params.query || "*" },
+            timerange: params.time_range,
+            filter: (params.streams && params.streams.length)
+              ? { type: "or", filters: params.streams.map(s => ({ type: "stream", id: s })) }
+              : null,
+            search_types: [{
+              id: "st",
+              type: "pivot",
+              row_groups:    mkGroups(params.row_fields,    params.row_limit || 50),
+              column_groups: mkGroups(params.column_fields, params.col_limit || 20),
+              series: [{ type: "count", id: "c" }],
+              rollup: true,
+            }],
+          }],
+          parameters: [],
+        };
+        const r = await api.views_search_sync(body);
+        const rows = r.results?.q?.search_types?.st?.rows || [];
+        const rN = (params.row_fields || []).length;
+        return rows
+          .filter(row => row.source === "leaf")
+          .map(row => ({
+            row_keys: row.key.slice(0, rN),
+            col_keys: row.key.slice(rN),
+            count:    row.values?.[0]?.value || 0,
+          }));
+
+    histogram_grouped:
+      description: >
+        Time-series histogram, optionally grouped by a field. interval is an
+        ISO-8601 timeunit string (PT30S, PT1M, PT1H, P1D). Returns
+        [{bucket_start, group_key|null, count}].
+      params:
+        query:      { type: string,  default: "*" }
+        time_range: { type: object,  required: true }
+        interval:   { type: string,  default: "PT1M" }
+        group_by:   { type: string,  default: "" }
+        size:       { type: integer, default: 10 }
+        streams:    { type: array,   default: [] }
+      timeout: 60s
+      depends_on: [views_search_sync]
+      code: |
+        const rowGroups = [{
+          type: "time", field: "timestamp",
+          interval: { type: "timeunit", value: params.interval || "PT1M" },
+        }];
+        if (params.group_by) {
+          rowGroups.push({ type: "values", field: params.group_by, limit: params.size || 10 });
+        }
+        const body = {
+          queries: [{
+            id: "q",
+            query: { type: "elasticsearch", query_string: params.query || "*" },
+            timerange: params.time_range,
+            filter: (params.streams && params.streams.length)
+              ? { type: "or", filters: params.streams.map(s => ({ type: "stream", id: s })) }
+              : null,
+            search_types: [{
+              id: "st", type: "pivot",
+              row_groups: rowGroups,
+              series: [{ type: "count", id: "c" }],
+              rollup: false,
+            }],
+          }],
+          parameters: [],
+        };
+        const r = await api.views_search_sync(body);
+        const rows = r.results?.q?.search_types?.st?.rows || [];
+        return rows
+          .filter(row => row.source === "leaf")
+          .map(row => ({
+            bucket_start: row.key[0],
+            group_key:    row.key[1] || null,
+            count:        row.values?.[0]?.value || 0,
+          }));
+
+    field_stats:
+      description: "count, min, max, mean, cardinality for a numeric field. Replaces the removed _stats endpoints."
+      params:
+        query:      { type: string, default: "*" }
+        time_range: { type: object, required: true }
+        field:      { type: string, required: true }
+        streams:    { type: array,  default: [] }
+      timeout: 30s
+      depends_on: [views_search_sync]
+      code: |
+        const series = ["count","min","max","avg","card"].map(fn => ({
+          type: fn, field: params.field, id: fn,
+        }));
+        const body = {
+          queries: [{
+            id: "q",
+            query: { type: "elasticsearch", query_string: params.query || "*" },
+            timerange: params.time_range,
+            filter: (params.streams && params.streams.length)
+              ? { type: "or", filters: params.streams.map(s => ({ type: "stream", id: s })) }
+              : null,
+            search_types: [{ id: "st", type: "pivot", row_groups: [], series, rollup: true }],
+          }],
+          parameters: [],
+        };
+        const r = await api.views_search_sync(body);
+        const row = (r.results?.q?.search_types?.st?.rows || []).find(x => x.source === "leaf");
+        const out = {};
+        for (const v of (row?.values || [])) {
+          out[v.key[v.key.length - 1]] = v.value;
+        }
+        return out;
+
+    search_messages_compact:
+      description: >
+        Search returning only {ts, src, lvl, msg} per message -- ~80 bytes/msg
+        instead of ~500. Offset/limit pagination (Graylog's Views API does not
+        support search_after on the messages search-type). Pass the next_offset
+        returned by the previous call to fetch the next page.
+      params:
+        query:      { type: string,  default: "*" }
+        time_range: { type: object,  required: true }
+        limit:      { type: integer, default: 200 }
+        offset:     { type: integer, default: 0 }
+        streams:    { type: array,   default: [] }
+      timeout: 60s
+      depends_on: [views_search_sync]
+      code: |
+        const limit = params.limit || 200;
+        const offset = params.offset || 0;
+        const body = {
+          queries: [{
+            id: "q",
+            query: { type: "elasticsearch", query_string: params.query || "*" },
+            timerange: params.time_range,
+            filter: (params.streams && params.streams.length)
+              ? { type: "or", filters: params.streams.map(s => ({ type: "stream", id: s })) }
+              : null,
+            search_types: [{
+              id: "st", type: "messages",
+              limit: limit, offset: offset,
+              fields: ["timestamp", "source", "level", "message"],
+              sort: [{ field: "timestamp", order: "DESC" }],
+            }],
+          }],
+          parameters: [],
+        };
+        const r = await api.views_search_sync(body);
+        const msgs = r.results?.q?.search_types?.st?.messages || [];
+        const total = r.results?.q?.search_types?.st?.total_results;
+        const nextOffset = offset + msgs.length;
+        return {
+          messages: msgs.map(m => ({
+            ts:  m.message.timestamp,
+            src: m.message.source,
+            lvl: m.message.level,
+            msg: m.message.message,
+          })),
+          next_offset: (msgs.length === limit && (total == null || nextOffset < total)) ? nextOffset : null,
+          total: total,
+        };
+
+    incident_window:
+      description: >
+        Forensic snapshot for a service-incident window. Returns
+        {window, pivot_source_level, top_errors, baseline_pivot}.
+        timestamp is ISO-8601, window_minutes default 6 (i.e. +/- 3 min).
+        baseline_pivot covers the same-length window 1 hour earlier for
+        comparison.
+      params:
+        timestamp:      { type: string,  required: true }
+        window_minutes: { type: integer, default: 6 }
+        streams:        { type: array,   default: [] }
+      timeout: 90s
+      depends_on: [views_search_sync]
+      code: |
+        const t = new Date(params.timestamp).getTime();
+        const half = (params.window_minutes || 6) * 30 * 1000;
+        const tr = {
+          type: "absolute",
+          from: new Date(t - half).toISOString(),
+          to:   new Date(t + half).toISOString(),
+        };
+        const baselineTr = {
+          type: "absolute",
+          from: new Date(t - half - 3600 * 1000).toISOString(),
+          to:   new Date(t + half - 3600 * 1000).toISOString(),
+        };
+        const streamFilter = (params.streams && params.streams.length)
+          ? { type: "or", filters: params.streams.map(s => ({ type: "stream", id: s })) }
+          : null;
+        const pivotBody = (timerange) => ({
+          queries: [{
+            id: "q",
+            query: { type: "elasticsearch", query_string: "*" },
+            timerange,
+            filter: streamFilter,
+            search_types: [{
+              id: "st", type: "pivot",
+              row_groups:    [{ type: "values", field: "source", limit: 100 }],
+              column_groups: [{ type: "values", field: "level",  limit: 8 }],
+              series: [{ type: "count", id: "c" }],
+              rollup: true,
+            }],
+          }],
+          parameters: [],
+        });
+        const errorBody = (timerange) => ({
+          queries: [{
+            id: "q",
+            query: { type: "elasticsearch", query_string: "level:<=4" },
+            timerange,
+            filter: streamFilter,
+            search_types: [{
+              id: "st", type: "pivot",
+              row_groups: [{ type: "values", field: "message", limit: 10 }],
+              series: [{ type: "count", id: "c" }],
+              rollup: false,
+            }],
+          }],
+          parameters: [],
+        });
+        const flatPivot = (r) => (r.results?.q?.search_types?.st?.rows || [])
+          .filter(row => row.source === "leaf")
+          .map(row => ({
+            row_keys: row.key.slice(0, 1),
+            col_keys: row.key.slice(1),
+            count:    row.values?.[0]?.value || 0,
+          }));
+        const flatTerms = (r) => (r.results?.q?.search_types?.st?.rows || [])
+          .filter(row => row.source === "leaf")
+          .map(row => ({ key: row.key[0], count: row.values?.[0]?.value || 0 }));
+        const [matrixR, errorsR, baselineR] = await Promise.all([
+          api.views_search_sync(pivotBody(tr)),
+          api.views_search_sync(errorBody(tr)),
+          api.views_search_sync(pivotBody(baselineTr)),
+        ]);
+        return {
+          window: tr,
+          pivot_source_level: flatPivot(matrixR),
+          top_errors:         flatTerms(errorsR),
+          baseline_pivot:     flatPivot(baselineR),
+        };
+
+  hints:
+    search_relative:
+      max_results: "10000 (Elasticsearch default result window)"
+      query_syntax: "Lucene -- supports AND, OR, NOT, wildcards, ranges, field:value"
+      stream_filter: "filter param uses 'streams:STREAM_ID' format"
+      absolute_window: "for absolute timestamp windows on 6.x use timestamp:[\"FROM\" TO \"TO\"] in the query plus a generous range, OR use views_search_sync / aggregate_pivot with timerange.type=absolute"
+    search_keyword:
+      keyword_grammar: "open-ended Natty phrases ONLY: 'last 5 minutes', 'last 7 hours', 'yesterday', 'last week'. '7 hours ago' returns HTTP 400 -- use 'last 7 hours' instead, or views_search_sync for closed ranges."
+    views_search_sync:
+      time_range_shapes: |
+        absolute: { type: "absolute", from: "2026-04-25T00:11:00.000Z", to: "2026-04-25T00:17:00.000Z" }
+        relative: { type: "relative", range: 3600 }
+        keyword:  { type: "keyword",  keyword: "last 5 minutes" }
+      pivot_row_response: "search_types[].rows[].source is one of 'leaf' or 'non-leaf' -- always filter to leaf rows for flat output"
+      stream_filter: "no top-level 'streams' field -- Graylog returns HTTP 400. Scope per query via query.filter: { type: 'or', filters: [{ type: 'stream', id: STREAM_ID }, ...] }"
+    aggregate_pivot:
+      replaces: "deprecated _terms / _histogram / _stats endpoints removed in Graylog 6.0"
+      row_col_keys: "row.key is an array -- first row_fields entries are row dimensions, the rest are column dimensions when rollup=true"
+    histogram_grouped:
+      interval_format: "ISO-8601 timeunit, e.g. PT30S (30s), PT1M (1min), PT1H, P1D"
+    list_sources:
+      base_url_caveat: "if you receive HTML instead of JSON, the configured base_url in backends.yaml does not end with /api -- fix the backends.yaml entry"
+    create_stream:
+      default_stream_id: "000000000000000000000001 -- cannot be deleted"
+      starts_paused: "newly created streams are paused -- call resume_stream to activate"
+    create_stream_rule:
+      rule_types: "1=exact, 2=regex, 3=greater_than, 4=less_than, 5=field_presence, 6=contains, 7=always_match, 8=match_input"
+    create_pipeline:
+      source_syntax: "Graylog pipeline language, not Lucene. Validate with parse_pipeline first."
+    create_input:
+      requires_type: "call list_input_types first to get available types and their config schemas"
+    create_extractor:
+      types: "regex, substring, split_and_index, copy_input, grok, json, lookup_table"
+    create_event_definition:
+      priority_values: "1=low, 2=normal, 3=high"
+    set_logger_level:
+      levels: "TRACE, DEBUG, INFO, WARN, ERROR"
+    override_lb_status:
+      values: "ALIVE or DEAD"
+
+  examples:
+    - name: "Search recent errors"
+      description: "Search for error-level messages in the last hour"
+      code: |
+        const results = await api.search_relative({
+          query: "level:3 OR level:ERROR",
+          range: 3600,
+          limit: 50,
+          sort: "timestamp:desc"
+        });
+        return results.messages;
+
+    - name: "Source x Level matrix for an incident window"
+      description: "Reproduce a 6-minute pivot around a service-incident timestamp (replaces removed _terms endpoint)."
+      code: |
+        return await api.aggregate_pivot({
+          query: "*",
+          time_range: {
+            type: "absolute",
+            from: "2026-04-25T00:11:00.000Z",
+            to:   "2026-04-25T00:17:00.000Z",
+          },
+          row_fields:    ["source"],
+          column_fields: ["level"],
+          row_limit: 100, col_limit: 8,
+        });
+
+    - name: "One-shot incident forensics"
+      description: "Pivot + top errors + 1h-earlier baseline around a given timestamp."
+      code: |
+        return await api.incident_window({
+          timestamp: "2026-04-25T00:14:00Z",
+          window_minutes: 6,
+        });
+
+    - name: "Compact paginated message drill-down"
+      description: "Offset-paged search returning only ts/src/lvl/msg per message."
+      code: |
+        const tr = { type: "relative", range: 3600 };
+        const p1 = await api.search_messages_compact({
+          query: "level:<=4", time_range: tr, limit: 100,
+        });
+        const p2 = await api.search_messages_compact({
+          query: "level:<=4", time_range: tr, limit: 100,
+          offset: p1.next_offset,
+        });
+        return { page1: p1.messages.length, page2: p2.messages.length, total: p1.total };
+
+    - name: "Histogram with grouping"
+      description: "30-second buckets of messages grouped by level for the last hour."
+      code: |
+        return await api.histogram_grouped({
+          query: "*",
+          time_range: { type: "relative", range: 3600 },
+          interval: "PT30S",
+          group_by: "level",
+          size: 8,
+        });
+
+    - name: "Create stream with rule"
+      description: "Create a stream for nginx logs and add a source-matching rule"
+      code: |
+        const stream = await api.create_stream({
+          title: "Nginx Access Logs",
+          description: "All messages from nginx servers",
+          matching_type: "OR"
+        });
+        await api.create_stream_rule({
+          streamId: stream.stream_id,
+          field: "source",
+          type: 2,
+          value: "^nginx-.*",
+          description: "Match nginx sources"
+        });
+        await api.resume_stream({ streamId: stream.stream_id });
+        return stream;
+
+    - name: "Pipeline with rule"
+      description: "Create a pipeline rule and a pipeline that uses it"
+      code: |
+        const rule = await api.create_pipeline_rule({
+          title: "Extract HTTP status",
+          source: 'rule "extract http status"\nwhen\n  has_field("http_response_code")\nthen\n  set_field("http_status_class", substring(to_string($message.http_response_code), 0, 1) + "xx");\nend'
+        });
+        const pipeline = await api.create_pipeline({
+          title: "HTTP Enrichment",
+          source: 'pipeline "HTTP Enrichment"\nstage 0 match either\nrule "extract http status"\nend'
+        });
+        return { rule, pipeline };
