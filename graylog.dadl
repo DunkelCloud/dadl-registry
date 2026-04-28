@@ -178,17 +178,21 @@ backend:
       access: read
       description: >
         Execute a Views/Search query synchronously and return results inline.
-        Body shape: { queries: [...], parameters: [], streams: [] }. Each query has
-        id, query.query_string, timerange (absolute / relative / keyword), optional
-        filter, and search_types[] (pivot, messages, events, ...). For everyday
-        forensic work prefer the higher-level composites: aggregate_by_field,
-        aggregate_pivot, histogram_grouped, field_stats, search_messages_compact,
-        incident_window. Server-side timeout via ?timeout=<seconds>, default 60.
+        Body shape: { id?, queries: [...], parameters: [], skip_no_streams_check? }.
+        NOTE: there is no top-level "streams" field -- Graylog rejects it with
+        HTTP 400. Scope to streams via query.filter (e.g.
+        { type: "or", filters: [{ type: "stream", id: STREAM_ID }] }) on the
+        individual query object. Each query has id, query.query_string, timerange
+        (absolute / relative / keyword), optional filter, and search_types[]
+        (pivot, messages, events, ...). For everyday forensic work prefer the
+        higher-level composites: aggregate_by_field, aggregate_pivot,
+        histogram_grouped, field_stats, search_messages_compact, incident_window.
+        Server-side timeout via ?timeout=<seconds>, default 60.
       params:
-        queries:    { type: array,   in: body, required: true,  description: "Array of query objects" }
-        parameters: { type: array,   in: body, default: [],     description: "Declared parameters (usually [])" }
-        streams:    { type: array,   in: body, default: [],     description: "Stream IDs to scope (optional)" }
-        timeout:    { type: integer, in: query, default: 60,    description: "Server-side timeout in seconds" }
+        queries:                 { type: array,   in: body, required: true,  description: "Array of query objects" }
+        parameters:              { type: array,   in: body, default: [],     description: "Declared parameters (usually [])" }
+        skip_no_streams_check:   { type: boolean, in: body, description: "Skip the safety check that requires at least one stream filter (admin-only)" }
+        timeout:                 { type: integer, in: query, default: 60,    description: "Server-side timeout in seconds" }
       response:
         result_path: "$"
       pagination: none
@@ -3237,7 +3241,7 @@ backend:
         relative: { type: "relative", range: 3600 }
         keyword:  { type: "keyword",  keyword: "last 5 minutes" }
       pivot_row_response: "search_types[].rows[].source is one of 'leaf' or 'non-leaf' -- always filter to leaf rows for flat output"
-      stream_filter: "use top-level body field streams: [streamId,...] OR a query.filter object with type:'or' and stream sub-filters"
+      stream_filter: "no top-level 'streams' field -- Graylog returns HTTP 400. Scope per query via query.filter: { type: 'or', filters: [{ type: 'stream', id: STREAM_ID }, ...] }"
     aggregate_pivot:
       replaces: "deprecated _terms / _histogram / _stats endpoints removed in Graylog 6.0"
       row_col_keys: "row.key is an array -- first row_fields entries are row dimensions, the rest are column dimensions when rollup=true"
