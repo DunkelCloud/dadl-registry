@@ -19,7 +19,10 @@
 #   endpoints were removed in Graylog 6.0 and are no longer surfaced here.
 # - Plain message retrieval is still available via search_relative (legacy, working in 6.x)
 #   and search_keyword (open-ended Natty phrases). For absolute windows or projected fields
-#   use views_search_sync / search_messages_compact / views_search_messages.
+#   use views_search_sync / search_messages_compact.
+# - CSV export endpoints (/search/universal/relative/export, /views/search/messages) are
+#   not surfaced -- they require an Accept: text/csv override that the registry schema
+#   does not currently allow. Pull JSON via views_search_sync and convert client-side.
 # - Search results are limited to 10,000 by default (Elasticsearch result window).
 # - Pagination uses offset/limit pattern. Response includes "total" for total count.
 # - Stream filtering in search: use filter param "streams:STREAM_ID" to scope queries.
@@ -42,7 +45,7 @@ date: "2026-04-26"
 backend:
   name: graylog
   type: rest
-  version: "2.0.0"
+  version: "1.0"
   # base_url intentionally omitted -- self-hosted, provided via backends.yaml
   description: "Graylog REST API -- log search (Views/Search + legacy universal), streams, pipelines, inputs, alerts, events, dashboards, users, roles, sidecars, index management, and cluster administration. Targets Graylog 6.x."
 
@@ -138,28 +141,6 @@ backend:
         result_path: "$"
       pagination: none
 
-    export_search_relative:
-      method: GET
-      path: /search/universal/relative/export
-      access: read
-      description: >
-        Export search results as CSV for a relative time range.
-        Returns CSV data with selected fields -- the /export path makes Graylog
-        respond with text/csv regardless of the request Accept header.
-        For modern field-projected exports, prefer views_search_messages.
-      params:
-        query: { type: string, in: query, required: true }
-        range: { type: integer, in: query, required: true }
-        fields: { type: string, in: query, required: true, description: "Comma-separated list of fields to export" }
-        limit: { type: integer, in: query, default: 500 }
-        offset: { type: integer, in: query, default: 0 }
-        filter: { type: string, in: query }
-      response:
-        binary: true
-        content_type: text/csv
-        result_path: "$"
-      pagination: none
-
     # ──────────────────────────────────────────────
     # Search -- Keyword Time Range
     # ──────────────────────────────────────────────
@@ -209,26 +190,6 @@ backend:
         streams:    { type: array,   in: body, default: [],     description: "Stream IDs to scope (optional)" }
         timeout:    { type: integer, in: query, default: 60,    description: "Server-side timeout in seconds" }
       response:
-        result_path: "$"
-      pagination: none
-
-    views_search_messages:
-      method: POST
-      path: /views/search/messages
-      access: read
-      description: >
-        CSV export via Views/Search API. Body shape mirrors views_search_sync but
-        the search_types[] should contain a single message_list. The /messages
-        endpoint returns text/csv based on the body's search_type, not the
-        Accept header. Drop-in replacement for the legacy export_search_relative
-        when you need precise field projection or absolute time ranges.
-      params:
-        queries:    { type: array, in: body, required: true }
-        parameters: { type: array, in: body, default: [] }
-        streams:    { type: array, in: body, default: [] }
-      response:
-        binary: true
-        content_type: text/csv
         result_path: "$"
       pagination: none
 
