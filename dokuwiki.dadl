@@ -543,6 +543,119 @@ backend:
         });
         return { success: true, heading: target, inserted_at_line: insertIdx };
 
+    chunked_save_page:
+      description: >
+        Stateful chunked save: buffers text chunks server-side in a hidden
+        draft page and writes the assembled content to the target page in a
+        single revision when finalized.
+
+        Workflow:
+          1. First chunk: chunk_index=0  (resets the buffer for this session_id).
+          2. Middle chunks: chunk_index=1..N-2  (each appended to the buffer).
+          3. Final chunk: chunk_index=N-1, finalize=true
+             — assembles buffer, writes target page in ONE revision, deletes draft.
+
+        Use this when the per-call payload of execute_code is too small to fit
+        the full page text in a single save_page call (e.g. when the calling
+        transport limits the size of tool-call arguments). Each call carries
+        only one chunk so the per-call payload stays small, while the target
+        page receives one clean revision.
+
+        All intermediate buffer operations (draft create, chunk appends, draft
+        delete) are flagged as DokuWiki minor edits, so they are hidden from
+        the default Recent Changes view. Only the final write to the target
+        page surfaces — the noise stays out of the wiki's change history.
+
+        Caveats:
+          - session_id must be unique per upload — collisions corrupt the buffer.
+          - Abandoned sessions leave a draft at _chunked_uploads:<session_id>;
+            re-using the same session_id with chunk_index=0 cleans it up.
+          - Chunks must arrive in order; the composite does not reorder them.
+      params:
+        session_id:
+          type: string
+          required: true
+          description: "Unique upload session ID (e.g. UUID or random string)."
+        page:
+          type: string
+          required: true
+          description: "Target page ID. Must be passed on every call; only used at finalize."
+        chunk_index:
+          type: integer
+          required: true
+          description: "0-based chunk index. 0 starts (or resets) the session."
+        text:
+          type: string
+          required: true
+          description: "Chunk content in DokuWiki syntax."
+        finalize:
+          type: boolean
+          description: "Set true on the last chunk to commit the assembled buffer to the target page."
+        summary:
+          type: string
+          description: "Edit summary for the final target-page revision (only used when finalize=true)."
+        isminor:
+          type: boolean
+          description: "Mark the final revision as minor."
+      timeout: 60s
+      depends_on: [get_page, save_page, append_page]
+      code: |
+        // All draft-buffer operations (initial save, intermediate appends, final
+        // cleanup-delete) are flagged isminor:true so they are filtered out of
+        // DokuWiki's default Recent Changes view. Only the final write to the
+        // user-supplied target page surfaces as a normal edit. Without this,
+        // each chunked save dumps N+2 entries into _dokuwiki.changes per logical
+        // user action, which pollutes the change log and can trigger UI
+        // pagination artifacts.
+        const draft = "_chunked_uploads:" + params.session_id;
+        const idx = params.chunk_index;
+
+        if (idx === 0) {
+          await api.save_page({
+            page: draft,
+            text: params.text,
+            summary: "chunked-upload " + params.session_id + " start",
+            isminor: true
+          });
+        } else {
+          await api.append_page({
+            page: draft,
+            text: params.text,
+            summary: "chunked-upload " + params.session_id + " chunk " + idx,
+            isminor: true
+          });
+        }
+
+        if (!params.finalize) {
+          return { ok: true, session_id: params.session_id, chunk_index: idx, buffered: true };
+        }
+
+        // Finalize: read the assembled buffer, write target in one revision,
+        // then delete the draft (DokuWiki: empty text on existing page = delete).
+        const fullText = (await api.get_page({ page: draft })).result;
+        if (fullText === null || fullText === undefined || fullText === "") {
+          return { ok: false, error: "buffer_empty_or_missing", session_id: params.session_id };
+        }
+        await api.save_page({
+          page: params.page,
+          text: fullText,
+          summary: params.summary || ("assembled from " + (idx + 1) + " chunks (" + params.session_id + ")"),
+          isminor: params.isminor || false
+        });
+        await api.save_page({
+          page: draft,
+          text: "",
+          summary: "chunked-upload " + params.session_id + " cleanup",
+          isminor: true
+        });
+        return {
+          ok: true,
+          session_id: params.session_id,
+          chunks_assembled: idx + 1,
+          bytes_written: fullText.length,
+          target: params.page
+        };
+
   examples:
     - name: "Find and read a page"
       description: "Search for a page by keyword and read its content"
