@@ -1,13 +1,18 @@
-# xen-orchestra.dadl -- Xen Orchestra REST API (XO 6.x)
+# xen-orchestra.dadl -- Xen Orchestra REST API (XO 6.4+)
 # DADL backend for ToolMesh
 #
 # Domain Notes for LLM consumers:
 # - Xen Orchestra (XO) is the web management UI for XCP-ng / XenServer hypervisors.
-# - The REST API is at /rest/v0/ and currently in beta (minor changes possible).
-# - Only admin users can use the REST API.
+# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added).
+# - Swagger docs available at /rest/v0/docs (OpenAPI spec for runtime discovery).
+# - Access control: pre-6.4 was admin-only; XO 6.4+ uses fine-grained RBAC v2 (acl-privileges/acl-roles).
+#   Endpoints with no declared privilege still require admin -- see /users/me/acl-privileges to inspect yours.
 # - A "pool" is a cluster of XCP-ng hosts sharing storage. Use /pools to discover them.
 # - A "host" is a physical XCP-ng hypervisor machine within a pool.
 # - A "VM" is a virtual machine identified by UUID.
+# - A "VM template" is a stamp from which new VMs are cloned (separate /vm-templates collection).
+# - A "VM snapshot" is a point-in-time copy of a VM (separate /vm-snapshots collection).
+# - A "VDI snapshot" is a point-in-time copy of a VDI (separate /vdi-snapshots collection).
 # - A "SR" (Storage Repository) is a storage backend (local disk, NFS, iSCSI, etc.).
 # - A "VDI" (Virtual Disk Image) is a virtual disk stored on an SR.
 # - A "VBD" (Virtual Block Device) connects a VDI to a VM (disk attachment).
@@ -18,16 +23,28 @@
 # - A "PGPU" is a physical GPU on a host (for GPU passthrough / vGPU).
 # - A "SM" (Storage Manager) describes an available SR driver/plugin.
 # - A "proxy" is an XO Proxy instance for distributed backups and remote pool management.
+# - A "server" is a registered XCP-ng/XenServer connection in XO (you connect XO to your hosts via /servers).
 # - A "message" is a XAPI alert/notification (e.g. HA alerts, license warnings).
+# - An "alarm" is a XAPI performance/health alarm (CPU, memory, disk thresholds) -- distinct from messages.
+# - A "schedule" runs a backup-job on a cron expression; manual run via /schedules/{id}/actions/run.
+# - A "backup-repository" is a target where backups are written (NFS, S3, SMB, local).
+# - "events" provides a Server-Sent Events (SSE) stream for real-time XAPI object changes.
+# - RBAC v2: "groups" have users, "acl-roles" group "acl-privileges" and are attached to users/groups.
 # - Collections return arrays of URLs by default. Use ?fields=name_label,uuid for objects.
 # - Use ?filter=<expression> with XO filter syntax (e.g. "power_state:Running").
-# - Use ?ndjson for newline-delimited JSON; add &watch for real-time streaming.
-# - Actions are async by default -- add ?sync to get the result directly.
-# - Tags: add with PUT /<type>/<uuid>/tags/<tag>, remove with DELETE.
+# - Use ?ndjson for newline-delimited JSON; add &watch for real-time streaming on /tasks.
+# - Use ?markdown=true (XO 6.4+) for markdown-formatted collection responses (LLM-friendly).
+# - Actions are async by default -- add ?sync to get the result directly (blocks; risk of timeout for long ops).
+# - Tags: add with PUT /<type>/{id}/tags/{tag}, remove with DELETE.
+# - Sub-resources: alarms, messages, tasks are exposed per-object as /<type>/{id}/{alarms|messages|tasks}.
+# - Stats: /vms/{id}/stats and /hosts/{id}/stats accept ?granularity=seconds|minutes|hours|days.
 # - VM export: .xva (native), .ova. Compression: gzip (slow), zstd (fast, XCP-ng only).
 # - VDI export: .vhd (default), .raw. Import to existing VDI requires exact size match.
-# - UUID "_" means "any/default" for collection-level actions (e.g. /pools/_/actions).
-# - Backup jobs use /backup-jobs (not deprecated /backup/jobs/vm).
+# - UUID "_" means "any/default" for collection-level actions (e.g. /pools/_/actions does not exist anymore --
+#   action discovery is now via Swagger spec at /rest/v0/docs).
+# - Backup jobs: use /backup-jobs (modern). Old /backup/jobs/vm subroutes are DEPRECATED (removal 2026-09-12).
+# - Auth tokens: prefer POST /users/{id}/authentication_tokens (POST /users/authentication_tokens is DEPRECATED).
+# - User id "me" is a shortcut for the current authenticated user.
 
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
 
@@ -36,15 +53,15 @@ credits:
 
 source_name: "Xen Orchestra REST API"
 source_url: "https://docs.xen-orchestra.com/restapi"
-date: "2026-04-06"
+date: "2026-05-02"
 
 backend:
   name: xen-orchestra
   type: rest
-  version: "2.0"
+  version: "3.0"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
-  description: "Xen Orchestra REST API -- manage XCP-ng/XenServer virtualization: VMs, hosts, pools, storage, networks, snapshots, backups, tasks, and live monitoring"
+  description: "Xen Orchestra REST API (XO 6.4+) -- complete coverage: VMs, hosts, pools, storage (SR/VDI/VBD), networks (VIF/PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges), proxies, servers, dashboards, auth tokens, health check"
 
   auth:
     type: bearer
@@ -78,12 +95,12 @@ backend:
       max_items: 500
 
   coverage:
-    endpoints: 93
-    total_endpoints: 93
+    endpoints: 229
+    total_endpoints: 229
     percentage: 100
-    focus: "VMs (CRUD, lifecycle, suspend/resume/pause, export/import, snapshots, migration, cloning), hosts (enable/disable), pools (VM creation, network creation, emergency shutdown, rolling reboot/update, VM import), SRs (scan, forget, reclaim space, VDI import), VDIs (CRUD, export/import, migration), VBDs (create/delete, connect/disconnect), VIFs (create/delete), PIFs, PBDs (plug/unplug), PCIs, PGPUs, SMs, networks, tasks (CRUD, abort), backups (archives, jobs, logs, restore logs), proxies, messages, servers, dashboards, auth tokens, health check"
-    missing: "ACLv2 management (preview), plugin-specific endpoints (SDN controller VIF rules), XOSAN"
-    last_reviewed: "2026-04-06"
+    focus: "Complete REST API coverage for XO 6.4+: all object types (VMs, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, power, snapshot/clone/migrate, export/import, hotplug), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges), backups (archives, jobs, logs, restore-logs, repositories, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update, management reconfigure, audit logs, missing patches), XOA appliance (dashboard, ping, gui-routes). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
+    missing: "Generic PATCH /vms/{id} and PATCH /vdis/{id} -- the typed REST API does not yet expose XAPI property writes (use tags or JSON-RPC for renames). SDN-controller plugin endpoints (network/VIF traffic rules under /plugins/sdn-controller/*) -- only available when xo-server-sdn-controller plugin is installed; deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13"
+    last_reviewed: "2026-05-02"
 
   setup:
     credential_steps:
@@ -93,6 +110,7 @@ backend:
       - "Generate an auth token via CLI: xo-cli --createToken xo.example.com <user> <password>"
       - "Or via API: POST /rest/v0/users/me/authentication_tokens with Basic auth"
       - "Copy the returned token value -- use it as the authenticationToken cookie"
+      - "Optional (XO 6.4+): create dedicated non-admin users via POST /users and assign acl-roles via PUT /acl-roles/{id}/users/{userId}"
     env_var: CREDENTIAL_XEN_ORCHESTRA_TOKEN
     backends_yaml: |
       - name: xen-orchestra
@@ -100,22 +118,25 @@ backend:
         dadl: xen-orchestra.dadl
         url: "https://xo.example.com/rest/v0"
     required_scopes:
-      - "Admin user (only admin users can access the REST API)"
+      - "Admin user, OR an RBAC v2 user with appropriate acl-privileges (XO 6.4+)"
     docs_url: "https://docs.xen-orchestra.com/restapi"
-    notes: "The url in backends.yaml must point to your XO instance including /rest/v0. Generate a token via xo-cli --createToken or POST /rest/v0/users/me/authentication_tokens with Basic auth. Swagger docs at /rest/v0/docs."
+    notes: "The url in backends.yaml must point to your XO instance including /rest/v0. Generate a token via xo-cli --createToken or POST /rest/v0/users/me/authentication_tokens with Basic auth. Live Swagger UI at /rest/v0/docs lists all endpoints with required RBAC privileges. For RBAC v2 setup see https://docs.xen-orchestra.com/xo6/acl-v2."
 
   hints:
     list_vms:
       filter_syntax: "XO filter: power_state:Running, name_label:my-vm, tags:production"
       fields_param: "Use fields=name_label,power_state,uuid for compact results"
       ndjson: "Use ndjson=true for streaming; combine with watch=true for live updates"
+      markdown: "XO 6.4+: markdown=true returns markdown-formatted output (LLM-friendly)"
     create_vm:
       required: "name_label + template UUID are minimum required params"
       memory: "Memory in bytes (e.g. 2147483648 = 2 GB)"
       cloud_config: "Cloud-init config as string for automatic guest setup"
       note: "CPU settings not yet available via REST API"
     snapshot_vm:
-      note: "Returns a task reference by default; use ?sync for direct result"
+      note: "Returns a task reference by default; use ?sync for direct result with snapshot id"
+    clone_vm:
+      modes: "Fast clone (same SR, fast=true), full copy (same SR, fast=false), or cross-SR/cross-pool copy (provide srId, optionally compress=gzip|zstd)"
     export_vm_xva:
       compression: "zstd is fastest (XCP-ng only), gzip is universal but slow"
     import_vm_xva:
@@ -126,10 +147,12 @@ backend:
     list_tasks:
       watch_mode: "Use ndjson=true&watch=true for real-time task monitoring"
       wait: "On single task: ?wait=result blocks until completion"
+    delete_tasks:
+      note: "Bulk delete: removes ALL tasks the current user has 'task:delete' privilege on. Irreversible."
     create_vbd:
       note: "Connects a VDI to a VM. Use connect_vbd/disconnect_vbd for hotplug."
     migrate_vdi:
-      note: "Moves a VDI between SRs without VM downtime (live storage migration). Large disks can take minutes — avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
+      note: "Moves a VDI between SRs without VM downtime (live storage migration). Large disks can take minutes -- avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
     migrate_vm:
       note: "Live-migrates a VM to another host, optionally with storage migration. For large VMs avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
     emergency_shutdown_pool:
@@ -138,40 +161,449 @@ backend:
       note: "Reboots each host sequentially, migrating VMs automatically. No downtime."
     rolling_update_pool:
       note: "Applies pending updates to each host sequentially with live migration."
+    create_pool_network:
+      modes: "Three flavors: create_network (basic with PIF), create_bonded_network (link aggregation across pifIds with bondMode), create_internal_network (host-internal, no physical PIF)"
+    management_reconfigure_host:
+      warning: "Moves the management interface to a different PIF. May briefly disconnect XO from the host."
+    get_host_stats:
+      granularity: "seconds (last 10min) | minutes (last 2h) | hours (last week) | days (last year)"
+    get_vm_stats:
+      granularity: "seconds (last 10min) | minutes (last 2h) | hours (last week) | days (last year)"
+      data_sources: "Use add/delete data_source endpoints to enable/disable specific RRD metrics (e.g. cpu0, vif_0_rx)"
+    open_events_stream:
+      note: "Server-Sent Events (SSE) connection. The endpoint returns a subscription ID; then use POST /events/{id}/subscriptions to add object-type listeners (VM, host, pool, etc.). Events emitted: ping, add, update, remove."
+    run_schedule:
+      note: "Manually triggers a backup-job execution outside its cron schedule. Returns a task reference."
+    get_dashboard:
+      note: "Aggregated overview: pool/host/VM counts, storage usage, recent backup-jobs (7d), disconnected servers, disabled hosts. Pre-6.4 path was /dashboards (now removed); use /dashboard (singular)."
+    create_user:
+      permission_field: "Permission strings: 'admin', 'user', 'none'. Omit for default user-level access."
+    create_authentication_token:
+      expires_in: "Accepts either a number (milliseconds) or a duration string (e.g. '1 hour', '7 days', '30d')"
+      note: "Use user_id='me' for self. POST /users/authentication_tokens (without user id in path) is DEPRECATED -- removal 2026-10-13."
+    create_acl_role:
+      flow: "1) Create role via POST /acl-roles. 2) Add privileges via POST /acl-privileges (with roleId). 3) Attach role to user/group via PUT /acl-roles/{id}/{users|groups}/{userId|groupId}."
+    add_server:
+      note: "Registers a new XCP-ng/XenServer pool master to XO. body.host is the IP/hostname, body.username/password are XAPI credentials. Use connect_server afterwards to establish the connection."
 
   tools:
 
     # =========================================================================
-    # HEALTH CHECK
+    # XOA -- Health Check, Dashboard, GUI Routes
     # =========================================================================
 
     ping:
       method: GET
       path: /ping
       access: read
-      description: "Health check. Unauthenticated. Returns pong if XO is running."
+      description: "Health check. Unauthenticated. Returns {result: 'pong', timestamp}. Use this to verify the XO instance is reachable before trying authenticated calls."
       pagination: none
 
-    # =========================================================================
-    # AUTHENTICATION -- Token Management
-    # =========================================================================
-
-    create_auth_token:
-      method: POST
-      path: /users/{user_id}/authentication_tokens
-      access: admin
-      description: "Create an authentication token. Use 'me' as user_id for current user."
+    get_dashboard:
+      method: GET
+      path: /dashboard
+      access: read
+      description: "Aggregated dashboard for the XOA appliance: pool/host/VM counts, storage usage, recent backup-jobs (last 7 days), disconnected servers, disabled hosts. Use ndjson=true for streaming output. Replaces the legacy plural /dashboards endpoint."
       params:
-        user_id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+        ndjson: { type: boolean, in: query, description: "Stream as newline-delimited JSON" }
       pagination: none
+
+    get_gui_routes:
+      method: GET
+      path: /gui-routes
+      access: read
+      description: "Returns the URLs of the legacy XO5 (xo5) and modern XO6 (xo6) web UIs. Useful for clients that need to deep-link into the GUI."
+      pagination: none
+
+    # =========================================================================
+    # USERS -- CRUD + Auth Tokens + Sub-resources (RBAC v2 in XO 6.4+)
+    # =========================================================================
+
+    list_users:
+      method: GET
+      path: /users
+      access: admin
+      description: "List all users. Returns URLs by default; use fields for objects. Requires user:read privilege."
+      params:
+        fields: { type: string, in: query, description: "Comma-separated fields (e.g. id,name,email,permission)" }
+        filter: { type: string, in: query, description: "XO filter (e.g. permission:admin)" }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query, description: "Markdown-formatted output (XO 6.4+)" }
+
+    get_user:
+      method: GET
+      path: /users/{id}
+      access: admin
+      description: "Get details of a single user. Use id='me' for the current authenticated user. Self-fetch is always allowed; reading another user requires user:read privilege."
+      params:
+        id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+      pagination: none
+
+    create_user:
+      method: POST
+      path: /users
+      access: admin
+      description: "Create a new user. Returns {id} of the created user. Requires user:create privilege."
+      params:
+        name: { type: string, in: body, required: true, description: "Username/email for the user" }
+        password: { type: string, in: body, required: true }
+        permission: { type: string, in: body, description: "'admin', 'user', or 'none' (default: 'none')" }
+      pagination: none
+
+    update_user:
+      method: PATCH
+      path: /users/{id}
+      access: admin
+      description: "Update user properties. Cannot change own permission. Synchronized users (LDAP/SAML/OIDC) cannot have name/password changed."
+      params:
+        id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+        name: { type: string, in: body }
+        password: { type: string, in: body }
+        permission: { type: string, in: body, description: "'admin', 'user', or 'none'" }
+        preferences: { type: object, in: body, description: "Per-user UI/CLI preferences object" }
+      pagination: none
+
+    delete_user:
+      method: DELETE
+      path: /users/{id}
+      access: dangerous
+      description: "Delete a user. Irreversible. Requires user:delete privilege."
+      params:
+        id: { type: string, in: path, required: true, description: "User UUID" }
+      pagination: none
+
+    list_user_groups:
+      method: GET
+      path: /users/{id}/groups
+      access: admin
+      description: "List groups the user is a member of (filtered by group:read privilege). Use id='me' for self."
+      params:
+        id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_user_tasks:
+      method: GET
+      path: /users/{id}/tasks
+      access: admin
+      description: "List tasks owned by the user (filtered by task:read privilege). Use id='me' for self."
+      params:
+        id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_user_acl_privileges:
+      method: GET
+      path: /users/{id}/acl-privileges
+      access: admin
+      description: "List effective RBAC v2 acl-privileges for the user (XO 6.4+). Useful for inspecting what a user can actually do. Self-call (/users/me/acl-privileges) is always permitted."
+      params:
+        id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+        fields: { type: string, in: query, description: "e.g. id,action,resource" }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
 
     list_auth_tokens:
       method: GET
-      path: /users/{user_id}/authentication_tokens
+      path: /users/{id}/authentication_tokens
       access: admin
-      description: "List all authentication tokens for a user"
+      description: "List all authentication tokens for a user. Use id='me' for self."
       params:
-        user_id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+        id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
+      pagination: none
+
+    create_auth_token:
+      method: POST
+      path: /users/{id}/authentication_tokens
+      access: admin
+      description: "Create a new authentication token. You can only create tokens for yourself (use id='me'). Returns {token} including the secret (store it securely; cannot be retrieved later)."
+      params:
+        id: { type: string, in: path, required: true, description: "Must be your own user UUID or 'me'" }
+        client: { type: object, in: body, description: "Optional {id: string} to identify the client" }
+        description: { type: string, in: body, description: "Human-readable purpose, e.g. 'CI pipeline'" }
+        expiresIn: { type: string, in: body, description: "Duration string ('1 hour', '7 days') or milliseconds" }
+      pagination: none
+
+    # =========================================================================
+    # GROUPS -- RBAC v2 (XO 6.4+)
+    # =========================================================================
+
+    list_groups:
+      method: GET
+      path: /groups
+      access: admin
+      description: "List all groups (filtered by group:read privilege)."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_group:
+      method: GET
+      path: /groups/{id}
+      access: admin
+      description: "Get details of a single group."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_group:
+      method: POST
+      path: /groups
+      access: admin
+      description: "Create a new group. Returns {id} of the created group."
+      params:
+        name: { type: string, in: body, required: true }
+      pagination: none
+
+    update_group:
+      method: PATCH
+      path: /groups/{id}
+      access: admin
+      description: "Update group properties (currently only name)."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+      pagination: none
+
+    delete_group:
+      method: DELETE
+      path: /groups/{id}
+      access: dangerous
+      description: "Delete a group. Irreversible. Removes all role attachments to this group."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    add_user_to_group:
+      method: PUT
+      path: /groups/{id}/users/{userId}
+      access: admin
+      description: "Add a user to a group."
+      params:
+        id: { type: string, in: path, required: true, description: "Group UUID" }
+        userId: { type: string, in: path, required: true, description: "User UUID" }
+      pagination: none
+
+    remove_user_from_group:
+      method: DELETE
+      path: /groups/{id}/users/{userId}
+      access: write
+      description: "Remove a user from a group."
+      params:
+        id: { type: string, in: path, required: true, description: "Group UUID" }
+        userId: { type: string, in: path, required: true, description: "User UUID" }
+      pagination: none
+
+    list_group_users:
+      method: GET
+      path: /groups/{id}/users
+      access: admin
+      description: "List users that are members of the group."
+      params:
+        id: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_group_tasks:
+      method: GET
+      path: /groups/{id}/tasks
+      access: admin
+      description: "List tasks associated with members of the group."
+      params:
+        id: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    # =========================================================================
+    # ACL ROLES -- RBAC v2 (XO 6.4+)
+    # =========================================================================
+
+    list_acl_roles:
+      method: GET
+      path: /acl-roles
+      access: admin
+      description: "List all RBAC v2 roles. A role groups privileges and can be attached to users/groups."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_acl_role:
+      method: GET
+      path: /acl-roles/{id}
+      access: admin
+      description: "Get details of a single role."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_acl_role:
+      method: POST
+      path: /acl-roles
+      access: admin
+      description: "Create a new RBAC role. Returns {id}. Add privileges via POST /acl-privileges (with roleId), then attach to users/groups."
+      params:
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+      pagination: none
+
+    update_acl_role:
+      method: PATCH
+      path: /acl-roles/{id}
+      access: admin
+      description: "Update a role's name and/or description (set description to null to clear)."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        description: { type: string, in: body, description: "Set to null to remove description" }
+      pagination: none
+
+    delete_acl_role:
+      method: DELETE
+      path: /acl-roles/{id}
+      access: dangerous
+      description: "Delete a role. Irreversible. All attachments to users/groups are removed; privileges referencing this role are also dropped."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    copy_acl_role:
+      method: POST
+      path: /acl-roles/{id}/actions/copy
+      access: admin
+      description: "Duplicate a role (and its privileges) under a new name. Useful for deriving custom roles from built-in ones."
+      params:
+        id: { type: string, in: path, required: true, description: "Source role UUID" }
+        name: { type: string, in: body, description: "Name for the new copy" }
+        description: { type: string, in: body }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    list_acl_role_privileges:
+      method: GET
+      path: /acl-roles/{id}/privileges
+      access: admin
+      description: "List all acl-privileges attached to this role."
+      params:
+        id: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    attach_acl_role_to_group:
+      method: PUT
+      path: /acl-roles/{id}/groups/{groupId}
+      access: admin
+      description: "Attach an RBAC role to a group. All members of the group inherit the role's privileges."
+      params:
+        id: { type: string, in: path, required: true, description: "Role UUID" }
+        groupId: { type: string, in: path, required: true, description: "Group UUID" }
+      pagination: none
+
+    detach_acl_role_from_group:
+      method: DELETE
+      path: /acl-roles/{id}/groups/{groupId}
+      access: write
+      description: "Detach an RBAC role from a group."
+      params:
+        id: { type: string, in: path, required: true, description: "Role UUID" }
+        groupId: { type: string, in: path, required: true, description: "Group UUID" }
+      pagination: none
+
+    attach_acl_role_to_user:
+      method: PUT
+      path: /acl-roles/{id}/users/{userId}
+      access: admin
+      description: "Attach an RBAC role directly to a user (in addition to roles inherited via groups)."
+      params:
+        id: { type: string, in: path, required: true, description: "Role UUID" }
+        userId: { type: string, in: path, required: true, description: "User UUID" }
+      pagination: none
+
+    detach_acl_role_from_user:
+      method: DELETE
+      path: /acl-roles/{id}/users/{userId}
+      access: write
+      description: "Detach an RBAC role from a user."
+      params:
+        id: { type: string, in: path, required: true, description: "Role UUID" }
+        userId: { type: string, in: path, required: true, description: "User UUID" }
+      pagination: none
+
+    # =========================================================================
+    # ACL PRIVILEGES -- RBAC v2 (XO 6.4+)
+    # =========================================================================
+
+    list_acl_privileges:
+      method: GET
+      path: /acl-privileges
+      access: admin
+      description: "List all RBAC v2 privileges (each privilege = role + resource + action, optionally scoped by object)."
+      params:
+        fields: { type: string, in: query, description: "e.g. id,action,resource,roleId" }
+        filter: { type: string, in: query, description: "e.g. action:create" }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+
+    get_acl_privilege:
+      method: GET
+      path: /acl-privileges/{id}
+      access: admin
+      description: "Get details of a single privilege."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_acl_privilege:
+      method: POST
+      path: /acl-privileges
+      access: admin
+      description: "Grant a new privilege (action on a resource type, optionally scoped to a specific object) to a role. Returns {id}. Body fields depend on the resource type -- see Swagger /rest/v0/docs for the privilege schema."
+      params:
+        roleId: { type: string, in: body, required: true, description: "Target role UUID" }
+        resource: { type: string, in: body, required: true, description: "e.g. 'vm', 'host', 'pool', 'user', 'backup-job'" }
+        action: { type: string, in: body, required: true, description: "e.g. 'read', 'create', 'delete', 'update', 'snapshot'" }
+        objectId: { type: string, in: body, description: "Optional: scope to a specific object UUID" }
+      pagination: none
+
+    update_acl_privilege:
+      method: PATCH
+      path: /acl-privileges/{id}
+      access: admin
+      description: "Update a privilege's resource/action/objectId (roleId is immutable)."
+      params:
+        id: { type: string, in: path, required: true }
+        resource: { type: string, in: body }
+        action: { type: string, in: body }
+        objectId: { type: string, in: body }
+      pagination: none
+
+    delete_acl_privilege:
+      method: DELETE
+      path: /acl-privileges/{id}
+      access: dangerous
+      description: "Revoke a privilege. Irreversible."
+      params:
+        id: { type: string, in: path, required: true }
       pagination: none
 
     # =========================================================================
@@ -188,6 +620,7 @@ backend:
         filter: { type: string, in: query, description: "XO filter (e.g. power_state:Running)" }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_vm:
       method: GET
@@ -198,16 +631,9 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
-    update_vm:
-      method: PATCH
-      path: /vms/{uuid}
-      access: write
-      description: "Update VM properties (name_label, name_description, tags)"
-      params:
-        uuid: { type: string, in: path, required: true }
-        name_label: { type: string, in: body }
-        name_description: { type: string, in: body }
-      pagination: none
+    # Note: There is no generic PATCH /vms/{uuid} for renaming etc. (the typed REST API
+    # does not expose XAPI property writes yet). Use add_vm_tag/remove_vm_tag for tags;
+    # for name_label/description changes, use the JSON-RPC endpoint or xo-cli.
 
     delete_vm:
       method: DELETE
@@ -226,9 +652,10 @@ backend:
       method: POST
       path: /vms/{uuid}/actions/start
       access: write
-      description: "Start a halted VM"
+      description: "Start a halted VM. Optionally pin to a specific host via body.hostId."
       params:
         uuid: { type: string, in: path, required: true }
+        hostId: { type: string, in: body, description: "Optional: target host UUID" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -246,7 +673,7 @@ backend:
       method: POST
       path: /vms/{uuid}/actions/hard_shutdown
       access: write
-      description: "Force shutdown a VM immediately"
+      description: "Force shutdown a VM immediately (equivalent to pulling the plug)"
       params:
         uuid: { type: string, in: path, required: true }
         sync: { type: boolean, in: query }
@@ -313,58 +740,31 @@ backend:
       pagination: none
 
     # =========================================================================
-    # VM ACTIONS -- Snapshots, Cloning, Migration
+    # VM ACTIONS -- Snapshot, Clone, Migration
     # =========================================================================
 
     snapshot_vm:
       method: POST
       path: /vms/{uuid}/actions/snapshot
       access: write
-      description: "Create a snapshot of a VM"
+      description: "Create a snapshot of a VM. Returns task reference; use ?sync to get the snapshot id directly."
       params:
         uuid: { type: string, in: path, required: true }
-        name_label: { type: string, in: body, required: true }
+        name_label: { type: string, in: body, description: "Optional name for the snapshot (auto-generated if omitted)" }
         sync: { type: boolean, in: query }
-      pagination: none
-
-    delete_snapshot:
-      method: DELETE
-      path: /vm-snapshots/{uuid}
-      access: dangerous
-      description: "Delete a VM snapshot. Irreversible."
-      params:
-        uuid: { type: string, in: path, required: true }
-      pagination: none
-
-    list_vm_snapshots:
-      method: GET
-      path: /vm-snapshots
-      access: read
-      description: "List all VM snapshots"
-      params:
-        fields: { type: string, in: query }
-        filter: { type: string, in: query }
-        limit: { type: integer, in: query }
-        ndjson: { type: boolean, in: query }
-      pagination: none
-
-    get_vm_snapshot:
-      method: GET
-      path: /vm-snapshots/{uuid}
-      access: read
-      description: "Get details of a VM snapshot"
-      params:
-        uuid: { type: string, in: path, required: true }
       pagination: none
 
     clone_vm:
       method: POST
       path: /vms/{uuid}/actions/clone
       access: write
-      description: "Clone a VM"
+      description: "Clone a VM. Three modes: fast clone on same SR (fast=true, omit srId), full copy on same SR (fast=false), or copy to another SR/pool (provide srId, optional compress=gzip|zstd for cross-pool)."
       params:
         uuid: { type: string, in: path, required: true }
-        name_label: { type: string, in: body, required: true }
+        name_label: { type: string, in: body, description: "Name for the clone" }
+        fast: { type: boolean, in: body, description: "True for fast clone (CoW); ignored if srId is set" }
+        srId: { type: string, in: body, description: "Target SR UUID (full copy; can be on another pool)" }
+        compress: { type: string, in: body, description: "'gzip' or 'zstd' (only for cross-pool copy)" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -372,7 +772,7 @@ backend:
       method: POST
       path: /vms/{uuid}/actions/migrate
       access: write
-      description: "Live-migrate a VM to another host"
+      description: "Live-migrate a VM to another host. Supports cross-SR storage migration via srId."
       params:
         uuid: { type: string, in: path, required: true }
         hostId: { type: string, in: body, description: "Target host UUID" }
@@ -388,10 +788,10 @@ backend:
       method: GET
       path: /vms/{uuid}.xva
       access: read
-      description: "Export a VM as XVA"
+      description: "Export a VM as XVA (XCP-ng native format). Streamed binary download."
       params:
         uuid: { type: string, in: path, required: true }
-        compress: { type: string, in: query, description: "gzip or zstd" }
+        compress: { type: string, in: query, description: "'gzip' (universal, slow) or 'zstd' (XCP-ng only, fast)" }
       response:
         binary: true
         content_type: application/octet-stream
@@ -401,7 +801,7 @@ backend:
       method: GET
       path: /vms/{uuid}.ova
       access: read
-      description: "Export a VM as OVA"
+      description: "Export a VM as OVA (Open Virtualization Format, portable across hypervisors)."
       params:
         uuid: { type: string, in: path, required: true }
       response:
@@ -413,7 +813,7 @@ backend:
       method: POST
       path: /pools/{pool_id}/vms
       access: write
-      description: "Import a VM from XVA upload into a pool"
+      description: "Import a VM from XVA upload into a pool. Body is the raw XVA stream."
       params:
         pool_id: { type: string, in: path, required: true }
         sr: { type: string, in: query, description: "Target SR (pool default if omitted)" }
@@ -421,8 +821,38 @@ backend:
       pagination: none
 
     # =========================================================================
-    # VM SUB-RESOURCES -- Tags, VDIs, Dashboard, Actions
+    # VM SUB-RESOURCES -- Stats, Tags, VDIs, Dashboard, Sub-collections
     # =========================================================================
+
+    get_vm_stats:
+      method: GET
+      path: /vms/{uuid}/stats
+      access: read
+      description: "Get RRD statistics for a VM (CPU, memory, network, disk). VM must be running."
+      params:
+        uuid: { type: string, in: path, required: true }
+        granularity: { type: string, in: query, description: "'seconds' (10min) | 'minutes' (2h) | 'hours' (1w) | 'days' (1y)" }
+      pagination: none
+
+    add_vm_data_source:
+      method: PUT
+      path: /vms/{uuid}/stats/data_source/{data_source}
+      access: write
+      description: "Enable a specific RRD data source on a VM (e.g. cpu0, vif_0_rx). VM must be running."
+      params:
+        uuid: { type: string, in: path, required: true }
+        data_source: { type: string, in: path, required: true, description: "Data source name" }
+      pagination: none
+
+    delete_vm_data_source:
+      method: DELETE
+      path: /vms/{uuid}/stats/data_source/{data_source}
+      access: write
+      description: "Disable / forget a specific RRD data source on a VM."
+      params:
+        uuid: { type: string, in: path, required: true }
+        data_source: { type: string, in: path, required: true }
+      pagination: none
 
     add_vm_tag:
       method: PUT
@@ -454,20 +884,297 @@ backend:
         fields: { type: string, in: query }
       pagination: none
 
+    list_vm_alarms:
+      method: GET
+      path: /vms/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms (performance/health thresholds) for the VM."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_messages:
+      method: GET
+      path: /vms/{uuid}/messages
+      access: read
+      description: "List XAPI messages/alerts emitted for the VM."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_tasks:
+      method: GET
+      path: /vms/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to this VM (running/completed/failed)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_backup_jobs:
+      method: GET
+      path: /vms/{uuid}/backup-jobs
+      access: read
+      description: "List backup-jobs that include this VM."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
     get_vm_dashboard:
       method: GET
       path: /vms/{uuid}/dashboard
       access: read
-      description: "Get dashboard/statistics for a VM"
+      description: "Get dashboard/statistics for a VM (aggregate metrics)."
       params:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
-    list_vm_actions:
+    # =========================================================================
+    # VM SNAPSHOTS
+    # =========================================================================
+
+    list_vm_snapshots:
       method: GET
-      path: /vms/_/actions
+      path: /vm-snapshots
       access: read
-      description: "Discover all available VM actions"
+      description: "List all VM snapshots"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_vm_snapshot:
+      method: GET
+      path: /vm-snapshots/{uuid}
+      access: read
+      description: "Get details of a VM snapshot"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_vm_snapshot:
+      method: DELETE
+      path: /vm-snapshots/{uuid}
+      access: dangerous
+      description: "Delete a VM snapshot. Irreversible."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    export_vm_snapshot:
+      method: GET
+      path: /vm-snapshots/{uuid}.{format}
+      access: read
+      description: "Export a VM snapshot as XVA or OVA. Format is the file extension ('xva' or 'ova')."
+      params:
+        uuid: { type: string, in: path, required: true }
+        format: { type: string, in: path, required: true, description: "'xva' or 'ova'" }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    list_vm_snapshot_vdis:
+      method: GET
+      path: /vm-snapshots/{uuid}/vdis
+      access: read
+      description: "List VDIs belonging to a VM snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+      pagination: none
+
+    list_vm_snapshot_alarms:
+      method: GET
+      path: /vm-snapshots/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms scoped to a VM snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_snapshot_messages:
+      method: GET
+      path: /vm-snapshots/{uuid}/messages
+      access: read
+      description: "List XAPI messages scoped to a VM snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_snapshot_tasks:
+      method: GET
+      path: /vm-snapshots/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to a VM snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_vm_snapshot_tag:
+      method: PUT
+      path: /vm-snapshots/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a VM snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_vm_snapshot_tag:
+      method: DELETE
+      path: /vm-snapshots/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a VM snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # VM TEMPLATES -- New collection in XO 6.4+
+    # =========================================================================
+
+    list_vm_templates:
+      method: GET
+      path: /vm-templates
+      access: read
+      description: "List all VM templates. Templates are stamps from which create_vm produces new VMs."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_vm_template:
+      method: GET
+      path: /vm-templates/{uuid}
+      access: read
+      description: "Get details of a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_vm_template:
+      method: DELETE
+      path: /vm-templates/{uuid}
+      access: dangerous
+      description: "Delete a VM template. Irreversible. Built-in templates may be protected."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    export_vm_template:
+      method: GET
+      path: /vm-templates/{uuid}.{format}
+      access: read
+      description: "Export a VM template as XVA or OVA."
+      params:
+        uuid: { type: string, in: path, required: true }
+        format: { type: string, in: path, required: true, description: "'xva' or 'ova'" }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    list_vm_template_vdis:
+      method: GET
+      path: /vm-templates/{uuid}/vdis
+      access: read
+      description: "List VDIs belonging to a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+      pagination: none
+
+    list_vm_template_alarms:
+      method: GET
+      path: /vm-templates/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms scoped to a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_template_messages:
+      method: GET
+      path: /vm-templates/{uuid}/messages
+      access: read
+      description: "List XAPI messages scoped to a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_template_tasks:
+      method: GET
+      path: /vm-templates/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_vm_template_tag:
+      method: PUT
+      path: /vm-templates/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_vm_template_tag:
+      method: DELETE
+      path: /vm-templates/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
       pagination: none
 
     # =========================================================================
@@ -484,6 +1191,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_host:
       method: GET
@@ -494,13 +1202,142 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
+    get_host_stats:
+      method: GET
+      path: /hosts/{uuid}/stats
+      access: read
+      description: "Get RRD statistics for a host (CPU, memory, NIC, disk). Host must be enabled."
+      params:
+        uuid: { type: string, in: path, required: true }
+        granularity: { type: string, in: query, description: "'seconds' | 'minutes' | 'hours' | 'days'" }
+      pagination: none
+
+    get_host_audit_log:
+      method: GET
+      path: /hosts/{uuid}/audit.txt
+      access: admin
+      description: "Download the host's audit log as plain text. Useful for compliance and forensics."
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        binary: true
+        content_type: text/plain
+      pagination: none
+
+    get_host_logs:
+      method: GET
+      path: /hosts/{uuid}/logs.tgz
+      access: admin
+      description: "Download the host's full logs as a gzipped tarball. Useful for support tickets and debugging."
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        binary: true
+        content_type: application/gzip
+      pagination: none
+
+    list_host_alarms:
+      method: GET
+      path: /hosts/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms (performance/health thresholds) for the host."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_host_smt:
+      method: GET
+      path: /hosts/{uuid}/smt
+      access: read
+      description: "Get the SMT (Simultaneous Multi-Threading / Hyper-Threading) status of the host."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_host_missing_patches:
+      method: GET
+      path: /hosts/{uuid}/missing_patches
+      access: read
+      description: "List all patches/updates that are available but not yet installed on the host."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_host_messages:
+      method: GET
+      path: /hosts/{uuid}/messages
+      access: read
+      description: "List XAPI messages/alerts emitted for the host."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_host_tasks:
+      method: GET
+      path: /hosts/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to this host (running/completed/failed)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_host_tag:
+      method: PUT
+      path: /hosts/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a host."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_host_tag:
+      method: DELETE
+      path: /hosts/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a host."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    management_reconfigure_host:
+      method: POST
+      path: /hosts/{uuid}/actions/management_reconfigure
+      access: admin
+      description: "Move the management interface (control plane) to a different PIF. May briefly disconnect XO from the host."
+      params:
+        uuid: { type: string, in: path, required: true }
+        pif: { type: string, in: body, required: true, description: "Target PIF UUID" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
     disable_host:
       method: POST
       path: /hosts/{uuid}/actions/disable
       access: admin
-      description: "Disable a host (prepare for maintenance)"
+      description: "Disable a host (prepare for maintenance). Optionally evacuate VMs in the same call (body.evacuate=true, optional force/vmIdsToForceMigrate)."
       params:
         uuid: { type: string, in: path, required: true }
+        evacuate: { type: boolean, in: body, description: "True = evacuate VMs to other hosts" }
+        force: { type: boolean, in: body, description: "Force migration even if rules disagree (with evacuate=true)" }
+        vmIdsToForceMigrate: { type: array, in: body, description: "Specific VM UUIDs to force-migrate" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -512,13 +1349,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         sync: { type: boolean, in: query }
-      pagination: none
-
-    list_host_actions:
-      method: GET
-      path: /hosts/_/actions
-      access: read
-      description: "Discover all available host actions"
       pagination: none
 
     # =========================================================================
@@ -535,6 +1365,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_pool:
       method: GET
@@ -545,11 +1376,95 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
-    list_pool_actions:
+    get_pool_stats:
       method: GET
-      path: /pools/_/actions
+      path: /pools/{uuid}/stats
       access: read
-      description: "Discover all available pool actions"
+      description: "Get aggregated RRD statistics for the entire pool."
+      params:
+        uuid: { type: string, in: path, required: true }
+        granularity: { type: string, in: query, description: "'seconds' | 'minutes' | 'hours' | 'days'" }
+      pagination: none
+
+    get_pool_dashboard:
+      method: GET
+      path: /pools/{uuid}/dashboard
+      access: read
+      description: "Get dashboard for a single pool (counts of VMs/hosts/SRs, usage)."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_pool_alarms:
+      method: GET
+      path: /pools/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for the pool and its objects."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_pool_missing_patches:
+      method: GET
+      path: /pools/{uuid}/missing_patches
+      access: read
+      description: "Aggregate of missing patches across all hosts in the pool."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_pool_messages:
+      method: GET
+      path: /pools/{uuid}/messages
+      access: read
+      description: "List XAPI messages for the pool."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_pool_tasks:
+      method: GET
+      path: /pools/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to the pool."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_pool_tag:
+      method: PUT
+      path: /pools/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a pool."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_pool_tag:
+      method: DELETE
+      path: /pools/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a pool."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
       pagination: none
 
     create_vm:
@@ -558,7 +1473,7 @@ backend:
       access: write
       description: "Create a new VM from a template"
       params:
-        pool_id: { type: string, in: path, required: true, description: "Pool UUID or '_'" }
+        pool_id: { type: string, in: path, required: true, description: "Pool UUID" }
         name_label: { type: string, in: body, required: true }
         template: { type: string, in: body, required: true, description: "Template UUID" }
         name_description: { type: string, in: body }
@@ -602,13 +1517,32 @@ backend:
         sync: { type: boolean, in: query }
       pagination: none
 
+    create_pool_network:
+      method: POST
+      path: /pools/{pool_id}/actions/create_network
+      access: write
+      description: "Create a basic network on a pool (attached to a single PIF). For aggregation use create_bonded_network; for isolated use create_internal_network."
+      params:
+        pool_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        pif: { type: string, in: body, required: true, description: "PIF UUID to bind the network to" }
+        mtu: { type: integer, in: body, description: "MTU (optional, default from PIF)" }
+        vlan: { type: integer, in: body, description: "VLAN ID (optional)" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
     create_bonded_network:
       method: POST
       path: /pools/{pool_id}/actions/create_bonded_network
       access: write
-      description: "Create a bonded network across pool hosts"
+      description: "Create a bonded (link-aggregated) network across multiple PIFs in the pool."
       params:
         pool_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        pifIds: { type: array, in: body, required: true, description: "Array of PIF UUIDs to bond" }
+        bondMode: { type: string, in: body, description: "'balance-slb' | 'active-backup' | 'lacp'" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -616,11 +1550,22 @@ backend:
       method: POST
       path: /pools/{pool_id}/actions/create_internal_network
       access: write
-      description: "Create an internal-only network"
+      description: "Create an internal-only network (host-local, no physical PIF, useful for VM-to-VM private traffic)"
       params:
         pool_id: { type: string, in: path, required: true }
         name_label: { type: string, in: body, required: true }
         name_description: { type: string, in: body }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    management_reconfigure_pool:
+      method: POST
+      path: /pools/{pool_id}/actions/management_reconfigure
+      access: admin
+      description: "Reconfigure the management interface across all hosts in the pool. Coordinated equivalent of management_reconfigure_host."
+      params:
+        pool_id: { type: string, in: path, required: true }
+        pif: { type: string, in: body, required: true, description: "Target PIF UUID (must exist on the pool master)" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -638,6 +1583,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_sr:
       method: GET
@@ -648,11 +1594,70 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
+    list_sr_alarms:
+      method: GET
+      path: /srs/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for the SR (e.g. low free space)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_sr_messages:
+      method: GET
+      path: /srs/{uuid}/messages
+      access: read
+      description: "List XAPI messages for the SR."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_sr_tasks:
+      method: GET
+      path: /srs/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to the SR."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_sr_tag:
+      method: PUT
+      path: /srs/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to an SR."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_sr_tag:
+      method: DELETE
+      path: /srs/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from an SR."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
     scan_sr:
       method: POST
       path: /srs/{uuid}/actions/scan
       access: write
-      description: "Scan an SR to refresh its VDI list"
+      description: "Scan an SR to refresh its VDI list (detects manual changes on the underlying storage)."
       params:
         uuid: { type: string, in: path, required: true }
         sync: { type: boolean, in: query }
@@ -662,7 +1667,7 @@ backend:
       method: POST
       path: /srs/{uuid}/actions/forget
       access: dangerous
-      description: "Forget an SR (detach without destroying data)"
+      description: "Forget an SR (detach without destroying data on the underlying storage)."
       params:
         uuid: { type: string, in: path, required: true }
         sync: { type: boolean, in: query }
@@ -672,17 +1677,10 @@ backend:
       method: POST
       path: /srs/{uuid}/actions/reclaim_space
       access: write
-      description: "Reclaim unused space on a thin-provisioned SR"
+      description: "Reclaim unused space on a thin-provisioned SR."
       params:
         uuid: { type: string, in: path, required: true }
         sync: { type: boolean, in: query }
-      pagination: none
-
-    list_sr_actions:
-      method: GET
-      path: /srs/_/actions
-      access: read
-      description: "Discover all available SR actions"
       pagination: none
 
     # =========================================================================
@@ -699,6 +1697,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_vdi:
       method: GET
@@ -730,15 +1729,66 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
-    update_vdi:
-      method: PATCH
-      path: /vdis/{uuid}
-      access: write
-      description: "Update VDI properties (name_label, name_description)"
+    # Note: No generic PATCH /vdis/{uuid} either -- use add_vdi_tag/remove_vdi_tag for
+    # tags; rename via JSON-RPC API.
+
+    list_vdi_alarms:
+      method: GET
+      path: /vdis/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for the VDI."
       params:
         uuid: { type: string, in: path, required: true }
-        name_label: { type: string, in: body }
-        name_description: { type: string, in: body }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vdi_messages:
+      method: GET
+      path: /vdis/{uuid}/messages
+      access: read
+      description: "List XAPI messages for the VDI."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vdi_tasks:
+      method: GET
+      path: /vdis/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to the VDI."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_vdi_tag:
+      method: PUT
+      path: /vdis/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a VDI."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_vdi_tag:
+      method: DELETE
+      path: /vdis/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a VDI."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
       pagination: none
 
     migrate_vdi:
@@ -797,15 +1847,152 @@ backend:
       method: PUT
       path: /vdis/{uuid}.vhd
       access: write
-      description: "Replace existing VDI contents. Size must match."
+      description: "Replace existing VDI contents (VHD format). Size must match exactly."
+      params:
+        uuid: { type: string, in: path, required: true }
+      content_type: application/octet-stream
+      pagination: none
+
+    import_vdi_to_existing_raw:
+      method: PUT
+      path: /vdis/{uuid}.raw
+      access: write
+      description: "Replace existing VDI contents (raw format). Size must match exactly."
       params:
         uuid: { type: string, in: path, required: true }
       content_type: application/octet-stream
       pagination: none
 
     # =========================================================================
+    # VDI SNAPSHOTS
+    # =========================================================================
+
+    list_vdi_snapshots:
+      method: GET
+      path: /vdi-snapshots
+      access: read
+      description: "List all VDI snapshots."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_vdi_snapshot:
+      method: GET
+      path: /vdi-snapshots/{uuid}
+      access: read
+      description: "Get details of a VDI snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_vdi_snapshot:
+      method: DELETE
+      path: /vdi-snapshots/{uuid}
+      access: dangerous
+      description: "Delete a VDI snapshot. Irreversible."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    export_vdi_snapshot:
+      method: GET
+      path: /vdi-snapshots/{uuid}.{format}
+      access: read
+      description: "Export a VDI snapshot as VHD or raw. Format is the file extension ('vhd' or 'raw')."
+      params:
+        uuid: { type: string, in: path, required: true }
+        format: { type: string, in: path, required: true, description: "'vhd' or 'raw'" }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    list_vdi_snapshot_alarms:
+      method: GET
+      path: /vdi-snapshots/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms scoped to a VDI snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vdi_snapshot_messages:
+      method: GET
+      path: /vdi-snapshots/{uuid}/messages
+      access: read
+      description: "List XAPI messages scoped to a VDI snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vdi_snapshot_tasks:
+      method: GET
+      path: /vdi-snapshots/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to a VDI snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_vdi_snapshot_tag:
+      method: PUT
+      path: /vdi-snapshots/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a VDI snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_vdi_snapshot_tag:
+      method: DELETE
+      path: /vdi-snapshots/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a VDI snapshot."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
     # VBDs -- Virtual Block Devices
     # =========================================================================
+
+    list_vbds:
+      method: GET
+      path: /vbds
+      access: read
+      description: "List all VBDs (VDI-to-VM attachments)."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_vbd:
+      method: GET
+      path: /vbds/{uuid}
+      access: read
+      description: "Get details of a VBD."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
 
     create_vbd:
       method: POST
@@ -825,6 +2012,45 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
       pagination: none
+
+    list_vbd_alarms:
+      method: GET
+      path: /vbds/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for the VBD."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vbd_messages:
+      method: GET
+      path: /vbds/{uuid}/messages
+      access: read
+      description: "List XAPI messages for the VBD."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vbd_tasks:
+      method: GET
+      path: /vbds/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to the VBD."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     connect_vbd:
       method: POST
@@ -860,6 +2086,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_network:
       method: GET
@@ -879,18 +2106,101 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
+    list_network_alarms:
+      method: GET
+      path: /networks/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for the network."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_network_messages:
+      method: GET
+      path: /networks/{uuid}/messages
+      access: read
+      description: "List XAPI messages for the network."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_network_tasks:
+      method: GET
+      path: /networks/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to the network."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_network_tag:
+      method: PUT
+      path: /networks/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a network."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_network_tag:
+      method: DELETE
+      path: /networks/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a network."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
     # =========================================================================
     # VIFs -- Virtual Network Interfaces
     # =========================================================================
+
+    list_vifs:
+      method: GET
+      path: /vifs
+      access: read
+      description: "List all virtual network interfaces."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_vif:
+      method: GET
+      path: /vifs/{uuid}
+      access: read
+      description: "Get details of a VIF."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
 
     create_vif:
       method: POST
       path: /vifs
       access: write
-      description: "Create a virtual network interface on a VM"
+      description: "Create a virtual network interface on a VM. The VM and network must belong to the same pool."
       params:
-        vm: { type: string, in: body, required: true }
-        network: { type: string, in: body, required: true }
+        vmId: { type: string, in: body, required: true, description: "VM UUID" }
+        networkId: { type: string, in: body, required: true, description: "Network UUID" }
+        MAC: { type: string, in: body, description: "Optional MAC address (auto-generated if omitted)" }
+        device: { type: string, in: body, description: "Optional device index (e.g. '0', '1')" }
+        MTU: { type: integer, in: body, description: "Optional MTU override" }
       pagination: none
 
     delete_vif:
@@ -901,6 +2211,65 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
       pagination: none
+
+    connect_vif:
+      method: POST
+      path: /vifs/{uuid}/actions/connect
+      access: write
+      description: "Hotplug a VIF to a running VM (XO 6.4+)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    disconnect_vif:
+      method: POST
+      path: /vifs/{uuid}/actions/disconnect
+      access: write
+      description: "Hot-unplug a VIF from a running VM (XO 6.4+)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    list_vif_alarms:
+      method: GET
+      path: /vifs/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for the VIF."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vif_messages:
+      method: GET
+      path: /vifs/{uuid}/messages
+      access: read
+      description: "List XAPI messages for the VIF."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vif_tasks:
+      method: GET
+      path: /vifs/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to the VIF."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     # =========================================================================
     # PIFs -- Physical Network Interfaces
@@ -916,6 +2285,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_pif:
       method: GET
@@ -926,8 +2296,47 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
+    list_pif_alarms:
+      method: GET
+      path: /pifs/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for the PIF (e.g. link down)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_pif_messages:
+      method: GET
+      path: /pifs/{uuid}/messages
+      access: read
+      description: "List XAPI messages for the PIF."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_pif_tasks:
+      method: GET
+      path: /pifs/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to the PIF."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
     # =========================================================================
-    # PBDs -- Physical Block Devices
+    # PBDs -- Physical Block Devices (SR-to-host attachments)
     # =========================================================================
 
     list_pbds:
@@ -940,6 +2349,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_pbd:
       method: GET
@@ -984,6 +2394,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_pci:
       method: GET
@@ -1004,6 +2415,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_pgpu:
       method: GET
@@ -1024,6 +2436,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_sm:
       method: GET
@@ -1048,6 +2461,7 @@ backend:
         filter: { type: string, in: query }
         ndjson: { type: boolean, in: query }
         watch: { type: boolean, in: query, description: "Watch mode (requires ndjson)" }
+        markdown: { type: boolean, in: query }
 
     get_task:
       method: GET
@@ -1068,6 +2482,13 @@ backend:
         id: { type: string, in: path, required: true }
       pagination: none
 
+    delete_tasks:
+      method: DELETE
+      path: /tasks
+      access: dangerous
+      description: "Bulk delete: removes ALL tasks the current user has 'task:delete' privilege on. Irreversible."
+      pagination: none
+
     abort_task:
       method: POST
       path: /tasks/{id}/actions/abort
@@ -1079,12 +2500,94 @@ backend:
       pagination: none
 
     # =========================================================================
-    # BACKUPS
+    # MESSAGES (XAPI alerts/notifications)
+    # =========================================================================
+
+    list_messages:
+      method: GET
+      path: /messages
+      access: read
+      description: "List XAPI messages/alerts (e.g. HA alerts, license warnings)"
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_message:
+      method: GET
+      path: /messages/{uuid}
+      access: read
+      description: "Get details of a XAPI message"
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ALARMS (XAPI performance/health alarms; distinct from messages)
+    # =========================================================================
+
+    list_alarms:
+      method: GET
+      path: /alarms
+      access: read
+      description: "List all XAPI alarms (CPU, memory, disk, latency thresholds)."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_alarm:
+      method: GET
+      path: /alarms/{uuid}
+      access: read
+      description: "Get details of a single XAPI alarm."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # EVENTS (Server-Sent Events for real-time XAPI changes)
+    # =========================================================================
+
+    open_events_stream:
+      method: GET
+      path: /events
+      access: read
+      description: "Open an SSE (Server-Sent Events) connection. Returns a subscriber id which is used to add/remove subscriptions. Events emitted: ping (keepalive), add (object created), update (object changed), remove (object deleted)."
+      pagination: none
+
+    add_event_subscription:
+      method: POST
+      path: /events/{id}/subscriptions
+      access: read
+      description: "Add an object-type subscription to an open SSE connection. Returns the subscription id (= collection name)."
+      params:
+        id: { type: string, in: path, required: true, description: "Subscriber UUID returned by open_events_stream" }
+        collection: { type: string, in: body, required: true, description: "XO collection: 'VM', 'host', 'pool', 'SR', 'VDI', 'task', etc." }
+        fields: { type: string, in: body, description: "Either '*' (all fields) or array of field names" }
+      pagination: none
+
+    remove_event_subscription:
+      method: DELETE
+      path: /events/{id}/subscriptions/{subscriptionId}
+      access: read
+      description: "Remove a subscription from an open SSE connection."
+      params:
+        id: { type: string, in: path, required: true, description: "Subscriber UUID" }
+        subscriptionId: { type: string, in: path, required: true, description: "Collection name (e.g. 'VM')" }
+      pagination: none
+
+    # =========================================================================
+    # BACKUPS -- Archives, Jobs, Logs, Restore Logs, Repositories, Schedules
     # =========================================================================
 
     list_backups:
       method: GET
-      path: /backups
+      path: /backup-archives
       access: read
       description: "List all backup archives"
       params:
@@ -1092,21 +2595,41 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_backup:
+      method: GET
+      path: /backup-archives/{id}
+      access: read
+      description: "Get details of a backup archive."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
 
     list_backup_jobs:
       method: GET
       path: /backup-jobs
       access: read
-      description: "List all configured backup jobs"
+      description: "List all configured backup jobs (VM, metadata, mirror)"
       params:
         fields: { type: string, in: query }
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_backup_job:
+      method: GET
+      path: /backup-jobs/{id}
+      access: read
+      description: "Get details of a backup job."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
 
     list_backup_logs:
       method: GET
-      path: /backup-log
+      path: /backup-logs
       access: read
       description: "List backup execution logs"
       params:
@@ -1114,6 +2637,16 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_backup_log:
+      method: GET
+      path: /backup-logs/{id}
+      access: read
+      description: "Get details of a single backup log entry."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
 
     list_restore_logs:
       method: GET
@@ -1125,30 +2658,76 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
-    # =========================================================================
-    # MESSAGES, PROXIES, SERVERS, DASHBOARDS
-    # =========================================================================
-
-    list_messages:
+    get_restore_log:
       method: GET
-      path: /messages
+      path: /restore-logs/{id}
       access: read
-      description: "List XAPI messages/alerts"
+      description: "Get details of a single restore log entry."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_backup_repositories:
+      method: GET
+      path: /backup-repositories
+      access: read
+      description: "List all backup repositories (NFS, S3, SMB, local targets where backups are stored)."
       params:
         fields: { type: string, in: query }
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
-    get_message:
+    get_backup_repository:
       method: GET
-      path: /messages/{uuid}
+      path: /backup-repositories/{id}
       access: read
-      description: "Get details of a XAPI message"
+      description: "Get details of a backup repository (capacity, type, status)."
       params:
-        uuid: { type: string, in: path, required: true }
+        id: { type: string, in: path, required: true }
       pagination: none
+
+    # =========================================================================
+    # SCHEDULES (Backup-job schedules / cron triggers)
+    # =========================================================================
+
+    list_schedules:
+      method: GET
+      path: /schedules
+      access: read
+      description: "List all schedules (cron triggers attached to backup-jobs)."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_schedule:
+      method: GET
+      path: /schedules/{id}
+      access: read
+      description: "Get details of a schedule (cron expression, jobId, enabled)."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    run_schedule:
+      method: POST
+      path: /schedules/{id}/actions/run
+      access: write
+      description: "Manually trigger the backup-job behind this schedule (outside its cron). Returns task reference."
+      params:
+        id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # PROXIES (XO Proxy instances for distributed backups)
+    # =========================================================================
 
     list_proxies:
       method: GET
@@ -1160,6 +2739,7 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     get_proxy:
       method: GET
@@ -1168,6 +2748,46 @@ backend:
       description: "Get details of an XO Proxy"
       params:
         id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SERVERS (XCP-ng/XenServer pool master connections)
+    # =========================================================================
+
+    list_servers:
+      method: GET
+      path: /servers
+      access: admin
+      description: "List all XCP-ng/XenServer connections registered in XO."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_server:
+      method: GET
+      path: /servers/{id}
+      access: admin
+      description: "Get details of a registered server (status, label, host, username)."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    add_server:
+      method: POST
+      path: /servers
+      access: admin
+      description: "Register a new XCP-ng/XenServer pool master in XO. Returns {id}. Use connect_server afterwards to establish the XAPI connection."
+      params:
+        host: { type: string, in: body, required: true, description: "IP or hostname of the pool master" }
+        username: { type: string, in: body, required: true, description: "XAPI username (typically 'root')" }
+        password: { type: string, in: body, required: true, description: "XAPI password" }
+        label: { type: string, in: body, description: "Friendly display name" }
+        httpProxy: { type: string, in: body, description: "Optional HTTP proxy URL" }
+        allowUnauthorized: { type: boolean, in: body, description: "Skip SSL cert verification (insecure)" }
+        readOnly: { type: boolean, in: body, description: "Connect in read-only mode" }
       pagination: none
 
     delete_server:
@@ -1179,16 +2799,38 @@ backend:
         id: { type: string, in: path, required: true }
       pagination: none
 
-    list_dashboards:
-      method: GET
-      path: /dashboards
-      access: read
-      description: "List dashboards with infrastructure overview"
+    connect_server:
+      method: POST
+      path: /servers/{id}/actions/connect
+      access: admin
+      description: "Establish the XAPI connection to a registered server."
       params:
+        id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    disconnect_server:
+      method: POST
+      path: /servers/{id}/actions/disconnect
+      access: admin
+      description: "Drop the XAPI connection to a registered server (without removing it from XO)."
+      params:
+        id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    list_server_tasks:
+      method: GET
+      path: /servers/{id}/tasks
+      access: admin
+      description: "List tasks scoped to this server connection."
+      params:
+        id: { type: string, in: path, required: true }
         fields: { type: string, in: query }
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
   examples:
     - name: "List running VMs"
@@ -1224,16 +2866,14 @@ backend:
         return vbd;
 
     - name: "Host maintenance"
-      description: "Disable host, migrate VMs, re-enable"
+      description: "Disable host with auto-evacuation, then re-enable"
       code: |
-        await api.disable_host({ uuid: "host-uuid", sync: true });
-        const vms = await api.list_vms({
-          fields: "uuid,resident_on",
-          filter: "resident_on:host-uuid"
+        await api.disable_host({
+          uuid: "host-uuid",
+          evacuate: true,
+          sync: true
         });
-        for (const vm of vms) {
-          await api.migrate_vm({ uuid: vm.uuid, sync: true });
-        }
+        // ... do maintenance work ...
         await api.enable_host({ uuid: "host-uuid", sync: true });
 
     - name: "Rolling pool update"
@@ -1242,3 +2882,81 @@ backend:
         const pools = await api.list_pools({ fields: "uuid" });
         const task = await api.rolling_update_pool({ pool_id: pools[0].uuid });
         return await api.get_task({ id: task.id, wait: "result" });
+
+    - name: "Provision RBAC v2 read-only operator role (XO 6.4+)"
+      description: "Create a role, grant VM/host read privileges, and attach to a user"
+      code: |
+        const role = await api.create_acl_role({
+          name: "operator-readonly",
+          description: "Read-only access to all VMs and hosts"
+        });
+        await api.create_acl_privilege({ roleId: role.id, resource: "vm", action: "read" });
+        await api.create_acl_privilege({ roleId: role.id, resource: "host", action: "read" });
+        await api.create_acl_privilege({ roleId: role.id, resource: "pool", action: "read" });
+        await api.attach_acl_role_to_user({ id: role.id, userId: "operator-user-uuid" });
+        return role;
+
+    - name: "Group-based access control"
+      description: "Create a team group, add users, attach a role"
+      code: |
+        const group = await api.create_group({ name: "devops-team" });
+        await api.add_user_to_group({ id: group.id, userId: "alice-uuid" });
+        await api.add_user_to_group({ id: group.id, userId: "bob-uuid" });
+        await api.attach_acl_role_to_group({ id: "operator-role-uuid", groupId: group.id });
+        return group;
+
+    - name: "Trigger a scheduled backup manually"
+      description: "Run a backup-job outside its cron schedule"
+      code: |
+        const schedules = await api.list_schedules({
+          fields: "id,name,jobId",
+          filter: "name:nightly-backup"
+        });
+        const task = await api.run_schedule({ id: schedules[0].id });
+        return await api.get_task({ id: task.id, wait: "result" });
+
+    - name: "Add a new XCP-ng pool to XO"
+      description: "Register a pool master and connect"
+      code: |
+        const server = await api.add_server({
+          host: "xcp.example.com",
+          username: "root",
+          password: "supersecret",
+          label: "production-pool"
+        });
+        await api.connect_server({ id: server.id, sync: true });
+        return server;
+
+    - name: "Provision VM from template list"
+      description: "Pick the first Debian template and clone-boot a new VM"
+      code: |
+        const templates = await api.list_vm_templates({
+          fields: "uuid,name_label",
+          filter: "name_label:Debian"
+        });
+        const pools = await api.list_pools({ fields: "uuid" });
+        return await api.create_vm({
+          pool_id: pools[0].uuid,
+          name_label: "fresh-debian",
+          template: templates[0].uuid,
+          memory: 2147483648,
+          boot: true,
+          sync: true
+        });
+
+    - name: "Live host stats over the last hour"
+      description: "Pull minute-granularity CPU/memory/IO for a host"
+      code: |
+        return await api.get_host_stats({
+          uuid: "host-uuid",
+          granularity: "minutes"
+        });
+
+    - name: "Health snapshot — alarms, missing patches, disconnected servers"
+      description: "Quick infrastructure health overview"
+      code: |
+        const [alarms, dashboard] = await Promise.all([
+          api.list_alarms({ fields: "id,object,time,body" }),
+          api.get_dashboard()
+        ]);
+        return { alarms, dashboard };
