@@ -1,57 +1,106 @@
 # deepl.dadl — DeepL REST API for ToolMesh
-# Machine translation, document translation, glossaries, text improvement, and usage tracking
+# Machine translation, document translation, multilingual glossaries, style rules,
+# translation memory, text improvement (Write) and usage tracking
 #
 # Domain Notes for LLM consumers:
 # - DeepL uses "DeepL-Auth-Key" scheme in Authorization header, NOT standard Bearer
-# - Language codes: source langs are short (EN, DE, FR), target langs can be regional (EN-GB, EN-US, PT-BR, PT-PT)
-# - Free API uses api-free.deepl.com, Pro uses api.deepl.com — base_url must match the plan
-# - Glossaries require source_lang to be explicitly set in translate calls
-# - Document translation is async: upload → poll status → download result
-# - The /v2/write/rephrase endpoint does NOT translate — it improves text in the same language
-# - formality and writing_style are only supported for select target languages
-# - Max 50 texts per translate request, max 128 KiB request body for translation
-# - Translated documents are auto-deleted after download (one-time retrieval)
+# - Two plans share the same DADL: Free → api-free.deepl.com, Pro → api.deepl.com
+#   The Free auth key ends with ":fx"; backends.yaml.url must match the plan
+# - API mixes /v2 and /v3 paths. base_url is the host only — every tool path is
+#   fully-qualified (e.g. /v2/translate, /v3/glossaries). Do not strip the version
+# - Language code casing depends on resource:
+#     translate, languages, usage  → UPPERCASE (EN-US, DE, PT-BR, ZH-HANS)
+#     glossaries (v3), write       → lowercase (en, de, pt-BR, zh)
+# - target_lang regional variants only exist for English (EN-US/EN-GB) and Portuguese
+#   (PT-BR/PT-PT). All other languages use the 2-letter code as target_lang
+# - Style rules and translation memories are NEW (2026 features) — they unlock
+#   per-language style/tone profiles and TM-based segment reuse:
+#     style_id, custom_instructions, translation_memory_id parameters of /v2/translate
+#     default the model to quality_optimized (slower, higher quality)
+# - tag_handling_version: v2 is the new improved algorithm (better HTML/XML structure
+#   preservation, position-independent translation). v1 is the legacy default
+# - Document translation is async (one-time download):
+#     upload_document → poll check_document_status (until status=done) → download_document
+#     Document is auto-deleted on first successful download
+# - Glossary v3 = multilingual: a single glossary can carry many source→target dictionaries.
+#   Identify a dictionary by the (source_lang, target_lang) pair passed as query params
+# - Translation Memory is currently read-only via API (only GET /v3/translation_memories).
+#   Create/edit happens in the DeepL web UI
+# - formality only applies to: DE, FR, IT, ES, NL, PL, PT-BR, PT-PT, JA, RU
+# - writing_style and tone (for rephrase) are mutually exclusive within a single call
+# - Errors: 456 = quota exceeded (terminal), 529 = too many requests (retry).
+#   Free plan responses to over-limit traffic use 456 not 429
+# - Translation request body capped at 128 KiB; rephrase capped at 10 KiB; max 50 texts
+# - Plan/feature gating (tested 2026-05):
+#     /v2/translate, /v2/document, /v2/usage, /v3/languages, /v3/glossaries,
+#     /v3/style_rules  → available on Free
+#     /v3/translation_memories                                   → 403 on Free (Pro-only)
+#     /v2/write/rephrase                                         → 403 on Free
+#         requires a DeepL Write API subscription, NOT the standard translate plan
+# - /v3/languages reports >120 translate_text languages but only 8 with style_rules
+#   support (de, en, es, fr, it, ja, ko, zh) — see resource=style_rules
+# - configured_rules enums are LANGUAGE-SPECIFIC. Many rules/values are only valid
+#   for a subset of languages — e.g. punctuation.quotes and style_and_tone.formality
+#   are not accepted for 'de'. When in doubt, omit configured_rules and use
+#   custom_instructions (free-form prompts) which work for all 8 style_rules langs
+# - add_custom_instruction returns the new instruction with field 'id' (NOT
+#   'instruction_id') — store it as instruction_id when calling get/update/delete
+
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
 credits:
   - "Dunkel Cloud GmbH"
-source_name: "DeepL REST API v2"
-source_url: https://developers.deepl.com/docs
-date: "2026-03-31"
+source_name: "DeepL REST API (v2 + v3)"
+source_url: https://developers.deepl.com/api-reference
+date: "2026-05-21"
 
 backend:
   name: deepl
   type: rest
-  version: "1.0"
-  base_url: https://api.deepl.com/v2
-  description: "DeepL REST API v2 — machine translation, document translation, glossary management, text improvement (Write), and usage tracking"
+  version: "2.0"
+  base_url: https://api.deepl.com
+  description: >
+    DeepL REST API — text translation (with style profiles, translation memory,
+    glossaries and improved tag handling), document translation, multilingual
+    glossary management, style rules CRUD, text improvement (Write), language
+    metadata and usage tracking. Mixes /v2 and /v3 endpoints.
 
   coverage:
-    endpoints: 14
-    total_endpoints: 18
-    percentage: 78
-    focus: "text translation, document translation, glossaries, text improvement (Write), languages, usage"
-    missing: "admin API (key management, org usage), voice API (WebSocket), style rules CRUD"
-    last_reviewed: "2026-03-31"
+    endpoints: 27
+    total_endpoints: 38
+    percentage: 71
+    focus: >
+      text translation (with style_id / translation_memory_id / custom_instructions /
+      tag_handling v2), document translation, multilingual v3 glossaries, style rules
+      (CRUD + custom instructions + configured rules), translation memory listing,
+      text improvement (Write/rephrase), v3 languages and usage
+    missing: >
+      admin API (org analytics, developer key management), voice translation
+      (WebSocket, not REST), language detection beta endpoint, translation memory
+      mutation (TM create/edit are web-UI only as of 2026-05)
+    last_reviewed: "2026-05-21"
 
   setup:
     credential_steps:
-      - "Sign up for a DeepL API account at https://www.deepl.com/pro-api"
-      - "Choose API Free (500k chars/month) or API Pro (pay-per-use)"
-      - "Navigate to Account → API Keys"
-      - "Copy your Authentication Key (format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx for Free, without :fx for Pro)"
+      - "Sign up for a DeepL API plan at https://www.deepl.com/pro-api"
+      - "Choose API Free (500k chars/month) or API Pro (pay-per-use, unlocks style rules + TM + multilingual glossaries)"
+      - "Open Account → API Keys"
+      - "Create a new Authentication Key and copy it"
+      - "Free keys end with ':fx' and require api-free.deepl.com — Pro keys use api.deepl.com"
+      - "Store the key in your credential store under the name 'deepl_auth_key'"
     env_var: CREDENTIAL_DEEPL_AUTH_KEY
     backends_yaml: |
       - name: deepl
         transport: rest
-        dadl: /app/dadl/deepl.dadl
-        url: "https://api.deepl.com/v2"      # use https://api-free.deepl.com/v2 for Free plan
+        dadl: deepl.dadl
+        url: "https://api.deepl.com"       # Free plan: https://api-free.deepl.com
     required_scopes: []
-    docs_url: "https://developers.deepl.com/docs"
+    docs_url: "https://developers.deepl.com/docs/getting-started/auth"
     notes: >
-      Free API keys end with ":fx" and must use api-free.deepl.com. Pro keys use api.deepl.com.
-      Legacy auth via query param auth_key was deprecated Nov 2025. All auth must use the
-      Authorization header with "DeepL-Auth-Key" scheme. Rate limits are not publicly documented
-      but 429 responses include Retry-After header.
+      The legacy auth_key query parameter was deprecated in Nov 2025 — all auth
+      must use the Authorization header with "DeepL-Auth-Key" scheme. Style rules,
+      translation memory and multilingual glossaries are Pro-only. Rate limits are
+      not publicly documented; 429 and 529 include Retry-After. Free plan returns
+      456 (not 429) when the monthly character quota is exhausted.
 
   auth:
     type: bearer
@@ -59,15 +108,18 @@ backend:
     inject_into: header
     header_name: Authorization
     prefix: "DeepL-Auth-Key "
-    # DeepL uses custom scheme: "DeepL-Auth-Key <key>" instead of standard "Bearer <key>"
+    # Custom scheme — sends "Authorization: DeepL-Auth-Key <key>" instead of "Bearer <key>"
 
   defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
     errors:
       format: json
       message_path: "$.message"
-      retry_on: [429, 502, 503, 529]
+      retry_on: [429, 502, 503, 504, 529]
       terminal: [400, 401, 403, 404, 413, 456]
-      # 456 = quota exceeded, 529 = too many requests (DeepL-specific)
+      # 456 = quota exceeded (Free plan over-limit), 529 = too many concurrent requests
       retry_strategy:
         max_retries: 3
         backoff: exponential
@@ -79,14 +131,19 @@ backend:
 
   tools:
 
-    # ─── Text Translation ────────────────────────────────────────────────
+    # ─── Text Translation ─────────────────────────────────────────────────
+    # The most-used endpoint. Supports new (2026) style profiles, translation
+    # memory, per-call custom instructions and the improved tag handling v2.
 
     translate:
       method: POST
-      path: /translate
+      path: /v2/translate
       access: write
-      content_type: application/json
-      description: "Translate text into a target language. Supports up to 50 texts per request (max 128 KiB body). Auto-detects source language if not specified."
+      description: >
+        Translate text into a target language. Up to 50 texts per request, max
+        128 KiB body. Auto-detects source language when source_lang is omitted.
+        Setting style_id, custom_instructions or translation_memory_id implicitly
+        switches model_type to quality_optimized.
       params:
         text:
           type: array
@@ -97,11 +154,15 @@ backend:
           type: string
           in: body
           required: true
-          description: "Target language code, e.g. EN-US, DE, FR, ES, PT-BR, ZH-HANS"
+          description: "Target language code, UPPERCASE — e.g. EN-US, EN-GB, DE, FR, ES, PT-BR, PT-PT, ZH-HANS"
         source_lang:
           type: string
           in: body
-          description: "Source language code. Omit for auto-detection"
+          description: "Source language code (UPPERCASE, 2-letter — e.g. EN, DE). Omit for auto-detection"
+        context:
+          type: string
+          in: body
+          description: "Additional context that influences translation but is not translated itself"
         model_type:
           type: string
           in: body
@@ -110,14 +171,27 @@ backend:
           type: string
           in: body
           description: "default, more, less, prefer_more, prefer_less — only DE, FR, IT, ES, NL, PL, PT-BR, PT-PT, JA, RU"
-        context:
-          type: string
-          in: body
-          description: "Additional context to influence translation (not translated itself)"
         glossary_id:
           type: string
           in: body
-          description: "Glossary ID to use. Requires source_lang to be set"
+          description: "Glossary UUID to apply. Requires source_lang to be set explicitly"
+        style_id:
+          type: string
+          in: body
+          description: "Style rule list UUID (from /v3/style_rules). Forces quality_optimized model"
+        custom_instructions:
+          type: array
+          in: body
+          description: "Up to 10 per-call instructions (max 300 chars each). Forces quality_optimized model"
+        translation_memory_id:
+          type: string
+          in: body
+          description: "Translation memory UUID (from /v3/translation_memories). Requires quality_optimized model"
+        translation_memory_threshold:
+          type: integer
+          in: body
+          default: 75
+          description: "Minimum match % (0-100) for a TM segment to be applied. Default 75"
         split_sentences:
           type: string
           in: body
@@ -125,43 +199,64 @@ backend:
         preserve_formatting:
           type: boolean
           in: body
-          description: "Preserve original formatting conventions"
+          description: "Preserve original formatting (capitalization, punctuation)"
         tag_handling:
           type: string
           in: body
           description: "xml or html — enables tag-aware translation"
+        tag_handling_version:
+          type: string
+          in: body
+          description: "v1 (legacy, default) or v2 (improved structure preservation, position-independent translation)"
+        outline_detection:
+          type: boolean
+          in: body
+          description: "Auto-detect XML structure (default true). Set false to take manual control"
+        non_splitting_tags:
+          type: array
+          in: body
+          description: "XML tag names that should never cause a sentence split"
+        splitting_tags:
+          type: array
+          in: body
+          description: "XML tag names that should always cause a sentence split"
         ignore_tags:
           type: array
           in: body
-          description: "XML/HTML tags whose content should not be translated"
+          description: "XML/HTML tags whose content must not be translated"
         show_billed_characters:
           type: boolean
           in: body
-          description: "Include billed_characters count in response"
+          description: "Include billed_characters per translation in the response"
       response:
         result_path: "$"
+      pagination: none
 
-    # ─── Document Translation ────────────────────────────────────────────
-    # Workflow: upload_document → check_document_status (poll) → download_document
+    # ─── Document Translation ─────────────────────────────────────────────
+    # Async flow: upload_document → poll check_document_status → download_document.
+    # The translated document is auto-deleted after the first successful download.
 
     upload_document:
       method: POST
-      path: /document
+      path: /v2/document
       access: write
       content_type: multipart/form-data
       max_body_size: 50MB
-      description: "Upload a document for translation. Returns document_id and document_key for status polling and download. Supports docx, pptx, xlsx, pdf, html, txt, xliff, srt, jpg, png."
+      description: >
+        Upload a document for translation. Returns {document_id, document_key} for
+        status polling and download. Supports docx, doc, pptx, xlsx, pdf, htm, html,
+        txt, xlf, xliff, srt, jpeg, jpg, png.
       params:
         file:
           type: file_url
           in: body
           required: true
-          description: "Document file to translate"
+          description: "Document URL — ToolMesh fetches and uploads the bytes"
         target_lang:
           type: string
           in: body
           required: true
-          description: "Target language code"
+          description: "Target language code (UPPERCASE)"
         source_lang:
           type: string
           in: body
@@ -169,7 +264,7 @@ backend:
         glossary_id:
           type: string
           in: body
-          description: "Glossary ID to use. Requires source_lang to be set"
+          description: "Glossary UUID. Requires source_lang to be set"
         formality:
           type: string
           in: body
@@ -177,168 +272,527 @@ backend:
         output_format:
           type: string
           in: body
-          description: "Desired output format extension, e.g. pdf (not all combinations supported)"
+          description: "Override the output file extension (e.g. pdf). Not every combination is supported"
       response:
         result_path: "$"
       pagination: none
 
     check_document_status:
       method: POST
-      path: /document/{document_id}
+      path: /v2/document/{document_id}
       access: read
-      content_type: application/json
-      description: "Check the translation status of an uploaded document. Status: queued, translating, done, error. Poll until done."
+      description: >
+        Check translation status of an uploaded document. status is one of
+        queued, translating, done, error. Poll with exponential backoff —
+        seconds_remaining can be wildly off (sometimes 2^27).
       depends_on: [upload_document]
       params:
         document_id:
           type: string
           in: path
           required: true
-          description: "Document ID from upload_document response"
+          description: "Document ID returned by upload_document"
         document_key:
           type: string
           in: body
           required: true
-          description: "Document key from upload_document response"
+          description: "Document key returned by upload_document — required for every status/download call"
       response:
         result_path: "$"
       pagination: none
 
     download_document:
       method: POST
-      path: /document/{document_id}/result
+      path: /v2/document/{document_id}/result
       access: read
-      content_type: application/json
-      description: "Download the translated document. Only available when status is 'done'. Document is auto-deleted after download (one-time retrieval)."
+      description: >
+        Download the translated document. Only valid when status is 'done'. The
+        document is auto-deleted on first successful download — store it before
+        retrying.
       depends_on: [check_document_status]
       params:
         document_id:
           type: string
           in: path
           required: true
-          description: "Document ID from upload_document response"
+          description: "Document ID returned by upload_document"
         document_key:
           type: string
           in: body
           required: true
-          description: "Document key from upload_document response"
+          description: "Document key returned by upload_document"
       response:
         type: file_url
         ttl: 1h
       pagination: none
 
-    # ─── Glossary Management ─────────────────────────────────────────────
+    # ─── Multilingual Glossaries (v3) ─────────────────────────────────────
+    # The v3 endpoints replace the old monolingual /v2/glossaries (still works
+    # but is feature-frozen). A v3 glossary carries an array of dictionaries —
+    # one per source→target language pair.
 
     list_glossaries:
       method: GET
-      path: /glossaries
+      path: /v3/glossaries
       access: read
-      description: "List all glossaries for the authenticated account"
+      description: "List all multilingual glossaries on the account. Returns array under 'glossaries'."
       response:
         result_path: "$.glossaries"
       pagination: none
 
     create_glossary:
       method: POST
-      path: /glossaries
+      path: /v3/glossaries
       access: write
-      content_type: application/json
-      description: "Create a new glossary with term pairs. Entries are TSV or CSV formatted (one pair per line)."
+      description: >
+        Create a multilingual glossary. The dictionaries array carries one entry per
+        source→target language pair. Use lowercase 2-letter codes (en, de, fr).
+        entries_format must be 'tsv' or 'csv'; entries is a single string with one
+        pair per line (source TAB target for TSV, source COMMA target for CSV).
       params:
         name:
           type: string
           in: body
           required: true
           description: "Human-readable glossary name"
-        source_lang:
-          type: string
+        dictionaries:
+          type: array
           in: body
           required: true
-          description: "Source language code, e.g. en"
-        target_lang:
-          type: string
-          in: body
-          required: true
-          description: "Target language code, e.g. de"
-        entries:
-          type: string
-          in: body
-          required: true
-          description: "Glossary entries as TSV or CSV string (one term pair per line)"
-        entries_format:
-          type: string
-          in: body
-          required: true
-          description: "Format of entries: tsv or csv"
+          description: >
+            Array of {source_lang, target_lang, entries, entries_format} objects.
+            Example: [{source_lang:'en', target_lang:'de', entries:'API\tSchnittstelle', entries_format:'tsv'}]
       response:
         result_path: "$"
       pagination: none
 
     get_glossary:
       method: GET
-      path: /glossaries/{glossary_id}
+      path: /v3/glossaries/{glossary_id}
       access: read
-      description: "Retrieve metadata of a single glossary (name, languages, entry count, creation time)"
+      description: "Retrieve metadata of a single glossary (name, dictionary inventory, creation time)"
       params:
         glossary_id:
           type: string
           in: path
           required: true
-          description: "Glossary ID"
+          description: "Glossary UUID"
       response:
         result_path: "$"
       pagination: none
 
-    get_glossary_entries:
-      method: GET
-      path: /glossaries/{glossary_id}/entries
-      access: read
-      description: "Retrieve all term pairs of a glossary as tab-separated values"
+    update_glossary:
+      method: PATCH
+      path: /v3/glossaries/{glossary_id}
+      access: write
+      description: >
+        Update the glossary name and/or merge new dictionary entries. Existing
+        entries for the same source→target pair are merged (new pairs added,
+        conflicting pairs overwritten).
       params:
         glossary_id:
           type: string
           in: path
           required: true
-          description: "Glossary ID"
-        Accept:
+          description: "Glossary UUID"
+        name:
           type: string
-          in: header
-          default: "text/tab-separated-values"
-          description: "Response format — must be text/tab-separated-values"
+          in: body
+          description: "New glossary name"
+        dictionaries:
+          type: array
+          in: body
+          description: "Dictionary entries to merge in (same shape as create_glossary)"
       response:
         result_path: "$"
       pagination: none
 
     delete_glossary:
       method: DELETE
-      path: /glossaries/{glossary_id}
+      path: /v3/glossaries/{glossary_id}
       access: dangerous
-      description: "Permanently delete a glossary. This action cannot be undone."
+      description: "Permanently delete a glossary and all its dictionaries. Cannot be undone."
       params:
         glossary_id:
           type: string
           in: path
           required: true
-          description: "Glossary ID to delete"
+          description: "Glossary UUID"
       pagination: none
 
-    list_glossary_language_pairs:
+    get_glossary_entries:
       method: GET
-      path: /glossary-language-pairs
+      path: /v3/glossaries/{glossary_id}/entries
       access: read
-      description: "List all supported source-target language pairs for glossaries"
+      description: >
+        Retrieve all term pairs of a single dictionary inside the glossary,
+        identified by the (source_lang, target_lang) query pair. Returns TSV.
+      params:
+        glossary_id:
+          type: string
+          in: path
+          required: true
+          description: "Glossary UUID"
+        source_lang:
+          type: string
+          in: query
+          required: true
+          description: "Source language code (lowercase, e.g. en)"
+        target_lang:
+          type: string
+          in: query
+          required: true
+          description: "Target language code (lowercase, e.g. de)"
+        Accept:
+          type: string
+          in: header
+          default: "text/tab-separated-values"
+          description: "Response format — text/tab-separated-values"
       response:
-        result_path: "$.supported_languages"
+        result_path: "$"
       pagination: none
 
-    # ─── Text Improvement (Write) ────────────────────────────────────────
+    replace_glossary_dictionary:
+      method: PUT
+      path: /v3/glossaries/{glossary_id}/dictionaries
+      access: write
+      description: >
+        Replace (or create) the dictionary for a single source→target language pair
+        in an existing glossary. Existing entries for that pair are overwritten.
+      params:
+        glossary_id:
+          type: string
+          in: path
+          required: true
+          description: "Glossary UUID"
+        source_lang:
+          type: string
+          in: body
+          required: true
+          description: "Source language code (lowercase, e.g. en)"
+        target_lang:
+          type: string
+          in: body
+          required: true
+          description: "Target language code (lowercase, e.g. de)"
+        entries:
+          type: string
+          in: body
+          required: true
+          description: "Term pairs as a single string (one pair per line)"
+        entries_format:
+          type: string
+          in: body
+          required: true
+          description: "tsv or csv"
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_glossary_dictionary:
+      method: DELETE
+      path: /v3/glossaries/{glossary_id}/dictionaries
+      access: dangerous
+      description: "Delete a single dictionary (one language pair) from a multilingual glossary"
+      params:
+        glossary_id:
+          type: string
+          in: path
+          required: true
+          description: "Glossary UUID"
+        source_lang:
+          type: string
+          in: query
+          required: true
+          description: "Source language code (lowercase)"
+        target_lang:
+          type: string
+          in: query
+          required: true
+          description: "Target language code (lowercase)"
+      pagination: none
+
+    # ─── Style Rules (v3) ─────────────────────────────────────────────────
+    # NEW in 2026 — define per-language style profiles (configured rules across
+    # 7 categories + free-form custom instructions). Reference via style_id in
+    # translate calls to enforce brand voice / industry terminology.
+
+    list_style_rules:
+      method: GET
+      path: /v3/style_rules
+      access: read
+      description: >
+        List style rule lists on the account. Set detailed=true to include the
+        full configured_rules and custom_instructions per list. Paginated.
+      params:
+        detailed:
+          type: boolean
+          in: query
+          default: false
+          description: "When true, include configured_rules and custom_instructions inline"
+        page:
+          type: integer
+          in: query
+          default: 0
+          description: "Page index (0-based)"
+        page_size:
+          type: integer
+          in: query
+          default: 10
+          description: "Items per page (1-25)"
+      response:
+        result_path: "$.style_rules"
+      pagination: none
+
+    create_style_rule:
+      method: POST
+      path: /v3/style_rules
+      access: write
+      description: >
+        Create a style rule list for a single language. configured_rules covers 7
+        categories (dates_and_times, formatting, numbers, punctuation,
+        spelling_and_grammar, style_and_tone, vocabulary) — each with predefined
+        enum options. custom_instructions adds free-form prompts (max 200, 300
+        chars each).
+      params:
+        name:
+          type: string
+          in: body
+          required: true
+          description: "Style rule list name (max 1024 chars)"
+        language:
+          type: string
+          in: body
+          required: true
+          description: "Lowercase language code: de, en, es, fr, it, ja, ko, zh"
+        configured_rules:
+          type: object
+          in: body
+          description: >
+            Categorised style preferences. Keys: dates_and_times, formatting,
+            numbers, punctuation, spelling_and_grammar, style_and_tone, vocabulary
+        custom_instructions:
+          type: array
+          in: body
+          description: "Up to 200 {label, prompt, source_language?} objects. prompt ≤ 300 chars"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_style_rule:
+      method: GET
+      path: /v3/style_rules/{style_id}
+      access: read
+      description: "Retrieve a single style rule list with its configured_rules and custom_instructions"
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_style_rule:
+      method: PATCH
+      path: /v3/style_rules/{style_id}
+      access: write
+      description: "Rename a style rule list (other fields are immutable — use the dedicated sub-endpoints to mutate rules/instructions)"
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+        name:
+          type: string
+          in: body
+          required: true
+          description: "New name (max 1024 chars)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_style_rule:
+      method: DELETE
+      path: /v3/style_rules/{style_id}
+      access: dangerous
+      description: "Permanently delete a style rule list and all its custom instructions. Cannot be undone."
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+      pagination: none
+
+    replace_configured_rules:
+      method: PUT
+      path: /v3/style_rules/{style_id}/configured_rules
+      access: write
+      description: >
+        Replace the entire configured_rules object on a style rule list. Send the
+        full object — fields omitted are reset to default.
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+        configured_rules:
+          type: object
+          in: body
+          required: true
+          description: >
+            Full configured_rules object. Keys: dates_and_times, formatting,
+            numbers, punctuation, spelling_and_grammar, style_and_tone, vocabulary
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_custom_instruction:
+      method: POST
+      path: /v3/style_rules/{style_id}/custom_instructions
+      access: write
+      description: "Add a custom instruction to an existing style rule list. Up to 200 per style rule."
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+        label:
+          type: string
+          in: body
+          required: true
+          description: "Instruction label (max 100 chars)"
+        prompt:
+          type: string
+          in: body
+          required: true
+          description: "Instruction text (max 300 chars)"
+        source_language:
+          type: string
+          in: body
+          description: "Restrict the instruction to a specific source language (lowercase code)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_custom_instruction:
+      method: GET
+      path: /v3/style_rules/{style_id}/custom_instructions/{instruction_id}
+      access: read
+      description: "Retrieve a single custom instruction"
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+        instruction_id:
+          type: string
+          in: path
+          required: true
+          description: "Custom instruction UUID"
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_custom_instruction:
+      method: PUT
+      path: /v3/style_rules/{style_id}/custom_instructions/{instruction_id}
+      access: write
+      description: "Replace a custom instruction (label/prompt/source_language). All fields are sent — omitted fields reset."
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+        instruction_id:
+          type: string
+          in: path
+          required: true
+          description: "Custom instruction UUID"
+        label:
+          type: string
+          in: body
+          required: true
+          description: "Instruction label (max 100 chars)"
+        prompt:
+          type: string
+          in: body
+          required: true
+          description: "Instruction text (max 300 chars)"
+        source_language:
+          type: string
+          in: body
+          description: "Restrict to a specific source language (lowercase code)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_custom_instruction:
+      method: DELETE
+      path: /v3/style_rules/{style_id}/custom_instructions/{instruction_id}
+      access: dangerous
+      description: "Permanently remove a custom instruction from a style rule list"
+      params:
+        style_id:
+          type: string
+          in: path
+          required: true
+          description: "Style rule UUID"
+        instruction_id:
+          type: string
+          in: path
+          required: true
+          description: "Custom instruction UUID"
+      pagination: none
+
+    # ─── Translation Memory (v3) ──────────────────────────────────────────
+    # NEW in 2026. Read-only via API — TMs are created/edited in the DeepL web UI.
+    # Reference a TM via translation_memory_id in /v2/translate to reuse stored
+    # segments above the translation_memory_threshold (default 75 %).
+
+    list_translation_memories:
+      method: GET
+      path: /v3/translation_memories
+      access: read
+      description: >
+        List translation memories on the account. Each entry carries
+        {translation_memory_id, name, source_language, target_languages,
+        segment_count}. Paginated, max page_size 25.
+      params:
+        page:
+          type: integer
+          in: query
+          default: 0
+          description: "Page index (0-based)"
+        page_size:
+          type: integer
+          in: query
+          default: 10
+          description: "Items per page (1-25)"
+      response:
+        result_path: "$.translation_memories"
+      pagination: none
+
+    # ─── Text Improvement (Write) ─────────────────────────────────────────
+    # Improves text in the same language — does NOT translate.
 
     rephrase_text:
       method: POST
-      path: /write/rephrase
+      path: /v2/write/rephrase
       access: write
-      content_type: application/json
-      description: "Improve and rephrase text without changing the language (max 10 KiB body). Supports writing styles and tones. Does NOT translate — source and target language must match."
+      description: >
+        Improve and rephrase text without changing the language (max 10 KiB body).
+        Supports writing styles and tones. Does NOT translate — target_lang must
+        match the source language (one of: de, en-GB, en-US, es, fr, it, ja, ko,
+        pt-BR, pt-PT, zh). writing_style and tone are mutually exclusive in a
+        single call.
       params:
         text:
           type: array
@@ -348,49 +802,117 @@ backend:
         target_lang:
           type: string
           in: body
-          description: "Target language (must match source): de, en-GB, en-US, es, fr, it, ja, ko, pt-BR, pt-PT, zh"
+          description: "Output language (must match source): de, en-GB, en-US, es, fr, it, ja, ko, pt-BR, pt-PT, zh"
         writing_style:
           type: string
           in: body
-          description: "simple, business, academic, casual, default, prefer_simple, prefer_business, prefer_academic, prefer_casual — mutually exclusive with tone"
+          description: "simple, business, academic, casual, default — or prefer_* variants. Mutually exclusive with tone"
         tone:
           type: string
           in: body
-          description: "enthusiastic, friendly, confident, diplomatic, default, prefer_enthusiastic, prefer_friendly, prefer_confident, prefer_diplomatic — mutually exclusive with writing_style"
+          description: "enthusiastic, friendly, confident, diplomatic, default — or prefer_* variants. Mutually exclusive with writing_style"
       response:
         result_path: "$"
       pagination: none
 
-    # ─── Languages & Usage ───────────────────────────────────────────────
+    # ─── Languages & Usage ────────────────────────────────────────────────
+    # /v3/languages replaces the deprecated /v2/languages — it exposes feature
+    # support per language (formality, glossary, voice, write, style_rules).
 
     list_languages:
       method: GET
-      path: /languages
+      path: /v3/languages
       access: read
-      description: "List supported languages. Use type=source for source languages, type=target for target languages (includes regional variants and formality support info)."
+      description: >
+        List languages supported for a given resource. Returns formality, glossary
+        and other feature flags relevant to that resource. Resource is required.
       params:
-        type:
+        resource:
           type: string
           in: query
-          description: "source or target (default: source)"
+          required: true
+          description: "translate_text | translate_document | glossary | voice | write | style_rules"
+        include:
+          type: array
+          in: query
+          description: "Optional flags to include extra entries: ['beta'], ['external'], or both"
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_language_resources:
+      method: GET
+      path: /v3/languages/resources
+      access: read
+      description: "List the supported 'resource' values usable with list_languages (translate_text, glossary, ...)"
       response:
         result_path: "$"
       pagination: none
 
     get_usage:
       method: GET
-      path: /usage
+      path: /v2/usage
       access: read
-      description: "Retrieve character usage and quota for the current billing period. Returns character_count (consumed) and character_limit (max allowed)."
+      description: >
+        Retrieve character usage and quota for the current billing period. Returns
+        character_count (consumed) and character_limit (cap). Pro plans return
+        very large limits; Free is exactly 500000.
       response:
         result_path: "$"
       pagination: none
 
-  # ─── Examples ────────────────────────────────────────────────────────
+  # ─── Hints ─────────────────────────────────────────────────────────────
+
+  hints:
+    translate:
+      max_texts: "50 per request"
+      max_body_size: "128 KiB"
+      formality_langs: "DE, FR, IT, ES, NL, PL, PT-BR, PT-PT, JA, RU"
+      glossary_note: "glossary_id requires source_lang to be set explicitly"
+      style_id_note: "style_id, custom_instructions, translation_memory_id all force model_type=quality_optimized"
+      tag_handling_versions: "v1 is legacy default; v2 (recommended) preserves HTML/XML structure better"
+      target_lang_casing: "UPPERCASE, regional only for EN (EN-US/EN-GB) and PT (PT-BR/PT-PT)"
+    upload_document:
+      supported_formats: "docx, doc, pptx, xlsx, pdf, htm, html, txt, xlf, xliff, srt, jpeg, jpg, png"
+      workflow: "upload_document → poll check_document_status until status=done → download_document"
+    check_document_status:
+      statuses: "queued, translating, done, error"
+      seconds_remaining_warning: "estimate is unreliable; can return 2^27 — poll with exponential backoff"
+    download_document:
+      one_time: "translated document is auto-deleted on first successful download"
+    rephrase_text:
+      not_translation: "improves text in the same language — does not translate"
+      mutually_exclusive: "writing_style and tone cannot be combined in one call"
+      max_body_size: "10 KiB"
+      supported_langs: "de, en-GB, en-US, es, fr, it, ja, ko, pt-BR, pt-PT, zh"
+      plan_gating: "free standard plan returns 403 — requires a separate DeepL Write API subscription"
+    create_glossary:
+      multilingual: "v3 glossaries carry many dictionaries — one per source→target pair"
+      tsv_format: "one entry per line, source TAB target"
+      csv_format: "one entry per line, source COMMA target"
+      lang_casing: "glossary lang codes are LOWERCASE (en, de, pt-BR) — different from translate"
+    create_style_rule:
+      categories: "configured_rules has 7 keys: dates_and_times, formatting, numbers, punctuation, spelling_and_grammar, style_and_tone, vocabulary"
+      langs: "one language per style rule list — pick from de, en, es, fr, it, ja, ko, zh"
+      custom_instructions_limit: "max 200 per style rule, prompt max 300 chars"
+      configured_rules_lang_specific: "rule keys and enum values are language-specific — 'quotes' and style_and_tone.formality are NOT valid for 'de'. Omit configured_rules if unsure"
+    add_custom_instruction:
+      response_field: "returns {id, label, prompt} — the property is 'id', not 'instruction_id'. Pass it as instruction_id when calling get/update/delete"
+    list_style_rules:
+      detailed_flag: "set detailed=true to inline configured_rules and custom_instructions"
+    list_translation_memories:
+      read_only: "API is currently read-only — create/edit TMs in the DeepL web UI"
+      reference_in_translate: "pass translation_memory_id (with quality_optimized model) to /v2/translate"
+      plan_gating: "Pro-only — free plan returns 403"
+    list_languages:
+      v3_replaces_v2: "use this; /v2/languages is deprecated"
+      resources: "translate_text | translate_document | glossary | voice | write | style_rules"
+
+  # ─── Examples ──────────────────────────────────────────────────────────
 
   examples:
-    - name: "Translate text"
-      description: "Translate English text to German with formal tone"
+    - name: "Translate text with formality"
+      description: "Translate English to German with a more formal tone"
       code: |
         const result = await api.translate({
           text: ["Hello, how are you?", "Please send the report."],
@@ -399,48 +921,79 @@ backend:
         });
         return result.translations;
 
-    - name: "Translate with glossary"
-      description: "Create a glossary and use it for consistent translations"
+    - name: "Translate with style profile and translation memory"
+      description: "Use a style rule list plus a TM (both force quality_optimized model)"
       code: |
-        const glossary = await api.create_glossary({
-          name: "Tech Terms EN-DE",
-          source_lang: "en",
-          target_lang: "de",
-          entries: "API\tSchnittstelle\ndeployment\tBereitstellung\nrepository\tRepository",
-          entries_format: "tsv"
-        });
+        const styles = await api.list_style_rules({ detailed: false, page: 0, page_size: 25 });
+        const tms = await api.list_translation_memories({ page: 0, page_size: 25 });
+        const brand = styles.find(s => s.name === "Brand voice — DE");
+        const legalTm = tms.find(t => t.name === "Legal");
         const result = await api.translate({
-          text: ["The API deployment to the repository was successful."],
+          text: ["The contract is binding upon signature."],
           source_lang: "EN",
           target_lang: "DE",
-          glossary_id: glossary.glossary_id
+          style_id: brand.style_id,
+          translation_memory_id: legalTm.translation_memory_id,
+          translation_memory_threshold: 80,
+          tag_handling: "html",
+          tag_handling_version: "v2"
         });
         return result.translations;
 
+    - name: "Create a multilingual glossary (EN→DE and DE→EN)"
+      description: "Bidirectional glossary in a single v3 glossary object"
+      code: |
+        const glossary = await api.create_glossary({
+          name: "Tech Terms EN↔DE",
+          dictionaries: [
+            { source_lang: "en", target_lang: "de",
+              entries: "API\tSchnittstelle\ndeployment\tBereitstellung", entries_format: "tsv" },
+            { source_lang: "de", target_lang: "en",
+              entries: "Schnittstelle\tAPI\nBereitstellung\tdeployment", entries_format: "tsv" }
+          ]
+        });
+        return glossary;
+
+    - name: "Create a style profile with configured rules and custom instructions"
+      description: "German brand-voice style with formal punctuation and a custom instruction"
+      code: |
+        const style = await api.create_style_rule({
+          name: "Brand voice — DE",
+          language: "de",
+          configured_rules: {
+            style_and_tone: { formality: "formal", gender_language: "gender_neutral" },
+            punctuation: { quotes: "german_double" }
+          },
+          custom_instructions: [
+            { label: "Product name", prompt: "Always render 'ToolMesh' verbatim — never translate the product name." }
+          ]
+        });
+        return style;
+
     - name: "Document translation workflow"
-      description: "Upload a document, poll status, and download the result"
+      description: "Upload, poll status with exponential backoff, then download"
       code: |
         const doc = await api.upload_document({
           file: "https://toolmesh-host/files/f-abc123",
           target_lang: "FR"
         });
-        let status;
+        let status, delay = 1000;
         do {
+          await new Promise(r => setTimeout(r, delay));
           status = await api.check_document_status({
             document_id: doc.document_id,
             document_key: doc.document_key
           });
+          delay = Math.min(delay * 2, 16000);
         } while (status.status === "queued" || status.status === "translating");
-        if (status.status === "done") {
-          return await api.download_document({
-            document_id: doc.document_id,
-            document_key: doc.document_key
-          });
-        }
-        throw new Error(`Translation failed: ${status.message}`);
+        if (status.status !== "done") throw new Error(`Translation failed: ${status.message}`);
+        return await api.download_document({
+          document_id: doc.document_id,
+          document_key: doc.document_key
+        });
 
-    - name: "Improve text style"
-      description: "Rephrase text in a more business-like writing style"
+    - name: "Improve text in business style"
+      description: "Rephrase casual English in a more business-like writing style"
       code: |
         const result = await api.rephrase_text({
           text: ["Hey, just wanted to let you know that the thing is done."],
@@ -449,30 +1002,15 @@ backend:
         });
         return result.improvements;
 
-    - name: "Check usage quota"
-      description: "Check remaining character quota and calculate percentage used"
+    - name: "List supported translate-text languages with feature flags"
+      description: "Use the new /v3/languages endpoint to discover formality/glossary support"
+      code: |
+        const langs = await api.list_languages({ resource: "translate_text" });
+        return langs.filter(l => l.supports_formality);
+
+    - name: "Check usage quota with percentage"
+      description: "Compute the percentage of the character quota used this period"
       code: |
         const usage = await api.get_usage();
         const pct = Math.round((usage.character_count / usage.character_limit) * 100);
         return { ...usage, percentage_used: pct };
-
-  # ─── Hints ─────────────────────────────────────────────────────────
-
-  hints:
-    translate:
-      max_texts: "50 per request"
-      max_body_size: "128 KiB"
-      formality_langs: "DE, FR, IT, ES, NL, PL, PT-BR, PT-PT, JA, RU"
-      glossary_note: "glossary_id requires source_lang to be explicitly set"
-    upload_document:
-      supported_formats: "docx, doc, pptx, xlsx, pdf, htm, html, txt, xlf, xliff, srt, jpeg, jpg, png"
-      workflow: "upload → poll check_document_status → download_document"
-    download_document:
-      one_time: "document is auto-deleted after first download"
-    rephrase_text:
-      not_translation: "does not translate, only improves text in the same language"
-      mutually_exclusive: "writing_style and tone cannot be used together"
-      max_body_size: "10 KiB"
-    create_glossary:
-      tsv_format: "one entry per line, source TAB target"
-      csv_format: "one entry per line, source COMMA target"
