@@ -1,0 +1,4394 @@
+# mikrotik.dadl -- MikroTik RouterOS REST API for ToolMesh
+# DADL backend for managing MikroTik RouterOS devices (routers, switches, APs)
+# via the JSON REST API introduced in RouterOS v7.1beta4 (stable from v7.9+).
+#
+# Domain Notes for LLM consumers:
+# - MikroTik RouterOS is the operating system of all MikroTik network devices
+#   (routers, switches, wireless access points, RouterBOARDs, CHR cloud images).
+#   This DADL covers the REST API, not the legacy binary API on port 8728/8729.
+# - REST API requires RouterOS v7.1beta4 or later; v7.9+ recommended (adds plain
+#   HTTP support, but production deployments should always use HTTPS).
+# - Self-hosted appliance: base_url is intentionally omitted -- provided via
+#   backends.yaml with the actual device URL, e.g. https://10.0.0.1/rest or
+#   https://router.example.com/rest. Self-signed TLS certificates are extremely
+#   common on MikroTik devices -- configure tls_skip_verify accordingly.
+# - Prerequisites on the device: the "www-ssl" service must be enabled in
+#   /ip/service (and have a valid certificate) for HTTPS access, OR the "www"
+#   service for plain HTTP (RouterOS v7.9+). Either is a valid REST transport.
+#   Production deployments should prefer www-ssl (Basic Auth credentials are
+#   otherwise sent in plaintext); lab/internal-only setups commonly use www.
+#   CRITICAL when hardening: identify which service ToolMesh is currently
+#   connected through (check the backends.yaml `url:` -- http vs https) and
+#   DO NOT disable it. Disabling your own transport locks ToolMesh out
+#   immediately, with no second chance via this DADL.
+# - Authentication: HTTP Basic Auth using a RouterOS local user account.
+#   Username and password are the same as console/SSH/Winbox credentials.
+#   Create a dedicated API user with a restricted group (e.g. group "read"
+#   for read-only access, or a custom group with specific policies).
+# - HTTP method mapping to RouterOS CLI verbs:
+#     GET    -> /print  (list or get-by-id)
+#     PATCH  -> /set    (update; ID goes in URL path, NOT request body)
+#     PUT    -> /add    (create a new record)
+#     DELETE -> /remove (delete by ID)
+#     POST   -> any console command (ping, reboot, run-script, monitor, etc.)
+# - Resource IDs: every record has a ".id" field in the form "*1", "*A", "*1F"
+#   (asterisk followed by hex). IDs are NOT stable across reboots/exports --
+#   ID *3 on Monday may be a different rule after a config reload. For stable
+#   references, use the "name" field (interfaces, queues, scripts) or "comment"
+#   field (firewall rules often tagged with comments for cross-reference).
+# - For tools where a named resource exists, you can also reference it by name
+#   in the URL: GET /interface/ether1 works as well as GET /interface/*1.
+# - Response format: GETs always return a JSON ARRAY of objects (even when only
+#   one record matches). Single-record GETs by ID return one object. ALL field
+#   values are encoded as strings, even numbers and booleans -- "1500" not 1500,
+#   "true" not true. Clients must parse as needed.
+# - Error format: { "error": <http_status>, "message": "<reason>", "detail": "<optional>" }
+#   Example: { "error": 404, "message": "Not Found" }
+#   ToolMesh maps "$.message" to error message and "$.error" to error code.
+# - No pagination! The REST API returns ALL matching records in one response.
+#   Use the .query parameter via POST /print to filter server-side (much cheaper
+#   than fetching everything and filtering client-side).
+# - The .proplist field (POST /print body) selects which properties to return,
+#   reducing response size. Format: ".proplist": ["name","type"] or "name,type".
+# - The .query field implements the RouterOS query stack for filtering. Format:
+#   ".query": ["type=ether", "type=vlan", "#|!"]  -- last entry "#|!" combines
+#   the prior conditions with OR-NOT logic. See RouterOS API docs for syntax.
+# - 60-second hard timeout on all REST requests. Long-running commands (ping,
+#   bandwidth-test, monitor) must include a "count" or "duration" parameter,
+#   or "once": "" to return after a single iteration. Without these, the
+#   request will hang and time out.
+# - Boolean fields in request bodies: send as JSON strings "true"/"false" OR as
+#   actual booleans -- RouterOS accepts both. Numbers: octal (leading 0) and
+#   hex (leading 0x) are accepted. Exponent notation (1e5) is NOT supported.
+# - "Disabled" semantics: many resources have a "disabled" field. To toggle a
+#   firewall rule or interface off, PATCH with {"disabled":"yes"} (the canonical
+#   value); "true" also works. To enable, send {"disabled":"no"}.
+# - /ip/service is a SPECIAL endpoint: PATCH is NOT supported (returns HTTP 400
+#   on any field). Use POST /ip/service/set with 'numbers' instead (mirrors the
+#   CLI '/ip/service set telnet disabled=yes'). Verified empirically on
+#   RouterOS 7.22.3 — covered via set_ip_service / disable_ip_service /
+#   enable_ip_service in this DADL. The dynamic www entries that appear in the
+#   list represent active inbound connections (connection=true, dynamic=true),
+#   NOT separate service slots — filter dynamic!=true to see only configurable
+#   service definitions.
+# - RouterOS has TWO update worlds and the DADL exposes both:
+#     1. Collections with full CRUD (PUT/PATCH/DELETE): /ip/address, /ip/route,
+#        /ip/firewall/{filter,nat,mangle,raw}, /ip/dhcp-server/{,lease,network},
+#        /ip/dns/static, /ppp/{secret,profile}, /queue/simple, /queue/tree,
+#        /user, /user/group, /interface/{bridge,vlan,wireguard,...},
+#        /interface/wireguard/peers, /interface/list{,/member}, /system/script,
+#        /system/scheduler, /system/logging, /system/logging/action,
+#        /tool/netwatch, /ipv6/{address,route}, /ipv6/firewall/filter,
+#        /ip/ipsec/{peer,identity,policy,profile,proposal}.
+#     2. Singletons and slave-controlled resources updated via POST /xxx/set:
+#        /ip/service (lockout-warning above), /ipv6/settings, /ip/cloud,
+#        /ip/dns, /system/{identity,clock,note}, /system/ntp/{client,server},
+#        /snmp, /tool/e-mail (SMTP), /interface/{l2tp,sstp,pptp,ovpn}-server/server,
+#        /interface/ethernet (slave ports reject PATCH on mtu/l2mtu — use
+#        /interface/ethernet/set with numbers for atomic mtu+l2mtu),
+#        /interface/ethernet/switch (CRS3xx switch-chip global), /interface/lte
+#        (operator-side fields like apn, network-mode).
+#     A generic POST /interface/set with numbers also exists and is the safest
+#     way to bulk-change name/comment/mtu across mixed interface types in one
+#     atomic transaction (CLI: /interface set [find ...] mtu=9000).
+# - convenience-twin pattern: many /xxx/set endpoints also expose /xxx/enable
+#   and /xxx/disable that take only "numbers" (comma-separated names/.ids).
+#   Provided for /ip/service, /interface, /system/package. Same intent: keep the
+#   common-case scripts short.
+# - Firewall rule ordering matters! Rules are evaluated top-to-bottom. To reorder,
+#   use POST /ip/firewall/filter/move with {"numbers":"*3","destination":"*1"}.
+#   Same pattern applies to NAT, mangle, raw, and IPv6 filter chains — all
+#   covered in this DADL via move_firewall_{filter,nat,mangle,raw} and
+#   move_ipv6_firewall_filter.
+# - Logging to Graylog / external syslog: define one /system/logging/action
+#   record (target=remote, remote=<ip>, remote-port=<port>, remote-protocol=tcp,
+#   remote-log-format=cef|syslog|default), then add /system/logging RULES that
+#   route topic combinations (e.g. "system,info" or "firewall,!debug") to that
+#   action. The five default actions (memory, disk, echo, remote, email)
+#   CANNOT be deleted or renamed — re-purpose them via /set, or add a new
+#   custom action alongside.
+# - Backup & export: POST /system/backup/save creates a binary backup .backup file
+#   on the device's flash. POST /export emits the running configuration as RSC
+#   script. Files are listed via GET /file and deleted via DELETE /file/*id.
+#   To retrieve files off-device, use FTP/SFTP -- the REST API does not stream
+#   file contents directly.
+# - Reboot is destructive! POST /system/reboot disconnects all sessions and
+#   takes the device offline for 30-90 seconds. Schedule changes with
+#   "safe-mode" timeouts where possible.
+# - RouterOS package management: GET /system/package shows installed packages.
+#   POST /system/package/update/check-for-updates checks online. Most production
+#   deployments do NOT auto-update -- the API exposes these but use with care.
+# - WiFi vs Wireless: /interface/wireless is the legacy stack (still on most
+#   devices). /interface/wifi is the newer stack on cAP ax, hAP ax, Audience,
+#   etc. They are NOT interchangeable -- pick the one that matches the device.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "MikroTik RouterOS REST API"
+source_url: "https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST+API"
+date: "2026-05-21"
+
+backend:
+  name: mikrotik
+  type: rest
+  version: "1.0"
+  # base_url intentionally omitted -- self-hosted, provided via backends.yaml.
+  # Each MikroTik device has its own URL (e.g. https://10.0.0.1/rest).
+  description: "MikroTik RouterOS REST API -- manage interfaces, IP addresses, routing, firewall, DHCP, DNS, PPP, queues, wireless, system configuration, users, certificates, files, logs, and diagnostics on RouterOS v7.1+ devices"
+
+  auth:
+    type: basic
+    username_credential: mikrotik_username
+    password_credential: mikrotik_password
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+
+    # RouterOS REST API has NO pagination -- all matching records are returned
+    # in a single response. Use .query (via POST /print) to filter server-side.
+    # Tools below set "pagination: none" explicitly where helpful.
+
+    errors: &standard-errors
+      format: json
+      message_path: "$.message"
+      code_path: "$.error"
+      retry_on: [502, 503, 504]
+      terminal: [400, 401, 403, 404, 409]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+
+    response: &default-response
+      result_path: "$"
+      max_items: 500
+      allow_jq_override: true
+
+  coverage:
+    endpoints: 295
+    total_endpoints: 450
+    percentage: 64
+    focus: "system (resource, identity, clock, health, license, package, script, scheduler, reboot/shutdown, backup, note, logging rules + actions with /set twin), interfaces (generic set, list/CRUD, ethernet + atomic /set + switch chip + switch port, bridge + /set + port /set + VLAN CRUD + host/FDB table, vlan, bonding CRUD, wireless legacy, wifi, lte + /set, wireguard + interface CRUD + peers, list/member + list CRUD), IP (address, route, ARP, neighbor, service set/enable/disable, pool, cloud + /set), DNS (settings, static, cache), DHCP server (CRUD + /set + delete, lease, network CRUD, make-static, client CRUD + release/renew), firewall (filter, NAT, mangle full CRUD + move, raw full CRUD + move, address-list update, connection tracking), IPv6 (address full CRUD, route CRUD, firewall filter CRUD + move, ND, settings /set), PPP (secret, active, profile CRUD), routing (BGP connection CRUD, BGP templates/sessions, OSPF instance + area CRUD, interface-templates, neighbors, routing-filter rules CRUD), queues (simple full, tree, type), tools (ping, traceroute, bandwidth-test, netwatch CRUD, email SMTP settings get/set + send), users (user, group CRUD, ssh-keys, active sessions), logs, certificates, files, SNMP, VPN servers (L2TP/SSTP/PPTP/OVPN singleton get/set), IPsec (peer, identity, policy, profile, proposal full CRUD; active-peers, installed-sa, flush, settings), container (RouterOS 7), MPLS basics"
+    missing: "CAPsMAN controller endpoints (out of scope: CRS354 is Ethernet-only), RADIUS server config, hotspot user profiles/walled garden, /interface/wireless deep config (legacy stack; tooling focuses on the modern /interface/wifi stack), BGP VPN/VPLS, OSPFv3 (instance.version=3 supported but no separate tooling), MPLS LDP detail, RIPv2, traffic-flow exporter, traffic monitor, GPS, ROMON, dude integration, dot1x, w60g, modem deep config, /tool/fetch (file upload/download via REST), file repository sync, certificate ACME plugin, /caps-man for new wifi stack (intentional: per-device wifi-config exposes set already)"
+    last_reviewed: "2026-05-21"
+
+  setup:
+    credential_steps:
+      - "Log in to your MikroTik device via Winbox, SSH, or WebFig as an admin"
+      - "Enable the REST API service: /ip/service> set www-ssl disabled=no (HTTPS) or set www disabled=no (HTTP, NOT recommended for production)"
+      - "Ensure www-ssl has a valid certificate: /ip/service> set www-ssl certificate=<cert-name>"
+      - "Create a dedicated API user: /user/add name=api-user password=<strong-password> group=read (or 'full' / a custom group)"
+      - "For least-privilege custom groups: /user/group/add name=api-readonly policy=api,read,test,winbox"
+      - "Verify access: curl -k -u api-user:<password> https://<router-ip>/rest/system/resource"
+      - "Store the credentials: CREDENTIAL_MIKROTIK_USERNAME=api-user and CREDENTIAL_MIKROTIK_PASSWORD=<password>"
+    env_var: CREDENTIAL_MIKROTIK_USERNAME and CREDENTIAL_MIKROTIK_PASSWORD
+    backends_yaml: |
+      - name: mikrotik
+        transport: rest
+        dadl: mikrotik.dadl
+        url: "https://10.0.0.1/rest"   # HTTPS (recommended) -- requires www-ssl service
+        # url: "http://10.0.0.1/rest"  # plain HTTP -- requires www service (RouterOS v7.9+)
+    required_scopes:
+      - "api -- required for REST/API access"
+      - "read -- list and get operations"
+    optional_scopes:
+      - "write -- create/update operations (PUT, PATCH)"
+      - "policy -- modify user/group policies"
+      - "test -- ping, traceroute, bandwidth-test"
+      - "sniff -- packet sniffer (rarely needed)"
+      - "sensitive -- view/set passwords and secret keys"
+      - "reboot -- system reboot and shutdown"
+      - "ftp -- file management"
+    docs_url: "https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST+API"
+    notes: "RouterOS v7.1+ required (v7.9+ recommended). Most MikroTik devices ship with self-signed certificates -- ToolMesh must skip TLS verification or you must install a trusted certificate via /certificate/import. The 'api' policy is REQUIRED on the user's group for any REST access. For read-only monitoring, use group with policy=api,read,test,winbox; for full management add write,policy,reboot,ftp,sensitive."
+
+  hints:
+    list_interfaces:
+      filter_by_type: "GET /interface?type=ether -- filter by interface type (ether, vlan, bridge, wifi, wireguard, lte, ppp-client, ...)"
+      stable_id: "Use 'name' (e.g. ether1) as the stable identifier; .id (*1) changes after config reload"
+    update_interface:
+      common_fields: "name, comment, disabled (yes/no), mtu, mac-address (ether only), arp"
+    list_firewall_filter:
+      chain_filter: "Filter by chain: ?chain=input | forward | output | <custom-chain>"
+      order_matters: "Rules are evaluated top-to-bottom -- use move_firewall_filter to reorder"
+    add_firewall_filter:
+      required: "chain and action are minimum; e.g. {chain:'input',action:'accept',protocol:'tcp',dst-port:'22'}"
+      action_values: "accept, drop, reject, log, passthrough, jump, return, tarpit, fasttrack-connection, add-src-to-address-list, add-dst-to-address-list"
+    move_firewall_filter:
+      example: "POST {numbers:'*5', destination:'*1'} moves rule *5 to position before *1"
+    add_ip_address:
+      required: "address (CIDR like 192.168.1.1/24) and interface name; e.g. {address:'192.168.10.1/24',interface:'bridge1'}"
+    list_dhcp_leases:
+      status_field: "status: bound, waiting, offered, expired, busy"
+      make_static: "Use make_dhcp_lease_static({id:'*5'}) to convert dynamic lease to static reservation"
+    add_dns_static:
+      required: "name (hostname) and address (IP) OR cname (target FQDN); type defaults to A"
+      regexp_support: "use 'regexp' instead of 'name' for wildcard/regex matches"
+    add_ppp_secret:
+      required: "name (username) and password; service: any|async|l2tp|ovpn|pppoe|pptp|sstp; profile defaults to 'default'"
+    ping:
+      required_params: "address is required; ALWAYS pass count (1-10) to bound runtime -- the REST API has a 60s hard timeout"
+      response_shape: "Each ping iteration is one JSON object with seq, time, host, status fields"
+    bandwidth_test:
+      required_params: "address (target IP), and ALWAYS set duration (e.g. '5s') to bound runtime"
+      protocols: "protocol: udp (default) or tcp; direction: send | receive | both"
+    add_static_route:
+      required: "dst-address (CIDR like 0.0.0.0/0) and gateway (next-hop IP or interface name)"
+      distance: "Administrative distance (default 1 for static); lower wins"
+    add_simple_queue:
+      max_limit: "Format: '<upload>/<download>' in bits/sec, e.g. '10M/100M' for 10Mbps up, 100Mbps down"
+      target: "target is the IP/CIDR or interface name to shape, e.g. '192.168.10.0/24'"
+    list_wireguard_peers:
+      key_fields: "public-key (peer's pubkey), endpoint-address, endpoint-port, allowed-address, last-handshake, rx, tx"
+    create_user:
+      required: "name (username), group (read|full|write|<custom>); password is optional but strongly recommended"
+      group_policies: "Custom groups defined via /user/group with policy field (comma-separated policies)"
+    reboot_system:
+      destructive: "Disconnects ALL sessions and takes device offline for 30-90s; no confirmation prompt"
+    create_backup:
+      filename: "name field sets the backup filename (without .backup extension); stored in device flash"
+      encrypted: "Pass dont-encrypt='yes' to skip encryption (NOT recommended); otherwise password protects the backup"
+    get_ntp_client:
+      status_values: "status: 'synchronized' (healthy), 'started' (running but not yet synced), 'using-local-clock' (no upstream reachable), 'error', 'stopped' (disabled), 'search'"
+      drift_check: "If system-offset > ~50ms or status != 'synchronized' for >5min, investigate firewall, DNS, or unreachable servers"
+    set_ntp_client:
+      sensible_defaults: "{enabled:'yes', mode:'unicast', servers:'time.cloudflare.com,ptbtime1.ptb.de,pool.ntp.org'} -- mix providers for redundancy"
+      vrf_note: "If management is in a non-default VRF, set vrf= accordingly or NTP queries will use the wrong routing table"
+    list_ip_services:
+      transport_services: "Services that may be the active ToolMesh transport: 'www' (HTTP, port 80) and 'www-ssl' (HTTPS, port 443). NEVER disable the one matching backends.yaml `url:` -- doing so locks ToolMesh out instantly."
+      management_services: "Also commonly relied on for OOB management: 'ssh' (22), 'winbox' (8291), 'api' (8728, binary cleartext), 'api-ssl' (8729). Disabling these is fine if at least one alternative remains reachable."
+      dynamic_entries: "Entries with dynamic='true' (e.g. connection='true', remote='ip:port') are active inbound CONNECTIONS, not service definitions. Filter dynamic!=true when reasoning about configurable services."
+    set_ip_service:
+      lockout_warning: "Disabling 'www' OR 'www-ssl' may sever the REST transport that ToolMesh is currently using. ALWAYS read list_ip_services first and confirm which service matches the backends.yaml URL scheme (http -> www, https -> www-ssl) before changing it."
+      example_disable: "{numbers:'telnet', disabled:'yes'} disables Telnet; {numbers:'telnet,ftp,api', disabled:'yes'} disables three at once (only via /set, not via /disable -- the convenience endpoint takes only 'numbers')."
+      example_restrict: "{numbers:'ssh', address:'10.0.0.0/8,192.168.0.0/16'} restricts SSH to internal CIDRs."
+    disable_ip_service:
+      safe_targets: "Common cleartext services safe to disable on a hardened box: 'telnet' (23), 'ftp' (21), 'api' (8728 binary). 'www' (80) is safe ONLY if ToolMesh uses HTTPS; check backends.yaml first."
+      reversible: "Use enable_ip_service({numbers:'<name>'}) to re-enable. Service definitions are static -- they are never removed by disable, only flipped."
+    set_interface:
+      atomic_bulk: "Generic /interface/set lets you change name/comment/mtu/disabled across MIXED interface types in one transaction. Reference targets via 'numbers' (comma-separated names or .ids). Prefer set_ethernet_interface for ether-specific fields (l2mtu, speed, duplex), set_lte_interface for cellular fields, etc."
+      jumbo_jumbo: "For atomic jumbo enable, prefer set_ethernet_interface({numbers:'ether1,...', mtu:'9000', l2mtu:'9014'}) — the ethernet endpoint validates the combo at once. The generic set_interface only changes l3 mtu and can be silently clamped by an unchanged l2mtu."
+    set_bridge:
+      atomic_bridge: "Use POST /interface/bridge/set with 'numbers' when toggling multiple bridges or to keep mtu/admin-mac/vlan-filtering changes atomic. PATCH update_bridge works for single-record edits."
+    set_bridge_port:
+      slave_safety: "Bridge ports are slave-controlled — PATCH update on the (id) endpoint can reject mtu/l2mtu changes. POST /interface/bridge/port/set with numbers lets you change pvid/frame-types/ingress-filtering/hw on one or many ports atomically without the slave-validation gotcha."
+    add_logging_action:
+      target_values: "memory | disk | echo | remote | email. Cannot create another 'remote' or 'email' — the 5 defaults are reserved names; new actions must use distinct names (e.g. 'graylog', 'siem-tcp')."
+      remote_protocol_default: "remote-protocol defaults to 'udp'. Most syslog daemons (rsyslog, FluentD, syslog-ng) listen on UDP/514 by default. TCP/514 requires the receiver to be explicitly configured for TCP — confirm before using."
+      remote_format_choice: "remote-log-format is empirically constrained to {default, cef} on RouterOS 7.22.3 -- 'bsd-syslog'/'iso8601'/'local7' return HTTP 400. To send proper RFC 3164 (with PRI header so severity routes correctly downstream), set BOTH remote-log-format='default' AND bsd-syslog='yes'. Without bsd-syslog='yes', the default format has no PRI header and syslog daemons cannot infer severity (everything ends up at level=1/alert in Graylog)."
+      remote_example: "Sane Graylog/FluentD setup (UDP/514, RFC 3164 with ISO timestamps): {name:'syslog', target:'remote', remote:'192.168.100.15', remote-port:'514', remote-protocol:'udp', remote-log-format:'default', bsd-syslog:'yes', syslog-time-format:'iso8601'}. CEF over TCP only if receiver explicitly parses CEF for this source IP."
+      state_transition: "RouterOS keeps stale fields when changing format: switching FROM cef leaves cef-event-delimiter set, which then blocks subsequent format changes with HTTP 400. Workaround: set remote-log-format='default' FIRST (clears cef-event-delimiter), then apply other fields in a separate call."
+    set_logging_action:
+      defaults_repurpose: "Use {numbers:'remote', remote:'10.0.0.5', remote-protocol:'udp'} to re-aim the built-in 'remote' action without creating a new one. Same for 'email' (email-to/email-cc/email-start-tls)."
+      verify_receiver_first: "Before changing the built-in 'remote' action, verify the target syslog daemon's listening protocol and parser. Common Graylog/FluentD setups listen UDP/514 with RFC 3164 — pushing TCP+CEF blindly results in silently dropped messages."
+    add_logging_rule:
+      topics_syntax: "Comma-separated topic AND-list. Negate with '!' prefix. Example: 'firewall,!debug' matches firewall topic excluding debug severity. Common: 'system,info', 'critical', 'account', 'dhcp,!debug', 'bridge,info'."
+      action_default: "'memory' is the default action — set action='remote' (or your custom name) to forward to Graylog/syslog."
+    set_ip_cloud:
+      ddns_only: "Singleton. Toggle ddns-enabled='yes' to register the device with mynetname.net for dynamic DNS, ddns-update-interval='1d' for refresh cadence. Disable update-time='yes' if you do NOT want IP Cloud to push device time."
+    set_email_settings:
+      smtp_singleton: "Singleton SMTP config at /tool/e-mail. Required for send_email and for the 'email' logging action. Fields: server (smtp host), port, start-tls, user, password, from, vrf. TLS-by-default: start-tls='yes' for STARTTLS on 587, 'tls-only' for implicit-TLS on 465."
+    set_l2tp_server:
+      singleton: "Server singleton (/interface/l2tp-server/server) — toggles L2TP server on/off. Per-user accounts live in /ppp/secret with service='l2tp'. For L2TP/IPsec, set use-ipsec='yes' and ipsec-secret=<psk>."
+    set_sstp_server:
+      singleton: "Server singleton (/interface/sstp-server/server). Requires a valid TLS certificate (certificate=<name>). Common port is 443 — make sure it doesn't collide with www-ssl."
+    set_ovpn_server:
+      singleton: "Server singleton (/interface/ovpn-server/server). RouterOS OpenVPN does NOT support UDP — TCP only. Use cipher=aes256-cbc and auth=sha256 for compatible clients."
+    list_ethernet_switches:
+      crs3xx_note: "On CRS3xx-series boxes there is a hardware switch chip exposed under /interface/ethernet/switch. The chip's port-by-port l2mtu is configured via /interface/ethernet/switch/port — independently of (and a hard cap on) /interface/ethernet l2mtu. For jumbo, BOTH must be raised."
+    set_ethernet_switch:
+      global_jumbo: "Some switch chips expose a global max-frame-size or l2mtu on /interface/ethernet/switch/set (numbers=<chip>). On CRS354 the per-port chip l2mtu is the controlling cap — chip-level set is rarely needed but exposed here for completeness."
+    add_ipsec_peer:
+      auth_method: "Common: 'pre-shared-key' (legacy IKEv1) or 'pre-shared-key-xauth' / 'rsa-signature' / 'eap' for IKEv2. exchange-mode='ike2' is the modern default. Pair with /ip/ipsec/identity records that link peers to profiles+policies."
+    add_ipsec_policy:
+      tunnel_template: "Set template='yes' for road-warrior dynamic policies (matches all incoming SAs that complete IKE); template='no' for static site-to-site policies (must specify src-address/dst-address). action='encrypt' for normal IPsec, 'none' to bypass."
+
+  tools:
+
+    # =========================================================================
+    # SYSTEM -- core device identity, resources, health, and lifecycle
+    # =========================================================================
+
+    get_system_resource:
+      method: GET
+      path: /system/resource
+      access: read
+      description: >
+        Get the device's hardware and runtime resource summary: architecture
+        (mipsbe/arm/arm64/x86_64/tile), board-name, CPU model and count, CPU load,
+        RAM (free/total), HDD (free/total), uptime, RouterOS version, build-time.
+        Returns a single JSON object (NOT an array).
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_identity:
+      method: GET
+      path: /system/identity
+      access: read
+      description: >
+        Get the device's identity (hostname shown in Winbox, neighbor discovery,
+        and the CLI prompt). Returns a single-field object: {"name":"<hostname>"}.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_system_identity:
+      method: POST
+      path: /system/identity/set
+      access: admin
+      description: "Set the device's hostname/identity. Send {name: '<new-name>'}."
+      params:
+        name: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_clock:
+      method: GET
+      path: /system/clock
+      access: read
+      description: >
+        Get the current date, time, timezone, and DST setting on the device.
+        Useful for verifying NTP sync and timezone configuration.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_system_clock:
+      method: POST
+      path: /system/clock/set
+      access: admin
+      description: >
+        Set the device clock. Useful fields: time-zone-name (e.g. 'Europe/Berlin'),
+        time-zone-autodetect ('yes'/'no'), date ('YYYY-MM-DD'), time ('HH:MM:SS').
+      params:
+        time-zone-name: { type: string, in: body }
+        time-zone-autodetect: { type: string, in: body }
+        date: { type: string, in: body }
+        time: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ntp_client:
+      method: GET
+      path: /system/ntp/client
+      access: read
+      description: >
+        Get NTP client config and live sync state. Key fields: enabled ('true'/'false'),
+        mode (unicast|broadcast|multicast|manycast), servers (comma-separated upstream
+        NTP server IPs/FQDNs), vrf. Read-only status fields: status (started|stopped|
+        synchronized|using-local-clock|error|search), synced-server, synced-stratum,
+        system-offset (e.g. '0.5ms'), freq-diff. If 'status' is anything other than
+        'synchronized', the device clock is drifting on its own RTC/quartz.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ntp_client:
+      method: POST
+      path: /system/ntp/client/set
+      access: admin
+      description: >
+        Update the NTP client. Most common change: provide a comma-separated list
+        of trusted NTP servers and enable the client. Example body:
+        {enabled:'yes', servers:'time.cloudflare.com,ptbtime1.ptb.de', mode:'unicast'}.
+        Apply takes effect immediately; allow a few seconds for first sync attempt.
+      params:
+        enabled: { type: string, in: body, description: "'yes' or 'no'" }
+        mode: { type: string, in: body, description: "unicast (default) | broadcast | multicast | manycast" }
+        servers: { type: string, in: body, description: "Comma-separated IPs or FQDNs, e.g. 'time.cloudflare.com,pool.ntp.org'" }
+        vrf: { type: string, in: body, description: "VRF to send NTP queries from (default: main)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ntp_server:
+      method: GET
+      path: /system/ntp/server
+      access: read
+      description: >
+        Get the device's NTP SERVER config (whether this router serves time to
+        other clients). Fields: enabled, broadcast, multicast, manycast, use-local-clock,
+        local-clock-stratum, vrf, broadcast-addresses. Most edge devices keep
+        this disabled and rely solely on the client.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ntp_server:
+      method: POST
+      path: /system/ntp/server/set
+      access: admin
+      description: "Update the NTP server config (enable broadcast/multicast/manycast NTP serving)."
+      params:
+        enabled: { type: string, in: body }
+        broadcast: { type: string, in: body }
+        multicast: { type: string, in: body }
+        manycast: { type: string, in: body }
+        use-local-clock: { type: string, in: body }
+        local-clock-stratum: { type: string, in: body }
+        broadcast-addresses: { type: string, in: body }
+        vrf: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_health:
+      method: GET
+      path: /system/health
+      access: read
+      description: >
+        Get hardware sensor readings: CPU temperature, board temperature, fan
+        speeds, voltage, PSU state. Available sensors vary by hardware model;
+        small devices (hAP lite, hEX lite) expose only a subset.
+      response:
+        result_path: "$"
+
+    get_system_health_settings:
+      method: GET
+      path: /system/health/settings
+      access: read
+      description: >
+        Get the cooling/fan control settings (separate from the read-only sensor
+        values in /system/health). Typical fields: fan-mode (auto|manual),
+        fan-min-speed-percent (PWM floor, e.g. 30), fan-target-temperature
+        (target CPU/board temp for PWM control, e.g. 55), and PSU-related toggles
+        (use-fan, fan-failure-trigger). Available only on devices with controllable
+        fans (CCR, CRS3xx with PWM headers, RB5009, etc.). On fan-less hardware
+        (cAP, hAP, hEX, CHR) this endpoint typically returns an empty object.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_system_health_settings:
+      method: POST
+      path: /system/health/settings/set
+      access: admin
+      description: >
+        Configure cooling/fan behavior. Common changes -- quieter idle:
+        {fan-mode:'auto', fan-min-speed-percent:'20', fan-target-temperature:'55'}.
+        Force constant high RPM (e.g. dusty environment): {fan-mode:'manual',
+        fan-min-speed-percent:'100'}. CAUTION: setting fan-target-temperature too
+        high (>70C) or fan-min-speed-percent too low on a thermally constrained
+        chassis can cause throttling or shutdown. Verify with get_system_health
+        afterwards.
+      params:
+        fan-mode: { type: string, in: body, description: "auto | manual (device-dependent)" }
+        fan-min-speed-percent: { type: string, in: body, description: "PWM floor, 0-100. Below ~15 fans may stall." }
+        fan-target-temperature: { type: string, in: body, description: "Target CPU/board temp in Celsius (typical 50-65)" }
+        use-fan: { type: string, in: body, description: "'yes' or 'no' -- some devices allow disabling fan logic entirely" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_license:
+      method: GET
+      path: /system/license
+      access: read
+      description: "Get the RouterOS license level (0-6), software-id, and CHR upgrade state. Level 6 = CHR/x86, levels 4-5 = WISP/Controller."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_routerboard:
+      method: GET
+      path: /system/routerboard
+      access: read
+      description: >
+        Get RouterBOARD hardware info: model, serial-number, firmware-type, factory-firmware
+        (the firmware that shipped from the factory), current-firmware (running),
+        upgrade-firmware (latest available bundled with the running RouterOS package),
+        routerboot version. The 'routerboard' flag is 'true' on physical MikroTik
+        hardware and 'false' on CHR/x86 (where this endpoint typically returns empty).
+        For CRS3xx switches this is the canonical source for the factory firmware
+        revision and the bootloader (RouterBOOT) version that the device shipped with.
+      response:
+        result_path: "$"
+      pagination: none
+
+    upgrade_routerboard_firmware:
+      method: POST
+      path: /system/routerboard/upgrade
+      access: dangerous
+      description: >
+        Trigger a RouterBOOT firmware upgrade to the version reported in
+        'upgrade-firmware'. The new firmware is staged for the next boot --
+        the device MUST be rebooted (POST /system/reboot) for the upgrade
+        to take effect. Different from RouterOS package upgrades (see
+        install_package_updates) -- this updates ONLY the bootloader/CPLD/SoC
+        firmware bundled with the running RouterOS package. Returns no body
+        on success; check get_routerboard afterwards to confirm
+        current-firmware matches upgrade-firmware.
+      response:
+        result_path: "$"
+      pagination: none
+
+    downgrade_routerboard_firmware:
+      method: POST
+      path: /system/routerboard/downgrade
+      access: dangerous
+      description: >
+        Downgrade RouterBOOT firmware to the factory firmware. Same reboot
+        requirement as upgrade. Rarely needed; use only when a RouterBOOT
+        upgrade caused issues and you need to revert.
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_system_packages:
+      method: GET
+      path: /system/package
+      access: read
+      description: >
+        List all installed RouterOS packages with version, build time, and
+        disabled state. Standard package set: system, wireless, ipv6, advanced-tools,
+        routing, security, wifi-qcom-ac, etc. Disabled packages remain on flash
+        but are not loaded.
+
+    enable_system_package:
+      method: POST
+      path: /system/package/enable
+      access: admin
+      description: "Enable a package by name. Requires reboot to take effect."
+      params:
+        numbers: { type: string, in: body, required: true, description: "Package name or .id" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    disable_system_package:
+      method: POST
+      path: /system/package/disable
+      access: admin
+      description: "Disable a package by name. Requires reboot to unload."
+      params:
+        numbers: { type: string, in: body, required: true, description: "Package name or .id" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    check_for_package_updates:
+      method: POST
+      path: /system/package/update/check-for-updates
+      access: admin
+      description: >
+        Check the MikroTik update server for available RouterOS updates.
+        Returns installed-version, latest-version, status ('System is already up to date',
+        'New version is available'). Does NOT install -- use install_package_updates.
+      response:
+        result_path: "$"
+      pagination: none
+
+    install_package_updates:
+      method: POST
+      path: /system/package/update/install
+      access: admin
+      description: >
+        Download and install RouterOS updates from MikroTik servers. The device
+        WILL reboot after install. Channel must be set first via set channel
+        (stable, long-term, testing, development).
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_system_scripts:
+      method: GET
+      path: /system/script
+      access: read
+      description: "List all stored scripts on the device with name, source code, run-count, last-started, owner, and policies."
+
+    get_system_script:
+      method: GET
+      path: /system/script/{id}
+      access: read
+      description: "Get a single script by .id or name. Returns the full source field."
+      params:
+        id: { type: string, in: path, required: true, description: "Script .id (e.g. *1) or name" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_system_script:
+      method: PUT
+      path: /system/script
+      access: admin
+      description: "Create a new script. Provide name and source (RouterOS scripting language)."
+      params:
+        name: { type: string, in: body, required: true }
+        source: { type: string, in: body, required: true, description: "Script source code" }
+        policy: { type: string, in: body, description: "Comma-separated policies, e.g. 'read,write,test'" }
+        comment: { type: string, in: body }
+        dont-require-permissions: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_system_script:
+      method: PATCH
+      path: /system/script/{id}
+      access: admin
+      description: "Update an existing script's source, policies, or comment."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        source: { type: string, in: body }
+        policy: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_system_script:
+      method: DELETE
+      path: /system/script/{id}
+      access: dangerous
+      description: "Delete a script by .id or name."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    run_system_script:
+      method: POST
+      path: /system/script/run
+      access: admin
+      description: "Execute a stored script by .id. Output (if any) is appended to the system log."
+      params:
+        ".id": { type: string, in: body, required: true, description: "Script .id, e.g. '*1'" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_system_scheduler:
+      method: GET
+      path: /system/scheduler
+      access: read
+      description: "List scheduled tasks (cron-like). Each has name, start-date, start-time, interval, on-event (script to run), policy, run-count, next-run."
+
+    add_system_scheduler:
+      method: PUT
+      path: /system/scheduler
+      access: admin
+      description: "Schedule a script to run at a specific time or interval."
+      params:
+        name: { type: string, in: body, required: true }
+        on-event: { type: string, in: body, required: true, description: "Script name or inline source" }
+        start-date: { type: string, in: body, description: "e.g. 'jan/01/2026'" }
+        start-time: { type: string, in: body, description: "e.g. '03:00:00' or 'startup'" }
+        interval: { type: string, in: body, description: "e.g. '1d' or '00:05:00'" }
+        policy: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_system_scheduler:
+      method: PATCH
+      path: /system/scheduler/{id}
+      access: admin
+      description: "Update a scheduled task (name, on-event, start-date/time, interval, policy, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        on-event: { type: string, in: body }
+        start-date: { type: string, in: body }
+        start-time: { type: string, in: body }
+        interval: { type: string, in: body }
+        policy: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_system_scheduler:
+      method: DELETE
+      path: /system/scheduler/{id}
+      access: admin
+      description: "Delete a scheduled task by .id or name."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    reboot_system:
+      method: POST
+      path: /system/reboot
+      access: dangerous
+      description: >
+        Reboot the device immediately. Disconnects ALL sessions; device will be
+        offline for 30-90 seconds. There is no undo. Confirm intent before calling.
+      response:
+        result_path: "$"
+      pagination: none
+
+    shutdown_system:
+      method: POST
+      path: /system/shutdown
+      access: dangerous
+      description: >
+        Power-off the device immediately. Device requires physical power-cycle
+        to come back online. Use only when you have on-site access.
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_backup:
+      method: POST
+      path: /system/backup/save
+      access: admin
+      description: >
+        Create a binary backup of the running configuration. Stored on device
+        flash as <name>.backup. Retrieve via FTP/SFTP -- the REST API does not
+        stream file contents.
+      params:
+        name: { type: string, in: body, required: true, description: "Backup filename WITHOUT .backup extension" }
+        password: { type: string, in: body, description: "Encryption password (default: device admin password)" }
+        dont-encrypt: { type: string, in: body, description: "'yes' to skip encryption (NOT recommended)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    load_backup:
+      method: POST
+      path: /system/backup/load
+      access: dangerous
+      description: >
+        Restore configuration from a backup file. Device WILL reboot. Backup
+        must already exist in /file (uploaded via FTP/SFTP or made via create_backup).
+      params:
+        name: { type: string, in: body, required: true, description: "Backup filename (with or without .backup extension)" }
+        password: { type: string, in: body, description: "Decryption password" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    export_config:
+      method: POST
+      path: /export
+      access: admin
+      description: >
+        Export the running configuration as an RSC script. If 'file' is provided,
+        writes to /file/<name>.rsc on the device; otherwise returns the script
+        text inline. 'compact' (yes/no) and 'verbose' (yes/no) control verbosity.
+      params:
+        file: { type: string, in: body, description: "Filename to write (omit to get inline output)" }
+        compact: { type: string, in: body, description: "'yes' for compact form (omit defaults)" }
+        verbose: { type: string, in: body, description: "'yes' for verbose form (all properties)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_note:
+      method: GET
+      path: /system/note
+      access: read
+      description: "Get the login banner / system note shown on console login. Often used for ownership/contact info."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_system_note:
+      method: POST
+      path: /system/note/set
+      access: admin
+      description: "Set the login banner / system note."
+      params:
+        note: { type: string, in: body, required: true }
+        show-at-login: { type: string, in: body, description: "'yes' or 'no'" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # INTERFACES -- generic, ethernet, bridge, vlan, bonding
+    # =========================================================================
+
+    list_interfaces:
+      method: GET
+      path: /interface
+      access: read
+      description: >
+        List all interfaces (physical and virtual) with name, type, MTU, MAC address,
+        running/disabled state, rx/tx-byte counters, last-link-up/down. Type values:
+        ether, vlan, bridge, wireless, wifi, wireguard, lte, ppp-client, ovpn-server,
+        ovpn-client, l2tp-server, sstp-server, pptp-server, eoip, ipip, gre, vrrp, etc.
+      params:
+        type: { type: string, in: query, description: "Filter by interface type" }
+        running: { type: string, in: query, description: "'true' or 'false'" }
+        disabled: { type: string, in: query, description: "'true' or 'false'" }
+
+    get_interface:
+      method: GET
+      path: /interface/{id}
+      access: read
+      description: "Get a single interface by name (e.g. 'ether1', 'bridge1') or .id (e.g. '*1')."
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_interface:
+      method: PATCH
+      path: /interface/{id}
+      access: write
+      description: >
+        Update common interface properties: name, comment, mtu (L3), l2mtu (L2),
+        disabled, arp mode. NOTE on jumbo frames: RouterOS clamps L3 'mtu' to
+        l2mtu - 14 bytes. To run mtu=9000 you must FIRST raise 'l2mtu' to at
+        least 9014 (or use the max-l2mtu the hardware reports). On CRS3xx
+        switch-chips the per-port l2mtu IS writable and changes the chip's
+        accepted frame size on that port.
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        comment: { type: string, in: body }
+        mtu: { type: string, in: body, description: "L3 MTU (IP payload). Must be <= l2mtu - 14." }
+        l2mtu: { type: string, in: body, description: "L2 MTU (Ethernet frame body). Must be <= max-l2mtu reported by hardware." }
+        disabled: { type: string, in: body, description: "'yes' or 'no'" }
+        arp: { type: string, in: body, description: "enabled | disabled | proxy-arp | reply-only | local-proxy-arp" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    enable_interface:
+      method: POST
+      path: /interface/enable
+      access: write
+      description: "Enable one or more interfaces by .id or name (comma-separated in 'numbers')."
+      params:
+        numbers: { type: string, in: body, required: true, description: "e.g. 'ether1' or '*1,*2'" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    disable_interface:
+      method: POST
+      path: /interface/disable
+      access: write
+      description: "Disable one or more interfaces."
+      params:
+        numbers: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    monitor_interface_traffic:
+      method: POST
+      path: /interface/monitor-traffic
+      access: read
+      description: >
+        Sample rx/tx rates for an interface. ALWAYS pass once='' to avoid the 60s
+        timeout, otherwise the API streams indefinitely.
+      params:
+        interface: { type: string, in: body, required: true }
+        once: { type: string, in: body, default: "", description: "Pass empty string '' to return after one sample" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_interface:
+      method: POST
+      path: /interface/set
+      access: write
+      description: >
+        Atomically update one or more interfaces (any type) via the CLI-style
+        '/interface set'. Use this when you need to change name/comment/mtu/disabled
+        across MIXED interface types in one transaction (CLI:
+        '/interface set [find ...] mtu=9000'). For ether-specific atomic edits
+        (l2mtu, speed, duplex) use set_ethernet_interface; for cellular APN/mode
+        use set_lte_interface. The generic /interface/set only touches L3 mtu and
+        cannot raise l2mtu on Ethernet ports.
+      params:
+        numbers: { type: string, in: body, required: true, description: "Interface name(s) or .id(s), comma-separated" }
+        name: { type: string, in: body }
+        comment: { type: string, in: body }
+        mtu: { type: string, in: body, description: "L3 MTU; clamped by l2mtu on Ethernet — use set_ethernet_interface to raise l2mtu first" }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_ethernet_interfaces:
+      method: GET
+      path: /interface/ethernet
+      access: read
+      description: "List physical Ethernet ports with name, default-name, MAC, MTU, speed, auto-negotiation, full-duplex, SFP details."
+
+    set_ethernet_interface:
+      method: POST
+      path: /interface/ethernet/set
+      access: admin
+      description: >
+        Atomically update one or more Ethernet ports via the CLI-style
+        '/interface/ethernet set' command. PREFERRED for jumbo-frame setup on
+        switches: PATCH /interface/ethernet/{id} returns HTTP 400 when a port
+        is a bridge slave (slave='true') OR when mtu would exceed current
+        l2mtu - 14. This POST endpoint sets l2mtu and mtu in a single atomic
+        transaction so the validator sees both new values together. Reference
+        ports via 'numbers' (comma-separated names or .ids).
+      params:
+        numbers: { type: string, in: body, required: true, description: "Port name(s) or .id(s), e.g. 'ether1,ether2,...' or '*E,*F,*10'" }
+        l2mtu: { type: string, in: body, description: "L2 frame size cap; set together with mtu for jumbo" }
+        mtu: { type: string, in: body, description: "L3 MTU; must satisfy mtu <= l2mtu - 14" }
+        name: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+        mac-address: { type: string, in: body }
+        speed: { type: string, in: body }
+        full-duplex: { type: string, in: body }
+        auto-negotiation: { type: string, in: body }
+        advertise: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ethernet_interface:
+      method: PATCH
+      path: /interface/ethernet/{id}
+      access: write
+      description: >
+        Update an Ethernet port's properties (name, speed, advertise, full-duplex,
+        auto-negotiation, comment, disabled, MTU/l2mtu, MAC override).
+        Jumbo-frame note: raise l2mtu (e.g. to 9014 or up to max-l2mtu) BEFORE
+        setting mtu=9000, otherwise RouterOS silently clamps mtu to l2mtu - 14.
+        For slave (bridge-member) ports this PATCH frequently returns HTTP 400
+        when changing mtu/l2mtu -- use set_ethernet_interface instead, which
+        sets both values atomically via the /set endpoint.
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+        mtu: { type: string, in: body }
+        l2mtu: { type: string, in: body, description: "L2 frame size cap. Set BEFORE raising mtu for jumbo." }
+        mac-address: { type: string, in: body }
+        speed: { type: string, in: body, description: "10Mbps | 100Mbps | 1Gbps | 10Gbps | auto" }
+        full-duplex: { type: string, in: body }
+        auto-negotiation: { type: string, in: body }
+        advertise: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_ethernet_switches:
+      method: GET
+      path: /interface/ethernet/switch
+      access: read
+      description: >
+        List hardware switch chips (CRS3xx-series and similar). Each chip has
+        name (e.g. 'switch1'), type, mirror-source, mirror-target, cpu-flow-control.
+        On boxes with no switch chip (RB4011, hAP family) this returns an empty
+        array.
+
+    list_ethernet_switch_ports:
+      method: GET
+      path: /interface/ethernet/switch/port
+      access: read
+      description: >
+        List per-port switch-chip configuration (separate from /interface/ethernet
+        L2/L3 view). Fields: name (chip-port id like 'switch1-cpu' or 'ether1'),
+        l2mtu, vlan-mode, vlan-header, default-vlan-id, mirror, mirror-egress.
+        On CRS3xx the chip enforces its own per-port l2mtu — this is the cap
+        that /interface/ethernet l2mtu is clamped against. For end-to-end jumbo
+        you usually need set_ethernet_interface (raises ether l2mtu) AND, on
+        older firmwares, set_ethernet_switch_port (raises chip-port l2mtu).
+
+    set_ethernet_switch:
+      method: POST
+      path: /interface/ethernet/switch/set
+      access: admin
+      description: >
+        Atomically update one or more switch chips. Reference via 'numbers'
+        (chip name or .id). Use for changing mirror-source/mirror-target,
+        cpu-flow-control. Rarely needed on a 'just give me jumbo frames'
+        workflow — try set_ethernet_interface first.
+      params:
+        numbers: { type: string, in: body, required: true, description: "Switch name (e.g. 'switch1') or .id" }
+        mirror-source: { type: string, in: body }
+        mirror-target: { type: string, in: body }
+        cpu-flow-control: { type: string, in: body, description: "'yes' enables Ethernet flow-control on the CPU port" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ethernet_switch_port:
+      method: POST
+      path: /interface/ethernet/switch/port/set
+      access: admin
+      description: >
+        Atomically update one or more switch-chip ports. Reference via 'numbers'
+        (port name like 'ether1' or chip-port .id). Most relevant field is
+        'l2mtu' on older RouterOS releases where the chip cap needs explicit
+        bumping for jumbo. On RouterOS 7.10+ the chip auto-tracks /interface/ethernet
+        l2mtu; this endpoint is the fallback if your hardware does not.
+      params:
+        numbers: { type: string, in: body, required: true }
+        l2mtu: { type: string, in: body }
+        vlan-mode: { type: string, in: body, description: "disabled | optional | check | secure" }
+        vlan-header: { type: string, in: body, description: "leave-as-is | always-strip | add-if-missing" }
+        default-vlan-id: { type: string, in: body }
+        mirror: { type: string, in: body }
+        mirror-egress: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_bridges:
+      method: GET
+      path: /interface/bridge
+      access: read
+      description: "List bridge interfaces (Layer-2 software switches). Returns name, mtu, protocol-mode (none|rstp|stp|mstp), vlan-filtering, igmp-snooping, fast-forward."
+
+    add_bridge:
+      method: PUT
+      path: /interface/bridge
+      access: write
+      description: "Create a new bridge interface. At minimum provide name; common options: protocol-mode (rstp), vlan-filtering ('yes' for VLAN-aware bridge)."
+      params:
+        name: { type: string, in: body, required: true }
+        comment: { type: string, in: body }
+        protocol-mode: { type: string, in: body, default: "rstp", description: "none|stp|rstp|mstp" }
+        vlan-filtering: { type: string, in: body, description: "'yes' enables 802.1Q VLAN filtering" }
+        igmp-snooping: { type: string, in: body }
+        fast-forward: { type: string, in: body }
+        admin-mac: { type: string, in: body }
+        auto-mac: { type: string, in: body }
+        mtu: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_bridge:
+      method: PATCH
+      path: /interface/bridge/{id}
+      access: write
+      description: "Update bridge properties (name, protocol-mode, vlan-filtering, igmp-snooping, fast-forward, mtu, admin-mac, comment)."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        comment: { type: string, in: body }
+        protocol-mode: { type: string, in: body }
+        vlan-filtering: { type: string, in: body }
+        igmp-snooping: { type: string, in: body }
+        fast-forward: { type: string, in: body }
+        admin-mac: { type: string, in: body }
+        mtu: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_bridge:
+      method: POST
+      path: /interface/bridge/set
+      access: write
+      description: >
+        Atomically update one or more bridges via CLI-style '/interface/bridge set'.
+        Useful when you need to flip vlan-filtering or protocol-mode on multiple
+        bridges in one transaction. Reference via 'numbers' (bridge name or .id).
+      params:
+        numbers: { type: string, in: body, required: true }
+        name: { type: string, in: body }
+        comment: { type: string, in: body }
+        protocol-mode: { type: string, in: body }
+        vlan-filtering: { type: string, in: body }
+        igmp-snooping: { type: string, in: body }
+        fast-forward: { type: string, in: body }
+        admin-mac: { type: string, in: body }
+        mtu: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_bridge:
+      method: DELETE
+      path: /interface/bridge/{id}
+      access: dangerous
+      description: "Delete a bridge by .id or name. Removes all port memberships."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_bridge_ports:
+      method: GET
+      path: /interface/bridge/port
+      access: read
+      description: "List bridge port memberships (which interfaces are members of which bridges). Key fields: bridge, interface, pvid, frame-types, ingress-filtering."
+
+    add_bridge_port:
+      method: PUT
+      path: /interface/bridge/port
+      access: write
+      description: "Add an interface to a bridge."
+      params:
+        bridge: { type: string, in: body, required: true }
+        interface: { type: string, in: body, required: true }
+        pvid: { type: string, in: body, description: "Default VLAN ID for untagged frames (when vlan-filtering)" }
+        frame-types: { type: string, in: body, description: "admit-all | admit-only-vlan-tagged | admit-only-untagged-and-priority-tagged" }
+        ingress-filtering: { type: string, in: body }
+        hw: { type: string, in: body, description: "'yes' to use hardware offload" }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_bridge_port:
+      method: DELETE
+      path: /interface/bridge/port/{id}
+      access: write
+      description: "Remove a port from a bridge."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    set_bridge_port:
+      method: POST
+      path: /interface/bridge/port/set
+      access: write
+      description: >
+        Atomically update one or more bridge ports via CLI-style
+        '/interface/bridge/port set'. Reference via 'numbers' (.id or
+        bridge-port name). Use this instead of PATCH when you need to flip
+        pvid/frame-types/ingress-filtering on many ports together; PATCH on
+        individual bridge-port records can interact awkwardly with hardware
+        offload and slave validation.
+      params:
+        numbers: { type: string, in: body, required: true }
+        bridge: { type: string, in: body }
+        pvid: { type: string, in: body }
+        frame-types: { type: string, in: body }
+        ingress-filtering: { type: string, in: body }
+        hw: { type: string, in: body, description: "'yes' enables hardware offload (CRS3xx)" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_bridge_hosts:
+      method: GET
+      path: /interface/bridge/host
+      access: read
+      description: >
+        List the bridge forwarding database (FDB) — every MAC the bridge has
+        learned, plus where (which port). Fields: mac-address, on-interface,
+        bridge, age, local (yes=our own MAC), external (yes=learned from
+        another switch), dynamic. Essential for debugging "host disappeared"
+        issues — confirms whether the bridge ever saw the MAC.
+
+    list_bridge_vlans:
+      method: GET
+      path: /interface/bridge/vlan
+      access: read
+      description: "List bridge VLAN configurations (which VLAN IDs are tagged/untagged on which bridge ports). Used with vlan-filtering=yes bridges."
+
+    add_bridge_vlan:
+      method: PUT
+      path: /interface/bridge/vlan
+      access: write
+      description: "Configure VLAN tagging on a bridge."
+      params:
+        bridge: { type: string, in: body, required: true }
+        vlan-ids: { type: string, in: body, required: true, description: "VLAN IDs, e.g. '10' or '10,20,30'" }
+        tagged: { type: string, in: body, description: "Tagged ports (comma-separated), e.g. 'ether1,ether2'" }
+        untagged: { type: string, in: body, description: "Untagged ports" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_bridge_vlan:
+      method: PATCH
+      path: /interface/bridge/vlan/{id}
+      access: write
+      description: "Update an existing bridge-vlan record (tagged/untagged port lists, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        bridge: { type: string, in: body }
+        vlan-ids: { type: string, in: body }
+        tagged: { type: string, in: body }
+        untagged: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_bridge_vlan:
+      method: DELETE
+      path: /interface/bridge/vlan/{id}
+      access: write
+      description: "Remove a bridge-vlan record."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_vlan_interfaces:
+      method: GET
+      path: /interface/vlan
+      access: read
+      description: "List VLAN interfaces (802.1Q sub-interfaces). Each has name, vlan-id, interface (parent), mtu."
+
+    add_vlan_interface:
+      method: PUT
+      path: /interface/vlan
+      access: write
+      description: "Create a VLAN sub-interface on a physical or bridge interface."
+      params:
+        name: { type: string, in: body, required: true }
+        vlan-id: { type: string, in: body, required: true, description: "VLAN ID 1-4094" }
+        interface: { type: string, in: body, required: true, description: "Parent interface name" }
+        mtu: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_vlan_interface:
+      method: DELETE
+      path: /interface/vlan/{id}
+      access: dangerous
+      description: "Delete a VLAN interface."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_bonding_interfaces:
+      method: GET
+      path: /interface/bonding
+      access: read
+      description: "List bonding (link aggregation) interfaces. Modes: 802.3ad (LACP), balance-rr, balance-xor, broadcast, active-backup, etc."
+
+    add_bonding_interface:
+      method: PUT
+      path: /interface/bonding
+      access: write
+      description: "Create a bonding interface that aggregates physical Ethernet ports. For switch-side LACP both sides must speak 802.3ad."
+      params:
+        name: { type: string, in: body, required: true }
+        slaves: { type: string, in: body, required: true, description: "Comma-separated member ports, e.g. 'ether1,ether2'" }
+        mode: { type: string, in: body, default: "802.3ad", description: "802.3ad | balance-rr | balance-xor | broadcast | active-backup | balance-tlb | balance-alb | balance-slb" }
+        lacp-rate: { type: string, in: body, description: "30secs | 1sec (LACP PDU interval)" }
+        transmit-hash-policy: { type: string, in: body, description: "layer-2 | layer-2-and-3 | layer-3-and-4" }
+        mtu: { type: string, in: body }
+        primary: { type: string, in: body, description: "Preferred active slave for active-backup mode" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_bonding_interface:
+      method: PATCH
+      path: /interface/bonding/{id}
+      access: write
+      description: "Update a bonding interface (slaves, mode, lacp-rate, hash policy, comment)."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        slaves: { type: string, in: body }
+        mode: { type: string, in: body }
+        lacp-rate: { type: string, in: body }
+        transmit-hash-policy: { type: string, in: body }
+        mtu: { type: string, in: body }
+        primary: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_bonding_interface:
+      method: DELETE
+      path: /interface/bonding/{id}
+      access: dangerous
+      description: "Delete a bonding interface. Member ports return to individual L2 state."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_interface_lists:
+      method: GET
+      path: /interface/list
+      access: read
+      description: "List interface lists (named groups of interfaces, used in firewall rules as 'in-interface-list' / 'out-interface-list'). Default lists: WAN, LAN."
+
+    add_interface_list:
+      method: PUT
+      path: /interface/list
+      access: write
+      description: "Create a new interface list. Use to group interfaces for firewall in-/out-interface-list matching."
+      params:
+        name: { type: string, in: body, required: true }
+        comment: { type: string, in: body }
+        include: { type: string, in: body, description: "Comma-separated list names to merge in" }
+        exclude: { type: string, in: body, description: "Comma-separated list names to subtract" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_interface_list:
+      method: DELETE
+      path: /interface/list/{id}
+      access: dangerous
+      description: "Delete an interface list. Firewall rules referencing it will break — audit first."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_interface_list_members:
+      method: GET
+      path: /interface/list/member
+      access: read
+      description: "List members of all interface lists. Key fields: list, interface."
+
+    add_interface_list_member:
+      method: PUT
+      path: /interface/list/member
+      access: write
+      description: "Add an interface to an interface list."
+      params:
+        list: { type: string, in: body, required: true, description: "List name, e.g. 'WAN'" }
+        interface: { type: string, in: body, required: true }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_interface_list_member:
+      method: DELETE
+      path: /interface/list/member/{id}
+      access: write
+      description: "Remove an interface from an interface list."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # WIRELESS / WIFI / LTE / WIREGUARD
+    # =========================================================================
+
+    list_wireless_interfaces:
+      method: GET
+      path: /interface/wireless
+      access: read
+      description: >
+        List legacy wireless interfaces (cAP, hAP ac, RB devices). Each has
+        ssid, mode (ap-bridge|station|station-bridge|bridge), band, channel-width,
+        frequency, security-profile, radio-name, master-interface.
+        Use list_wifi_interfaces for newer cAP ax / hAP ax / Audience devices.
+
+    list_wireless_security_profiles:
+      method: GET
+      path: /interface/wireless/security-profiles
+      access: read
+      description: "List wireless security profiles (WPA/WPA2/WPA3 PSK and EAP). Key fields: name, mode, authentication-types, wpa2-pre-shared-key, group-ciphers, unicast-ciphers."
+
+    list_wireless_registrations:
+      method: GET
+      path: /interface/wireless/registration-table
+      access: read
+      description: "List currently associated wireless clients (CAPsMAN/wireless). Returns mac-address, interface, signal-strength, tx-rate, rx-rate, uptime."
+
+    list_wifi_interfaces:
+      method: GET
+      path: /interface/wifi
+      access: read
+      description: "List newer 802.11ax wifi interfaces (cAP ax, hAP ax, Audience family). Newer stack than /interface/wireless."
+
+    list_wifi_registrations:
+      method: GET
+      path: /interface/wifi/registration-table
+      access: read
+      description: "List clients connected to the new wifi stack interfaces."
+
+    monitor_wifi:
+      method: POST
+      path: /interface/wifi/monitor
+      access: read
+      description: "Sample current wifi interface state (channel, tx-rate, noise floor). ALWAYS pass once=''."
+      params:
+        numbers: { type: string, in: body, required: true, description: "wifi interface name, e.g. 'wifi1'" }
+        once: { type: string, in: body, default: "" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_lte_interfaces:
+      method: GET
+      path: /interface/lte
+      access: read
+      description: "List LTE/cellular modem interfaces. Each has name, apn, pin, network-mode, status, imei."
+
+    set_lte_interface:
+      method: POST
+      path: /interface/lte/set
+      access: admin
+      description: >
+        Update an LTE modem interface (APN, network selection, PIN, name).
+        Reference via 'numbers' (lte interface name). Carrier change normally
+        triggers a brief re-attach (5-10s). For per-APN profile work see
+        /interface/lte/apn (singleton APN list is queryable via the modem itself).
+      params:
+        numbers: { type: string, in: body, required: true, description: "LTE interface, e.g. 'lte1'" }
+        apn: { type: string, in: body, description: "Carrier APN, e.g. 'internet.telekom'" }
+        pin: { type: string, in: body, description: "SIM PIN (4-8 digits) if SIM is PIN-locked" }
+        network-mode: { type: string, in: body, description: "Comma list of allowed RATs: 'gsm,3g,lte,5g'" }
+        operator: { type: string, in: body, description: "Numeric MCC+MNC (e.g. '26201' DT-DE) to lock; empty for auto" }
+        modem-init: { type: string, in: body }
+        allow-roaming: { type: string, in: body, description: "'yes' permits roaming when home network unavailable" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    monitor_lte:
+      method: POST
+      path: /interface/lte/monitor
+      access: read
+      description: "Sample LTE modem state (signal RSSI/RSRP/RSRQ, technology, current-operator, cell-id). ALWAYS pass once=''."
+      params:
+        numbers: { type: string, in: body, required: true, description: "LTE interface name, e.g. 'lte1'" }
+        once: { type: string, in: body, default: "" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_wireguard_interfaces:
+      method: GET
+      path: /interface/wireguard
+      access: read
+      description: "List WireGuard VPN interfaces. Each has name, public-key, private-key (hidden unless 'sensitive' policy), listen-port, mtu."
+
+    add_wireguard_interface:
+      method: PUT
+      path: /interface/wireguard
+      access: write
+      description: "Create a WireGuard interface. RouterOS auto-generates a key pair if private-key is omitted."
+      params:
+        name: { type: string, in: body, required: true }
+        listen-port: { type: string, in: body, description: "UDP port, default 13231" }
+        private-key: { type: string, in: body, description: "Base64 X25519 key; auto-generated if omitted" }
+        mtu: { type: string, in: body, description: "Default 1420" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_wireguard_interface:
+      method: PATCH
+      path: /interface/wireguard/{id}
+      access: write
+      description: >
+        Update a WireGuard interface (listen-port, private-key, mtu, comment,
+        disabled). Rotating private-key requires re-distributing the resulting
+        public-key to every peer — handle with care.
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        listen-port: { type: string, in: body }
+        private-key: { type: string, in: body }
+        mtu: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_wireguard_interface:
+      method: DELETE
+      path: /interface/wireguard/{id}
+      access: dangerous
+      description: "Delete a WireGuard interface. ALL associated peers are removed implicitly."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_wireguard_peers:
+      method: GET
+      path: /interface/wireguard/peers
+      access: read
+      description: "List configured WireGuard peers. Key fields: interface, public-key, endpoint-address, endpoint-port, allowed-address, last-handshake, rx, tx, current-endpoint-address."
+
+    add_wireguard_peer:
+      method: PUT
+      path: /interface/wireguard/peers
+      access: write
+      description: "Add a WireGuard peer to an interface."
+      params:
+        interface: { type: string, in: body, required: true }
+        public-key: { type: string, in: body, required: true, description: "Peer's WireGuard public key (base64)" }
+        allowed-address: { type: string, in: body, required: true, description: "CIDRs allowed from this peer, e.g. '10.99.0.2/32'" }
+        endpoint-address: { type: string, in: body, description: "Peer's IP or DNS name (omit for peers behind NAT)" }
+        endpoint-port: { type: string, in: body, description: "Default 13231" }
+        preshared-key: { type: string, in: body }
+        persistent-keepalive: { type: string, in: body, description: "Seconds, e.g. '25'" }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_wireguard_peer:
+      method: PATCH
+      path: /interface/wireguard/peers/{id}
+      access: write
+      description: "Update a WireGuard peer (allowed-address, endpoint, keepalive, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        allowed-address: { type: string, in: body }
+        endpoint-address: { type: string, in: body }
+        endpoint-port: { type: string, in: body }
+        preshared-key: { type: string, in: body }
+        persistent-keepalive: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_wireguard_peer:
+      method: DELETE
+      path: /interface/wireguard/peers/{id}
+      access: write
+      description: "Remove a WireGuard peer."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # IP -- addresses, routes, ARP, services
+    # =========================================================================
+
+    list_ip_addresses:
+      method: GET
+      path: /ip/address
+      access: read
+      description: "List all configured IPv4 addresses with address (CIDR), network, interface, dynamic (yes for DHCP-acquired), disabled, comment."
+      params:
+        interface: { type: string, in: query, description: "Filter by interface name" }
+        dynamic: { type: string, in: query, description: "'true' or 'false'" }
+
+    add_ip_address:
+      method: PUT
+      path: /ip/address
+      access: write
+      description: "Assign an IPv4 address to an interface."
+      params:
+        address: { type: string, in: body, required: true, description: "CIDR notation, e.g. '192.168.1.1/24'" }
+        interface: { type: string, in: body, required: true }
+        network: { type: string, in: body, description: "Network address (auto-calculated if omitted)" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ip_address:
+      method: PATCH
+      path: /ip/address/{id}
+      access: write
+      description: "Update an IP address record (address, interface, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        address: { type: string, in: body }
+        interface: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ip_address:
+      method: DELETE
+      path: /ip/address/{id}
+      access: dangerous
+      description: "Remove an IPv4 address. May disconnect remote sessions if the deleted address is the management IP."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ip_routes:
+      method: GET
+      path: /ip/route
+      access: read
+      description: >
+        List the IPv4 routing table. Each route has dst-address (CIDR), gateway,
+        distance, scope, target-scope, routing-mark, active, dynamic, suppress-hw-offload.
+        Filter active=true to see only currently used routes.
+      params:
+        active: { type: string, in: query }
+        dst-address: { type: string, in: query }
+        gateway: { type: string, in: query }
+
+    add_ip_route:
+      method: PUT
+      path: /ip/route
+      access: write
+      description: "Add a static IPv4 route. Default route: dst-address='0.0.0.0/0' with a gateway."
+      params:
+        dst-address: { type: string, in: body, required: true, description: "Destination CIDR, e.g. '10.0.0.0/8' or '0.0.0.0/0' for default" }
+        gateway: { type: string, in: body, required: true, description: "Next-hop IP or interface name" }
+        distance: { type: string, in: body, description: "Administrative distance (default 1)" }
+        scope: { type: string, in: body }
+        target-scope: { type: string, in: body }
+        routing-mark: { type: string, in: body }
+        check-gateway: { type: string, in: body, description: "ping | arp | bfd | none" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ip_route:
+      method: PATCH
+      path: /ip/route/{id}
+      access: write
+      description: "Update a static route."
+      params:
+        id: { type: string, in: path, required: true }
+        dst-address: { type: string, in: body }
+        gateway: { type: string, in: body }
+        distance: { type: string, in: body }
+        check-gateway: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ip_route:
+      method: DELETE
+      path: /ip/route/{id}
+      access: dangerous
+      description: "Delete a static route."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ip_arp:
+      method: GET
+      path: /ip/arp
+      access: read
+      description: "List the ARP (IPv4-to-MAC) table. Includes static and dynamic entries with address, mac-address, interface, complete (yes/no), dynamic."
+
+    add_ip_arp:
+      method: PUT
+      path: /ip/arp
+      access: write
+      description: "Add a static ARP entry (useful for ARP reply-only mode)."
+      params:
+        address: { type: string, in: body, required: true }
+        mac-address: { type: string, in: body, required: true }
+        interface: { type: string, in: body, required: true }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ip_arp:
+      method: DELETE
+      path: /ip/arp/{id}
+      access: write
+      description: "Remove an ARP entry."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ip_neighbors:
+      method: GET
+      path: /ip/neighbor
+      access: read
+      description: "List devices discovered via MNDP/CDP/LLDP on directly connected interfaces. Useful for topology discovery."
+
+    list_ip_services:
+      method: GET
+      path: /ip/service
+      access: read
+      description: >
+        List the management services and their state: api, api-ssl, ftp, ssh, telnet,
+        winbox, www (HTTP), www-ssl (HTTPS REST). Each has port, address (allowed
+        source CIDR), disabled, certificate, tls-version.
+
+    set_ip_service:
+      method: POST
+      path: /ip/service/set
+      access: admin
+      description: >
+        Update a management service (enable/disable, change port, restrict source
+        'address' list, bind to certificate). NOTE: /ip/service is one of the few
+        RouterOS endpoints that does NOT support PATCH -- use this POST /set form
+        (mirrors the CLI '/ip/service set ...' command). Reference services via
+        'numbers' as the service name (e.g. 'telnet', 'www-ssl') or .id ('*0').
+        Be careful disabling the service you are currently connected through.
+      params:
+        numbers: { type: string, in: body, required: true, description: "Service name (e.g. 'www-ssl') or .id ('*0')" }
+        disabled: { type: string, in: body, description: "'yes' to disable, 'no' to enable" }
+        port: { type: string, in: body }
+        address: { type: string, in: body, description: "Comma-separated CIDRs allowed to connect; empty string = no restriction" }
+        certificate: { type: string, in: body }
+        tls-version: { type: string, in: body, description: "any|only-1.2|only-1.3" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    disable_ip_service:
+      method: POST
+      path: /ip/service/disable
+      access: admin
+      description: "Convenience wrapper to disable one or more services. Pass service name(s) or .id(s) as comma-separated 'numbers'."
+      params:
+        numbers: { type: string, in: body, required: true, description: "e.g. 'telnet' or 'telnet,ftp,www,api' or '*0,*1'" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    enable_ip_service:
+      method: POST
+      path: /ip/service/enable
+      access: admin
+      description: "Convenience wrapper to enable one or more services. Pass service name(s) or .id(s) as comma-separated 'numbers'."
+      params:
+        numbers: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_ip_pools:
+      method: GET
+      path: /ip/pool
+      access: read
+      description: "List IP address pools (used by DHCP server, PPP server, etc.). Each has name, ranges (CIDR or IP range), next-pool."
+
+    get_ip_cloud:
+      method: GET
+      path: /ip/cloud
+      access: read
+      description: "Get MikroTik IP Cloud (dynamic DNS) status: ddns-enabled, dns-name (xxxxx.sn.mynetname.net), public-address, status."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ip_cloud:
+      method: POST
+      path: /ip/cloud/set
+      access: admin
+      description: >
+        Update MikroTik IP Cloud (dynamic DNS) settings. Singleton — toggle
+        ddns-enabled='yes' to register the device's WAN IP with mynetname.net.
+        Disable update-time='yes' if you do NOT want IP Cloud to push device
+        time (e.g. when you have your own NTP servers).
+      params:
+        ddns-enabled: { type: string, in: body, description: "'yes' to enable mynetname.net DDNS, 'no' to disable" }
+        ddns-update-interval: { type: string, in: body, description: "Refresh cadence, e.g. '1d', '10m'; 'none' for off" }
+        update-time: { type: string, in: body, description: "'yes' = let IP Cloud push device time; 'no' = use local NTP only" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # DNS
+    # =========================================================================
+
+    get_dns_settings:
+      method: GET
+      path: /ip/dns
+      access: read
+      description: "Get DNS resolver settings: servers (upstream), dynamic-servers, allow-remote-requests, cache-size, max-concurrent-queries."
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_dns_settings:
+      method: POST
+      path: /ip/dns/set
+      access: admin
+      description: "Update DNS resolver settings."
+      params:
+        servers: { type: string, in: body, description: "Comma-separated upstream DNS IPs, e.g. '1.1.1.1,9.9.9.9'" }
+        allow-remote-requests: { type: string, in: body, description: "'yes' makes router a DNS server for LAN" }
+        cache-size: { type: string, in: body }
+        cache-max-ttl: { type: string, in: body }
+        use-doh-server: { type: string, in: body, description: "DNS-over-HTTPS server URL" }
+        verify-doh-cert: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_dns_static:
+      method: GET
+      path: /ip/dns/static
+      access: read
+      description: "List static DNS entries (local DNS records). Each has name, type (A|AAAA|CNAME|NS|MX|SRV|TXT), address/cname/target, ttl."
+
+    add_dns_static:
+      method: PUT
+      path: /ip/dns/static
+      access: write
+      description: "Add a static DNS entry. Use either name+address (A record) or name+cname."
+      params:
+        name: { type: string, in: body, description: "Hostname or FQDN (use 'regexp' for wildcards instead)" }
+        regexp: { type: string, in: body, description: "Regex match (alternative to name)" }
+        type: { type: string, in: body, description: "A | AAAA | CNAME | MX | NS | SRV | TXT (default A)" }
+        address: { type: string, in: body, description: "IPv4 for A records" }
+        aaaa-address: { type: string, in: body, description: "IPv6 for AAAA records" }
+        cname: { type: string, in: body }
+        text: { type: string, in: body, description: "TXT record value" }
+        ttl: { type: string, in: body, default: "1d" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_dns_static:
+      method: PATCH
+      path: /ip/dns/static/{id}
+      access: write
+      description: "Update a static DNS entry."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        address: { type: string, in: body }
+        cname: { type: string, in: body }
+        ttl: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_dns_static:
+      method: DELETE
+      path: /ip/dns/static/{id}
+      access: write
+      description: "Remove a static DNS entry."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_dns_cache:
+      method: GET
+      path: /ip/dns/cache
+      access: read
+      description: "List currently cached DNS resolutions on the device."
+
+    flush_dns_cache:
+      method: POST
+      path: /ip/dns/cache/flush
+      access: admin
+      description: "Clear the DNS resolver cache."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # DHCP SERVER / CLIENT
+    # =========================================================================
+
+    list_dhcp_servers:
+      method: GET
+      path: /ip/dhcp-server
+      access: read
+      description: "List DHCP server instances. Each has name, interface, address-pool, lease-time, authoritative, disabled."
+
+    add_dhcp_server:
+      method: PUT
+      path: /ip/dhcp-server
+      access: write
+      description: "Create a DHCP server. Requires interface and address-pool."
+      params:
+        name: { type: string, in: body, required: true }
+        interface: { type: string, in: body, required: true }
+        address-pool: { type: string, in: body, required: true, description: "Name of an existing /ip/pool" }
+        lease-time: { type: string, in: body, default: "10m", description: "e.g. '1h', '1d', '10m'" }
+        authoritative: { type: string, in: body, default: "yes" }
+        disabled: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_dhcp_server:
+      method: PATCH
+      path: /ip/dhcp-server/{id}
+      access: write
+      description: "Update a DHCP server."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        interface: { type: string, in: body }
+        address-pool: { type: string, in: body }
+        lease-time: { type: string, in: body }
+        authoritative: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_dhcp_server:
+      method: POST
+      path: /ip/dhcp-server/set
+      access: write
+      description: >
+        Atomically update one or more DHCP server instances via CLI-style
+        '/ip/dhcp-server set'. Reference via 'numbers' (server name or .id).
+        Use this when changing lease-time / authoritative across multiple
+        servers in one go.
+      params:
+        numbers: { type: string, in: body, required: true }
+        name: { type: string, in: body }
+        interface: { type: string, in: body }
+        address-pool: { type: string, in: body }
+        lease-time: { type: string, in: body }
+        authoritative: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_dhcp_server:
+      method: DELETE
+      path: /ip/dhcp-server/{id}
+      access: dangerous
+      description: "Delete a DHCP server instance. Clients will fail to renew leases."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_dhcp_leases:
+      method: GET
+      path: /ip/dhcp-server/lease
+      access: read
+      description: >
+        List DHCP leases (both dynamic and static reservations). Key fields:
+        address, mac-address, server, host-name, dynamic (yes/no), status
+        (bound | waiting | offered | expired), last-seen, comment.
+      params:
+        status: { type: string, in: query, description: "bound | waiting | offered | expired" }
+        dynamic: { type: string, in: query, description: "'true' or 'false'" }
+
+    add_dhcp_lease:
+      method: PUT
+      path: /ip/dhcp-server/lease
+      access: write
+      description: "Create a static DHCP reservation."
+      params:
+        address: { type: string, in: body, required: true }
+        mac-address: { type: string, in: body, required: true, description: "AA:BB:CC:DD:EE:FF" }
+        server: { type: string, in: body, description: "DHCP server name (default: 'all')" }
+        client-id: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_dhcp_lease:
+      method: DELETE
+      path: /ip/dhcp-server/lease/{id}
+      access: write
+      description: "Delete a DHCP lease/reservation."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    make_dhcp_lease_static:
+      method: POST
+      path: /ip/dhcp-server/lease/make-static
+      access: write
+      description: "Convert a dynamic DHCP lease into a static reservation. Most common workflow for reserving an IP for a known device."
+      params:
+        numbers: { type: string, in: body, required: true, description: "Lease .id (e.g. '*5')" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_dhcp_networks:
+      method: GET
+      path: /ip/dhcp-server/network
+      access: read
+      description: "List DHCP network options (subnet, gateway, dns-server, ntp-server, domain) advertised to clients."
+
+    add_dhcp_network:
+      method: PUT
+      path: /ip/dhcp-server/network
+      access: write
+      description: "Add DHCP network options for a subnet."
+      params:
+        address: { type: string, in: body, required: true, description: "Subnet CIDR, e.g. '192.168.1.0/24'" }
+        gateway: { type: string, in: body, description: "Default gateway for clients" }
+        dns-server: { type: string, in: body, description: "Comma-separated DNS server IPs" }
+        ntp-server: { type: string, in: body }
+        domain: { type: string, in: body }
+        netmask: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_dhcp_network:
+      method: PATCH
+      path: /ip/dhcp-server/network/{id}
+      access: write
+      description: "Update a DHCP server network (gateway, dns, ntp, domain, comment)."
+      params:
+        id: { type: string, in: path, required: true }
+        address: { type: string, in: body }
+        gateway: { type: string, in: body }
+        dns-server: { type: string, in: body }
+        ntp-server: { type: string, in: body }
+        domain: { type: string, in: body }
+        netmask: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_dhcp_network:
+      method: DELETE
+      path: /ip/dhcp-server/network/{id}
+      access: write
+      description: "Remove a DHCP server network. Existing leases remain but new clients will get no options."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_dhcp_clients:
+      method: GET
+      path: /ip/dhcp-client
+      access: read
+      description: "List DHCP client instances. Each has interface, status (bound|searching|stopped), address, gateway, primary-dns, secondary-dns, expires-after."
+
+    add_dhcp_client:
+      method: PUT
+      path: /ip/dhcp-client
+      access: write
+      description: "Enable a DHCP client on an interface (typical WAN setup)."
+      params:
+        interface: { type: string, in: body, required: true }
+        add-default-route: { type: string, in: body, default: "yes" }
+        use-peer-dns: { type: string, in: body, default: "yes" }
+        use-peer-ntp: { type: string, in: body, default: "yes" }
+        default-route-distance: { type: string, in: body, description: "Distance for the learned default route (default 1)" }
+        dhcp-options: { type: string, in: body, description: "Comma-separated option-set names" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_dhcp_client:
+      method: PATCH
+      path: /ip/dhcp-client/{id}
+      access: write
+      description: "Update a DHCP client (interface, add-default-route, use-peer-dns, etc.)."
+      params:
+        id: { type: string, in: path, required: true }
+        interface: { type: string, in: body }
+        add-default-route: { type: string, in: body }
+        use-peer-dns: { type: string, in: body }
+        use-peer-ntp: { type: string, in: body }
+        default-route-distance: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_dhcp_client:
+      method: DELETE
+      path: /ip/dhcp-client/{id}
+      access: dangerous
+      description: "Delete a DHCP client. WAN-side delete may sever connectivity — confirm before invoking."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    release_dhcp_client:
+      method: POST
+      path: /ip/dhcp-client/release
+      access: admin
+      description: "Release the current lease on a DHCP client and re-discover. Brief connectivity drop expected."
+      params:
+        numbers: { type: string, in: body, required: true, description: "DHCP client .id" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    renew_dhcp_client:
+      method: POST
+      path: /ip/dhcp-client/renew
+      access: admin
+      description: "Force a DHCP renew on a client. Useful when DNS/gateway info has changed on the upstream server."
+      params:
+        numbers: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL -- filter, NAT, mangle, raw, address-list, connection
+    # =========================================================================
+
+    list_firewall_filter:
+      method: GET
+      path: /ip/firewall/filter
+      access: read
+      description: >
+        List IPv4 firewall filter rules. Each rule has chain (input|forward|output|<custom>),
+        action (accept|drop|reject|jump|log|...), protocol, src-address, dst-address,
+        src-port, dst-port, in-interface, out-interface, connection-state, comment.
+        Rules are evaluated TOP-TO-BOTTOM per chain.
+      params:
+        chain: { type: string, in: query }
+        action: { type: string, in: query }
+        disabled: { type: string, in: query }
+
+    add_firewall_filter:
+      method: PUT
+      path: /ip/firewall/filter
+      access: admin
+      description: >
+        Add an IPv4 firewall filter rule. Required: chain and action. New rules
+        are appended to the END of the chain -- use move_firewall_filter to reorder.
+      params:
+        chain: { type: string, in: body, required: true }
+        action: { type: string, in: body, required: true }
+        protocol: { type: string, in: body, description: "tcp|udp|icmp|igmp|ipsec-esp|...; omit for any" }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body, description: "Port, range '8000-8100', or list '80,443'" }
+        dst-port: { type: string, in: body }
+        src-address-list: { type: string, in: body, description: "Match against named address-list" }
+        dst-address-list: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        in-interface-list: { type: string, in: body, description: "Name of interface list, e.g. 'WAN'" }
+        out-interface: { type: string, in: body }
+        out-interface-list: { type: string, in: body }
+        connection-state: { type: string, in: body, description: "Comma-separated: established,related,new,invalid,untracked" }
+        connection-nat-state: { type: string, in: body }
+        log: { type: string, in: body, description: "'yes' to log when matched" }
+        log-prefix: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+        jump-target: { type: string, in: body, description: "Custom chain name (with action=jump)" }
+        address-list: { type: string, in: body, description: "For action=add-src-to-address-list / add-dst-to-address-list" }
+        address-list-timeout: { type: string, in: body, description: "e.g. '1h', '0s' for permanent" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_firewall_filter:
+      method: PATCH
+      path: /ip/firewall/filter/{id}
+      access: admin
+      description: "Update an existing filter rule (any field)."
+      params:
+        id: { type: string, in: path, required: true }
+        chain: { type: string, in: body }
+        action: { type: string, in: body }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        out-interface: { type: string, in: body }
+        connection-state: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_firewall_filter:
+      method: DELETE
+      path: /ip/firewall/filter/{id}
+      access: dangerous
+      description: "Delete a filter rule. Removing an accept rule can lock you out -- check before deleting."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    move_firewall_filter:
+      method: POST
+      path: /ip/firewall/filter/move
+      access: admin
+      description: "Reorder filter rules. Move rule(s) in 'numbers' to position before 'destination'."
+      params:
+        numbers: { type: string, in: body, required: true, description: "Rule .id(s) to move, e.g. '*5'" }
+        destination: { type: string, in: body, required: true, description: "Rule .id to move before" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_firewall_nat:
+      method: GET
+      path: /ip/firewall/nat
+      access: read
+      description: "List IPv4 NAT rules (srcnat/dstnat). Common actions: masquerade (srcnat to outgoing interface), dst-nat (port forward), src-nat, redirect."
+      params:
+        chain: { type: string, in: query, description: "srcnat | dstnat | <custom>" }
+        action: { type: string, in: query }
+
+    add_firewall_nat:
+      method: PUT
+      path: /ip/firewall/nat
+      access: admin
+      description: >
+        Add a NAT rule. Common patterns -- Masquerade (LAN to WAN):
+        {chain:'srcnat',action:'masquerade',out-interface-list:'WAN'}.
+        Port forward (DNAT): {chain:'dstnat',action:'dst-nat',protocol:'tcp',dst-port:'80',in-interface:'ether1',to-addresses:'192.168.1.10',to-ports:'8080'}.
+      params:
+        chain: { type: string, in: body, required: true }
+        action: { type: string, in: body, required: true }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        in-interface-list: { type: string, in: body }
+        out-interface: { type: string, in: body }
+        out-interface-list: { type: string, in: body }
+        to-addresses: { type: string, in: body, description: "DNAT target IP or range" }
+        to-ports: { type: string, in: body, description: "DNAT target port or range" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_firewall_nat:
+      method: PATCH
+      path: /ip/firewall/nat/{id}
+      access: admin
+      description: "Update a NAT rule."
+      params:
+        id: { type: string, in: path, required: true }
+        chain: { type: string, in: body }
+        action: { type: string, in: body }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        out-interface: { type: string, in: body }
+        to-addresses: { type: string, in: body }
+        to-ports: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_firewall_nat:
+      method: DELETE
+      path: /ip/firewall/nat/{id}
+      access: dangerous
+      description: "Delete a NAT rule. Removing masquerade can break LAN-to-WAN traffic."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    move_firewall_nat:
+      method: POST
+      path: /ip/firewall/nat/move
+      access: admin
+      description: "Reorder NAT rules. Move rule(s) in 'numbers' to position before 'destination'."
+      params:
+        numbers: { type: string, in: body, required: true }
+        destination: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_firewall_mangle:
+      method: GET
+      path: /ip/firewall/mangle
+      access: read
+      description: "List mangle rules (packet marking, MSS clamping, TTL, DSCP). Chains: prerouting, postrouting, input, forward, output."
+      params:
+        chain: { type: string, in: query }
+        action: { type: string, in: query }
+
+    add_firewall_mangle:
+      method: PUT
+      path: /ip/firewall/mangle
+      access: admin
+      description: "Add a mangle rule (mark-packet, mark-connection, change-mss, change-ttl, change-dscp, ...)."
+      params:
+        chain: { type: string, in: body, required: true }
+        action: { type: string, in: body, required: true }
+        new-packet-mark: { type: string, in: body }
+        new-connection-mark: { type: string, in: body }
+        new-routing-mark: { type: string, in: body }
+        passthrough: { type: string, in: body }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        in-interface-list: { type: string, in: body }
+        out-interface: { type: string, in: body }
+        out-interface-list: { type: string, in: body }
+        connection-mark: { type: string, in: body }
+        connection-state: { type: string, in: body }
+        new-mss: { type: string, in: body }
+        new-ttl: { type: string, in: body }
+        new-dscp: { type: string, in: body }
+        log: { type: string, in: body }
+        log-prefix: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_firewall_mangle:
+      method: PATCH
+      path: /ip/firewall/mangle/{id}
+      access: admin
+      description: "Update a mangle rule (any field)."
+      params:
+        id: { type: string, in: path, required: true }
+        chain: { type: string, in: body }
+        action: { type: string, in: body }
+        new-packet-mark: { type: string, in: body }
+        new-connection-mark: { type: string, in: body }
+        new-routing-mark: { type: string, in: body }
+        new-mss: { type: string, in: body }
+        new-ttl: { type: string, in: body }
+        new-dscp: { type: string, in: body }
+        passthrough: { type: string, in: body }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        out-interface: { type: string, in: body }
+        connection-mark: { type: string, in: body }
+        connection-state: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_firewall_mangle:
+      method: DELETE
+      path: /ip/firewall/mangle/{id}
+      access: dangerous
+      description: "Delete a mangle rule. Removing mark-routing rules can break policy routing."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    move_firewall_mangle:
+      method: POST
+      path: /ip/firewall/mangle/move
+      access: admin
+      description: "Reorder mangle rules. Move rule(s) in 'numbers' to position before 'destination'."
+      params:
+        numbers: { type: string, in: body, required: true }
+        destination: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_firewall_raw:
+      method: GET
+      path: /ip/firewall/raw
+      access: read
+      description: "List firewall raw rules (pre-conntrack, used for DDoS mitigation and bypassing connection tracking)."
+
+    add_firewall_raw:
+      method: PUT
+      path: /ip/firewall/raw
+      access: admin
+      description: >
+        Add a raw firewall rule. Raw rules run BEFORE connection-tracking and
+        are evaluated for every packet — keep them lean. Common patterns:
+        notrack for high-volume known-good traffic, drop for known-bad source
+        IPs, ICMP rate-limit pre-conntrack.
+      params:
+        chain: { type: string, in: body, required: true, description: "prerouting | output" }
+        action: { type: string, in: body, required: true, description: "accept | drop | notrack | jump | log | return" }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-address-list: { type: string, in: body }
+        dst-address-list: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        in-interface-list: { type: string, in: body }
+        log: { type: string, in: body }
+        log-prefix: { type: string, in: body }
+        jump-target: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_firewall_raw:
+      method: PATCH
+      path: /ip/firewall/raw/{id}
+      access: admin
+      description: "Update a raw firewall rule."
+      params:
+        id: { type: string, in: path, required: true }
+        chain: { type: string, in: body }
+        action: { type: string, in: body }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_firewall_raw:
+      method: DELETE
+      path: /ip/firewall/raw/{id}
+      access: dangerous
+      description: "Delete a raw firewall rule."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    move_firewall_raw:
+      method: POST
+      path: /ip/firewall/raw/move
+      access: admin
+      description: "Reorder raw firewall rules. Move rule(s) in 'numbers' to position before 'destination'."
+      params:
+        numbers: { type: string, in: body, required: true }
+        destination: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_firewall_address_lists:
+      method: GET
+      path: /ip/firewall/address-list
+      access: read
+      description: "List firewall address-list entries (named groups of IPs/CIDRs used by other firewall rules)."
+      params:
+        list: { type: string, in: query, description: "Filter by list name" }
+
+    add_firewall_address_list:
+      method: PUT
+      path: /ip/firewall/address-list
+      access: admin
+      description: "Add an entry to a firewall address-list."
+      params:
+        list: { type: string, in: body, required: true, description: "Address-list name" }
+        address: { type: string, in: body, required: true, description: "IP, CIDR, or FQDN" }
+        timeout: { type: string, in: body, description: "Auto-expire after, e.g. '1h'; omit or '0s' for permanent" }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_firewall_address_list:
+      method: PATCH
+      path: /ip/firewall/address-list/{id}
+      access: admin
+      description: "Update an existing address-list entry (address, list, timeout, comment)."
+      params:
+        id: { type: string, in: path, required: true }
+        list: { type: string, in: body }
+        address: { type: string, in: body }
+        timeout: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_firewall_address_list:
+      method: DELETE
+      path: /ip/firewall/address-list/{id}
+      access: admin
+      description: "Remove an entry from an address-list."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_firewall_connections:
+      method: GET
+      path: /ip/firewall/connection
+      access: read
+      description: >
+        List currently tracked connections (connection-tracking table). Key fields:
+        src-address, dst-address, protocol, tcp-state, timeout, orig-bytes,
+        repl-bytes, reply-src-address (for NAT), reply-dst-address.
+      params:
+        protocol: { type: string, in: query }
+
+    # =========================================================================
+    # IPv6
+    # =========================================================================
+
+    list_ipv6_addresses:
+      method: GET
+      path: /ipv6/address
+      access: read
+      description: "List configured IPv6 addresses. Includes link-local (FE80::/10), GUA, and ULA addresses."
+
+    add_ipv6_address:
+      method: PUT
+      path: /ipv6/address
+      access: write
+      description: "Assign an IPv6 address to an interface."
+      params:
+        address: { type: string, in: body, required: true, description: "IPv6 CIDR, e.g. '2001:db8::1/64'" }
+        interface: { type: string, in: body, required: true }
+        advertise: { type: string, in: body, description: "'yes' to include in RA" }
+        eui-64: { type: string, in: body, description: "'yes' to derive the host bits from the interface MAC" }
+        from-pool: { type: string, in: body, description: "Name of a /ipv6/pool to delegate from" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipv6_address:
+      method: PATCH
+      path: /ipv6/address/{id}
+      access: write
+      description: "Update an IPv6 address record."
+      params:
+        id: { type: string, in: path, required: true }
+        address: { type: string, in: body }
+        interface: { type: string, in: body }
+        advertise: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipv6_address:
+      method: DELETE
+      path: /ipv6/address/{id}
+      access: dangerous
+      description: "Remove an IPv6 address."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ipv6_routes:
+      method: GET
+      path: /ipv6/route
+      access: read
+      description: "List the IPv6 routing table."
+      params:
+        active: { type: string, in: query }
+        dst-address: { type: string, in: query }
+
+    add_ipv6_route:
+      method: PUT
+      path: /ipv6/route
+      access: write
+      description: "Add a static IPv6 route. Default route: dst-address='::/0' with a gateway."
+      params:
+        dst-address: { type: string, in: body, required: true }
+        gateway: { type: string, in: body, required: true }
+        distance: { type: string, in: body }
+        scope: { type: string, in: body }
+        target-scope: { type: string, in: body }
+        routing-mark: { type: string, in: body }
+        check-gateway: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipv6_route:
+      method: PATCH
+      path: /ipv6/route/{id}
+      access: write
+      description: "Update a static IPv6 route."
+      params:
+        id: { type: string, in: path, required: true }
+        dst-address: { type: string, in: body }
+        gateway: { type: string, in: body }
+        distance: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipv6_route:
+      method: DELETE
+      path: /ipv6/route/{id}
+      access: dangerous
+      description: "Delete a static IPv6 route."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ipv6_firewall_filter:
+      method: GET
+      path: /ipv6/firewall/filter
+      access: read
+      description: "List IPv6 firewall filter rules. Same chain/action semantics as IPv4."
+      params:
+        chain: { type: string, in: query }
+        action: { type: string, in: query }
+        disabled: { type: string, in: query }
+
+    add_ipv6_firewall_filter:
+      method: PUT
+      path: /ipv6/firewall/filter
+      access: admin
+      description: "Add an IPv6 firewall filter rule. Required: chain and action."
+      params:
+        chain: { type: string, in: body, required: true }
+        action: { type: string, in: body, required: true }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        src-address-list: { type: string, in: body }
+        dst-address-list: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        in-interface-list: { type: string, in: body }
+        out-interface: { type: string, in: body }
+        out-interface-list: { type: string, in: body }
+        connection-state: { type: string, in: body }
+        icmp-options: { type: string, in: body, description: "ICMPv6 type for action=accept of ND traffic" }
+        log: { type: string, in: body }
+        log-prefix: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipv6_firewall_filter:
+      method: PATCH
+      path: /ipv6/firewall/filter/{id}
+      access: admin
+      description: "Update an IPv6 firewall filter rule."
+      params:
+        id: { type: string, in: path, required: true }
+        chain: { type: string, in: body }
+        action: { type: string, in: body }
+        protocol: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        in-interface: { type: string, in: body }
+        out-interface: { type: string, in: body }
+        connection-state: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipv6_firewall_filter:
+      method: DELETE
+      path: /ipv6/firewall/filter/{id}
+      access: dangerous
+      description: "Delete an IPv6 firewall filter rule."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    move_ipv6_firewall_filter:
+      method: POST
+      path: /ipv6/firewall/filter/move
+      access: admin
+      description: "Reorder IPv6 filter rules. Move rule(s) in 'numbers' to position before 'destination'."
+      params:
+        numbers: { type: string, in: body, required: true }
+        destination: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_ipv6_neighbors:
+      method: GET
+      path: /ipv6/neighbor
+      access: read
+      description: "List the IPv6 neighbor table (NDP, equivalent to ARP for IPv6)."
+
+    list_ipv6_nd:
+      method: GET
+      path: /ipv6/nd
+      access: read
+      description: "List IPv6 Neighbor Discovery / Router Advertisement settings per interface (M, O flags, RA interval, RA lifetime, MTU). This controls RA SENDING (the device acting as an IPv6 router for its LAN), not RA receiving (SLAAC client behavior). For SLAAC client behavior, see get_ipv6_settings / set_ipv6_settings."
+
+    get_ipv6_settings:
+      method: GET
+      path: /ipv6/settings
+      access: read
+      description: >
+        Get the global IPv6 stack settings. Key fields: disable-ipv6 (yes/no),
+        forward (yes/no -- 'yes' makes the device a router; 'no' a host),
+        accept-router-advertisements (yes | no | yes-if-forwarding-disabled --
+        the last is the default and means the device accepts RAs only when
+        acting as a host), accept-redirects, max-neighbor-entries, soft-headers,
+        multipath-hash-policy. SLAAC client behavior requires forward='no' AND
+        accept-router-advertisements in {yes, yes-if-forwarding-disabled}.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ipv6_settings:
+      method: POST
+      path: /ipv6/settings/set
+      access: admin
+      description: >
+        Update global IPv6 settings. To enable SLAAC on a host/L2-switch:
+        {forward:'no', accept-router-advertisements:'yes'}. Note: changing
+        'forward' may affect routing behavior across all interfaces -- do this
+        only on devices that should NOT route IPv6 (e.g. switches, end hosts).
+      params:
+        disable-ipv6: { type: string, in: body, description: "'yes' disables IPv6 entirely" }
+        forward: { type: string, in: body, description: "'yes' router, 'no' host" }
+        accept-router-advertisements: { type: string, in: body, description: "yes | no | yes-if-forwarding-disabled" }
+        accept-redirects: { type: string, in: body, description: "yes | no | yes-if-forwarding-disabled" }
+        max-neighbor-entries: { type: string, in: body }
+        multipath-hash-policy: { type: string, in: body, description: "l3 | l4" }
+        soft-headers: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_ipv6_dhcp_clients:
+      method: GET
+      path: /ipv6/dhcp-client
+      access: read
+      description: >
+        List DHCPv6 clients (stateful IPv6 address/prefix from a DHCPv6 server).
+        SLAAC (RA-only) does NOT show up here -- only DHCPv6 client instances do.
+        Each entry has interface, request (address|prefix), status, address, prefix.
+
+    # =========================================================================
+    # PPP (PPPoE/L2TP/SSTP/PPTP/OpenVPN users)
+    # =========================================================================
+
+    list_ppp_secrets:
+      method: GET
+      path: /ppp/secret
+      access: read
+      description: "List PPP user accounts (used for PPPoE/L2TP/SSTP/PPTP/OVPN servers). Each has name, password (hidden), profile, service, local-address, remote-address."
+      params:
+        service: { type: string, in: query, description: "any|pppoe|l2tp|sstp|pptp|ovpn|async" }
+
+    add_ppp_secret:
+      method: PUT
+      path: /ppp/secret
+      access: admin
+      description: "Create a PPP user account."
+      params:
+        name: { type: string, in: body, required: true, description: "Username" }
+        password: { type: string, in: body, required: true }
+        profile: { type: string, in: body, default: "default" }
+        service: { type: string, in: body, description: "any|pppoe|l2tp|sstp|pptp|ovpn|async" }
+        local-address: { type: string, in: body }
+        remote-address: { type: string, in: body }
+        routes: { type: string, in: body, description: "Routes to push to the client" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ppp_secret:
+      method: PATCH
+      path: /ppp/secret/{id}
+      access: admin
+      description: "Update a PPP user (password, profile, service, addresses, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        password: { type: string, in: body }
+        profile: { type: string, in: body }
+        service: { type: string, in: body }
+        local-address: { type: string, in: body }
+        remote-address: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ppp_secret:
+      method: DELETE
+      path: /ppp/secret/{id}
+      access: admin
+      description: "Delete a PPP user account."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ppp_active:
+      method: GET
+      path: /ppp/active
+      access: read
+      description: "List currently connected PPP sessions (active PPPoE/L2TP/SSTP/PPTP/OVPN clients). Includes name, service, address, uptime, encoding, caller-id."
+
+    list_ppp_profiles:
+      method: GET
+      path: /ppp/profile
+      access: read
+      description: "List PPP profiles (templates for sessions: local-address, remote-address pool, dns-server, rate-limit, encryption)."
+
+    add_ppp_profile:
+      method: PUT
+      path: /ppp/profile
+      access: admin
+      description: "Create a PPP profile. Use to template L2TP/SSTP/PPTP/OVPN session settings (DNS, address pool, rate-limit, encryption)."
+      params:
+        name: { type: string, in: body, required: true }
+        local-address: { type: string, in: body, description: "Local tunnel IP or pool name" }
+        remote-address: { type: string, in: body, description: "Remote tunnel IP or pool name (e.g. 'vpn-pool')" }
+        dns-server: { type: string, in: body }
+        wins-server: { type: string, in: body }
+        rate-limit: { type: string, in: body, description: "rx-rate/tx-rate, e.g. '10M/10M'" }
+        use-encryption: { type: string, in: body, description: "yes | no | required (PPP-MPPE)" }
+        use-mpls: { type: string, in: body }
+        only-one: { type: string, in: body, description: "'yes' allows only one active session per user" }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ppp_profile:
+      method: PATCH
+      path: /ppp/profile/{id}
+      access: admin
+      description: "Update a PPP profile."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        local-address: { type: string, in: body }
+        remote-address: { type: string, in: body }
+        dns-server: { type: string, in: body }
+        wins-server: { type: string, in: body }
+        rate-limit: { type: string, in: body }
+        use-encryption: { type: string, in: body }
+        use-mpls: { type: string, in: body }
+        only-one: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ppp_profile:
+      method: DELETE
+      path: /ppp/profile/{id}
+      access: dangerous
+      description: "Delete a PPP profile. Cannot delete 'default' or 'default-encryption' built-in profiles."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ROUTING -- BGP, OSPF, routing table
+    # =========================================================================
+
+    list_routing_table:
+      method: GET
+      path: /routing/table
+      access: read
+      description: "List routing tables (multi-table support in RouterOS 7). Default is 'main'; custom tables used with routing-mark."
+
+    list_bgp_peers:
+      method: GET
+      path: /routing/bgp/connection
+      access: read
+      description: "List BGP peer connections (RouterOS 7 BGP). Each has name, remote.address, remote.as, local.address, local.role, established."
+
+    add_bgp_connection:
+      method: PUT
+      path: /routing/bgp/connection
+      access: admin
+      description: >
+        Add a BGP peer connection (RouterOS 7 BGP). Required: name and remote.address.
+        Use templates for common AS/role config and reference via 'template='.
+      params:
+        name: { type: string, in: body, required: true }
+        remote.address: { type: string, in: body, required: true }
+        remote.as: { type: string, in: body }
+        local.address: { type: string, in: body }
+        local.role: { type: string, in: body, description: "ibgp | ebgp | ebgp-multihop | rs | rs-client" }
+        template: { type: string, in: body, description: "Reference a /routing/bgp/template by name" }
+        router-id: { type: string, in: body }
+        connect: { type: string, in: body, description: "'yes' to actively initiate" }
+        listen: { type: string, in: body }
+        multihop: { type: string, in: body }
+        hold-time: { type: string, in: body }
+        keepalive-time: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_bgp_connection:
+      method: PATCH
+      path: /routing/bgp/connection/{id}
+      access: admin
+      description: "Update a BGP peer connection."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        remote.address: { type: string, in: body }
+        remote.as: { type: string, in: body }
+        local.address: { type: string, in: body }
+        local.role: { type: string, in: body }
+        template: { type: string, in: body }
+        hold-time: { type: string, in: body }
+        keepalive-time: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_bgp_connection:
+      method: DELETE
+      path: /routing/bgp/connection/{id}
+      access: dangerous
+      description: "Delete a BGP peer connection. Will tear down the BGP session immediately."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_bgp_sessions:
+      method: GET
+      path: /routing/bgp/session
+      access: read
+      description: "List currently established BGP sessions with state, uptime, prefix-count, last-error."
+
+    list_bgp_templates:
+      method: GET
+      path: /routing/bgp/template
+      access: read
+      description: "List BGP templates (reusable peer-config bundles). RouterOS 7 BGP requires at least one template — usually 'default'."
+
+    list_ospf_instances:
+      method: GET
+      path: /routing/ospf/instance
+      access: read
+      description: "List OSPF instances. Each has name, version, router-id, vrf."
+
+    add_ospf_instance:
+      method: PUT
+      path: /routing/ospf/instance
+      access: admin
+      description: "Create an OSPF instance (RouterOS 7). Required: name, router-id, version (default '2' for OSPFv2)."
+      params:
+        name: { type: string, in: body, required: true }
+        router-id: { type: string, in: body, required: true, description: "Dotted-quad, often a loopback IP" }
+        version: { type: string, in: body, default: "2", description: "2 = OSPFv2 (IPv4); 3 = OSPFv3 (IPv6)" }
+        vrf: { type: string, in: body, default: "main" }
+        redistribute: { type: string, in: body, description: "Comma-separated: connected,static,bgp,rip,fantasy" }
+        out-filter-chain: { type: string, in: body }
+        in-filter-chain: { type: string, in: body }
+        originate-default: { type: string, in: body, description: "never | always | if-installed" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ospf_instance:
+      method: DELETE
+      path: /routing/ospf/instance/{id}
+      access: dangerous
+      description: "Delete an OSPF instance. All adjacencies in this instance go down."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ospf_areas:
+      method: GET
+      path: /routing/ospf/area
+      access: read
+      description: "List OSPF areas. Each binds an instance to an area-id and type (default | stub | nssa | backbone)."
+
+    add_ospf_area:
+      method: PUT
+      path: /routing/ospf/area
+      access: admin
+      description: "Create an OSPF area (RouterOS 7)."
+      params:
+        name: { type: string, in: body, required: true }
+        instance: { type: string, in: body, required: true }
+        area-id: { type: string, in: body, required: true, description: "Dotted-quad, e.g. '0.0.0.0' for backbone" }
+        type: { type: string, in: body, default: "default", description: "default | stub | nssa | backbone" }
+        no-summaries: { type: string, in: body }
+        default-cost: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ospf_area:
+      method: DELETE
+      path: /routing/ospf/area/{id}
+      access: dangerous
+      description: "Delete an OSPF area."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ospf_interface_templates:
+      method: GET
+      path: /routing/ospf/interface-template
+      access: read
+      description: "List OSPF interface templates (which interfaces speak OSPF, in which area, with which cost/network type)."
+
+    list_ospf_neighbors:
+      method: GET
+      path: /routing/ospf/neighbor
+      access: read
+      description: "List OSPF neighbors with router-id, address, area, state (Down|Init|2-Way|ExStart|Exchange|Loading|Full), priority."
+
+    list_routing_filters:
+      method: GET
+      path: /routing/filter/rule
+      access: read
+      description: >
+        List routing-filter rules (RouterOS 7 unified filter system). Each rule
+        belongs to a chain (referenced from BGP/OSPF in/out filter-chain fields).
+        Fields: chain, rule (filter DSL: 'if (...) {...}'), comment, disabled.
+
+    add_routing_filter:
+      method: PUT
+      path: /routing/filter/rule
+      access: admin
+      description: >
+        Add a routing-filter rule. RouterOS 7 uses a unified rule DSL across
+        all protocols. Example: chain='bgp-in', rule='if (dst in 0.0.0.0/0)
+        { accept } reject'. Rules in a chain are evaluated top-to-bottom.
+      params:
+        chain: { type: string, in: body, required: true }
+        rule: { type: string, in: body, required: true, description: "Filter DSL expression" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_routing_filter:
+      method: PATCH
+      path: /routing/filter/rule/{id}
+      access: admin
+      description: "Update a routing-filter rule."
+      params:
+        id: { type: string, in: path, required: true }
+        chain: { type: string, in: body }
+        rule: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_routing_filter:
+      method: DELETE
+      path: /routing/filter/rule/{id}
+      access: dangerous
+      description: "Delete a routing-filter rule. Removing a deny-all leaf can flood the route table — audit first."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # QUEUES -- traffic shaping (simple queues + queue tree)
+    # =========================================================================
+
+    list_simple_queues:
+      method: GET
+      path: /queue/simple
+      access: read
+      description: "List simple queues (per-IP/per-subnet bandwidth limits). Each has name, target (IP/CIDR/interface), max-limit, burst-limit, parent, queue (queue-type)."
+
+    add_simple_queue:
+      method: PUT
+      path: /queue/simple
+      access: write
+      description: "Add a simple queue for bandwidth shaping."
+      params:
+        name: { type: string, in: body, required: true }
+        target: { type: string, in: body, required: true, description: "IP, CIDR, or interface name, e.g. '192.168.1.10/32'" }
+        max-limit: { type: string, in: body, required: true, description: "Format '<upload>/<download>' in bps, e.g. '10M/100M'" }
+        burst-limit: { type: string, in: body, description: "Same format as max-limit" }
+        burst-threshold: { type: string, in: body }
+        burst-time: { type: string, in: body }
+        parent: { type: string, in: body, default: "none" }
+        priority: { type: string, in: body, default: "8/8" }
+        queue: { type: string, in: body, description: "queue-type, e.g. 'default-small/default-small'" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_simple_queue:
+      method: PATCH
+      path: /queue/simple/{id}
+      access: write
+      description: "Update a simple queue."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        target: { type: string, in: body }
+        max-limit: { type: string, in: body }
+        burst-limit: { type: string, in: body }
+        priority: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_simple_queue:
+      method: DELETE
+      path: /queue/simple/{id}
+      access: write
+      description: "Remove a simple queue."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_queue_tree:
+      method: GET
+      path: /queue/tree
+      access: read
+      description: "List queue tree entries (HTB-based hierarchical shaping using packet marks from mangle)."
+
+    list_queue_types:
+      method: GET
+      path: /queue/type
+      access: read
+      description: "List queue disciplines (default-small, default, ethernet-default, wireless-default, fq-codel, cake, pcq, sfq, red, pfifo, bfifo)."
+
+    # =========================================================================
+    # TOOLS -- ping, traceroute, bandwidth, netwatch, email
+    # =========================================================================
+
+    ping:
+      method: POST
+      path: /ping
+      access: read
+      description: >
+        Send ICMP echo requests to a target. CRITICAL: always pass count (1-10) to
+        bound runtime -- the REST API has a 60s hard timeout. Each iteration is
+        returned as one object in the response array.
+      params:
+        address: { type: string, in: body, required: true, description: "Target IP or hostname" }
+        count: { type: string, in: body, required: true, default: "4", description: "Number of pings (1-10 typical)" }
+        size: { type: string, in: body, description: "Packet size bytes, default 56" }
+        interface: { type: string, in: body, description: "Source interface" }
+        src-address: { type: string, in: body }
+        do-not-fragment: { type: string, in: body }
+        ttl: { type: string, in: body }
+        interval: { type: string, in: body, description: "Seconds between pings (default 1s)" }
+      pagination: none
+
+    traceroute:
+      method: POST
+      path: /tool/traceroute
+      access: read
+      description: >
+        Trace the network path to a target. ALWAYS set count and timeout to bound
+        runtime. Returns one row per hop with address, loss, sent, last, avg, best, worst.
+      params:
+        address: { type: string, in: body, required: true }
+        count: { type: string, in: body, default: "1", description: "Probes per hop" }
+        max-hops: { type: string, in: body, default: "30" }
+        timeout: { type: string, in: body, default: "1s" }
+        src-address: { type: string, in: body }
+        use-dns: { type: string, in: body, description: "'yes' to resolve hops to hostnames" }
+        protocol: { type: string, in: body, description: "icmp|udp|tcp (default udp)" }
+        port: { type: string, in: body }
+      pagination: none
+
+    bandwidth_test:
+      method: POST
+      path: /tool/bandwidth-test
+      access: admin
+      description: >
+        Run a bandwidth test against another MikroTik device (target must run
+        bandwidth-server). ALWAYS pass duration to bound runtime. Resource-intensive.
+      params:
+        address: { type: string, in: body, required: true, description: "Remote MikroTik IP" }
+        duration: { type: string, in: body, required: true, default: "5s", description: "e.g. '5s', '30s', '2m'" }
+        protocol: { type: string, in: body, default: "udp", description: "udp | tcp" }
+        direction: { type: string, in: body, default: "receive", description: "send | receive | both" }
+        user: { type: string, in: body, description: "Bandwidth-server username" }
+        password: { type: string, in: body }
+        local-tx-speed: { type: string, in: body }
+        remote-tx-speed: { type: string, in: body }
+      pagination: none
+
+    list_netwatch:
+      method: GET
+      path: /tool/netwatch
+      access: read
+      description: "List netwatch monitors (ICMP/TCP/HTTP/HTTPS uptime checks against external hosts). Each has host, status (up|unknown|down), type, since."
+
+    add_netwatch:
+      method: PUT
+      path: /tool/netwatch
+      access: write
+      description: "Create a netwatch monitor."
+      params:
+        host: { type: string, in: body, required: true, description: "Target IP or hostname" }
+        type: { type: string, in: body, default: "simple", description: "simple (ICMP) | icmp | tcp-conn | http-get | https-get | dns" }
+        interval: { type: string, in: body, default: "10s" }
+        timeout: { type: string, in: body, default: "1s" }
+        up-script: { type: string, in: body, description: "Inline RouterOS script run on up transition" }
+        down-script: { type: string, in: body, description: "Inline RouterOS script run on down transition" }
+        port: { type: string, in: body, description: "For tcp-conn type" }
+        http-codes: { type: string, in: body, description: "For http(s)-get types, e.g. '200'" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_netwatch:
+      method: PATCH
+      path: /tool/netwatch/{id}
+      access: write
+      description: "Update a netwatch monitor (host, type, interval, scripts, port, http-codes, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        host: { type: string, in: body }
+        type: { type: string, in: body }
+        interval: { type: string, in: body }
+        timeout: { type: string, in: body }
+        up-script: { type: string, in: body }
+        down-script: { type: string, in: body }
+        port: { type: string, in: body }
+        http-codes: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_netwatch:
+      method: DELETE
+      path: /tool/netwatch/{id}
+      access: write
+      description: "Remove a netwatch monitor."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_settings:
+      method: GET
+      path: /tool/e-mail
+      access: read
+      description: >
+        Get the SMTP client settings. Singleton — required for send_email and
+        for the 'email' /system/logging/action. Fields: server, port, start-tls,
+        user, password (hidden), from, vrf.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_email_settings:
+      method: POST
+      path: /tool/e-mail/set
+      access: admin
+      description: >
+        Update the SMTP client settings. RouterOS 7.13+ uses the field 'tls'
+        (no | starttls | tls-only); older releases used 'start-tls' as a
+        boolean — both are accepted on 7.13+ for backward compatibility but
+        prefer 'tls'. STARTTLS submission (port 587):
+        {server:'smtp.example.com', port:'587', tls:'starttls', user:'noreply@x',
+        password:'<pwd>', from:'router@x'}. Implicit TLS (port 465):
+        tls='tls-only'. Cleartext (port 25): tls='no'.
+      params:
+        server: { type: string, in: body, description: "SMTP host IP or FQDN" }
+        port: { type: string, in: body, description: "SMTP port (587 STARTTLS, 465 implicit-TLS, 25 cleartext)" }
+        tls: { type: string, in: body, description: "no | starttls | tls-only (RouterOS 7.13+)" }
+        start-tls: { type: string, in: body, description: "Legacy boolean alias for 'tls'; accept 'yes' (STARTTLS) | 'no'. Prefer 'tls' on RouterOS 7.13+." }
+        user: { type: string, in: body }
+        password: { type: string, in: body }
+        from: { type: string, in: body, description: "RFC-5322 From: address" }
+        vrf: { type: string, in: body }
+        certificate-verification: { type: string, in: body, description: "'yes' to validate TLS certificate against trust store" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    send_email:
+      method: POST
+      path: /tool/e-mail/send
+      access: admin
+      description: "Send an email via the configured /tool/e-mail SMTP settings. Useful for alerting from scripts/scheduler."
+      params:
+        to: { type: string, in: body, required: true }
+        cc: { type: string, in: body }
+        subject: { type: string, in: body, required: true }
+        body: { type: string, in: body }
+        file: { type: string, in: body, description: "Attach file from /file" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # USERS / GROUPS
+    # =========================================================================
+
+    list_users:
+      method: GET
+      path: /user
+      access: admin
+      description: "List local user accounts. Each has name, group, address (allowed source CIDR), last-logged-in, disabled."
+
+    get_user:
+      method: GET
+      path: /user/{id}
+      access: admin
+      description: "Get a single user by name or .id."
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_user:
+      method: PUT
+      path: /user
+      access: admin
+      description: "Create a local user."
+      params:
+        name: { type: string, in: body, required: true }
+        password: { type: string, in: body, required: true }
+        group: { type: string, in: body, required: true, description: "read | write | full | <custom group name>" }
+        address: { type: string, in: body, description: "Comma-separated source CIDRs allowed to log in as this user" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_user:
+      method: PATCH
+      path: /user/{id}
+      access: admin
+      description: "Update a user (password, group, source restriction, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        password: { type: string, in: body }
+        group: { type: string, in: body }
+        address: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_user:
+      method: DELETE
+      path: /user/{id}
+      access: dangerous
+      description: "Delete a user. Cannot delete the user you're authenticated as."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_user_groups:
+      method: GET
+      path: /user/group
+      access: admin
+      description: "List user groups (named bundles of policies). Default groups: read, write, full. Each has name and policy field (comma-separated)."
+
+    add_user_group:
+      method: PUT
+      path: /user/group
+      access: admin
+      description: "Create a custom user group with specific policies."
+      params:
+        name: { type: string, in: body, required: true }
+        policy: { type: string, in: body, required: true, description: "Comma-separated: api, read, write, policy, test, winbox, password, sniff, sensitive, romon, reboot, ftp, web, dude, tikapp" }
+        skin: { type: string, in: body, default: "default" }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_user_group:
+      method: PATCH
+      path: /user/group/{id}
+      access: admin
+      description: "Update an existing user group's policies, skin, or comment. Cannot rename built-in 'read', 'write', 'full' groups."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        policy: { type: string, in: body }
+        skin: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_user_group:
+      method: DELETE
+      path: /user/group/{id}
+      access: dangerous
+      description: "Delete a custom user group. Built-in groups (read/write/full) cannot be deleted. Users assigned to a deleted group are orphaned — re-assign first."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_active_users:
+      method: GET
+      path: /user/active
+      access: admin
+      description: "List currently authenticated user sessions. Includes name, address (source IP), via (ssh|winbox|webfig|api|rest|console), when."
+
+    list_user_ssh_keys:
+      method: GET
+      path: /user/ssh-keys
+      access: admin
+      description: "List installed SSH public keys for user authentication."
+
+    import_user_ssh_key:
+      method: POST
+      path: /user/ssh-keys/import
+      access: admin
+      description: "Import an SSH public key from a file in /file for a user."
+      params:
+        user: { type: string, in: body, required: true }
+        public-key-file: { type: string, in: body, required: true, description: "Filename in /file" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # CERTIFICATES
+    # =========================================================================
+
+    list_certificates:
+      method: GET
+      path: /certificate
+      access: read
+      description: "List installed certificates and CAs. Each has name, common-name, subject-alt-name, issuer, expires-after, days-valid, fingerprint, private-key (yes/no)."
+
+    sign_certificate:
+      method: POST
+      path: /certificate/sign
+      access: admin
+      description: "Sign a certificate request with a CA certificate. Used in PKI workflows."
+      params:
+        number: { type: string, in: body, required: true, description: "Cert template .id or name" }
+        ca: { type: string, in: body, description: "Signing CA name" }
+        name: { type: string, in: body, description: "Output certificate name" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    import_certificate:
+      method: POST
+      path: /certificate/import
+      access: admin
+      description: "Import a certificate from a file in /file (PEM or PKCS#12)."
+      params:
+        file-name: { type: string, in: body, required: true, description: "Filename in /file" }
+        passphrase: { type: string, in: body, description: "For encrypted PKCS#12" }
+        name: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FILES, LOGS, SNMP
+    # =========================================================================
+
+    list_files:
+      method: GET
+      path: /file
+      access: read
+      description: "List files stored on the device flash. Includes name, type (file|directory|disk|.backup|.rsc|.crt|.key|.umb), size, creation-time."
+
+    delete_file:
+      method: DELETE
+      path: /file/{id}
+      access: admin
+      description: "Delete a file from device flash. Cannot delete in-use files."
+      params:
+        id: { type: string, in: path, required: true, description: "File .id or full filename" }
+      pagination: none
+
+    list_logs:
+      method: GET
+      path: /log
+      access: read
+      description: >
+        List system log entries. Each has time, topics (e.g. 'system,info'),
+        message. Logs are circular -- old entries are overwritten. Filter by
+        topics= via query for targeted lookups.
+      params:
+        topics: { type: string, in: query, description: "Comma-separated topics, e.g. 'system' or 'dhcp'" }
+      response:
+        result_path: "$"
+        max_items: 200
+
+    # =========================================================================
+    # SYSTEM LOGGING -- rules and actions (Graylog/syslog forwarding lives here)
+    # =========================================================================
+
+    list_logging_rules:
+      method: GET
+      path: /system/logging
+      access: read
+      description: >
+        List logging rules — each routes a topic pattern to an action.
+        Fields: topics (comma-separated AND-list, '!' to negate),
+        action (action name, e.g. 'memory', 'remote', 'graylog'), prefix,
+        regex, disabled. Rules are evaluated for every log line; matching is
+        a logical OR across multiple rules.
+
+    add_logging_rule:
+      method: PUT
+      path: /system/logging
+      access: admin
+      description: >
+        Add a logging rule. Most common pattern for remote forwarding:
+        {topics:'', action:'remote'} forwards EVERY topic to the remote action.
+        Narrower: {topics:'system,info', action:'graylog'} forwards only
+        system-info lines. Negation: {topics:'firewall,!debug', ...} excludes
+        debug-severity firewall messages.
+      params:
+        topics: { type: string, in: body, description: "Comma-separated topic AND-list, '!' to negate. Empty string matches ALL." }
+        action: { type: string, in: body, required: true, description: "Action name (defaults: memory|disk|echo|remote|email or your custom action)" }
+        prefix: { type: string, in: body, description: "String prepended to each message" }
+        regex: { type: string, in: body, description: "Match only messages matching this regex" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_logging_rule:
+      method: PATCH
+      path: /system/logging/{id}
+      access: admin
+      description: "Update a logging rule (topics, action, prefix, regex, comment, disabled)."
+      params:
+        id: { type: string, in: path, required: true }
+        topics: { type: string, in: body }
+        action: { type: string, in: body }
+        prefix: { type: string, in: body }
+        regex: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_logging_rule:
+      method: DELETE
+      path: /system/logging/{id}
+      access: admin
+      description: "Delete a logging rule. The 5 default actions remain available; only your custom rules are removed."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_logging_actions:
+      method: GET
+      path: /system/logging/action
+      access: read
+      description: >
+        List logging actions — destinations for log lines. RouterOS ships with
+        5 default actions that CANNOT be deleted or renamed: memory, disk,
+        echo, remote, email. Add new actions for additional targets (multiple
+        Graylog inputs, secondary syslog, etc.).
+
+    add_logging_action:
+      method: PUT
+      path: /system/logging/action
+      access: admin
+      description: >
+        Add a logging action (destination). Common pattern for Graylog (CEF
+        over TCP): {name:'graylog', target:'remote', remote:'192.168.100.15',
+        remote-port:'514', remote-protocol:'tcp', remote-log-format:'cef',
+        syslog-time-format:'iso8601'}. For a second memory ring buffer:
+        {name:'audit', target:'memory', memory-lines:'5000'}.
+      params:
+        name: { type: string, in: body, required: true, description: "Unique name; cannot collide with built-ins memory/disk/echo/remote/email" }
+        target: { type: string, in: body, required: true, description: "memory | disk | echo | remote | email" }
+        remote: { type: string, in: body, description: "Remote syslog host (IP or FQDN) — when target=remote" }
+        remote-port: { type: string, in: body, description: "Default 514" }
+        remote-protocol: { type: string, in: body, description: "udp | tcp | tls (default udp)" }
+        remote-log-format: { type: string, in: body, description: "default | cef. EMPIRICALLY (RouterOS 7.22.3) only these two values are accepted -- 'bsd-syslog' / 'iso8601' / 'local7' are NOT valid here (HTTP 400). RFC 3164 wrapping is controlled by the separate 'bsd-syslog' boolean flag, ISO 8601 timestamps by 'syslog-time-format'. 'cef' (RouterOS 7.18+) ONLY when the receiver has an explicit CEF parser. Note: 'default' format sends WITHOUT a syslog PRI header, so downstream syslog daemons cannot derive severity -- set bsd-syslog='yes' for FluentD/rsyslog severity routing." }
+        src-address: { type: string, in: body }
+        syslog-facility: { type: string, in: body, description: "auth | daemon | local0..7 (default daemon)" }
+        syslog-severity: { type: string, in: body, description: "auto | alert | critical | debug | error | info | warning" }
+        syslog-time-format: { type: string, in: body, description: "bsd-syslog | iso8601" }
+        vrf: { type: string, in: body }
+        memory-lines: { type: string, in: body }
+        memory-stop-on-full: { type: string, in: body }
+        disk-file-name: { type: string, in: body }
+        disk-lines-per-file: { type: string, in: body }
+        disk-file-count: { type: string, in: body }
+        disk-stop-on-full: { type: string, in: body }
+        email-to: { type: string, in: body }
+        email-cc: { type: string, in: body }
+        email-start-tls: { type: string, in: body }
+        bsd-syslog: { type: string, in: body }
+        check-certificate: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_logging_action:
+      method: PATCH
+      path: /system/logging/action/{id}
+      access: admin
+      description: >
+        Update a custom logging action. NOTE: for the 5 built-in actions
+        (memory, disk, echo, remote, email) PATCH on the path is unreliable —
+        use set_logging_action with numbers='remote' (etc.) instead.
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        target: { type: string, in: body }
+        remote: { type: string, in: body }
+        remote-port: { type: string, in: body }
+        remote-protocol: { type: string, in: body }
+        remote-log-format: { type: string, in: body }
+        src-address: { type: string, in: body }
+        syslog-facility: { type: string, in: body }
+        syslog-severity: { type: string, in: body }
+        syslog-time-format: { type: string, in: body }
+        vrf: { type: string, in: body }
+        memory-lines: { type: string, in: body }
+        disk-file-name: { type: string, in: body }
+        disk-lines-per-file: { type: string, in: body }
+        disk-file-count: { type: string, in: body }
+        email-to: { type: string, in: body }
+        email-cc: { type: string, in: body }
+        email-start-tls: { type: string, in: body }
+        check-certificate: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_logging_action:
+      method: POST
+      path: /system/logging/action/set
+      access: admin
+      description: >
+        Atomically update one or more logging actions via CLI-style
+        '/system/logging/action set'. THIS IS THE WAY to re-aim the built-in
+        'remote' or 'email' actions: {numbers:'remote', remote:'10.0.0.5',
+        remote-protocol:'tcp', remote-log-format:'cef'} — the built-ins can be
+        re-configured but not renamed/deleted. Reference via 'numbers' (action
+        name or .id).
+      params:
+        numbers: { type: string, in: body, required: true }
+        target: { type: string, in: body }
+        remote: { type: string, in: body }
+        remote-port: { type: string, in: body }
+        remote-protocol: { type: string, in: body }
+        remote-log-format: { type: string, in: body }
+        src-address: { type: string, in: body }
+        syslog-facility: { type: string, in: body }
+        syslog-severity: { type: string, in: body }
+        syslog-time-format: { type: string, in: body }
+        vrf: { type: string, in: body }
+        memory-lines: { type: string, in: body }
+        disk-file-name: { type: string, in: body }
+        disk-lines-per-file: { type: string, in: body }
+        disk-file-count: { type: string, in: body }
+        email-to: { type: string, in: body }
+        email-start-tls: { type: string, in: body }
+        check-certificate: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_logging_action:
+      method: DELETE
+      path: /system/logging/action/{id}
+      access: dangerous
+      description: "Delete a custom logging action. The 5 default actions (memory/disk/echo/remote/email) cannot be deleted."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_snmp_settings:
+      method: GET
+      path: /snmp
+      access: read
+      description: "Get SNMP agent settings: enabled, contact, location, engine-id, src-address, trap-target."
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_snmp_settings:
+      method: POST
+      path: /snmp/set
+      access: admin
+      description: "Update SNMP agent settings."
+      params:
+        enabled: { type: string, in: body }
+        contact: { type: string, in: body }
+        location: { type: string, in: body }
+        trap-version: { type: string, in: body, description: "1 | 2 | 3" }
+        trap-target: { type: string, in: body }
+        trap-community: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_snmp_communities:
+      method: GET
+      path: /snmp/community
+      access: admin
+      description: "List SNMP v1/v2c communities and v3 users. Includes name, addresses (source CIDRs), security, read-access, write-access."
+
+    # =========================================================================
+    # VPN SERVER SINGLETONS -- L2TP / SSTP / PPTP / OVPN
+    # Each has a server config (singleton via /set) + per-user accounts in /ppp/secret
+    # =========================================================================
+
+    get_l2tp_server:
+      method: GET
+      path: /interface/l2tp-server/server
+      access: read
+      description: "Get L2TP server config (singleton). Fields: enabled, max-mtu, max-mru, mrru, authentication (comma list of mschap2,mschap1,chap,pap), default-profile, use-ipsec ('no'|'yes'|'required'), ipsec-secret, caller-id-type, allow-fast-path."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_l2tp_server:
+      method: POST
+      path: /interface/l2tp-server/server/set
+      access: admin
+      description: >
+        Update L2TP server config. To enable plain L2TP: {enabled:'yes',
+        authentication:'mschap2', default-profile:'default-encryption'}.
+        For L2TP/IPsec: {enabled:'yes', use-ipsec:'required', ipsec-secret:'<psk>'}.
+        Per-user accounts live in /ppp/secret with service='l2tp'.
+      params:
+        enabled: { type: string, in: body }
+        max-mtu: { type: string, in: body }
+        max-mru: { type: string, in: body }
+        mrru: { type: string, in: body }
+        authentication: { type: string, in: body }
+        default-profile: { type: string, in: body }
+        use-ipsec: { type: string, in: body, description: "no | yes | required" }
+        ipsec-secret: { type: string, in: body }
+        caller-id-type: { type: string, in: body }
+        allow-fast-path: { type: string, in: body }
+        keepalive-timeout: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_sstp_server:
+      method: GET
+      path: /interface/sstp-server/server
+      access: read
+      description: "Get SSTP server config (singleton). Fields: enabled, port, certificate, authentication, default-profile, max-mtu, max-mru, mrru, tls-version, verify-client-certificate, force-aes."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_sstp_server:
+      method: POST
+      path: /interface/sstp-server/server/set
+      access: admin
+      description: >
+        Update SSTP server config. Required: a TLS certificate (certificate=<name>).
+        Default port is 443 — make sure it does NOT collide with www-ssl
+        (REST API). Common: {enabled:'yes', certificate:'sstp-cert', port:'8443',
+        authentication:'mschap2', default-profile:'default-encryption'}.
+      params:
+        enabled: { type: string, in: body }
+        port: { type: string, in: body }
+        certificate: { type: string, in: body }
+        authentication: { type: string, in: body }
+        default-profile: { type: string, in: body }
+        max-mtu: { type: string, in: body }
+        max-mru: { type: string, in: body }
+        mrru: { type: string, in: body }
+        tls-version: { type: string, in: body }
+        verify-client-certificate: { type: string, in: body }
+        force-aes: { type: string, in: body }
+        pfs: { type: string, in: body }
+        keepalive-timeout: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_pptp_server:
+      method: GET
+      path: /interface/pptp-server/server
+      access: read
+      description: "Get PPTP server config (singleton). Fields: enabled, max-mtu, max-mru, mrru, authentication, default-profile, keepalive-timeout. NOTE: PPTP is cryptographically broken — use L2TP/IPsec, SSTP, or WireGuard for new deployments."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_pptp_server:
+      method: POST
+      path: /interface/pptp-server/server/set
+      access: admin
+      description: "Update PPTP server config. Discouraged for new deployments."
+      params:
+        enabled: { type: string, in: body }
+        max-mtu: { type: string, in: body }
+        max-mru: { type: string, in: body }
+        mrru: { type: string, in: body }
+        authentication: { type: string, in: body }
+        default-profile: { type: string, in: body }
+        keepalive-timeout: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ovpn_server:
+      method: GET
+      path: /interface/ovpn-server/server
+      access: read
+      description: "Get OpenVPN server config (singleton). Fields: enabled, port, mode, netmask, mac-address, max-mtu, certificate, require-client-certificate, auth (md5|sha1|sha256|sha512), cipher (blowfish128|aes128-cbc|aes192-cbc|aes256-cbc|aes128-gcm|aes192-gcm|aes256-gcm), default-profile, tls-version, redirect-gateway."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ovpn_server:
+      method: POST
+      path: /interface/ovpn-server/server/set
+      access: admin
+      description: >
+        Update OpenVPN server config. RouterOS supports TCP only (no UDP).
+        Modern interop: {enabled:'yes', mode:'ip', port:'1194', certificate:'ovpn-cert',
+        require-client-certificate:'yes', auth:'sha256', cipher:'aes256-gcm,aes256-cbc',
+        default-profile:'default-encryption'}.
+      params:
+        enabled: { type: string, in: body }
+        port: { type: string, in: body }
+        mode: { type: string, in: body, description: "ip (TUN) | ethernet (TAP)" }
+        netmask: { type: string, in: body }
+        mac-address: { type: string, in: body }
+        max-mtu: { type: string, in: body }
+        certificate: { type: string, in: body }
+        require-client-certificate: { type: string, in: body }
+        auth: { type: string, in: body }
+        cipher: { type: string, in: body }
+        default-profile: { type: string, in: body }
+        tls-version: { type: string, in: body }
+        redirect-gateway: { type: string, in: body }
+        protocol: { type: string, in: body, description: "tcp (only on RouterOS); some builds expose 'udp' as a no-op" }
+        keepalive-timeout: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # IPSEC -- peers, identities, profiles, policies, proposals, SAs
+    # =========================================================================
+
+    list_ipsec_peers:
+      method: GET
+      path: /ip/ipsec/peer
+      access: read
+      description: "List IPsec peers. Each peer = remote endpoint + auth method + exchange-mode. Fields: name, address, profile, exchange-mode (ike2 recommended), passive, send-initial-contact, comment, disabled."
+
+    add_ipsec_peer:
+      method: PUT
+      path: /ip/ipsec/peer
+      access: admin
+      description: "Add an IPsec peer. For IKEv2 modern setup: {name:'site-a', address:'203.0.113.5/32', profile:'default', exchange-mode:'ike2'}."
+      params:
+        name: { type: string, in: body, required: true }
+        address: { type: string, in: body, description: "Peer IP/CIDR (use 0.0.0.0/0 for road-warrior responders)" }
+        profile: { type: string, in: body, default: "default" }
+        exchange-mode: { type: string, in: body, default: "ike2", description: "ike2 | main | aggressive (legacy)" }
+        passive: { type: string, in: body }
+        send-initial-contact: { type: string, in: body }
+        local-address: { type: string, in: body }
+        port: { type: string, in: body, default: "500" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipsec_peer:
+      method: PATCH
+      path: /ip/ipsec/peer/{id}
+      access: admin
+      description: "Update an IPsec peer."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        address: { type: string, in: body }
+        profile: { type: string, in: body }
+        exchange-mode: { type: string, in: body }
+        passive: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipsec_peer:
+      method: DELETE
+      path: /ip/ipsec/peer/{id}
+      access: dangerous
+      description: "Delete an IPsec peer. Tears down all SAs to that peer."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ipsec_identities:
+      method: GET
+      path: /ip/ipsec/identity
+      access: read
+      description: "List IPsec identities — bind peers to auth credentials + mode-config + policy template."
+
+    add_ipsec_identity:
+      method: PUT
+      path: /ip/ipsec/identity
+      access: admin
+      description: "Add an IPsec identity (peer + auth credentials). For PSK: {peer:'site-a', auth-method:'pre-shared-key', secret:'<psk>'}. For IKEv2 EAP: {peer:'rw', auth-method:'eap', eap-methods:'eap-mschapv2', username:'alice', password:'<pwd>'}."
+      params:
+        peer: { type: string, in: body, required: true }
+        auth-method: { type: string, in: body, default: "pre-shared-key", description: "pre-shared-key | pre-shared-key-xauth | digital-signature | rsa-signature | rsa-key | eap | eap-radius" }
+        secret: { type: string, in: body, description: "Pre-shared key (for PSK methods)" }
+        username: { type: string, in: body }
+        password: { type: string, in: body }
+        certificate: { type: string, in: body }
+        remote-certificate: { type: string, in: body }
+        eap-methods: { type: string, in: body }
+        my-id: { type: string, in: body, description: "auto | address | user-fqdn:<x> | fqdn:<x> | key-id:<x>" }
+        remote-id: { type: string, in: body }
+        match-by: { type: string, in: body, description: "remote-id | certificate" }
+        mode-config: { type: string, in: body, description: "Reference an /ip/ipsec/mode-config name" }
+        policy-template-group: { type: string, in: body, default: "default" }
+        notrack-chain: { type: string, in: body }
+        generate-policy: { type: string, in: body, description: "no | port-override | port-strict" }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipsec_identity:
+      method: PATCH
+      path: /ip/ipsec/identity/{id}
+      access: admin
+      description: "Update an IPsec identity."
+      params:
+        id: { type: string, in: path, required: true }
+        peer: { type: string, in: body }
+        auth-method: { type: string, in: body }
+        secret: { type: string, in: body }
+        username: { type: string, in: body }
+        password: { type: string, in: body }
+        certificate: { type: string, in: body }
+        my-id: { type: string, in: body }
+        remote-id: { type: string, in: body }
+        mode-config: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipsec_identity:
+      method: DELETE
+      path: /ip/ipsec/identity/{id}
+      access: dangerous
+      description: "Delete an IPsec identity."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ipsec_profiles:
+      method: GET
+      path: /ip/ipsec/profile
+      access: read
+      description: "List IPsec IKE profiles (Phase-1 / IKE_SA_INIT proposals). Each has name, hash-algorithm, enc-algorithm, dh-group, lifetime, nat-traversal."
+
+    add_ipsec_profile:
+      method: PUT
+      path: /ip/ipsec/profile
+      access: admin
+      description: "Add an IPsec profile. Modern IKEv2: {name:'strong', hash-algorithm:'sha256', enc-algorithm:'aes-256', dh-group:'modp2048,ecp256', lifetime:'1d', nat-traversal:'yes'}."
+      params:
+        name: { type: string, in: body, required: true }
+        hash-algorithm: { type: string, in: body }
+        enc-algorithm: { type: string, in: body }
+        dh-group: { type: string, in: body }
+        lifetime: { type: string, in: body }
+        nat-traversal: { type: string, in: body }
+        prf-algorithm: { type: string, in: body }
+        dpd-interval: { type: string, in: body }
+        dpd-maximum-failures: { type: string, in: body }
+        proposal-check: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipsec_profile:
+      method: PATCH
+      path: /ip/ipsec/profile/{id}
+      access: admin
+      description: "Update an IPsec profile."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        hash-algorithm: { type: string, in: body }
+        enc-algorithm: { type: string, in: body }
+        dh-group: { type: string, in: body }
+        lifetime: { type: string, in: body }
+        nat-traversal: { type: string, in: body }
+        dpd-interval: { type: string, in: body }
+        proposal-check: { type: string, in: body }
+        comment: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipsec_profile:
+      method: DELETE
+      path: /ip/ipsec/profile/{id}
+      access: dangerous
+      description: "Delete an IPsec profile. Cannot delete 'default'."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ipsec_proposals:
+      method: GET
+      path: /ip/ipsec/proposal
+      access: read
+      description: "List IPsec ESP/AH proposals (Phase-2 / CHILD_SA crypto). Each has name, auth-algorithms, enc-algorithms, pfs-group, lifetime."
+
+    add_ipsec_proposal:
+      method: PUT
+      path: /ip/ipsec/proposal
+      access: admin
+      description: "Add an IPsec ESP/AH proposal."
+      params:
+        name: { type: string, in: body, required: true }
+        auth-algorithms: { type: string, in: body }
+        enc-algorithms: { type: string, in: body }
+        pfs-group: { type: string, in: body }
+        lifetime: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipsec_proposal:
+      method: PATCH
+      path: /ip/ipsec/proposal/{id}
+      access: admin
+      description: "Update an IPsec proposal."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        auth-algorithms: { type: string, in: body }
+        enc-algorithms: { type: string, in: body }
+        pfs-group: { type: string, in: body }
+        lifetime: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipsec_proposal:
+      method: DELETE
+      path: /ip/ipsec/proposal/{id}
+      access: dangerous
+      description: "Delete an IPsec proposal. Cannot delete 'default'."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ipsec_policies:
+      method: GET
+      path: /ip/ipsec/policy
+      access: read
+      description: "List IPsec policies. Each policy = src/dst selector + action (encrypt|none|discard) + proposal + peer."
+
+    add_ipsec_policy:
+      method: PUT
+      path: /ip/ipsec/policy
+      access: admin
+      description: >
+        Add an IPsec policy. Static site-to-site: {peer:'site-a',
+        src-address:'10.0.0.0/24', dst-address:'10.1.0.0/24', action:'encrypt',
+        tunnel:'yes', proposal:'default', sa-src-address:'<local>',
+        sa-dst-address:'<peer>'}. Road-warrior dynamic template:
+        {peer:'rw', template:'yes', dst-address:'0.0.0.0/0', action:'encrypt'}.
+      params:
+        peer: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        protocol: { type: string, in: body, default: "all" }
+        action: { type: string, in: body, default: "encrypt", description: "encrypt | none | discard" }
+        level: { type: string, in: body, description: "require | unique (per-flow SA)" }
+        tunnel: { type: string, in: body }
+        proposal: { type: string, in: body, default: "default" }
+        template: { type: string, in: body, description: "'yes' for road-warrior dynamic template" }
+        group: { type: string, in: body }
+        ipsec-protocols: { type: string, in: body, description: "esp (default) | ah" }
+        sa-src-address: { type: string, in: body }
+        sa-dst-address: { type: string, in: body }
+        src-port: { type: string, in: body }
+        dst-port: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ipsec_policy:
+      method: PATCH
+      path: /ip/ipsec/policy/{id}
+      access: admin
+      description: "Update an IPsec policy."
+      params:
+        id: { type: string, in: path, required: true }
+        peer: { type: string, in: body }
+        src-address: { type: string, in: body }
+        dst-address: { type: string, in: body }
+        action: { type: string, in: body }
+        tunnel: { type: string, in: body }
+        proposal: { type: string, in: body }
+        sa-src-address: { type: string, in: body }
+        sa-dst-address: { type: string, in: body }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_ipsec_policy:
+      method: DELETE
+      path: /ip/ipsec/policy/{id}
+      access: dangerous
+      description: "Delete an IPsec policy. Active SAs are torn down."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_ipsec_active_peers:
+      method: GET
+      path: /ip/ipsec/active-peers
+      access: read
+      description: "List currently negotiated IPsec peers. Fields: id, state (established | half-open | ...), uptime, side, remote-address, dynamic-address."
+
+    list_ipsec_installed_sa:
+      method: GET
+      path: /ip/ipsec/installed-sa
+      access: read
+      description: "List currently installed IPsec SAs (Phase-2 ESP/AH security associations). Useful for debugging which selectors negotiated and how much data has flowed."
+
+    flush_ipsec_sa:
+      method: POST
+      path: /ip/ipsec/installed-sa/flush
+      access: admin
+      description: "Tear down all currently installed IPsec SAs. They will renegotiate on next traffic. Use to recover from stuck SA state."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ipsec_settings:
+      method: GET
+      path: /ip/ipsec/settings
+      access: read
+      description: "Get global IPsec settings (singleton). Fields: accept-redirects, interim-update, max-events-per-second, xauth-use-radius."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ipsec_settings:
+      method: POST
+      path: /ip/ipsec/settings/set
+      access: admin
+      description: "Update global IPsec settings."
+      params:
+        accept-redirects: { type: string, in: body }
+        interim-update: { type: string, in: body }
+        max-events-per-second: { type: string, in: body }
+        xauth-use-radius: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # CONTAINER (RouterOS 7 container support - x86/CHR/ARM64)
+    # =========================================================================
+
+    list_containers:
+      method: GET
+      path: /container
+      access: read
+      description: "List Docker-like containers configured on RouterOS (v7.4+ on supported hardware). Each has name, root-dir, mounts, interface, status, dns."
+
+    list_container_envs:
+      method: GET
+      path: /container/envs
+      access: read
+      description: "List container environment variables defined for use across containers."
+
+    list_container_mounts:
+      method: GET
+      path: /container/mounts
+      access: read
+      description: "List defined container mount points (host directory to container path mappings)."
+
+  examples:
+    - name: "List active DHCP leases on the LAN"
+      description: "Get all currently bound DHCP leases with hostname, IP, and MAC."
+      code: |
+        const leases = await api.list_dhcp_leases({ status: "bound" });
+        return leases.map(l => ({
+          host: l["host-name"] || "(unknown)",
+          ip: l.address,
+          mac: l["mac-address"],
+          server: l.server,
+          dynamic: l.dynamic === "true"
+        }));
+
+    - name: "Reserve a DHCP lease as static"
+      description: "Find a dynamic lease by MAC and convert it to a static reservation, then verify."
+      code: |
+        const leases = await api.list_dhcp_leases({});
+        const target = leases.find(l => l["mac-address"]?.toLowerCase() === "aa:bb:cc:11:22:33");
+        if (!target) return { error: "Lease not found" };
+        await api.make_dhcp_lease_static({ numbers: target[".id"] });
+        const updated = await api.list_dhcp_leases({});
+        return updated.find(l => l[".id"] === target[".id"]);
+
+    - name: "Disable cleartext management services without locking yourself out"
+      description: >
+        Safely disable the well-known cleartext services. Reads the current service
+        list first and EXCLUDES whichever HTTP-family service is the ToolMesh
+        transport (passed in as currentTransport) so the caller cannot orphan its
+        own session. Pass currentTransport='www' if backends.yaml uses http://,
+        or 'www-ssl' if it uses https://.
+      code: |
+        const currentTransport = params.currentTransport || "www-ssl";
+        const candidates = ["telnet", "ftp", "www", "api"];
+        const toDisable = candidates.filter(s => s !== currentTransport);
+        const services = await api.list_ip_services();
+        const active = (services || [])
+          .filter(s => s.dynamic !== "true")
+          .filter(s => toDisable.includes(s.name) && s.disabled !== "true");
+        if (active.length === 0) return { changed: [], note: "already hardened" };
+        await api.disable_ip_service({ numbers: active.map(s => s[".id"]).join(",") });
+        const after = (await api.list_ip_services()).filter(s => s.dynamic !== "true");
+        return {
+          transportKept: currentTransport,
+          disabled: active.map(s => s.name),
+          finalState: after.map(s => ({ name: s.name, port: s.port, disabled: s.disabled }))
+        };
+
+    - name: "Open port 22 from a specific source on the WAN"
+      description: "Add a firewall rule allowing SSH from a trusted IP on the WAN interface list."
+      code: |
+        return await api.add_firewall_filter({
+          chain: "input",
+          action: "accept",
+          protocol: "tcp",
+          "dst-port": "22",
+          "src-address": "203.0.113.42",
+          "in-interface-list": "WAN",
+          comment: "SSH from admin home"
+        });
+
+    - name: "Snapshot health and resource state"
+      description: "Pull system summary, health sensors, and interface counters for a quick status check."
+      code: |
+        const [resource, health, interfaces] = await Promise.all([
+          api.get_system_resource(),
+          api.get_system_health(),
+          api.list_interfaces({})
+        ]);
+        return {
+          uptime: resource.uptime,
+          version: resource.version,
+          cpuLoad: resource["cpu-load"],
+          freeMemory: resource["free-memory"],
+          totalMemory: resource["total-memory"],
+          temperature: health,
+          interfaces: interfaces.map(i => ({
+            name: i.name, type: i.type, running: i.running,
+            rxBytes: i["rx-byte"], txBytes: i["tx-byte"]
+          }))
+        };
+
+    - name: "Add a WireGuard peer for a new road-warrior client"
+      description: "Register a peer's public key with an allowed /32, then return the server's public key so the client can be configured."
+      code: |
+        const peer = await api.add_wireguard_peer({
+          interface: "wg0",
+          "public-key": "PUBLIC_KEY_FROM_CLIENT_BASE64",
+          "allowed-address": "10.99.0.5/32",
+          "persistent-keepalive": "25",
+          comment: "laptop-alice"
+        });
+        const wg = await api.list_wireguard_interfaces({});
+        const server = wg.find(w => w.name === "wg0");
+        return { peer, serverPublicKey: server?.["public-key"] };
+
+    - name: "Ping a target with bounded runtime"
+      description: "Send 4 ICMP echo requests and summarize loss + avg latency."
+      code: |
+        const results = await api.ping({ address: "1.1.1.1", count: "4" });
+        const sent = results.length;
+        const replied = results.filter(r => r.status !== "timeout").length;
+        const avg = results
+          .filter(r => r.time)
+          .map(r => parseFloat(String(r.time).replace(/[^0-9.]/g, "")))
+          .reduce((a, b) => a + b, 0) / Math.max(1, replied);
+        return { sent, replied, lossPct: ((sent - replied) / sent) * 100, avgMs: avg };
