@@ -48,7 +48,7 @@ for (const file of files) {
   // Parse YAML
   let doc: any;
   try {
-    doc = parseYaml(raw.toString("utf-8"), { maxAliasCount: 100 });
+    doc = parseYaml(raw.toString("utf-8"), { maxAliasCount: 500 });
   } catch (e: any) {
     errors.push(`YAML parse error: ${e.message}`);
     console.error(`\n❌ ${file}`);

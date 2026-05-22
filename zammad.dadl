@@ -1,0 +1,3063 @@
+# zammad.dadl -- Zammad REST API (v1)
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - Zammad is an open-source helpdesk / ticketing system. The API is exposed under
+#   /api/v1 on every Zammad instance. There is currently no v2.
+# - Authentication uses Personal Access Tokens. The header format is special:
+#   "Authorization: Token token=YOUR_TOKEN" (NOT "Bearer ..."). The DADL backend
+#   handles this via the auth prefix "Token token=".
+# - IMPORTANT -- Impersonation ("im Auftrag von"): every endpoint accepts an
+#   optional "X-On-Behalf-Of" HTTP header. Its value can be a numeric user id,
+#   a login, or an email address. The TOKEN OWNER must hold the underlying
+#   permission for the action (e.g. ticket.agent); the action is then recorded
+#   as performed by the impersonated user.
+#     - In ToolMesh this header is exposed on every tool as an optional
+#       parameter literally named `X-On-Behalf-Of` (the parameter key IS the
+#       HTTP header name -- that is how DADL maps `in: header` params).
+#       JavaScript access requires bracket-notation:
+#         await api.create_ticket({..., "X-On-Behalf-Of": "user@example.com"})
+#       There are three intended modes:
+#         (1) Off (default)         -- omit the header, action is recorded as token owner
+#         (2) Fixed user            -- backend operator pins X-On-Behalf-Of in
+#                                      backends.yaml via a header injection (see setup.notes)
+#         (3) Pass-through user     -- the LLM/agent passes the end-user identity
+#                                      explicitly per call
+#       Mode is configured outside the DADL; the parameter is always present
+#       on the tools.
+#     - Newer Zammad versions also accept the standard "From" header for the
+#       same purpose, but "X-On-Behalf-Of" remains the documented and
+#       universally supported form -- prefer it.
+# - IDs are numeric integers. References between objects are usually expressed
+#   either as `<name>_id` (numeric) or `<name>` (string lookup -- email, login,
+#   group name) depending on the field. Both are accepted on most create/update
+#   endpoints.
+# - The query parameter `expand=true` resolves foreign-key ids into their human
+#   labels (e.g. group_id -> group, state_id -> state). `full=true` returns all
+#   referenced objects as a side-load (record assets) plus a total_count -- but
+#   it inflates payload heavily, prefer expand for most calls.
+# - Search uses Elasticsearch-style query syntax when Zammad's ES integration
+#   is enabled: e.g. `state.name:open AND priority.name:"2 normal" AND
+#   created_at:>now-1h`. Without ES, the query parameter falls back to a
+#   limited SQL search.
+# - Pagination is page-based: page + per_page. Zammad enforces a server-side
+#   maximum per_page (admin-configured, typically 500) -- requests above are
+#   silently capped.
+# - Error format: {"error": "...", "error_human": "..."}. Both fields contain
+#   the message; error_human is the friendlier one.
+# - Article attachments: the canonical API mechanism is base64-encoded inline
+#   in the article body (attachments: [{filename, data, "mime-type"}]). The
+#   form_id-based upload cache is only used by the web UI.
+# - Object Manager: creating or modifying custom fields requires a follow-up
+#   call to /object_manager_attributes_execute_migrations before the changes
+#   take effect.
+# - PATCH vs PUT: Knowledge Base and Checklist endpoints use PATCH. Most other
+#   resources (tickets, users, organizations, groups, ...) use PUT.
+# - Time units in time_accounting are minutes (floating point allowed).
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Zammad REST API"
+source_url: "https://docs.zammad.org/en/latest/api/intro.html"
+date: "2026-05-22"
+
+# ── Reusable parameter fragments (YAML anchors) ─────────────
+# on_behalf_of (anchor name): the VALUE is referenced from every tool's
+#   params under the key `X-On-Behalf-Of` -- because for `in: header` params
+#   the DADL key IS the literal HTTP header name. So tools expose the
+#   parameter as `X-On-Behalf-Of` (bracket-notation in JS).
+# common list params: page/per_page/expand/full.
+
+_fragments:
+  on_behalf_of: &on_behalf_of
+    type: string
+    in: header
+    required: false
+    description: >-
+      Optional X-On-Behalf-Of header -- run this request as the named Zammad
+      user. Accepts numeric user id, login, or email. The configured API
+      token's permissions are checked; the action is recorded as the
+      impersonated user. Pass-through mode: caller supplies the end-user.
+      Fixed mode: operator pins a value via backends.yaml header injection.
+
+  page_param: &page_param
+    type: integer
+    in: query
+    description: "1-based page number"
+
+  per_page_param: &per_page_param
+    type: integer
+    in: query
+    description: "Items per page (capped server-side, typically 500 max)"
+
+  expand_param: &expand_param
+    type: boolean
+    in: query
+    description: "Resolve foreign-key IDs to human labels (group_id -> group, state_id -> state, etc.)"
+
+  full_param: &full_param
+    type: boolean
+    in: query
+    description: "Return all referenced records as side-loaded assets plus total_count. Heavy -- prefer expand."
+
+backend:
+  name: zammad
+  type: rest
+  version: "1.0"
+  # base_url intentionally omitted -- Zammad is self-hosted, supply
+  # via backends.yaml: url: "https://helpdesk.example.com/api/v1"
+  description: "Zammad helpdesk REST API -- tickets, articles, users, organizations, groups, roles, knowledge base, SLAs, calendars, object manager (custom fields), macros, triggers, overviews, reports, time accounting, and full admin surface. Supports X-On-Behalf-Of impersonation on every endpoint."
+
+  auth:
+    type: apikey
+    credential: zammad_token
+    inject_into: header
+    header_name: Authorization
+    # Zammad's token format is "Token token=XXX" -- not "Bearer XXX".
+    # ToolMesh concatenates prefix + credential value.
+    prefix: "Token token="
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    pagination: &default-pagination
+      strategy: page
+      request:
+        page_param: page
+        limit_param: per_page
+        limit_default: 50
+      # Zammad does not return a has_more flag, Link header, or next-page
+      # field on list endpoints -- it just returns up to per_page records.
+      # The LLM paginates manually until a short page (< per_page) appears.
+      behavior: expose
+      max_pages: 10
+    errors: &standard-errors
+      format: json
+      message_path: "$.error_human"
+      code_path: "$.error"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 409, 422]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+    response:
+      # Zammad list endpoints return a bare JSON array at the top level.
+      # No wrapping under .data / .results.
+      result_path: "$"
+      max_items: 500
+      allow_jq_override: true
+
+  coverage:
+    endpoints: 205
+    total_endpoints: 220
+    percentage: 93
+    focus: "tickets (CRUD + search + history + merge + summarize + tags + links + mentions + shared_draft + time_accounting), ticket_articles (CRUD + attachments inline base64), ticket_states/priorities (CRUD), global search (across all models + per-model + tag autocomplete), users (CRUD + me + search + password + preferences + devices + access_tokens + avatar + email_verify), organizations (CRUD + search), groups (CRUD), roles (CRUD), online_notifications (list + mark_seen + mark_all_read), object_manager_attributes (CRUD + execute_migrations), calendars (CRUD), slas (CRUD), knowledge_bases (init + categories + answers + publish/archive + permissions + reorder + attachments), checklists (CRUD + items + templates), macros, triggers, overviews, jobs (schedulers), reports, signatures, text_modules, templates, email_addresses, postmaster_filters, translations, settings, tag_list admin + tag_search, data_privacy_tasks, activity_stream, karma, monitoring (health/status/amount_check)"
+    missing: "external_credentials (OAuth setup for Twitter/Facebook/Google/Microsoft), form_submit (public embed form), upload_caches (form_id-based -- Web-UI internal), getting_started wizard, sessions long-polling (/message_send + /message_receive), email channel probe/verify sub-actions, channels generic CRUD, two-factor admin"
+    last_reviewed: "2026-05-22"
+
+  setup:
+    credential_steps:
+      - "Log in to your Zammad instance as the user who will own the token"
+      - "Click your avatar (bottom-left of the sidebar) -> Profile -> Token Access"
+      - "If 'Token Access' is hidden, an admin must grant the role permission 'user_preferences.access_token' (Admin -> Roles)"
+      - "Click 'Create', fill in a label (e.g. 'ToolMesh Integration')"
+      - "Tick the required permissions: ticket.agent (or ticket.customer), admin.user, admin.organization, knowledge_base.editor, etc. -- the token cannot exceed the user's own permissions"
+      - "Optionally set an expiry date (YYYY-MM-DD)"
+      - "Click 'Create' -- the token is shown ONCE, copy it immediately (cannot be recovered, only revoked)"
+      - "Provide only the raw token value in your credential store -- ToolMesh prepends 'Token token=' automatically"
+    env_var: CREDENTIAL_ZAMMAD_TOKEN
+    backends_yaml: |
+      - name: zammad
+        transport: rest
+        dadl: zammad.dadl
+        url: "https://helpdesk.example.com/api/v1"
+        # Optional fixed-user impersonation: pin every outbound request
+        # to act on behalf of a specific Zammad user. Comment out for
+        # default (token owner) behaviour or pass-through mode.
+        # headers:
+        #   X-On-Behalf-Of: "bot@example.com"
+    required_scopes:
+      - "ticket.agent (read+write tickets) OR ticket.customer (customer-side access)"
+    optional_scopes:
+      - "admin.user (manage users)"
+      - "admin.organization (manage organizations)"
+      - "admin.group (manage groups)"
+      - "admin.role (manage roles)"
+      - "admin.object (object manager / custom fields)"
+      - "admin.sla (service level agreements)"
+      - "admin.calendar"
+      - "admin.tag"
+      - "admin.macro"
+      - "admin.trigger"
+      - "admin.overview"
+      - "admin.checklists"
+      - "knowledge_base.reader (read KB)"
+      - "knowledge_base.editor (edit KB)"
+      - "report"
+      - "user_preferences.access_token (so the token can manage tokens)"
+    docs_url: "https://docs.zammad.org/en/latest/api/intro.html"
+    notes: |
+      The url MUST include the /api/v1 suffix, e.g.
+      "https://helpdesk.example.com/api/v1". Zammad is self-hosted, no
+      central endpoint.
+
+      Impersonation modes (X-On-Behalf-Of):
+        - Off            -- no header sent, action recorded as token owner.
+        - Pass-through   -- the calling agent supplies X-On-Behalf-Of per
+                            call (e.g. forwards the end-user's email).
+        - Fixed user     -- operator pins a value in backends.yaml under
+                            headers.X-On-Behalf-Of. Tool-level header still
+                            wins when supplied.
+
+      The token cannot exceed the creating user's permissions. For full
+      admin access, create the token as an admin account; for pure
+      customer self-service flows, create it as a customer.
+
+  hints:
+    create_ticket:
+      required: "title, group (name or group_id), customer (email or customer_id), article {subject, body, type, internal}"
+      article_types: "email, phone, web, note, sms, chat, fax"
+      impersonation: "Pass X-On-Behalf-Of=<customer-email> to record creation as the customer instead of the token owner -- the article will appear in their name. JS bracket-notation: {'X-On-Behalf-Of': 'alice@example.com'}"
+    update_ticket:
+      append_article: "Pass an article object alongside ticket fields (state, owner, etc.) to append a new article in the same call"
+      state_handling: "state can be the name ('open', 'closed', 'pending reminder', 'pending close') or numeric state_id"
+    search_tickets:
+      query_syntax: "Elasticsearch syntax when ES is enabled. Examples: 'state.name:open', 'priority.name:\"2 normal\"', 'tags:vip AND group.name:Support', 'created_at:>now-1h'"
+      structured: "Use the 'condition' parameter for structured queries instead of free-text query"
+    create_ticket_article:
+      attachments: "Pass attachments as an array of {filename, data (base64), 'mime-type'} -- field name has a hyphen which YAML allows in single quotes"
+      internal: "internal=true hides the article from customers"
+    search_users:
+      query: "Searches firstname, lastname, login, email. Use 'role_ids' filter for role membership."
+    create_object_manager_attribute:
+      migrations: "After creating/updating/deleting a custom field, you MUST call execute_object_manager_migrations -- the schema change is not applied until then"
+      data_types: "boolean, date, datetime, integer, select, multiselect, input, textarea, tree_select, autocompletion_ajax_external_data_source"
+    create_kb_answer:
+      translations: "translations_attributes is an array of {title, content (HTML), locale}. Each KB answer must have at least one translation."
+      publish: "After create, call publish_kb_answer (public), internal_kb_answer (internal), or leave as draft"
+    create_user_access_token:
+      one_time: "The token value is returned ONCE in the response under .token -- store immediately"
+    add_tag_to_object:
+      object: "Must be one of: Ticket, User, Organization, KnowledgeBase::Answer::Translation"
+    merge_tickets:
+      semantics: "All articles from slave_id move to master_id, slave is closed-merged. Operation is irreversible."
+
+  tools:
+
+    # =========================================================================
+    # Tickets -- CRUD, search, history, merge, summarize
+    # =========================================================================
+
+    list_tickets:
+      method: GET
+      path: /tickets
+      access: read
+      description: "List all tickets visible to the authenticated user. Paginated. Use search_tickets for filtered queries -- this endpoint has no filter parameters beyond pagination."
+      params:
+        page: *page_param
+        per_page: *per_page_param
+        expand: *expand_param
+        full: *full_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    get_ticket:
+      method: GET
+      path: /tickets/{id}
+      access: read
+      description: "Retrieve a single ticket by ID. Set all_articles=true to include the full article list under .articles."
+      params:
+        id: { type: integer, in: path, required: true }
+        all_articles: { type: boolean, in: query, description: "Include all articles under .articles" }
+        expand: *expand_param
+        full: *full_param
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_ticket:
+      method: POST
+      path: /tickets
+      access: write
+      description: >-
+        Create a new ticket with an initial article. Required: title, group
+        (group name or group_id), customer (email or customer_id), and an
+        article object {subject, body, type, internal}. Returns the created
+        ticket with its first article. Use X-On-Behalf-Of header to record
+        the ticket as created by another user.
+      params:
+        title: { type: string, in: body, required: true }
+        group: { type: string, in: body, description: "Group name (e.g. 'Users'); alternative to group_id" }
+        group_id: { type: integer, in: body }
+        customer: { type: string, in: body, description: "Customer email or login; alternative to customer_id" }
+        customer_id: { type: integer, in: body }
+        owner: { type: string, in: body, description: "Owner login; alternative to owner_id" }
+        owner_id: { type: integer, in: body }
+        state: { type: string, in: body, description: "State name (e.g. 'new', 'open'); alternative to state_id" }
+        state_id: { type: integer, in: body }
+        priority: { type: string, in: body, description: "Priority name (e.g. '2 normal'); alternative to priority_id" }
+        priority_id: { type: integer, in: body }
+        article:
+          type: object
+          in: body
+          required: true
+          description: "Initial article -- {subject, body, type ('email'/'note'/'web'/'phone'), sender ('Agent'/'Customer'), internal (bool), content_type ('text/plain'/'text/html'), to, cc, attachments[]}"
+        tags: { type: string, in: body, description: "Comma-separated tag names" }
+        mentions: { type: array, in: body, description: "Array of user_id integers to mention" }
+        pending_time: { type: string, in: body, description: "ISO 8601 timestamp for pending state" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_ticket:
+      method: PUT
+      path: /tickets/{id}
+      access: write
+      description: >-
+        Update an existing ticket. Any field can be partially updated. Pass an
+        'article' object alongside other fields to append a new article in the
+        same call (common pattern for replying with a state change).
+      params:
+        id: { type: integer, in: path, required: true }
+        title: { type: string, in: body }
+        group: { type: string, in: body }
+        group_id: { type: integer, in: body }
+        customer: { type: string, in: body }
+        customer_id: { type: integer, in: body }
+        owner: { type: string, in: body }
+        owner_id: { type: integer, in: body }
+        state: { type: string, in: body }
+        state_id: { type: integer, in: body }
+        priority: { type: string, in: body }
+        priority_id: { type: integer, in: body }
+        article: { type: object, in: body, description: "Optional new article to append: {subject, body, type, internal, sender, content_type, attachments[]}" }
+        pending_time: { type: string, in: body }
+        tags: { type: string, in: body, description: "Comma-separated -- replaces full tag set" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_ticket:
+      method: DELETE
+      path: /tickets/{id}
+      access: dangerous
+      description: "Permanently delete a ticket. Requires admin permission. Irreversible -- consider closing/merging instead."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    search_tickets:
+      method: GET
+      path: /tickets/search
+      access: read
+      description: >-
+        Full-text ticket search using Elasticsearch query syntax when ES is
+        enabled, or limited SQL otherwise. Examples: 'state.name:open',
+        'priority.name:"2 normal" AND tags:feedback',
+        'customer.email:*@example.com AND created_at:[2026-01-01 TO 2026-12-31]'.
+      params:
+        query: { type: string, in: query, description: "Elasticsearch-style search query" }
+        condition: { type: object, in: query, description: "Structured condition object (alternative to query)" }
+        limit: { type: integer, in: query, description: "Max results per request" }
+        sort_by: { type: string, in: query, description: "Field to sort by (e.g. created_at, updated_at)" }
+        order_by: { type: string, in: query, description: "asc or desc" }
+        expand: *expand_param
+        full: *full_param
+        with_total_count: { type: boolean, in: query }
+        only_total_count: { type: boolean, in: query, description: "Return only the count, no records" }
+        page: *page_param
+        per_page: *per_page_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    get_ticket_history:
+      method: GET
+      path: /ticket_history/{id}
+      access: read
+      description: "Get the full audit history for a ticket -- all changes, article additions, state transitions, with timestamps and acting users."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    merge_tickets:
+      method: POST
+      path: /ticket_merge/{master_id}/{slave_id}
+      access: dangerous
+      description: "Merge slave ticket into master ticket. All articles from slave move to master; slave is closed with state 'merged'. IRREVERSIBLE."
+      params:
+        master_id: { type: integer, in: path, required: true, description: "Surviving ticket ID" }
+        slave_id: { type: integer, in: path, required: true, description: "Ticket to merge in (will be closed)" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    summarize_ticket:
+      method: POST
+      path: /tickets/{id}/summarize
+      access: read
+      description: "Get an AI-generated summary of the ticket. Returns the existing summary or triggers async generation -- retry after ~30 seconds if generation is in progress."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Global Search -- across Tickets, Users, Organizations, KB
+    # =========================================================================
+
+    global_search:
+      method: GET
+      path: /search
+      access: read
+      description: >-
+        Search across ALL searchable models (Ticket, User, Organization,
+        KnowledgeBase::Answer::Translation, Chat::Session). Returns a mixed
+        array of result objects each tagged with .type. Use search_in_model
+        if you only need one type -- it's much cheaper.
+      params:
+        query: { type: string, in: query, required: true, description: "Elasticsearch-style query (e.g. 'printer offline', 'tags:vip')" }
+        limit: { type: integer, in: query, description: "Max results per model" }
+        offset: { type: integer, in: query }
+        order_by: { type: string, in: query, description: "asc | desc" }
+        sort_by: { type: string, in: query }
+        X-On-Behalf-Of: *on_behalf_of
+
+    search_in_model:
+      method: GET
+      path: /search/{model}
+      access: read
+      description: >-
+        Search within a single model. Cheaper and more focused than
+        global_search. {model} must be lowercased model name:
+        'ticket', 'user', 'organization', 'knowledge_base/answer/translation',
+        'chat/session'. THIS is the canonical way to find a ticket by free
+        text (e.g. 'find ticket about offline printer').
+      params:
+        model: { type: string, in: path, required: true, description: "ticket | user | organization | knowledge_base/answer/translation | chat/session" }
+        query: { type: string, in: query, required: true }
+        limit: { type: integer, in: query }
+        offset: { type: integer, in: query }
+        sort_by: { type: string, in: query }
+        order_by: { type: string, in: query }
+        X-On-Behalf-Of: *on_behalf_of
+
+    tag_search_autocomplete:
+      method: GET
+      path: /tag_search
+      access: read
+      description: "Tag-name autocomplete -- returns up to ~25 tag names matching the prefix. Used by UI search boxes."
+      params:
+        term: { type: string, in: query, required: true, description: "Tag name prefix" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Ticket Articles -- CRUD + attachments
+    # =========================================================================
+
+    list_articles_by_ticket:
+      method: GET
+      path: /ticket_articles/by_ticket/{ticket_id}
+      access: read
+      description: "List all articles belonging to a ticket. Returns chronological array."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        expand: *expand_param
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_article:
+      method: GET
+      path: /ticket_articles/{id}
+      access: read
+      description: "Retrieve a single ticket article by ID."
+      params:
+        id: { type: integer, in: path, required: true }
+        expand: *expand_param
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_article:
+      method: PUT
+      path: /ticket_articles/{id}
+      access: write
+      description: >-
+        Update an existing ticket article. The most common use is toggling the
+        `internal` flag (publish an internal note, or hide a previously public
+        article). Other editable fields (subject, body) depend on Zammad's
+        "ui_ticket_zoom_article_*_edit" settings -- by default, body editing
+        is allowed for a limited time after creation by the author and by
+        agents with the relevant permission.
+      params:
+        id: { type: integer, in: path, required: true }
+        internal: { type: boolean, in: body, description: "true = hidden from customers, false = visible" }
+        subject: { type: string, in: body }
+        body: { type: string, in: body }
+        content_type: { type: string, in: body, description: "text/plain or text/html" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_article:
+      method: POST
+      path: /ticket_articles
+      access: write
+      description: >-
+        Append a new article to an existing ticket. Common pattern: reply via
+        email (type=email, sender=Agent), internal note (type=note,
+        internal=true), or customer-side message (type=web, sender=Customer
+        with X-On-Behalf-Of=<customer email>).
+      params:
+        ticket_id: { type: integer, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "email, phone, web, note, sms, chat, fax" }
+        sender: { type: string, in: body, description: "Agent, Customer, System (defaults based on caller)" }
+        subject: { type: string, in: body }
+        body: { type: string, in: body, required: true }
+        content_type: { type: string, in: body, description: "text/plain or text/html" }
+        internal: { type: boolean, in: body, default: false, description: "true = hidden from customers" }
+        to: { type: string, in: body }
+        cc: { type: string, in: body }
+        from: { type: string, in: body }
+        time_unit: { type: number, in: body, description: "Time accounted for this article in minutes" }
+        attachments:
+          type: array
+          in: body
+          description: "Array of {filename, data (base64), 'mime-type'}. Inline base64 -- no separate upload step."
+        origin_by_id: { type: integer, in: body, description: "Alternative to X-On-Behalf-Of -- record this user as the article author via body field instead of header" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Attachments -- direct download by IDs
+    # =========================================================================
+
+    download_attachment:
+      method: GET
+      path: /ticket_attachment/{ticket_id}/{article_id}/{attachment_id}
+      access: read
+      description: "Download an attachment file. Returns the raw binary content."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        article_id: { type: integer, in: path, required: true }
+        attachment_id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      response:
+        binary: true
+      pagination: none
+
+    # =========================================================================
+    # Ticket Tags + Links + Mentions
+    # =========================================================================
+
+    list_tags_for_object:
+      method: GET
+      path: /tags
+      access: read
+      description: "Get all tags attached to a specific object (ticket, user, organization, KB answer)."
+      params:
+        object: { type: string, in: query, required: true, description: "Ticket | User | Organization | KnowledgeBase::Answer::Translation" }
+        o_id: { type: integer, in: query, required: true, description: "Object ID" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    add_tag:
+      method: POST
+      path: /tags/add
+      access: write
+      description: "Attach a tag to an object. Creates the tag if it does not exist (unless tag administration restricts this)."
+      params:
+        item: { type: string, in: body, required: true, description: "Tag name" }
+        object: { type: string, in: body, required: true, description: "Ticket | User | Organization | KnowledgeBase::Answer::Translation" }
+        o_id: { type: integer, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    remove_tag:
+      method: DELETE
+      path: /tags/remove
+      access: write
+      description: "Remove a tag from an object. Does not delete the tag definition itself."
+      params:
+        item: { type: string, in: body, required: true }
+        object: { type: string, in: body, required: true }
+        o_id: { type: integer, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    list_ticket_links:
+      method: GET
+      path: /links
+      access: read
+      description: "List all links between tickets. Pass link_object_value as the ticket NUMBER (not ID)."
+      params:
+        link_object: { type: string, in: query, required: true, description: "Always 'Ticket'" }
+        link_object_value: { type: string, in: query, required: true, description: "Ticket number (e.g. '99001')" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    add_ticket_link:
+      method: POST
+      path: /links/add
+      access: write
+      description: "Create a link between two tickets. link_type controls direction: 'normal' (peer), 'parent' (source is parent), 'child' (source is child)."
+      params:
+        link_type: { type: string, in: body, required: true, description: "normal | parent | child" }
+        link_object_source: { type: string, in: body, required: true, description: "Always 'Ticket'" }
+        link_object_source_number: { type: string, in: body, required: true, description: "Source ticket number" }
+        link_object_target: { type: string, in: body, required: true, description: "Always 'Ticket'" }
+        link_object_target_value: { type: integer, in: body, required: true, description: "Target ticket ID (numeric)" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    remove_ticket_link:
+      method: DELETE
+      path: /links/remove
+      access: write
+      description: "Remove a link between two tickets."
+      params:
+        link_type: { type: string, in: body, required: true }
+        link_object_source: { type: string, in: body, required: true }
+        link_object_source_number: { type: string, in: body, required: true }
+        link_object_target: { type: string, in: body, required: true }
+        link_object_target_value: { type: integer, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    list_my_mentions:
+      method: GET
+      path: /mentions
+      access: read
+      description: "List all mentions targeting the authenticated user (or impersonated user)."
+      params:
+        page: *page_param
+        per_page: *per_page_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    create_mention:
+      method: POST
+      path: /mentions
+      access: write
+      description: "Add a mention -- subscribes the current user to updates on a mentionable object (typically a ticket)."
+      params:
+        mentionable_type: { type: string, in: body, required: true, description: "Typically 'Ticket'" }
+        mentionable_id: { type: integer, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_mention:
+      method: DELETE
+      path: /mentions/{id}
+      access: write
+      description: "Remove a mention -- unsubscribes from updates."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Time Accounting (per ticket)
+    # =========================================================================
+
+    list_time_accounting:
+      method: GET
+      path: /tickets/{ticket_id}/time_accountings
+      access: read
+      description: "List all time-accounting entries for a ticket."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_time_accounting:
+      method: GET
+      path: /tickets/{ticket_id}/time_accountings/{id}
+      access: read
+      description: "Get a single time-accounting entry."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_time_accounting:
+      method: POST
+      path: /tickets/{ticket_id}/time_accountings
+      access: write
+      description: "Record time spent on a ticket. time_unit is in minutes (decimals allowed)."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        time_unit: { type: number, in: body, required: true, description: "Minutes (e.g. 15, 22.5)" }
+        type_id: { type: integer, in: body, description: "Optional time accounting type id" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_time_accounting:
+      method: PUT
+      path: /tickets/{ticket_id}/time_accountings/{id}
+      access: admin
+      description: "Update an existing time entry. Admin permission required."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        time_unit: { type: number, in: body }
+        type_id: { type: integer, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_time_accounting:
+      method: DELETE
+      path: /tickets/{ticket_id}/time_accountings/{id}
+      access: dangerous
+      description: "Delete a time-accounting entry. Admin permission required."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Shared Drafts (per ticket)
+    # =========================================================================
+
+    get_shared_draft:
+      method: GET
+      path: /tickets/{ticket_id}/shared_draft
+      access: read
+      description: "Get the shared draft for a ticket (collaborative reply being composed)."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_shared_draft:
+      method: PUT
+      path: /tickets/{ticket_id}/shared_draft
+      access: write
+      description: "Create the shared draft for a ticket."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        form_id: { type: string, in: body, required: true }
+        new_article: { type: object, in: body }
+        ticket_attributes: { type: object, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_shared_draft:
+      method: PATCH
+      path: /tickets/{ticket_id}/shared_draft
+      access: write
+      description: "Update the shared draft for a ticket."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        form_id: { type: string, in: body }
+        new_article: { type: object, in: body }
+        ticket_attributes: { type: object, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_shared_draft:
+      method: DELETE
+      path: /tickets/{ticket_id}/shared_draft
+      access: write
+      description: "Delete the shared draft for a ticket."
+      params:
+        ticket_id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Ticket Priorities -- CRUD
+    # =========================================================================
+
+    list_ticket_priorities:
+      method: GET
+      path: /ticket_priorities
+      access: read
+      description: "List all ticket priorities (e.g. '1 low', '2 normal', '3 high')."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_ticket_priority:
+      method: GET
+      path: /ticket_priorities/{id}
+      access: read
+      description: "Get a single ticket priority."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_ticket_priority:
+      method: POST
+      path: /ticket_priorities
+      access: admin
+      description: "Create a new ticket priority. Admin permission required."
+      params:
+        name: { type: string, in: body, required: true }
+        default_create: { type: boolean, in: body, description: "Use as default for new tickets" }
+        ui_icon: { type: string, in: body }
+        ui_color: { type: string, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_ticket_priority:
+      method: PUT
+      path: /ticket_priorities/{id}
+      access: admin
+      description: "Update a ticket priority."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        default_create: { type: boolean, in: body }
+        ui_icon: { type: string, in: body }
+        ui_color: { type: string, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_ticket_priority:
+      method: DELETE
+      path: /ticket_priorities/{id}
+      access: dangerous
+      description: "Delete a ticket priority. Fails if the priority is in use."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Ticket States -- CRUD
+    # =========================================================================
+
+    list_ticket_states:
+      method: GET
+      path: /ticket_states
+      access: read
+      description: "List all ticket states (e.g. new, open, pending reminder, pending close, closed, merged, removed)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_ticket_state:
+      method: GET
+      path: /ticket_states/{id}
+      access: read
+      description: "Get a single ticket state."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_ticket_state:
+      method: POST
+      path: /ticket_states
+      access: admin
+      description: "Create a new ticket state. state_type_id references a state type (new/open/closed/pending action/pending reminder/merged/removed)."
+      params:
+        name: { type: string, in: body, required: true }
+        state_type_id: { type: integer, in: body, required: true }
+        next_state_id: { type: integer, in: body }
+        ignore_escalation: { type: boolean, in: body }
+        default_create: { type: boolean, in: body }
+        default_follow_up: { type: boolean, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_ticket_state:
+      method: PUT
+      path: /ticket_states/{id}
+      access: admin
+      description: "Update a ticket state."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        state_type_id: { type: integer, in: body }
+        next_state_id: { type: integer, in: body }
+        ignore_escalation: { type: boolean, in: body }
+        default_create: { type: boolean, in: body }
+        default_follow_up: { type: boolean, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_ticket_state:
+      method: DELETE
+      path: /ticket_states/{id}
+      access: dangerous
+      description: "Delete a ticket state. Fails if the state is in use."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Users -- CRUD, me, search, password, preferences, devices
+    # =========================================================================
+
+    get_me:
+      method: GET
+      path: /users/me
+      access: read
+      description: "Get the currently authenticated user. With X-On-Behalf-Of header, returns the impersonated user."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    list_users:
+      method: GET
+      path: /users
+      access: read
+      description: "List users. Use search_users for filtered queries."
+      params:
+        page: *page_param
+        per_page: *per_page_param
+        expand: *expand_param
+        full: *full_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    get_user:
+      method: GET
+      path: /users/{id}
+      access: read
+      description: "Get a single user by ID."
+      params:
+        id: { type: integer, in: path, required: true }
+        expand: *expand_param
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    search_users:
+      method: GET
+      path: /users/search
+      access: read
+      description: "Search users by firstname/lastname/login/email (Elasticsearch syntax when enabled). Returns matching users."
+      params:
+        query: { type: string, in: query, description: "Search query (e.g. 'john', 'role_ids:2 AND active:true')" }
+        limit: { type: integer, in: query }
+        sort_by: { type: string, in: query }
+        order_by: { type: string, in: query }
+        expand: *expand_param
+        full: *full_param
+        page: *page_param
+        per_page: *per_page_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    create_user:
+      method: POST
+      path: /users
+      access: admin
+      description: "Create a new user. Email or login is required as a primary identifier."
+      params:
+        firstname: { type: string, in: body }
+        lastname: { type: string, in: body }
+        login: { type: string, in: body }
+        email: { type: string, in: body }
+        password: { type: string, in: body }
+        organization: { type: string, in: body, description: "Org name; alternative to organization_id" }
+        organization_id: { type: integer, in: body }
+        role_ids: { type: array, in: body, description: "Array of role ids (e.g. [3] for Customer)" }
+        roles: { type: array, in: body, description: "Array of role name strings (alternative to role_ids)" }
+        group_ids: { type: object, in: body, description: "Map of group_id -> permission array, e.g. {1: ['read','create']}" }
+        groups: { type: array, in: body }
+        phone: { type: string, in: body }
+        mobile: { type: string, in: body }
+        fax: { type: string, in: body }
+        web: { type: string, in: body }
+        address: { type: string, in: body }
+        note: { type: string, in: body }
+        vip: { type: boolean, in: body }
+        verified: { type: boolean, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_user:
+      method: PUT
+      path: /users/{id}
+      access: admin
+      description: "Update a user. All fields are optional -- only supplied fields are changed."
+      params:
+        id: { type: integer, in: path, required: true }
+        firstname: { type: string, in: body }
+        lastname: { type: string, in: body }
+        login: { type: string, in: body }
+        email: { type: string, in: body }
+        password: { type: string, in: body }
+        organization: { type: string, in: body }
+        organization_id: { type: integer, in: body }
+        role_ids: { type: array, in: body }
+        roles: { type: array, in: body }
+        group_ids: { type: object, in: body }
+        groups: { type: array, in: body }
+        phone: { type: string, in: body }
+        mobile: { type: string, in: body }
+        fax: { type: string, in: body }
+        web: { type: string, in: body }
+        address: { type: string, in: body }
+        note: { type: string, in: body }
+        vip: { type: boolean, in: body }
+        verified: { type: boolean, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_user:
+      method: DELETE
+      path: /users/{id}
+      access: dangerous
+      description: "Permanently delete a user. NOT recommended -- prefer marking inactive or using a GDPR data_privacy_task."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    change_my_password:
+      method: POST
+      path: /users/password_change
+      access: write
+      description: "Change the authenticated user's password. Requires the current password."
+      params:
+        password_old: { type: string, in: body, required: true }
+        password_new: { type: string, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    request_password_reset:
+      method: POST
+      path: /users/password_reset
+      access: write
+      description: "Initiate a password reset for a user (sends a reset email)."
+      params:
+        username: { type: string, in: body, required: true, description: "Login or email" }
+      pagination: none
+
+    verify_password_reset:
+      method: POST
+      path: /users/password_reset_verify
+      access: write
+      description: "Complete a password reset using the token from the reset email."
+      params:
+        token: { type: string, in: body, required: true }
+        password: { type: string, in: body, required: true }
+      pagination: none
+
+    send_email_verification:
+      method: POST
+      path: /users/email_verify_send
+      access: write
+      description: "Send a verification email to the supplied address. Used for self-signup flows."
+      params:
+        email: { type: string, in: body, required: true }
+      pagination: none
+
+    verify_email_token:
+      method: POST
+      path: /users/email_verify
+      access: write
+      description: "Complete an email verification by submitting the token from the verification email."
+      params:
+        token: { type: string, in: body, required: true }
+      pagination: none
+
+    upload_my_avatar:
+      method: POST
+      path: /users/avatar
+      access: write
+      description: >-
+        Upload an avatar image for the authenticated user. Both fields are
+        data-URLs (e.g. 'data:image/png;base64,iVBOR...'). avatar_full is
+        the original; avatar_resize is the cropped version (typically square).
+      params:
+        avatar_full: { type: string, in: body, required: true, description: "data: URL of the full image" }
+        avatar_resize: { type: string, in: body, required: true, description: "data: URL of the resized/cropped image" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_user_avatar:
+      method: GET
+      path: /users/image/{hash}
+      access: read
+      description: "Download a user avatar by its hash (returned in user objects under image)."
+      params:
+        hash: { type: string, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      response:
+        binary: true
+      pagination: none
+
+    unlock_user:
+      method: POST
+      path: /users/unlock/{id}
+      access: admin
+      description: "Unlock a user account that was locked due to failed login attempts."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_my_preferences:
+      method: GET
+      path: /users/preferences
+      access: read
+      description: "Get the authenticated user's preferences (notification settings, locale, etc.)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_my_preferences:
+      method: PUT
+      path: /users/preferences
+      access: write
+      description: "Update the authenticated user's preferences. Body shape mirrors the user.preferences field."
+      params:
+        preferences: { type: object, in: body, required: true, description: "Arbitrary preferences object" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    list_my_devices:
+      method: GET
+      path: /users/devices
+      access: read
+      description: "List devices that have authenticated as the current user (browsers, mobile apps)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    revoke_device:
+      method: DELETE
+      path: /users/devices/{id}
+      access: write
+      description: "Revoke a device session for the current user."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # User Access Tokens -- manage API tokens
+    # =========================================================================
+
+    list_my_access_tokens:
+      method: GET
+      path: /user_access_token
+      access: read
+      description: "List API tokens owned by the authenticated user, plus the catalog of permissions available to assign."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_my_access_token:
+      method: POST
+      path: /user_access_token
+      access: write
+      description: "Create a new personal access token. Token value is returned ONCE in the response under .token -- store immediately. Permissions cannot exceed the user's own."
+      params:
+        name: { type: string, in: body, required: true, description: "Label for the token" }
+        permission: { type: array, in: body, required: true, description: "Array of permission strings (e.g. ['ticket.agent','admin.user'])" }
+        expires_at: { type: string, in: body, description: "Optional expiry YYYY-MM-DD" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_my_access_token:
+      method: DELETE
+      path: /user_access_token/{id}
+      access: write
+      description: "Revoke a personal access token by ID."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # GDPR Data Privacy Tasks
+    # =========================================================================
+
+    list_data_privacy_tasks:
+      method: GET
+      path: /data_privacy_tasks
+      access: admin
+      description: "List pending and completed GDPR deletion tasks."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_data_privacy_task:
+      method: GET
+      path: /data_privacy_tasks/{id}
+      access: admin
+      description: "Get a single data-privacy task."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_data_privacy_task:
+      method: POST
+      path: /data_privacy_tasks
+      access: dangerous
+      description: "Schedule the deletion of a user (GDPR right to be forgotten). Currently only User is deletable."
+      params:
+        deletable_type: { type: string, in: body, required: true, description: "'User'" }
+        deletable_id: { type: integer, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    cancel_data_privacy_task:
+      method: DELETE
+      path: /data_privacy_tasks/{id}
+      access: admin
+      description: "Cancel a pending data-privacy task."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Organizations -- CRUD + search
+    # =========================================================================
+
+    list_organizations:
+      method: GET
+      path: /organizations
+      access: read
+      description: "List organizations."
+      params:
+        page: *page_param
+        per_page: *per_page_param
+        expand: *expand_param
+        full: *full_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    get_organization:
+      method: GET
+      path: /organizations/{id}
+      access: read
+      description: "Get a single organization."
+      params:
+        id: { type: integer, in: path, required: true }
+        expand: *expand_param
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    search_organizations:
+      method: GET
+      path: /organizations/search
+      access: read
+      description: "Search organizations (Elasticsearch syntax when enabled)."
+      params:
+        query: { type: string, in: query }
+        limit: { type: integer, in: query }
+        expand: *expand_param
+        page: *page_param
+        per_page: *per_page_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    create_organization:
+      method: POST
+      path: /organizations
+      access: admin
+      description: "Create a new organization."
+      params:
+        name: { type: string, in: body, required: true }
+        shared: { type: boolean, in: body, default: true, description: "Members share tickets" }
+        domain: { type: string, in: body }
+        domain_assignment: { type: boolean, in: body, description: "Auto-assign users from this email domain" }
+        active: { type: boolean, in: body, default: true }
+        vip: { type: boolean, in: body }
+        note: { type: string, in: body }
+        members: { type: array, in: body, description: "Array of user logins" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_organization:
+      method: PUT
+      path: /organizations/{id}
+      access: admin
+      description: "Update an organization."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        shared: { type: boolean, in: body }
+        domain: { type: string, in: body }
+        domain_assignment: { type: boolean, in: body }
+        active: { type: boolean, in: body }
+        vip: { type: boolean, in: body }
+        note: { type: string, in: body }
+        members: { type: array, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_organization:
+      method: DELETE
+      path: /organizations/{id}
+      access: dangerous
+      description: "Delete an organization. Fails if the organization has users or tickets."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Groups -- CRUD
+    # =========================================================================
+
+    list_groups:
+      method: GET
+      path: /groups
+      access: read
+      description: "List all groups (ticket inboxes / queues)."
+      params:
+        page: *page_param
+        per_page: *per_page_param
+        expand: *expand_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    get_group:
+      method: GET
+      path: /groups/{id}
+      access: read
+      description: "Get a single group."
+      params:
+        id: { type: integer, in: path, required: true }
+        expand: *expand_param
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_group:
+      method: POST
+      path: /groups
+      access: admin
+      description: "Create a new group. Nested groups use '::' as separator (e.g. 'Sales::Europe')."
+      params:
+        name: { type: string, in: body, required: true, description: "Group name -- use '::' for nesting" }
+        signature_id: { type: integer, in: body }
+        email_address_id: { type: integer, in: body }
+        assignment_timeout: { type: integer, in: body, description: "Minutes" }
+        follow_up_possible: { type: string, in: body, description: "'yes' | 'new_ticket'" }
+        follow_up_assignment: { type: boolean, in: body }
+        active: { type: boolean, in: body, default: true }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_group:
+      method: PUT
+      path: /groups/{id}
+      access: admin
+      description: "Update a group."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        signature_id: { type: integer, in: body }
+        email_address_id: { type: integer, in: body }
+        assignment_timeout: { type: integer, in: body }
+        follow_up_possible: { type: string, in: body }
+        follow_up_assignment: { type: boolean, in: body }
+        active: { type: boolean, in: body }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_group:
+      method: DELETE
+      path: /groups/{id}
+      access: dangerous
+      description: "Delete a group. Fails if the group contains tickets or users."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Roles -- CRUD (no DELETE in API)
+    # =========================================================================
+
+    list_roles:
+      method: GET
+      path: /roles
+      access: read
+      description: "List all roles (permission bundles)."
+      params:
+        page: *page_param
+        per_page: *per_page_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    get_role:
+      method: GET
+      path: /roles/{id}
+      access: read
+      description: "Get a single role."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_role:
+      method: POST
+      path: /roles
+      access: admin
+      description: "Create a new role with the given permissions."
+      params:
+        name: { type: string, in: body, required: true }
+        permission_ids: { type: array, in: body, description: "Array of permission ids" }
+        group_ids: { type: object, in: body, description: "Map of group_id -> permission array" }
+        active: { type: boolean, in: body, default: true }
+        default_at_signup: { type: boolean, in: body }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_role:
+      method: PUT
+      path: /roles/{id}
+      access: admin
+      description: "Update a role."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        permission_ids: { type: array, in: body }
+        group_ids: { type: object, in: body }
+        active: { type: boolean, in: body }
+        default_at_signup: { type: boolean, in: body }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Online Notifications
+    # =========================================================================
+
+    list_online_notifications:
+      method: GET
+      path: /online_notifications
+      access: read
+      description: "List the authenticated user's in-app notifications. Use expand=true for human-friendly object labels."
+      params:
+        expand: *expand_param
+        page: *page_param
+        per_page: *per_page_param
+        X-On-Behalf-Of: *on_behalf_of
+
+    get_online_notification:
+      method: GET
+      path: /online_notifications/{id}
+      access: read
+      description: "Get a single online notification."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_online_notification:
+      method: PUT
+      path: /online_notifications/{id}
+      access: write
+      description: "Update notification status (typically mark as seen)."
+      params:
+        id: { type: integer, in: path, required: true }
+        seen: { type: boolean, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_online_notification:
+      method: DELETE
+      path: /online_notifications/{id}
+      access: write
+      description: "Dismiss / delete a single notification."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    mark_all_notifications_read:
+      method: POST
+      path: /online_notifications/mark_all_as_read
+      access: write
+      description: "Mark all of the current user's notifications as seen."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Object Manager Attributes (custom fields)
+    # =========================================================================
+
+    list_object_attributes:
+      method: GET
+      path: /object_manager_attributes
+      access: read
+      description: "List all object-manager attributes (built-in + custom fields) across Ticket, User, Organization, Group."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_object_attribute:
+      method: GET
+      path: /object_manager_attributes/{id}
+      access: read
+      description: "Get a single object-manager attribute definition."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_object_attribute:
+      method: POST
+      path: /object_manager_attributes
+      access: admin
+      description: "Create a custom field. NOTE: changes do not take effect until execute_object_manager_migrations is called."
+      params:
+        name: { type: string, in: body, required: true, description: "Field name (snake_case)" }
+        object: { type: string, in: body, required: true, description: "Ticket | User | Organization | Group" }
+        display: { type: string, in: body, required: true, description: "Human label" }
+        data_type: { type: string, in: body, required: true, description: "boolean | date | datetime | integer | select | multiselect | input | textarea | tree_select | autocompletion_ajax_external_data_source" }
+        data_option: { type: object, in: body, description: "Type-specific options (e.g. {options: {a: 'A'}, default: 'a'})" }
+        screens: { type: object, in: body, description: "Visibility per screen (create_top, edit, view, ...)" }
+        position: { type: integer, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_object_attribute:
+      method: PUT
+      path: /object_manager_attributes/{id}
+      access: admin
+      description: "Update a custom field. Requires execute_object_manager_migrations to apply."
+      params:
+        id: { type: integer, in: path, required: true }
+        display: { type: string, in: body }
+        data_type: { type: string, in: body }
+        data_option: { type: object, in: body }
+        screens: { type: object, in: body }
+        position: { type: integer, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_object_attribute:
+      method: DELETE
+      path: /object_manager_attributes/{id}
+      access: dangerous
+      description: "Delete a custom field. Requires execute_object_manager_migrations to apply."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    execute_object_manager_migrations:
+      method: POST
+      path: /object_manager_attributes_execute_migrations
+      access: admin
+      description: "Apply pending object-manager schema migrations. MUST be called after create/update/delete of any custom field."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Calendars
+    # =========================================================================
+
+    list_calendars:
+      method: GET
+      path: /calendars
+      access: read
+      description: "List business-hour calendars (used for SLA escalation timing)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_calendar:
+      method: GET
+      path: /calendars/{id}
+      access: read
+      description: "Get a single calendar."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_calendar:
+      method: POST
+      path: /calendars
+      access: admin
+      description: "Create a business-hour calendar."
+      params:
+        name: { type: string, in: body, required: true }
+        timezone: { type: string, in: body, required: true, description: "e.g. 'Europe/Berlin'" }
+        business_hours: { type: object, in: body, description: "Map of weekday -> {active, timeframes: [[from,to]]}" }
+        default: { type: boolean, in: body }
+        ical_url: { type: string, in: body, description: "iCal feed for public holidays" }
+        public_holidays: { type: object, in: body, description: "Map of date -> {summary, active}" }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_calendar:
+      method: PUT
+      path: /calendars/{id}
+      access: admin
+      description: "Update a calendar."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        timezone: { type: string, in: body }
+        business_hours: { type: object, in: body }
+        default: { type: boolean, in: body }
+        ical_url: { type: string, in: body }
+        public_holidays: { type: object, in: body }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_calendar:
+      method: DELETE
+      path: /calendars/{id}
+      access: dangerous
+      description: "Delete a calendar. Fails if used by an SLA."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # SLAs
+    # =========================================================================
+
+    list_slas:
+      method: GET
+      path: /slas
+      access: read
+      description: "List Service Level Agreements."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_sla:
+      method: GET
+      path: /slas/{id}
+      access: read
+      description: "Get a single SLA."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_sla:
+      method: POST
+      path: /slas
+      access: admin
+      description: "Create an SLA. Time values are in minutes."
+      params:
+        name: { type: string, in: body, required: true }
+        calendar_id: { type: integer, in: body, required: true }
+        first_response_time: { type: integer, in: body, description: "Minutes" }
+        update_time: { type: integer, in: body, description: "Minutes" }
+        solution_time: { type: integer, in: body, description: "Minutes" }
+        condition: { type: object, in: body, description: "Zammad condition object selecting matching tickets" }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_sla:
+      method: PUT
+      path: /slas/{id}
+      access: admin
+      description: "Update an SLA."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        calendar_id: { type: integer, in: body }
+        first_response_time: { type: integer, in: body }
+        update_time: { type: integer, in: body }
+        solution_time: { type: integer, in: body }
+        condition: { type: object, in: body }
+        note: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_sla:
+      method: DELETE
+      path: /slas/{id}
+      access: dangerous
+      description: "Delete an SLA."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Knowledge Base -- top-level
+    # =========================================================================
+
+    init_knowledge_base:
+      method: POST
+      path: /knowledge_bases/init
+      access: read
+      description: "Initial KB overview -- returns the list of KBs, categories, and answer summaries."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_knowledge_base:
+      method: GET
+      path: /knowledge_bases/{id}
+      access: read
+      description: "Get a single Knowledge Base by ID."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_knowledge_base:
+      method: PATCH
+      path: /knowledge_bases/manage/{id}
+      access: admin
+      description: "Update KB settings (visibility, custom address, etc.)."
+      params:
+        id: { type: integer, in: path, required: true }
+        show_feed_icon: { type: boolean, in: body }
+        custom_address: { type: string, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_kb_permissions:
+      method: GET
+      path: /knowledge_bases/{id}/permissions
+      access: read
+      description: "Get role-based permissions for a KB. Returns an array of {role_id, access} where access is admin|editor|reader|none."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    set_kb_permissions:
+      method: PUT
+      path: /knowledge_bases/{id}/permissions
+      access: admin
+      description: "Set role-based permissions for a KB. Pass full permissions array (replaces existing)."
+      params:
+        id: { type: integer, in: path, required: true }
+        permissions: { type: array, in: body, required: true, description: "Array of {role_id, access}, access in {admin, editor, reader, none}" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    reorder_kb_root_categories:
+      method: PATCH
+      path: /knowledge_bases/{id}/categories/reorder_root_categories
+      access: admin
+      description: "Set the display order of top-level KB categories. Pass the full ordered list of category IDs."
+      params:
+        id: { type: integer, in: path, required: true }
+        ordered_ids: { type: array, in: body, required: true, description: "Array of category IDs in desired order" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # KB Categories
+    # =========================================================================
+
+    get_kb_category:
+      method: GET
+      path: /knowledge_bases/{kb_id}/categories/{id}
+      access: read
+      description: "Get a single KB category."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_kb_category:
+      method: POST
+      path: /knowledge_bases/{kb_id}/categories
+      access: write
+      description: "Create a KB category. translations_attributes is an array of {title, locale}."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        parent_id: { type: integer, in: body }
+        category_icon: { type: string, in: body }
+        translations_attributes: { type: array, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_kb_category:
+      method: PATCH
+      path: /knowledge_bases/{kb_id}/categories/{id}
+      access: write
+      description: "Update a KB category."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        parent_id: { type: integer, in: body }
+        category_icon: { type: string, in: body }
+        translations_attributes: { type: array, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_kb_category:
+      method: DELETE
+      path: /knowledge_bases/{kb_id}/categories/{id}
+      access: dangerous
+      description: "Delete a KB category. Fails if it has child categories or answers."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_kb_category_permissions:
+      method: GET
+      path: /knowledge_bases/{kb_id}/categories/{id}/permissions
+      access: read
+      description: "Get role permissions for a specific KB category (override category-level access)."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    set_kb_category_permissions:
+      method: PUT
+      path: /knowledge_bases/{kb_id}/categories/{id}/permissions
+      access: admin
+      description: "Set role permissions for a KB category (overrides KB-wide permissions for this subtree)."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        permissions: { type: array, in: body, required: true, description: "Array of {role_id, access}" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    reorder_kb_subcategories:
+      method: PATCH
+      path: /knowledge_bases/{kb_id}/categories/{id}/reorder_categories
+      access: write
+      description: "Set the display order of subcategories within a category."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true, description: "Parent category ID" }
+        ordered_ids: { type: array, in: body, required: true, description: "Array of subcategory IDs in desired order" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    reorder_kb_answers:
+      method: PATCH
+      path: /knowledge_bases/{kb_id}/categories/{id}/reorder_answers
+      access: write
+      description: "Set the display order of answers within a category."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true, description: "Category ID" }
+        ordered_ids: { type: array, in: body, required: true, description: "Array of answer IDs in desired order" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # KB Answers
+    # =========================================================================
+
+    get_kb_answer:
+      method: GET
+      path: /knowledge_bases/{kb_id}/answers/{id}
+      access: read
+      description: "Get a KB answer. Use include_contents=<translation_id> to inline the body content."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        include_contents: { type: integer, in: query, description: "Translation ID whose content to inline" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_kb_answer:
+      method: POST
+      path: /knowledge_bases/{kb_id}/answers
+      access: write
+      description: "Create a KB answer. translations_attributes must contain at least one {title, content (HTML), locale}."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        category_id: { type: integer, in: body, required: true }
+        translations_attributes: { type: array, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_kb_answer:
+      method: PATCH
+      path: /knowledge_bases/{kb_id}/answers/{id}
+      access: write
+      description: "Update a KB answer."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        category_id: { type: integer, in: body }
+        translations_attributes: { type: array, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_kb_answer:
+      method: DELETE
+      path: /knowledge_bases/{kb_id}/answers/{id}
+      access: dangerous
+      description: "Delete a KB answer."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    publish_kb_answer:
+      method: POST
+      path: /knowledge_bases/{kb_id}/answers/{id}/publish
+      access: write
+      description: "Publish a KB answer publicly."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    internal_kb_answer:
+      method: POST
+      path: /knowledge_bases/{kb_id}/answers/{id}/internal
+      access: write
+      description: "Publish a KB answer to internal audience only."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    archive_kb_answer:
+      method: POST
+      path: /knowledge_bases/{kb_id}/answers/{id}/archive
+      access: write
+      description: "Archive a KB answer (soft-hide without delete)."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    unarchive_kb_answer:
+      method: POST
+      path: /knowledge_bases/{kb_id}/answers/{id}/unarchive
+      access: write
+      description: "Restore an archived KB answer."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    upload_kb_answer_attachment:
+      method: POST
+      path: /knowledge_bases/{kb_id}/answers/{id}/attachments
+      access: write
+      description: "Attach a file to a KB answer. Multipart upload -- file_url is fetched by ToolMesh and forwarded as multipart/form-data."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        file: { type: file_url, in: body, required: true, description: "URL of the file to attach (ToolMesh fetches and forwards)" }
+      content_type: multipart/form-data
+      pagination: none
+
+    delete_kb_answer_attachment:
+      method: DELETE
+      path: /knowledge_bases/{kb_id}/answers/{id}/attachments/{attachment_id}
+      access: dangerous
+      description: "Remove an attachment from a KB answer."
+      params:
+        kb_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true, description: "Answer ID" }
+        attachment_id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Checklists
+    # =========================================================================
+
+    get_checklist:
+      method: GET
+      path: /checklists/{id}
+      access: read
+      description: "Get a single ticket checklist."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_checklist:
+      method: POST
+      path: /checklists
+      access: write
+      description: "Create a checklist on a ticket, optionally from a template."
+      params:
+        ticket_id: { type: integer, in: body, required: true }
+        template_id: { type: integer, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_checklist:
+      method: PATCH
+      path: /checklists/{id}
+      access: write
+      description: "Update checklist (rename, reorder items)."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        sorted_item_ids: { type: array, in: body, description: "Array of item ids in display order" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_checklist:
+      method: DELETE
+      path: /checklists/{id}
+      access: dangerous
+      description: "Delete a checklist (and all its items)."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Checklist Items
+    # =========================================================================
+
+    get_checklist_item:
+      method: GET
+      path: /checklist_items/{id}
+      access: read
+      description: "Get a single checklist item."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_checklist_item:
+      method: POST
+      path: /checklist_items
+      access: write
+      description: "Add an item to a checklist."
+      params:
+        checklist_id: { type: integer, in: body, required: true }
+        text: { type: string, in: body, required: true }
+        checked: { type: boolean, in: body, default: false }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_checklist_item:
+      method: PATCH
+      path: /checklist_items/{id}
+      access: write
+      description: "Update a checklist item (text and/or checked state)."
+      params:
+        id: { type: integer, in: path, required: true }
+        text: { type: string, in: body }
+        checked: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_checklist_item:
+      method: DELETE
+      path: /checklist_items/{id}
+      access: dangerous
+      description: "Delete a checklist item."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Checklist Templates
+    # =========================================================================
+
+    list_checklist_templates:
+      method: GET
+      path: /checklist_templates
+      access: read
+      description: "List checklist templates."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_checklist_template:
+      method: GET
+      path: /checklist_templates/{id}
+      access: read
+      description: "Get a single checklist template."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_checklist_template:
+      method: POST
+      path: /checklist_templates
+      access: admin
+      description: "Create a reusable checklist template."
+      params:
+        name: { type: string, in: body, required: true }
+        items: { type: array, in: body, description: "Array of item-text strings" }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_checklist_template:
+      method: PATCH
+      path: /checklist_templates/{id}
+      access: admin
+      description: "Update a checklist template."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        items: { type: array, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_checklist_template:
+      method: DELETE
+      path: /checklist_templates/{id}
+      access: dangerous
+      description: "Delete a checklist template."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Macros (admin-level automation shortcuts)
+    # =========================================================================
+
+    list_macros:
+      method: GET
+      path: /macros
+      access: read
+      description: "List macros (named action-bundles applied to tickets)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_macro:
+      method: GET
+      path: /macros/{id}
+      access: read
+      description: "Get a single macro."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_macro:
+      method: POST
+      path: /macros
+      access: admin
+      description: "Create a macro. perform is a map of attribute -> {value, ...}."
+      params:
+        name: { type: string, in: body, required: true }
+        perform: { type: object, in: body, required: true }
+        ux_flow_next_up: { type: string, in: body, description: "none | next_task | next_from_overview" }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_macro:
+      method: PUT
+      path: /macros/{id}
+      access: admin
+      description: "Update a macro."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        perform: { type: object, in: body }
+        ux_flow_next_up: { type: string, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_macro:
+      method: DELETE
+      path: /macros/{id}
+      access: dangerous
+      description: "Delete a macro."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Triggers (event-driven automations)
+    # =========================================================================
+
+    list_triggers:
+      method: GET
+      path: /triggers
+      access: read
+      description: "List automation triggers."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_trigger:
+      method: GET
+      path: /triggers/{id}
+      access: read
+      description: "Get a single trigger."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_trigger:
+      method: POST
+      path: /triggers
+      access: admin
+      description: "Create an event trigger. condition selects matching tickets; perform applies actions."
+      params:
+        name: { type: string, in: body, required: true }
+        condition: { type: object, in: body, required: true }
+        perform: { type: object, in: body, required: true }
+        disable_notification: { type: boolean, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_trigger:
+      method: PUT
+      path: /triggers/{id}
+      access: admin
+      description: "Update a trigger."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        condition: { type: object, in: body }
+        perform: { type: object, in: body }
+        disable_notification: { type: boolean, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_trigger:
+      method: DELETE
+      path: /triggers/{id}
+      access: dangerous
+      description: "Delete a trigger."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Overviews (saved ticket views)
+    # =========================================================================
+
+    list_overviews:
+      method: GET
+      path: /overviews
+      access: read
+      description: "List saved ticket overviews (custom queues / views)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_overview:
+      method: GET
+      path: /overviews/{id}
+      access: read
+      description: "Get a single overview."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_overview:
+      method: POST
+      path: /overviews
+      access: admin
+      description: "Create an overview (named ticket query) shared with selected roles."
+      params:
+        name: { type: string, in: body, required: true }
+        link: { type: string, in: body, description: "URL slug" }
+        prio: { type: integer, in: body, description: "Display order" }
+        role_ids: { type: array, in: body }
+        condition: { type: object, in: body, required: true }
+        order: { type: object, in: body, description: "{by, direction}" }
+        group_by: { type: string, in: body }
+        view: { type: object, in: body, description: "Display columns and density" }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_overview:
+      method: PUT
+      path: /overviews/{id}
+      access: admin
+      description: "Update an overview."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        link: { type: string, in: body }
+        prio: { type: integer, in: body }
+        role_ids: { type: array, in: body }
+        condition: { type: object, in: body }
+        order: { type: object, in: body }
+        group_by: { type: string, in: body }
+        view: { type: object, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_overview:
+      method: DELETE
+      path: /overviews/{id}
+      access: dangerous
+      description: "Delete an overview."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Schedulers / Jobs (recurring automations)
+    # =========================================================================
+
+    list_jobs:
+      method: GET
+      path: /jobs
+      access: read
+      description: "List scheduler jobs (recurring tasks executed on a timer)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_job:
+      method: GET
+      path: /jobs/{id}
+      access: read
+      description: "Get a single scheduler job."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_job:
+      method: POST
+      path: /jobs
+      access: admin
+      description: "Create a recurring scheduler job."
+      params:
+        name: { type: string, in: body, required: true }
+        timeplan: { type: object, in: body, required: true, description: "{days, hours, minutes} cron-like schedule" }
+        condition: { type: object, in: body, required: true }
+        perform: { type: object, in: body, required: true }
+        disable_notification: { type: boolean, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_job:
+      method: PUT
+      path: /jobs/{id}
+      access: admin
+      description: "Update a scheduler job."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        timeplan: { type: object, in: body }
+        condition: { type: object, in: body }
+        perform: { type: object, in: body }
+        disable_notification: { type: boolean, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_job:
+      method: DELETE
+      path: /jobs/{id}
+      access: dangerous
+      description: "Delete a scheduler job."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Reports
+    # =========================================================================
+
+    generate_report:
+      method: POST
+      path: /reports/generate
+      access: read
+      description: "Generate a report dataset (counts/aggregates) for a given metric over a date range."
+      params:
+        metric: { type: string, in: body, required: true, description: "e.g. 'count', 'create_channels', 'communication'" }
+        year: { type: integer, in: body }
+        month: { type: integer, in: body }
+        week: { type: integer, in: body }
+        day: { type: integer, in: body }
+        timeRange: { type: string, in: body, description: "year | month | week | day | realtime" }
+        profile_id: { type: integer, in: body, required: true, description: "Report profile id" }
+        downloadBackendSelected: { type: string, in: body, description: "Backend metric key" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    list_report_sets:
+      method: GET
+      path: /reports/sets
+      access: read
+      description: "List available report sets (configured profiles and backends)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Signatures
+    # =========================================================================
+
+    list_signatures:
+      method: GET
+      path: /signatures
+      access: read
+      description: "List email signatures."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_signature:
+      method: GET
+      path: /signatures/{id}
+      access: read
+      description: "Get a single signature."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_signature:
+      method: POST
+      path: /signatures
+      access: admin
+      description: "Create an email signature. body supports Zammad variable placeholders."
+      params:
+        name: { type: string, in: body, required: true }
+        body: { type: string, in: body, required: true }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_signature:
+      method: PUT
+      path: /signatures/{id}
+      access: admin
+      description: "Update a signature."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        body: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_signature:
+      method: DELETE
+      path: /signatures/{id}
+      access: dangerous
+      description: "Delete a signature."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Text Modules
+    # =========================================================================
+
+    list_text_modules:
+      method: GET
+      path: /text_modules
+      access: read
+      description: "List text modules (canned replies / snippets)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_text_module:
+      method: GET
+      path: /text_modules/{id}
+      access: read
+      description: "Get a single text module."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_text_module:
+      method: POST
+      path: /text_modules
+      access: admin
+      description: "Create a text module. keywords trigger autocomplete in the compose box."
+      params:
+        name: { type: string, in: body, required: true }
+        keywords: { type: string, in: body }
+        content: { type: string, in: body, required: true }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_text_module:
+      method: PUT
+      path: /text_modules/{id}
+      access: admin
+      description: "Update a text module."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        keywords: { type: string, in: body }
+        content: { type: string, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_text_module:
+      method: DELETE
+      path: /text_modules/{id}
+      access: dangerous
+      description: "Delete a text module."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Ticket Templates
+    # =========================================================================
+
+    list_templates:
+      method: GET
+      path: /templates
+      access: read
+      description: "List ticket-creation templates."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_template:
+      method: GET
+      path: /templates/{id}
+      access: read
+      description: "Get a single template."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_template:
+      method: POST
+      path: /templates
+      access: write
+      description: "Create a ticket template. options is a map of attribute -> value used to pre-fill the create form."
+      params:
+        name: { type: string, in: body, required: true }
+        options: { type: object, in: body, required: true }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_template:
+      method: PUT
+      path: /templates/{id}
+      access: write
+      description: "Update a template."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        options: { type: object, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_template:
+      method: DELETE
+      path: /templates/{id}
+      access: dangerous
+      description: "Delete a template."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Email Addresses (outbound senders)
+    # =========================================================================
+
+    list_email_addresses:
+      method: GET
+      path: /email_addresses
+      access: read
+      description: "List configured email-sender addresses."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_email_address:
+      method: GET
+      path: /email_addresses/{id}
+      access: read
+      description: "Get a single email address."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_email_address:
+      method: POST
+      path: /email_addresses
+      access: admin
+      description: "Add a sender email address linked to an outbound channel."
+      params:
+        realname: { type: string, in: body, required: true }
+        email: { type: string, in: body, required: true }
+        channel_id: { type: integer, in: body, required: true }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_email_address:
+      method: PUT
+      path: /email_addresses/{id}
+      access: admin
+      description: "Update an email address."
+      params:
+        id: { type: integer, in: path, required: true }
+        realname: { type: string, in: body }
+        email: { type: string, in: body }
+        channel_id: { type: integer, in: body }
+        note: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_email_address:
+      method: DELETE
+      path: /email_addresses/{id}
+      access: dangerous
+      description: "Delete an email address."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Postmaster (Email) Filter Rules
+    # =========================================================================
+
+    list_postmaster_filters:
+      method: GET
+      path: /postmaster_filters
+      access: read
+      description: "List postmaster filters (email pre-processing rules: match headers, set ticket properties)."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_postmaster_filter:
+      method: GET
+      path: /postmaster_filters/{id}
+      access: read
+      description: "Get a single postmaster filter."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_postmaster_filter:
+      method: POST
+      path: /postmaster_filters
+      access: admin
+      description: "Create a postmaster filter. match selects emails by header; perform assigns ticket fields."
+      params:
+        name: { type: string, in: body, required: true }
+        match: { type: object, in: body, required: true }
+        perform: { type: object, in: body, required: true }
+        channel: { type: string, in: body }
+        active: { type: boolean, in: body, default: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_postmaster_filter:
+      method: PUT
+      path: /postmaster_filters/{id}
+      access: admin
+      description: "Update a postmaster filter."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        match: { type: object, in: body }
+        perform: { type: object, in: body }
+        channel: { type: string, in: body }
+        active: { type: boolean, in: body }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_postmaster_filter:
+      method: DELETE
+      path: /postmaster_filters/{id}
+      access: dangerous
+      description: "Delete a postmaster filter."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Tag Administration (catalog-level)
+    # =========================================================================
+
+    list_all_tags:
+      method: GET
+      path: /tag_list
+      access: read
+      description: "List all defined tags with usage counts."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    create_tag_definition:
+      method: POST
+      path: /tag_list
+      access: admin
+      description: "Create a tag in the catalog (without attaching it to an object yet)."
+      params:
+        name: { type: string, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    rename_tag:
+      method: PUT
+      path: /tag_list/{id}
+      access: admin
+      description: "Rename a tag everywhere it is used."
+      params:
+        id: { type: integer, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    delete_tag_definition:
+      method: DELETE
+      path: /tag_list/{id}
+      access: dangerous
+      description: "Delete a tag from the catalog and detach it from all objects."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Translations (UI strings)
+    # =========================================================================
+
+    list_translations:
+      method: GET
+      path: /translations
+      access: read
+      description: "List UI string translations."
+      params:
+        locale: { type: string, in: query, description: "Filter by locale (e.g. 'de-de')" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    list_admin_translations:
+      method: GET
+      path: /translations/admin/lang/{locale}
+      access: admin
+      description: "Get all translations for a locale, including admin-overridable strings."
+      params:
+        locale: { type: string, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Settings (global system configuration)
+    # =========================================================================
+
+    list_settings:
+      method: GET
+      path: /settings
+      access: admin
+      description: "List system settings. Returns full setting objects -- use jq to filter by area or name."
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_setting:
+      method: GET
+      path: /settings/{id}
+      access: admin
+      description: "Get a single setting by ID."
+      params:
+        id: { type: integer, in: path, required: true }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    update_setting:
+      method: PUT
+      path: /settings/{id}
+      access: admin
+      description: "Update a system setting. Only state_current can typically be changed; structure depends on the setting."
+      params:
+        id: { type: integer, in: path, required: true }
+        state_current: { type: object, in: body, required: true, description: "New setting value, e.g. {value: 'foo'}" }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Activity Stream & Recent Viewed
+    # =========================================================================
+
+    get_activity_stream:
+      method: GET
+      path: /activity_stream
+      access: read
+      description: "Get the activity stream for the authenticated user (recent changes across visible objects)."
+      params:
+        limit: { type: integer, in: query }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    get_recent_viewed:
+      method: GET
+      path: /recent_viewed
+      access: read
+      description: "Get the list of recently viewed objects for the authenticated user."
+      params:
+        limit: { type: integer, in: query }
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Karma (Gamification leaderboard -- optional feature, often disabled)
+    # =========================================================================
+
+    list_karma_users:
+      method: GET
+      path: /karma/user_list
+      access: read
+      description: >-
+        Get the Karma gamification leaderboard. Returns an array of
+        {user_id, score, level} entries (level e.g. 'Beginner', 'Master').
+        Karma awards points for actions like first-response-within-SLA,
+        ticket-closed, KB-answer-published. Often disabled by admins --
+        404 means the feature is not enabled.
+      params:
+        X-On-Behalf-Of: *on_behalf_of
+      pagination: none
+
+    # =========================================================================
+    # Monitoring (health checks -- token query param, not Authorization)
+    # =========================================================================
+
+    monitoring_health_check:
+      method: GET
+      path: /monitoring/health_check
+      access: read
+      description: "Health check endpoint. NOTE: requires a separate monitoring token passed as ?token=... query parameter (configured in Admin -> System -> Monitoring), NOT the user access token."
+      params:
+        token: { type: string, in: query, required: true, description: "Monitoring token from Admin -> System -> Monitoring" }
+      pagination: none
+
+    monitoring_status:
+      method: GET
+      path: /monitoring/status
+      access: read
+      description: "System status / counts. Requires monitoring token (see monitoring_health_check)."
+      params:
+        token: { type: string, in: query, required: true }
+      pagination: none
+
+    monitoring_amount_check:
+      method: GET
+      path: /monitoring/amount_check
+      access: read
+      description: "Volume check (e.g. tickets created in last period)."
+      params:
+        token: { type: string, in: query, required: true }
+        periode: { type: string, in: query, description: "Time window, e.g. '1h', '24h', '7d'" }
+      pagination: none
+
+  # ===========================================================================
+  # Composite tools -- multi-step convenience operations
+  # ===========================================================================
+
+  composites:
+
+    reply_and_close:
+      description: "Append an outbound email reply to a ticket and close it in one atomic call. Common agent workflow."
+      params:
+        ticket_id: { type: integer, required: true }
+        body: { type: string, required: true }
+        subject: { type: string }
+        on_behalf_of: { type: string, description: "Optional impersonation -- numeric user id, login, or email. Forwarded as X-On-Behalf-Of header." }
+      timeout: 30s
+      depends_on: [update_ticket]
+      code: |
+        const args = {
+          id: params.ticket_id,
+          state: "closed",
+          article: {
+            subject: params.subject,
+            body: params.body,
+            type: "email",
+            sender: "Agent",
+            internal: false,
+            content_type: "text/html"
+          }
+        };
+        if (params.on_behalf_of) args["X-On-Behalf-Of"] = params.on_behalf_of;
+        return await api.update_ticket(args);
+
+    create_ticket_with_articles:
+      description: "Create a ticket and append additional follow-up articles in sequence. Useful for migrating existing conversations."
+      params:
+        title: { type: string, required: true }
+        group: { type: string, required: true }
+        customer: { type: string, required: true }
+        initial_article: { type: object, required: true, description: "{subject, body, type, internal, sender}" }
+        follow_ups: { type: array, description: "Array of additional article objects to append" }
+        on_behalf_of: { type: string, description: "Optional impersonation -- forwarded as X-On-Behalf-Of header" }
+      timeout: 60s
+      depends_on: [create_ticket, create_article]
+      code: |
+        const createArgs = {
+          title: params.title,
+          group: params.group,
+          customer: params.customer,
+          article: params.initial_article
+        };
+        if (params.on_behalf_of) createArgs["X-On-Behalf-Of"] = params.on_behalf_of;
+        const ticket = await api.create_ticket(createArgs);
+        const followUps = params.follow_ups || [];
+        for (const art of followUps) {
+          const articleArgs = { ticket_id: ticket.id, ...art };
+          if (params.on_behalf_of) articleArgs["X-On-Behalf-Of"] = params.on_behalf_of;
+          await api.create_article(articleArgs);
+        }
+        return ticket;
+
+    find_or_create_customer:
+      description: "Look up a customer by email; create them if they do not exist. Returns the user object."
+      params:
+        email: { type: string, required: true }
+        firstname: { type: string }
+        lastname: { type: string }
+        organization: { type: string }
+      timeout: 20s
+      depends_on: [search_users, create_user]
+      code: |
+        const found = await api.search_users({ query: "email:" + params.email, limit: 1 });
+        if (Array.isArray(found) && found.length > 0) return found[0];
+        return await api.create_user({
+          email: params.email,
+          firstname: params.firstname,
+          lastname: params.lastname,
+          organization: params.organization,
+          role_ids: [3]
+        });
+
+  # ===========================================================================
+  # Examples -- few-shot prompts for the LLM
+  # ===========================================================================
+
+  examples:
+
+    - name: "Open a ticket on behalf of a customer"
+      description: "Create a ticket attributed to a specific customer email (pass-through impersonation via X-On-Behalf-Of header)."
+      code: |
+        const ticket = await api.create_ticket({
+          title: "Printer offline in Berlin office",
+          group: "Support",
+          customer: "alice@customer.example",
+          article: {
+            subject: "Printer offline",
+            body: "The HP LaserJet in room 3.04 has been offline since this morning.",
+            type: "web",
+            sender: "Customer",
+            internal: false
+          },
+          "X-On-Behalf-Of": "alice@customer.example"
+        });
+        return ticket;
+
+    - name: "Search recent open tickets and summarize"
+      description: "Find all open tickets created in the last 24 hours and get their AI summaries."
+      code: |
+        const tickets = await api.search_tickets({
+          query: "state.name:open AND created_at:>now-24h",
+          limit: 10,
+          expand: true
+        });
+        const summaries = [];
+        for (const t of tickets) {
+          const sum = await api.summarize_ticket({ id: t.id });
+          summaries.push({ id: t.id, number: t.number, title: t.title, summary: sum });
+        }
+        return summaries;
+
+    - name: "Reply, set priority, and close in one call"
+      description: "Common agent workflow -- reply to a customer and close the ticket."
+      code: |
+        return await api.update_ticket({
+          id: 4711,
+          state: "closed",
+          priority: "2 normal",
+          article: {
+            subject: "Re: Your request",
+            body: "<p>Thanks for reaching out -- this is fixed in v1.2.3.</p>",
+            type: "email",
+            sender: "Agent",
+            internal: false,
+            content_type: "text/html"
+          }
+        });
+
+    - name: "Add a custom field to tickets and apply migrations"
+      description: "Create a custom 'priority_reason' text field on tickets and apply schema migrations."
+      code: |
+        await api.create_object_attribute({
+          name: "priority_reason",
+          object: "Ticket",
+          display: "Priority Reason",
+          data_type: "input",
+          data_option: { type: "text", maxlength: 255, null: true },
+          screens: { create_top: { ticket_agent: { shown: true } }, edit: { ticket_agent: { shown: true } } },
+          position: 200,
+          active: true
+        });
+        return await api.execute_object_manager_migrations();
+
+    - name: "Bulk tag tickets matching a search"
+      description: "Find tickets by query, attach a 'reviewed' tag to each."
+      code: |
+        const tickets = await api.search_tickets({
+          query: "state.name:closed AND tags:!reviewed AND closed_at:>now-7d",
+          limit: 50
+        });
+        for (const t of tickets) {
+          await api.add_tag({ item: "reviewed", object: "Ticket", o_id: t.id });
+        }
+        return { tagged: tickets.length };
