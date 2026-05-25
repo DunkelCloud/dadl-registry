@@ -121,6 +121,37 @@
 # - WiFi vs Wireless: /interface/wireless is the legacy stack (still on most
 #   devices). /interface/wifi is the newer stack on cAP ax, hAP ax, Audience,
 #   etc. They are NOT interchangeable -- pick the one that matches the device.
+#
+# Known ToolMesh wrapper bugs (as of 2026-05-25) — workarounds wired into
+# this DADL; remove the workarounds once the wrapper is fixed:
+# - PATCH/DELETE on /xxx/{*N-id} routes return HTTP 400. The wrapper does
+#   not percent-encode the leading asterisk in RouterOS .ids (e.g. '*6'
+#   should be '%2A6' in the URL path). Affects every update_*/delete_*
+#   tool in this DADL whose path uses {id}. Verified empirically on
+#   bridge-vlan (update_bridge_vlan, delete_bridge_vlan) — both fail
+#   on a freshly-added empty test record. Workaround: prefer the POST
+#   /xxx/set and POST /xxx/remove twins (set_bridge_vlan, remove_bridge_vlan,
+#   set_dhcp_server, set_bridge_port, set_ethernet_interface, set_interface,
+#   ...) which take 'numbers' in the body instead of an .id in the URL path.
+#   These have been added/marked WORKING throughout. Until the wrapper is
+#   fixed, fall back to /xxx/set + 'numbers' for edits, and to /xxx/remove
+#   + 'numbers' (or the CLI) for deletes. ToolMesh issue tracked in the
+#   DADL/Wrapper Befund 2026-05-25.
+# - POST /interface/bridge/port/set REQUIRES the bridge-port record's .id
+#   in 'numbers'. The interface name (e.g. 'ether47') returns HTTP 404 —
+#   verified on RouterOS 7.x. Lookup pattern: call list_bridge_ports first,
+#   filter by .interface, take the record's .id (a string like '*2E'),
+#   then pass that as 'numbers' to set_bridge_port. The set_bridge_port
+#   description and 'numbers' param description reflect this.
+# - Generic JSON-null swallowing: when a Code Mode call passes a field
+#   value of literal JSON null (intent: clear a nullable field), the
+#   wrapper drops the key before sending — the backend never sees it.
+#   Most fields in RouterOS are STRINGS, so the idiomatic 'clear' is an
+#   empty string ('') instead, which IS forwarded correctly. Use ''
+#   wherever you need to wipe a value (e.g. {address:''} on /ip/service
+#   to remove the source-address restriction). Reserve actual JSON null
+#   for backends where the field is genuinely nullable (NetBox FKs etc.) —
+#   on RouterOS this rarely applies.
 
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
 
@@ -129,12 +160,12 @@ credits:
 
 source_name: "MikroTik RouterOS REST API"
 source_url: "https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST+API"
-date: "2026-05-21"
+date: "2026-05-25"
 
 backend:
   name: mikrotik
   type: rest
-  version: "1.0"
+  version: "1.1"
   # base_url intentionally omitted -- self-hosted, provided via backends.yaml.
   # Each MikroTik device has its own URL (e.g. https://10.0.0.1/rest).
   description: "MikroTik RouterOS REST API -- manage interfaces, IP addresses, routing, firewall, DHCP, DNS, PPP, queues, wireless, system configuration, users, certificates, files, logs, and diagnostics on RouterOS v7.1+ devices"
@@ -170,12 +201,12 @@ backend:
       allow_jq_override: true
 
   coverage:
-    endpoints: 295
+    endpoints: 297
     total_endpoints: 450
-    percentage: 64
-    focus: "system (resource, identity, clock, health, license, package, script, scheduler, reboot/shutdown, backup, note, logging rules + actions with /set twin), interfaces (generic set, list/CRUD, ethernet + atomic /set + switch chip + switch port, bridge + /set + port /set + VLAN CRUD + host/FDB table, vlan, bonding CRUD, wireless legacy, wifi, lte + /set, wireguard + interface CRUD + peers, list/member + list CRUD), IP (address, route, ARP, neighbor, service set/enable/disable, pool, cloud + /set), DNS (settings, static, cache), DHCP server (CRUD + /set + delete, lease, network CRUD, make-static, client CRUD + release/renew), firewall (filter, NAT, mangle full CRUD + move, raw full CRUD + move, address-list update, connection tracking), IPv6 (address full CRUD, route CRUD, firewall filter CRUD + move, ND, settings /set), PPP (secret, active, profile CRUD), routing (BGP connection CRUD, BGP templates/sessions, OSPF instance + area CRUD, interface-templates, neighbors, routing-filter rules CRUD), queues (simple full, tree, type), tools (ping, traceroute, bandwidth-test, netwatch CRUD, email SMTP settings get/set + send), users (user, group CRUD, ssh-keys, active sessions), logs, certificates, files, SNMP, VPN servers (L2TP/SSTP/PPTP/OVPN singleton get/set), IPsec (peer, identity, policy, profile, proposal full CRUD; active-peers, installed-sa, flush, settings), container (RouterOS 7), MPLS basics"
-    missing: "CAPsMAN controller endpoints (out of scope: CRS354 is Ethernet-only), RADIUS server config, hotspot user profiles/walled garden, /interface/wireless deep config (legacy stack; tooling focuses on the modern /interface/wifi stack), BGP VPN/VPLS, OSPFv3 (instance.version=3 supported but no separate tooling), MPLS LDP detail, RIPv2, traffic-flow exporter, traffic monitor, GPS, ROMON, dude integration, dot1x, w60g, modem deep config, /tool/fetch (file upload/download via REST), file repository sync, certificate ACME plugin, /caps-man for new wifi stack (intentional: per-device wifi-config exposes set already)"
-    last_reviewed: "2026-05-21"
+    percentage: 65
+    focus: "system (resource, identity, clock, health, license, package, script, scheduler, reboot/shutdown, backup, note, logging rules + actions with /set twin), interfaces (generic set, list/CRUD, ethernet + atomic /set + switch chip + switch port, bridge + /set + port /set + VLAN CRUD + /set + /remove + host/FDB table, vlan, bonding CRUD, wireless legacy, wifi, lte + /set, wireguard + interface CRUD + peers, list/member + list CRUD), IP (address, route, ARP, neighbor, service set/enable/disable, pool, cloud + /set), DNS (settings, static, cache), DHCP server (CRUD + /set + delete, lease, network CRUD, make-static, client CRUD + release/renew), firewall (filter, NAT, mangle full CRUD + move, raw full CRUD + move, address-list update, connection tracking), IPv6 (address full CRUD, route CRUD, firewall filter CRUD + move, ND, settings /set), PPP (secret, active, profile CRUD), routing (BGP connection CRUD, BGP templates/sessions, OSPF instance + area CRUD, interface-templates, neighbors, routing-filter rules CRUD), queues (simple full, tree, type), tools (ping, traceroute, bandwidth-test, netwatch CRUD, email SMTP settings get/set + send), users (user, group CRUD, ssh-keys, active sessions), logs, certificates, files, SNMP, VPN servers (L2TP/SSTP/PPTP/OVPN singleton get/set), IPsec (peer, identity, policy, profile, proposal full CRUD; active-peers, installed-sa, flush, settings), container (RouterOS 7), MPLS basics"
+    missing: "CAPsMAN controller endpoints (out of scope: CRS354 is Ethernet-only), RADIUS server config, hotspot user profiles/walled garden, /interface/wireless deep config (legacy stack; tooling focuses on the modern /interface/wifi stack), BGP VPN/VPLS, OSPFv3 (instance.version=3 supported but no separate tooling), MPLS LDP detail, RIPv2, traffic-flow exporter, traffic monitor, GPS, ROMON, dude integration, dot1x, w60g, modem deep config, /tool/fetch (file upload/download via REST), file repository sync, certificate ACME plugin, /caps-man for new wifi stack (intentional: per-device wifi-config exposes set already). Also broken until ToolMesh wrapper fix (2026-05-25): every update_*/delete_* using PATCH/DELETE /xxx/{*N-id} returns HTTP 400 due to missing percent-encoding of the .id asterisk — see top-of-file 'Known ToolMesh wrapper bugs' note. Workarounds via POST /xxx/set + 'numbers' (and POST /xxx/remove + 'numbers' where exposed, e.g. remove_bridge_vlan) are unaffected."
+    last_reviewed: "2026-05-25"
 
   setup:
     credential_steps:
@@ -205,7 +236,7 @@ backend:
       - "reboot -- system reboot and shutdown"
       - "ftp -- file management"
     docs_url: "https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST+API"
-    notes: "RouterOS v7.1+ required (v7.9+ recommended). Most MikroTik devices ship with self-signed certificates -- ToolMesh must skip TLS verification or you must install a trusted certificate via /certificate/import. The 'api' policy is REQUIRED on the user's group for any REST access. For read-only monitoring, use group with policy=api,read,test,winbox; for full management add write,policy,reboot,ftp,sensitive."
+    notes: "RouterOS v7.1+ required (v7.9+ recommended). Most MikroTik devices ship with self-signed certificates -- ToolMesh must skip TLS verification or you must install a trusted certificate via /certificate/import. The 'api' policy is REQUIRED on the user's group for any REST access. For read-only monitoring, use group with policy=api,read,test,winbox; for full management add write,policy,reboot,ftp,sensitive. Known ToolMesh wrapper bugs (2026-05-25): (1) PATCH/DELETE /xxx/{*N-id} return HTTP 400 — use POST /xxx/set + 'numbers' (e.g. set_bridge_vlan) and POST /xxx/remove + 'numbers' (e.g. remove_bridge_vlan) instead. (2) set_bridge_port 'numbers' must be the bridge-port .id, not interface name. (3) JSON null is dropped by the wrapper — use empty string '' to clear fields. Full detail in the comment block at the top of this file."
 
   hints:
     list_interfaces:
@@ -277,6 +308,21 @@ backend:
       atomic_bridge: "Use POST /interface/bridge/set with 'numbers' when toggling multiple bridges or to keep mtu/admin-mac/vlan-filtering changes atomic. PATCH update_bridge works for single-record edits."
     set_bridge_port:
       slave_safety: "Bridge ports are slave-controlled — PATCH update on the (id) endpoint can reject mtu/l2mtu changes. POST /interface/bridge/port/set with numbers lets you change pvid/frame-types/ingress-filtering/hw on one or many ports atomically without the slave-validation gotcha."
+      numbers_must_be_id: "EMPIRICAL (RouterOS 7.x, verified 2026-05-25): 'numbers' MUST be the bridge-port record's .id (e.g. '*2E'). The interface name (e.g. 'ether47') returns HTTP 404 even though the CLI '/interface/bridge/port set [find interface=ether47]' accepts the resolver. Lookup pattern: call list_bridge_ports first, find the row where .interface matches, take .id, then pass that string as 'numbers'. Composite-friendly."
+      lookup_example: "const ports = await api.list_bridge_ports(); const row = ports.find(p => p.interface === 'ether47'); await api.set_bridge_port({numbers: row['.id'], pvid: '20'});"
+    update_bridge_vlan:
+      known_broken: "BROKEN as of 2026-05-25 — ToolMesh wrapper does not percent-encode the asterisk in RouterOS .ids when substituting into PATCH /xxx/{id} URLs, so the request returns HTTP 400. Use set_bridge_vlan instead (POST /interface/bridge/vlan/set with numbers in the body)."
+      workaround: "set_bridge_vlan({numbers: '<id>', comment: 'new'})"
+    delete_bridge_vlan:
+      known_broken: "BROKEN as of 2026-05-25 — same .id URL-encoding bug as update_bridge_vlan. Use remove_bridge_vlan instead (POST /interface/bridge/vlan/remove with numbers in the body)."
+      workaround: "remove_bridge_vlan({numbers: '<id>'})"
+    set_bridge_vlan:
+      preferred_until_fix: "Use this in place of update_bridge_vlan until the wrapper's PATCH /xxx/{*N-id} encoding bug is fixed. Identical semantics, but the .id travels in the request body instead of the URL path."
+      clearing_ports: "To remove ports from tagged/untagged lists, pass an empty string '' rather than JSON null — the wrapper drops keys with null values before sending."
+      lookup_example: "const vlans = await api.list_bridge_vlans(); const row = vlans.find(v => v['vlan-ids'] === '99'); await api.set_bridge_vlan({numbers: row['.id'], comment: 'updated'});"
+    remove_bridge_vlan:
+      preferred_until_fix: "Use this in place of delete_bridge_vlan until the wrapper's DELETE /xxx/{*N-id} encoding bug is fixed."
+      lookup_example: "const vlans = await api.list_bridge_vlans(); const row = vlans.find(v => v['vlan-ids'] === '99'); await api.remove_bridge_vlan({numbers: row['.id']});"
     add_logging_action:
       target_values: "memory | disk | echo | remote | email. Cannot create another 'remote' or 'email' — the 5 defaults are reserved names; new actions must use distinct names (e.g. 'graylog', 'siem-tcp')."
       remote_protocol_default: "remote-protocol defaults to 'udp'. Most syslog daemons (rsyslog, FluentD, syslog-ng) listen on UDP/514 by default. TCP/514 requires the receiver to be explicitly configured for TCP — confirm before using."
@@ -1156,13 +1202,19 @@ backend:
       access: write
       description: >
         Atomically update one or more bridge ports via CLI-style
-        '/interface/bridge/port set'. Reference via 'numbers' (.id or
-        bridge-port name). Use this instead of PATCH when you need to flip
-        pvid/frame-types/ingress-filtering on many ports together; PATCH on
-        individual bridge-port records can interact awkwardly with hardware
-        offload and slave validation.
+        '/interface/bridge/port set'. Use this instead of PATCH when you
+        need to flip pvid/frame-types/ingress-filtering on many ports
+        together; PATCH on individual bridge-port records can interact
+        awkwardly with hardware offload and slave validation.
+
+        IMPORTANT (verified 2026-05-25, RouterOS 7.x): 'numbers' MUST be
+        the bridge-port record's .id (e.g. '*2E'). Passing the interface
+        name (e.g. 'ether47') returns HTTP 404 — unlike the CLI, the REST
+        endpoint does NOT resolve interface→bridge-port. Lookup pattern:
+        call list_bridge_ports, find the row where .interface matches the
+        port you want, take its .id, then pass that as 'numbers'.
       params:
-        numbers: { type: string, in: body, required: true }
+        numbers: { type: string, in: body, required: true, description: "Bridge-port record .id(s), comma-separated, e.g. '*2E' or '*2E,*2F'. NOT interface name — the REST endpoint returns 404 on interface names. Use list_bridge_ports to resolve interface→.id." }
         bridge: { type: string, in: body }
         pvid: { type: string, in: body }
         frame-types: { type: string, in: body }
@@ -1211,7 +1263,18 @@ backend:
       method: PATCH
       path: /interface/bridge/vlan/{id}
       access: write
-      description: "Update an existing bridge-vlan record (tagged/untagged port lists, comment, disabled)."
+      description: >
+        Update an existing bridge-vlan record (tagged/untagged port lists,
+        comment, disabled).
+
+        KNOWN BROKEN (ToolMesh wrapper bug, 2026-05-25): this PATCH returns
+        HTTP 400 on RouterOS because the wrapper does not percent-encode
+        the leading asterisk in the .id URL segment (e.g. '*6' should be
+        '%2A6'). Reproduced empirically on a freshly-added empty test VLAN
+        with a trivial comment change. WORKAROUND: use set_bridge_vlan
+        (POST /interface/bridge/vlan/set with 'numbers') instead — it
+        passes the .id in the body and is not affected by the bug.
+        See top-of-file 'Known ToolMesh wrapper bugs' note.
       params:
         id: { type: string, in: path, required: true }
         bridge: { type: string, in: body }
@@ -1228,9 +1291,60 @@ backend:
       method: DELETE
       path: /interface/bridge/vlan/{id}
       access: write
-      description: "Remove a bridge-vlan record."
+      description: >
+        Remove a bridge-vlan record.
+
+        KNOWN BROKEN (ToolMesh wrapper bug, 2026-05-25): this DELETE returns
+        HTTP 400 — same .id URL-encoding bug as update_bridge_vlan.
+        WORKAROUND: use remove_bridge_vlan (POST /interface/bridge/vlan/remove
+        with 'numbers') instead.
       params:
         id: { type: string, in: path, required: true }
+      pagination: none
+
+    set_bridge_vlan:
+      method: POST
+      path: /interface/bridge/vlan/set
+      access: write
+      description: >
+        Update a bridge-vlan record via CLI-style '/interface/bridge/vlan set'.
+        Reference via 'numbers' = the .id of the bridge-vlan record (e.g. '*6').
+        PREFERRED over update_bridge_vlan until the ToolMesh wrapper bug
+        for PATCH /xxx/{*N-id} URL encoding is fixed — see the top-of-file
+        'Known ToolMesh wrapper bugs' note. Lookup the .id with
+        list_bridge_vlans first.
+
+        Note: although the CLI accepts multi-record selectors (e.g.
+        `[find vlan-ids=10,20]`), the REST docs only show single-.id
+        examples for /set. Treat this endpoint as one .id per call; loop
+        in a composite if you need batch.
+      params:
+        numbers: { type: string, in: body, required: true, description: "Bridge-vlan record .id, e.g. '*6'. Use list_bridge_vlans to resolve. Single .id only — multi-record batching via REST is undocumented." }
+        bridge: { type: string, in: body }
+        vlan-ids: { type: string, in: body }
+        tagged: { type: string, in: body, description: "Comma-separated port list. Pass empty string '' to clear (JSON null is dropped by the wrapper)." }
+        untagged: { type: string, in: body, description: "Comma-separated port list. Pass empty string '' to clear." }
+        comment: { type: string, in: body }
+        disabled: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    remove_bridge_vlan:
+      method: POST
+      path: /interface/bridge/vlan/remove
+      access: write
+      description: >
+        Remove a bridge-vlan record via CLI-style
+        '/interface/bridge/vlan remove'. Reference via 'numbers' = the .id
+        of the bridge-vlan record. PREFERRED over delete_bridge_vlan until
+        the ToolMesh wrapper bug for DELETE /xxx/{*N-id} URL encoding is
+        fixed. Lookup the .id with list_bridge_vlans first. Single .id
+        per call (see set_bridge_vlan note).
+      params:
+        numbers: { type: string, in: body, required: true, description: "Bridge-vlan record .id, e.g. '*6'. Single .id only." }
+      response:
+        result_path: "$"
       pagination: none
 
     list_vlan_interfaces:
