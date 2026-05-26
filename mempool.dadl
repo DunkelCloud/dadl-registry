@@ -1,0 +1,1524 @@
+# mempool.dadl — mempool.space Bitcoin Explorer REST API for ToolMesh
+# Bitcoin block explorer, mempool visualizer, lightning network explorer, and transaction accelerator
+#
+# Domain Notes for LLM consumers:
+# - mempool.space is a public Bitcoin/Lightning blockchain explorer; most endpoints are unauthenticated.
+# - The Accelerator (Pro) endpoints under /services/accelerator/* require an X-Mempool-Auth API key
+#   tied to a mempool.space account with prepaid balance. Public endpoints work without any credential.
+# - All amounts are in satoshis (sats) — 1 BTC = 100,000,000 sats. Fees are reported in sat/vB (sat per virtual byte).
+# - Block heights are 0-indexed; the genesis block is height 0. Block hashes are 64-char hex strings (little-endian display).
+# - Transaction IDs (txids) are 64-char hex strings.
+# - Timestamps are Unix epoch SECONDS (not milliseconds) unless explicitly noted otherwise.
+# - Address formats supported: legacy (1...), P2SH (3...), bech32 (bc1q...), taproot (bc1p...).
+# - Time period parameters across mining/lightning endpoints share the same vocabulary:
+#   "24h" | "3d" | "1w" | "1m" | "3m" | "6m" | "1y" | "2y" | "3y" — or omit for full history.
+#   Lightning statistics additionally accepts "latest".
+# - Mining pool slugs are lowercase, hyphenated (e.g. "antpool", "f2pool", "foundryusa", "viabtc").
+# - Country codes for Lightning endpoints are ISO 3166-1 alpha-2 (lowercase: "us", "de", "jp").
+# - Lightning channel status values: "open" | "active" | "closed".
+# - Lightning node pubkey is a 66-char hex string (compressed secp256k1 public key starting with "02" or "03").
+# - Pagination patterns vary by endpoint:
+#   - /address/{addr}/txs uses ?after_txid=<last_txid> query param (returns up to 25 confirmed txs per call)
+#   - /blocks/{startHeight} uses path-based stepping (returns 15 blocks starting from startHeight down)
+#   - /block/{hash}/txs/{start_index} uses path-based stepping (returns 25 txs per page)
+#   - Most other endpoints return bounded sets without pagination
+# - POST /api/tx accepts raw transaction HEX as plain-text body (NOT JSON-wrapped). Returns the txid as plain text on success.
+# - Rate limiting: HTTP 429 is returned when exceeded. The free tier limits are not formally published;
+#   Enterprise sponsorship grants higher quotas. Be respectful and cache where possible.
+# - The /api/v1/* prefix indicates extended endpoints beyond the Esplora-compatible base API.
+# - For self-hosted instances (Umbrel, RaspiBlitz, Start9, etc.) the same paths work — only base_url changes.
+# - The "Children Pay for Parent" (CPFP) feature lets a high-fee child tx pull a low-fee parent into a block.
+# - Replace-By-Fee (RBF): /api/v1/replacements returns mempool txs that replaced other txs.
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+credits:
+  - "Dunkel Cloud GmbH"
+source_name: "mempool.space REST API"
+source_url: https://mempool.space/docs/api/rest
+date: "2026-05-26"
+
+backend:
+  name: mempool
+  type: rest
+  version: "1.0"
+  base_url: https://mempool.space/api
+  description: "mempool.space — Bitcoin block explorer, mempool visualizer, fee estimator, Lightning Network explorer, and transaction accelerator"
+
+  coverage:
+    endpoints: 79
+    total_endpoints: 85
+    percentage: 93
+    focus: "general (difficulty, prices), addresses, blocks, mining (pools, hashrate, rewards), fees, mempool, transactions (incl. broadcast), Lightning (nodes, channels, geo), Accelerator (public + authenticated)"
+    missing: "block audit endpoints (predictions/score/summary — undocumented response shapes), Liquid sidechain endpoints"
+    last_reviewed: "2026-05-26"
+
+  setup:
+    credential_steps:
+      - "Most endpoints are PUBLIC — no credential is required to use general, address, block, mining, fee, mempool, transaction, and Lightning endpoints"
+      - "For Accelerator (Pro) endpoints only:"
+      - "1. Create an account at https://mempool.space and sign in"
+      - "2. Navigate to the Accelerator page: https://mempool.space/accelerator"
+      - "3. Top up your balance with Bitcoin or Lightning to enable Pro acceleration"
+      - "4. Generate or copy your X-Mempool-Auth API token from your account settings"
+      - "5. Store it as CREDENTIAL_MEMPOOL_AUTH_TOKEN in ToolMesh"
+    env_var: CREDENTIAL_MEMPOOL_AUTH_TOKEN
+    backends_yaml: |
+      - name: mempool
+        transport: rest
+        dadl: mempool.dadl
+        url: "https://mempool.space/api"
+    required_scopes: []
+    optional_scopes:
+      - "accelerator — required only for Pro acceleration endpoints (accelerate, cancel, balance, top-up history)"
+    docs_url: "https://mempool.space/docs/api/rest"
+    notes: >
+      mempool.space is a fully public Bitcoin explorer; no auth is needed for the vast majority of endpoints.
+      The X-Mempool-Auth header is only used by accelerator endpoints and personalizes acceleration estimates.
+      For self-hosted mempool instances (Umbrel, RaspiBlitz, Start9), override base_url in backends.yaml to
+      your local instance URL (e.g. http://umbrel.local:3006/api). Set credential to "none" if you only
+      need public endpoints.
+
+  auth:
+    type: apikey
+    credential: mempool_auth_token
+    inject_into: header
+    header_name: X-Mempool-Auth
+    # The X-Mempool-Auth header is optional for public endpoints and required only for
+    # Accelerator Pro endpoints. Use credential "none" if you don't have an account.
+
+  defaults:
+    headers:
+      Accept: application/json
+    errors:
+      format: text
+      message_path: "$"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 422]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+      rate_limit:
+        retry_after_header: Retry-After
+    response:
+      allow_jq_override: true
+
+  tools:
+
+    # ── General ──────────────────────────────────────────────────────
+
+    get_difficulty_adjustment:
+      method: GET
+      path: /v1/difficulty-adjustment
+      access: read
+      description: >
+        Get details on the next mining difficulty adjustment. Returns progressPercent, difficultyChange,
+        estimatedRetargetDate, remainingBlocks, remainingTime, previousRetarget, nextRetargetHeight,
+        timeAvg, timeOffset, and expectedBlocks. Updated each block.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_prices:
+      method: GET
+      path: /v1/prices
+      access: read
+      description: >
+        Get current bitcoin spot price denominated in main currencies (USD, EUR, GBP, CAD, CHF, AUD, JPY).
+        Returns { time, USD, EUR, GBP, CAD, CHF, AUD, JPY } with the timestamp of the price snapshot.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_historical_price:
+      method: GET
+      path: /v1/historical-price
+      access: read
+      description: >
+        Get bitcoin historical price denominated in the main currencies. When no parameters are provided
+        the full price history for all currencies is returned (can be large). Filter with `currency` and
+        anchor a single point in time with `timestamp` (Unix epoch seconds).
+      params:
+        currency:
+          type: string
+          in: query
+          required: false
+          description: "Currency code: USD, EUR, GBP, CAD, CHF, AUD, or JPY"
+        timestamp:
+          type: integer
+          in: query
+          required: false
+          description: "Unix epoch seconds — anchor for nearest historical price point"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Addresses ────────────────────────────────────────────────────
+
+    get_address:
+      method: GET
+      path: /address/{address}
+      access: read
+      description: >
+        Get details about a Bitcoin address including chain_stats (confirmed funded/spent tx counts and
+        sums in sats) and mempool_stats (unconfirmed activity). Supports legacy, P2SH, bech32, and taproot.
+      params:
+        address: { type: string, in: path, required: true, description: "Bitcoin address (1.../3.../bc1q.../bc1p...)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_address_txs:
+      method: GET
+      path: /address/{address}/txs
+      access: read
+      description: >
+        Get transaction history for an address, newest first. Returns the 50 most recent mempool
+        transactions plus the first 25 confirmed transactions. To paginate further into history,
+        use after_txid with the last txid from the previous page (returns up to 25 confirmed txs/call).
+      params:
+        address: { type: string, in: path, required: true, description: "Bitcoin address" }
+        after_txid:
+          type: string
+          in: query
+          required: false
+          description: "Pagination cursor — pass the last confirmed txid from the previous page"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_address_txs_chain:
+      method: GET
+      path: /address/{address}/txs/chain
+      access: read
+      description: >
+        Get only confirmed (mined) transactions for an address, newest first, up to 25 per page.
+        Use after_txid to paginate.
+      params:
+        address: { type: string, in: path, required: true }
+        after_txid: { type: string, in: query, required: false, description: "Pagination cursor — last confirmed txid" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_address_txs_mempool:
+      method: GET
+      path: /address/{address}/txs/mempool
+      access: read
+      description: >
+        Get only unconfirmed (mempool) transactions for an address. Returns up to 50 mempool entries.
+        No pagination — mempool depth is bounded.
+      params:
+        address: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_address_utxo:
+      method: GET
+      path: /address/{address}/utxo
+      access: read
+      description: >
+        Get the unspent transaction outputs (UTXOs) controlled by an address. Each entry has
+        txid, vout, value (sats), and status (confirmed flag + block_height/block_hash/block_time).
+      params:
+        address: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    validate_address:
+      method: GET
+      path: /v1/validate-address/{address}
+      access: read
+      description: >
+        Validate a Bitcoin address string. Returns { isvalid, address, scriptPubKey, isscript, iswitness, witness_version, witness_program }.
+        Use to detect typos before broadcasting or to identify the script type.
+      params:
+        address: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Blocks ───────────────────────────────────────────────────────
+
+    get_block:
+      method: GET
+      path: /block/{hash}
+      access: read
+      description: >
+        Get a block by hash. Returns id (hash), height, version, timestamp, tx_count, size (bytes),
+        weight (WU), merkle_root, previousblockhash, mediantime, nonce, bits, difficulty, and extras.
+      params:
+        hash: { type: string, in: path, required: true, description: "Block hash (64-char hex)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_extended:
+      method: GET
+      path: /v1/block/{hash}
+      access: read
+      description: >
+        Get an extended block by hash including mempool-derived fields: pool (mining pool slug+name+id),
+        avgFee, avgFeeRate, totalFees, medianFee, feeRange, reward, and mining metadata. Prefer this
+        over get_block for analytical use cases.
+      params:
+        hash: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_header:
+      method: GET
+      path: /block/{hash}/header
+      access: read
+      description: >
+        Get the raw 80-byte block header as a hex string. Useful for SPV proofs and external chain validation.
+      params:
+        hash: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_height:
+      method: GET
+      path: /block-height/{height}
+      access: read
+      description: >
+        Get the hash of the block at a specific height. Returns the block hash as plain text.
+        Useful for converting a height into a hash that other endpoints accept.
+      params:
+        height: { type: integer, in: path, required: true, description: "Block height (0 = genesis)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_timestamp:
+      method: GET
+      path: /v1/mining/blocks/timestamp/{timestamp}
+      access: read
+      description: >
+        Get the block nearest to a given Unix epoch SECONDS timestamp. Returns { height, hash, timestamp }.
+        Helpful for "what was the chain tip when X happened" lookups.
+      params:
+        timestamp: { type: integer, in: path, required: true, description: "Unix epoch seconds" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_raw:
+      method: GET
+      path: /block/{hash}/raw
+      access: read
+      description: >
+        Get the raw serialized block as binary data. Use sparingly — blocks can be up to ~4 MB.
+        Response type is application/octet-stream.
+      params:
+        hash: { type: string, in: path, required: true }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    get_block_status:
+      method: GET
+      path: /block/{hash}/status
+      access: read
+      description: >
+        Get a block's confirmation status. Returns { in_best_chain, height, next_best }. A block may be
+        "orphaned" (in_best_chain=false) after a reorg.
+      params:
+        hash: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_tip_height:
+      method: GET
+      path: /blocks/tip/height
+      access: read
+      description: >
+        Get the height of the current chain tip as plain text integer. Cheap, frequently used as a
+        liveness/sync check.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_tip_hash:
+      method: GET
+      path: /blocks/tip/hash
+      access: read
+      description: >
+        Get the hash of the current chain tip as plain text. Pair with get_block to fetch latest block details.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_txid:
+      method: GET
+      path: /block/{hash}/txid/{index}
+      access: read
+      description: >
+        Get the txid at a specific index within a block. Index 0 is the coinbase transaction.
+        Returns the txid as plain text.
+      params:
+        hash: { type: string, in: path, required: true }
+        index: { type: integer, in: path, required: true, description: "Tx index within block (0 = coinbase)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_txids:
+      method: GET
+      path: /block/{hash}/txids
+      access: read
+      description: >
+        Get all txids in a block as an ordered array of strings. Useful when you need every transaction
+        but want to avoid downloading full tx bodies.
+      params:
+        hash: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_txs:
+      method: GET
+      path: /block/{hash}/txs/{start_index}
+      access: read
+      description: >
+        Get up to 25 full transaction objects from a block starting at start_index. Step by 25 to paginate
+        (0, 25, 50, ...). Each tx includes vin, vout, fee, status, and weight.
+      params:
+        hash: { type: string, in: path, required: true }
+        start_index: { type: integer, in: path, required: true, description: "Starting tx index, must be a multiple of 25" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_blocks:
+      method: GET
+      path: /blocks/{startHeight}
+      access: read
+      description: >
+        Get summaries for the 10 most recent blocks ending at startHeight (descending). Omit startHeight
+        via get_blocks_latest to start from the chain tip. Each block summary has id, height, version,
+        timestamp, tx_count, size, weight, and merkle_root.
+      params:
+        startHeight: { type: integer, in: path, required: true, description: "Top block height for this page (descends 10 blocks)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_blocks_latest:
+      method: GET
+      path: /blocks
+      access: read
+      description: >
+        Get summaries for the 10 most recent blocks from the chain tip (descending).
+        Convenience endpoint — same response shape as get_blocks.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_blocks_extended:
+      method: GET
+      path: /v1/blocks/{startHeight}
+      access: read
+      description: >
+        Get extended summaries for the 15 most recent blocks ending at startHeight, including
+        mining pool, avgFee, avgFeeRate, totalFees, medianFee, and feeRange per block.
+      params:
+        startHeight: { type: integer, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_blocks_extended_latest:
+      method: GET
+      path: /v1/blocks
+      access: read
+      description: >
+        Get extended summaries for the 15 most recent blocks from the chain tip. Same shape as
+        get_blocks_extended.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_blocks_bulk:
+      method: GET
+      path: /v1/blocks-bulk/{minHeight}/{maxHeight}
+      access: read
+      description: >
+        Get extended block data for an inclusive height range. Returns extended summaries for every
+        block from minHeight to maxHeight. Limited to 10,000 blocks per request on hosted instance —
+        enterprise sponsorship required for larger ranges.
+      params:
+        minHeight: { type: integer, in: path, required: true }
+        maxHeight: { type: integer, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Mining ───────────────────────────────────────────────────────
+
+    get_mining_pools:
+      method: GET
+      path: /v1/mining/pools/{timePeriod}
+      access: read
+      description: >
+        Get a list of all mining pools ranked by blocks found during the time period. Returns each pool
+        with name, slug, link, blockCount, rank, and emptyBlocks. timePeriod is one of:
+        24h, 3d, 1w, 1m, 3m, 6m, 1y, 2y, 3y.
+      params:
+        timePeriod: { type: string, in: path, required: true, description: "24h | 3d | 1w | 1m | 3m | 6m | 1y | 2y | 3y" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_mining_pool:
+      method: GET
+      path: /v1/mining/pool/{slug}
+      access: read
+      description: >
+        Get detailed stats for one mining pool: name, slug, regexes, addresses, recent block history,
+        and basic activity metrics.
+      params:
+        slug: { type: string, in: path, required: true, description: "Pool slug (lowercase, hyphenated; e.g. antpool, f2pool, foundryusa)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_mining_pool_hashrates:
+      method: GET
+      path: /v1/mining/hashrate/pools/{timePeriod}
+      access: read
+      description: >
+        Get average hashrate and share of the network for each mining pool over a time period.
+        timePeriod values match get_mining_pools.
+      params:
+        timePeriod: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_mining_pool_hashrate:
+      method: GET
+      path: /v1/mining/pool/{slug}/hashrate
+      access: read
+      description: >
+        Get historical hashrate timeseries for a single mining pool. Each point has timestamp, avgHashrate, and share.
+      params:
+        slug: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_mining_pool_blocks:
+      method: GET
+      path: /v1/mining/pool/{slug}/blocks/{blockHeight}
+      access: read
+      description: >
+        Get blocks mined by a specific pool, descending from blockHeight. Returns up to 10 blocks per call.
+      params:
+        slug: { type: string, in: path, required: true }
+        blockHeight: { type: integer, in: path, required: true, description: "Starting block height (descends 10 blocks)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_hashrate:
+      method: GET
+      path: /v1/mining/hashrate/{timePeriod}
+      access: read
+      description: >
+        Get network-wide hashrate and difficulty timeseries over the period. Returns { hashrates, difficulty, currentHashrate, currentDifficulty }.
+      params:
+        timePeriod: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_difficulty_adjustments:
+      method: GET
+      path: /v1/mining/difficulty-adjustments/{interval}
+      access: read
+      description: >
+        Get the record of past difficulty adjustments over a trailing interval. Each entry has timestamp,
+        height, difficulty, adjustment (factor change). interval uses the same vocabulary as timePeriod.
+      params:
+        interval: { type: string, in: path, required: true, description: "24h | 3d | 1w | 1m | 3m | 6m | 1y | 2y | 3y" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_reward_stats:
+      method: GET
+      path: /v1/mining/reward-stats/{blockCount}
+      access: read
+      description: >
+        Get aggregated reward statistics across the last N blocks: startBlock, endBlock, totalReward,
+        totalFee, totalTx (count of transactions across those blocks).
+      params:
+        blockCount: { type: integer, in: path, required: true, description: "Number of recent blocks to aggregate" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_fees:
+      method: GET
+      path: /v1/mining/blocks/fees/{timePeriod}
+      access: read
+      description: >
+        Get average block-fee timeseries over the period. Each datapoint has timestamp, avgHeight, avgFees (sats).
+      params:
+        timePeriod: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_rewards:
+      method: GET
+      path: /v1/mining/blocks/rewards/{timePeriod}
+      access: read
+      description: >
+        Get average block-reward (subsidy + fees) timeseries over the period.
+      params:
+        timePeriod: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_feerates:
+      method: GET
+      path: /v1/mining/blocks/fee-rates/{timePeriod}
+      access: read
+      description: >
+        Get block fee-rate percentile timeseries (sat/vB at p10, p25, p50, p75, p90) over the period.
+        Useful for historical fee analysis.
+      params:
+        timePeriod: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_sizes_weights:
+      method: GET
+      path: /v1/mining/blocks/sizes-weights/{timePeriod}
+      access: read
+      description: >
+        Get block size (bytes) and weight (WU) timeseries over the period. Each point pairs avgSize and avgWeight.
+      params:
+        timePeriod: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_predictions:
+      method: GET
+      path: /v1/mining/blocks/predictions/{timePeriod}
+      access: read
+      description: >
+        Get block "health" predictions (template vs. actual deltas) timeseries over the period.
+        Returns audit deviation indicators useful for spotting unusual mining behavior.
+      params:
+        timePeriod: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_audit_score:
+      method: GET
+      path: /v1/block/{hash}/audit-score
+      access: read
+      description: >
+        Get the audit score for a specific block hash. Audit scores reflect how well the block's
+        contents matched mempool.space's predicted template at the moment of mining.
+      params:
+        hash: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_blocks_audit_scores:
+      method: GET
+      path: /v1/mining/blocks/audit/scores
+      access: read
+      description: >
+        Get audit scores for the most recent 16 blocks. Each entry has hash, height, and score.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_block_audit_summary:
+      method: GET
+      path: /v1/block/{hash}/audit-summary
+      access: read
+      description: >
+        Get a detailed audit summary for a block: which expected txs were missing, which surprises were
+        included, fee delta, and template-vs-actual differences.
+      params:
+        hash: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Fees ─────────────────────────────────────────────────────────
+
+    get_mempool_blocks_fees:
+      method: GET
+      path: /v1/fees/mempool-blocks
+      access: read
+      description: >
+        Get the projected next 8 mempool blocks (template projections). Each entry has blockSize, blockVSize,
+        nTx, totalFees (sats), medianFee, and feeRange (sat/vB percentiles). Useful for "when will my tx confirm".
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_recommended_fees:
+      method: GET
+      path: /v1/fees/recommended
+      access: read
+      description: >
+        Get recommended fee rates (sat/vB) for confirmation targets: fastestFee, halfHourFee, hourFee,
+        economyFee, and minimumFee. The most popular endpoint for wallets/apps to suggest a fee.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_precise_fees:
+      method: GET
+      path: /v1/fees/precise
+      access: read
+      description: >
+        Get precise (sub-sat/vB resolution) recommended fee rates. Same fields as get_recommended_fees
+        but reported as floats for high-precision applications.
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Mempool ──────────────────────────────────────────────────────
+
+    get_mempool:
+      method: GET
+      path: /mempool
+      access: read
+      description: >
+        Get mempool backlog overview: { count, vsize, total_fee, fee_histogram }. fee_histogram is an
+        array of [feeRate, vsize] buckets showing the fee-rate distribution of unconfirmed transactions.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_mempool_txids:
+      method: GET
+      path: /mempool/txids
+      access: read
+      description: >
+        Get every unconfirmed txid currently in the mempool. Response can be very large (tens of
+        thousands of strings) — prefer get_mempool for summary stats.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_mempool_recent:
+      method: GET
+      path: /mempool/recent
+      access: read
+      description: >
+        Get the latest mempool transactions, up to ~10. Each entry has txid, fee, vsize, and value (sats).
+        Use as a live feed of recently broadcast transactions.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_replacements:
+      method: GET
+      path: /v1/replacements
+      access: read
+      description: >
+        Get current RBF (Replace-By-Fee) replacements in the mempool. Returns a tree of replacements
+        with each node's txid, fee, and replacing/replaced relationships. Includes opt-in RBF only.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_fullrbf_replacements:
+      method: GET
+      path: /v1/fullrbf/replacements
+      access: read
+      description: >
+        Get full-RBF replacements (including non-opt-in transactions replaced under Full-RBF policy).
+        Same shape as get_replacements but covers a broader replacement set.
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Transactions ─────────────────────────────────────────────────
+
+    get_cpfp:
+      method: GET
+      path: /v1/cpfp/{txid}
+      access: read
+      description: >
+        Get the ancestors and best descendant fees for a transaction (Children-Pay-For-Parent context).
+        Returns { ancestors, bestDescendant, effectiveFeePerVsize, sigops } to understand the effective
+        confirmation priority of a tx considering its package.
+      params:
+        txid: { type: string, in: path, required: true, description: "Transaction ID (64-char hex)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx:
+      method: GET
+      path: /tx/{txid}
+      access: read
+      description: >
+        Get a transaction by txid. Returns txid, version, locktime, vin (inputs), vout (outputs),
+        size, weight, fee (sats), and status (confirmed flag + block info). Inputs include the prevout
+        being spent and witness data for SegWit.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx_hex:
+      method: GET
+      path: /tx/{txid}/hex
+      access: read
+      description: >
+        Get the raw transaction as a hex string. Use for re-broadcasting, offline signing, or external
+        verification.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx_merkleblock_proof:
+      method: GET
+      path: /tx/{txid}/merkleblock-proof
+      access: read
+      description: >
+        Get a Merkle block (SPV) proof for a confirmed transaction. Returns hex-encoded proof suitable
+        for verifying the tx is part of its block without downloading the full block.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx_merkle_proof:
+      method: GET
+      path: /tx/{txid}/merkle-proof
+      access: read
+      description: >
+        Get a JSON Merkle inclusion proof: { block_height, merkle, pos }. Lighter than merkleblock-proof
+        and easier to consume programmatically.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx_outspend:
+      method: GET
+      path: /tx/{txid}/outspend/{vout}
+      access: read
+      description: >
+        Get the spending status of one specific output (vout index). Returns { spent, txid, vin, status }
+        where status.confirmed indicates whether the spend is mined.
+      params:
+        txid: { type: string, in: path, required: true }
+        vout: { type: integer, in: path, required: true, description: "Output index within the transaction" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx_outspends:
+      method: GET
+      path: /tx/{txid}/outspends
+      access: read
+      description: >
+        Get the spending status of all outputs in a transaction as an array (one entry per vout).
+        Cheaper than calling get_tx_outspend per output.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx_raw:
+      method: GET
+      path: /tx/{txid}/raw
+      access: read
+      description: >
+        Get the raw transaction as binary (application/octet-stream). For hex-string output prefer get_tx_hex.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    get_tx_rbf:
+      method: GET
+      path: /v1/tx/{txid}/rbf
+      access: read
+      description: >
+        Get the full RBF history/timeline for a transaction — every replacement that has occurred,
+        with fee progression and timestamps.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_tx_status:
+      method: GET
+      path: /tx/{txid}/status
+      access: read
+      description: >
+        Get a transaction's confirmation status. Returns { confirmed, block_height, block_hash, block_time }.
+        Cheap polling endpoint to wait for a tx to confirm.
+      params:
+        txid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_transaction_times:
+      method: GET
+      path: /v1/transaction-times
+      access: read
+      description: >
+        Get the timestamps at which a list of unconfirmed transactions was first observed in the mempool.
+        Pass each txid via repeated txId[] query param. Returns an array of Unix epoch seconds in input order.
+      params:
+        txId:
+          type: array
+          in: query
+          required: true
+          description: "Repeat txId[] for each txid to look up (e.g. txId[]=abc&txId[]=def)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    broadcast_tx:
+      method: POST
+      path: /tx
+      access: write
+      description: >
+        Broadcast a raw transaction to the Bitcoin network. The request body is the raw transaction as
+        a HEX STRING (not JSON). On success returns the txid as plain text. On failure returns an error
+        string (e.g. "sendrawtransaction RPC error: ..."). The tx is rejected if it fails policy
+        (insufficient fee, conflicts with mempool, invalid script, etc.).
+      content_type: text/plain
+      params:
+        tx_hex:
+          type: string
+          in: body
+          required: true
+          description: "Raw transaction hex (no 0x prefix) — sent as the entire request body"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Lightning ────────────────────────────────────────────────────
+
+    get_lightning_statistics:
+      method: GET
+      path: /v1/lightning/statistics/{interval}
+      access: read
+      description: >
+        Get Lightning Network statistics timeseries over the interval. Returns datapoints with
+        channel_count, node_count, total_capacity (sats), tor_nodes, clearnet_nodes, unannounced_nodes,
+        avg_capacity, avg_fee_rate, avg_base_fee_mtokens, med_capacity, med_fee_rate, med_base_fee_mtokens.
+        interval values: latest, 24h, 3d, 1w, 1m, 3m, 6m, 1y, 2y, 3y.
+      params:
+        interval: { type: string, in: path, required: true, description: "latest | 24h | 3d | 1w | 1m | 3m | 6m | 1y | 2y | 3y" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_lightning:
+      method: GET
+      path: /v1/lightning/search
+      access: read
+      description: >
+        Full-text, case-insensitive search across Lightning nodes and channels. Returns { nodes, channels }
+        with matches on alias, pubkey, channel ID, etc.
+      params:
+        searchText: { type: string, in: query, required: true, description: "Search term (node alias, pubkey prefix, channel id, etc.)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_nodes_in_country:
+      method: GET
+      path: /v1/lightning/nodes/country/{country}
+      access: read
+      description: >
+        Get Lightning nodes in a specific country. country is an ISO 3166-1 alpha-2 code (lowercase, e.g. "us", "de").
+        Returns country info plus an array of nodes with public_key, alias, channels, capacity, etc.
+      params:
+        country: { type: string, in: path, required: true, description: "ISO 3166-1 alpha-2 country code (lowercase)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_node_stats_per_country:
+      method: GET
+      path: /v1/lightning/nodes/countries
+      access: read
+      description: >
+        Get per-country aggregate Lightning statistics: each entry has name (country), iso_code, count
+        (nodes), share (% of network), capacity, channels.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_isp_nodes:
+      method: GET
+      path: /v1/lightning/nodes/isp/{isp}
+      access: read
+      description: >
+        Get Lightning nodes hosted on a specific ISP (by ASN). isp is the AS number (e.g. "16509" for AWS).
+      params:
+        isp: { type: string, in: path, required: true, description: "ASN as integer string (e.g. 16509)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_isp_ranking:
+      method: GET
+      path: /v1/lightning/nodes/isp-ranking
+      access: read
+      description: >
+        Get the ranked list of ISPs hosting Lightning nodes by node count, capacity, and channel count.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_top_nodes:
+      method: GET
+      path: /v1/lightning/nodes/rankings
+      access: read
+      description: >
+        Get top 100 Lightning nodes overall — includes topByCapacity and topByChannels arrays each with
+        publicKey, alias, capacity, and channels.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_top_nodes_by_liquidity:
+      method: GET
+      path: /v1/lightning/nodes/rankings/liquidity
+      access: read
+      description: >
+        Get top 100 Lightning nodes by total channel capacity (descending).
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_top_nodes_by_connectivity:
+      method: GET
+      path: /v1/lightning/nodes/rankings/connectivity
+      access: read
+      description: >
+        Get top 100 Lightning nodes by number of channels (descending).
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_oldest_nodes:
+      method: GET
+      path: /v1/lightning/nodes/rankings/age
+      access: read
+      description: >
+        Get top 100 oldest Lightning nodes by first-seen timestamp (ascending — oldest first).
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_node:
+      method: GET
+      path: /v1/lightning/nodes/{pubKey}
+      access: read
+      description: >
+        Get detailed stats for a Lightning node by public key. Returns alias, channels, capacity,
+        first_seen, updated_at, color, sockets, country, city, asn (ISP), opened_channel_count,
+        closed_channel_count, active_channel_count.
+      params:
+        pubKey: { type: string, in: path, required: true, description: "Node public key (66-char hex)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_node_statistics:
+      method: GET
+      path: /v1/lightning/nodes/{pubKey}/statistics
+      access: read
+      description: >
+        Get historical capacity and channel count timeseries for a Lightning node.
+      params:
+        pubKey: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_channel:
+      method: GET
+      path: /v1/lightning/channels/{channelId}
+      access: read
+      description: >
+        Get details for a Lightning channel by its short channel ID. Returns node1/node2 pubkeys,
+        capacity, status, transaction_id (funding tx), and policy info per side.
+      params:
+        channelId: { type: string, in: path, required: true, description: "Short channel ID (e.g. 850000x1234x0)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_channels_from_txids:
+      method: GET
+      path: /v1/lightning/channels/txids
+      access: read
+      description: >
+        Get Lightning channels whose funding transaction matches the given txid(s). Pass each via
+        repeated txId[] query param. Useful for tracing on-chain → channel mappings.
+      params:
+        txId:
+          type: array
+          in: query
+          required: true
+          description: "Repeat txId[] for each funding txid to look up"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_channels_from_node:
+      method: GET
+      path: /v1/lightning/channels
+      access: read
+      description: >
+        Get Lightning channels for a node, filtered by status. status is one of: open, active, closed.
+        Returns an array of channels with capacity, transaction_id, status, fee policies, and counterparty.
+      params:
+        public_key:
+          type: string
+          in: query
+          required: true
+          description: "Node public key (66-char hex)"
+        status:
+          type: string
+          in: query
+          required: false
+          description: "Channel status filter: open | active | closed"
+        index:
+          type: integer
+          in: query
+          required: false
+          description: "Pagination offset (channels are returned in pages)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_channel_geodata:
+      method: GET
+      path: /v1/lightning/channels-geo
+      access: read
+      description: >
+        Get geographic data for ALL Lightning channels (large response). Each entry is a tuple
+        [pubKey1, alias1, lon1, lat1, pubKey2, alias2, lon2, lat2] for drawing the global channel map.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_lightning_channel_geodata_for_node:
+      method: GET
+      path: /v1/lightning/channels-geo/{pubKey}
+      access: read
+      description: >
+        Get geographic data only for channels of a specific node. Same tuple shape as the global endpoint.
+      params:
+        pubKey: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Accelerator (Public) ─────────────────────────────────────────
+
+    estimate_acceleration:
+      method: POST
+      path: /v1/services/accelerator/estimate
+      access: read
+      description: >
+        Estimate the cost of accelerating a stuck transaction via the mempool.space Accelerator service.
+        Request body { txInput: "<txid>" }. Returns available fee-rate targets, per-target costs (sats),
+        nextBlockFee, and recommendedFee. The X-Mempool-Auth header (if set) personalizes the estimate
+        against your prepaid balance.
+      params:
+        txInput:
+          type: string
+          in: body
+          required: true
+          description: "Transaction ID (64-char hex) to estimate acceleration cost for"
+      response:
+        result_path: "$"
+      pagination: none
+
+    generate_acceleration_invoice:
+      method: POST
+      path: /v1/services/payments/bitcoin
+      access: write
+      description: >
+        Generate a Lightning invoice (or on-chain payment request) to pay for a one-shot transaction
+        acceleration. Request body { product: "accelerator", amount: <sats>, ... }. Returns the BOLT11
+        invoice and a paymentId to poll for settlement.
+      params:
+        product:
+          type: string
+          in: body
+          required: true
+          description: "Payment product — typically 'accelerator'"
+        amount:
+          type: integer
+          in: body
+          required: true
+          description: "Amount in satoshis to pay"
+        txInput:
+          type: string
+          in: body
+          required: false
+          description: "Transaction txid being accelerated"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_pending_accelerations:
+      method: GET
+      path: /v1/services/accelerator/accelerations
+      access: read
+      description: >
+        Get the list of currently pending accelerations across the service (public view).
+        Each entry includes txid, status, added_at, feeDelta.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_acceleration_history_public:
+      method: GET
+      path: /v1/services/accelerator/accelerations/history
+      access: read
+      description: >
+        Get the public history of completed/failed accelerations. Useful as an audit feed.
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Accelerator (Authenticated — requires X-Mempool-Auth) ────────
+
+    get_top_up_history:
+      method: GET
+      path: /v1/services/accelerator/top-up-history
+      access: read
+      description: >
+        Get the prepaid-balance top-up history for your account. Requires X-Mempool-Auth credential.
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_available_balance:
+      method: GET
+      path: /v1/services/accelerator/balance
+      access: read
+      description: >
+        Get your available prepaid Accelerator balance in sats. Requires X-Mempool-Auth credential.
+        Returns { balance, ... }.
+      response:
+        result_path: "$"
+      pagination: none
+
+    accelerate_transaction:
+      method: POST
+      path: /v1/services/accelerator/accelerate
+      access: write
+      description: >
+        Submit an acceleration request for a stuck transaction (Pro). Requires X-Mempool-Auth credential
+        and sufficient prepaid balance. Body { txInput: "<txid>", targetFeeRate: <sat/vB> }. Deducts the
+        appropriate sat amount from your balance and submits the acceleration to participating miners.
+      params:
+        txInput:
+          type: string
+          in: body
+          required: true
+          description: "Transaction ID to accelerate"
+        targetFeeRate:
+          type: number
+          in: body
+          required: true
+          description: "Target effective fee rate in sat/vB (must be >= current minimum)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_acceleration_history:
+      method: GET
+      path: /v1/services/accelerator/history
+      access: read
+      description: >
+        Get YOUR account's acceleration history filtered by status. Requires X-Mempool-Auth credential.
+        status values: all | requested | accelerating | mined | completed | failed. Pass details=true
+        for full per-acceleration details.
+      params:
+        status:
+          type: string
+          in: query
+          required: true
+          description: "Filter: all | requested | accelerating | mined | completed | failed"
+        details:
+          type: boolean
+          in: query
+          required: false
+          description: "Set true to include detailed per-acceleration data"
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_acceleration:
+      method: POST
+      path: /v1/services/accelerator/cancel
+      access: dangerous
+      description: >
+        Cancel a pending acceleration (Pro). Requires X-Mempool-Auth credential. Cancellation is only
+        possible while the acceleration is still in "requested" status; once it has been picked up by
+        miners it cannot be revoked. Body { txInput: "<txid>" }.
+      params:
+        txInput:
+          type: string
+          in: body
+          required: true
+          description: "Transaction ID of the acceleration to cancel"
+      response:
+        result_path: "$"
+      pagination: none
+
+  # ── Composites ───────────────────────────────────────────────────
+
+  composites:
+
+    get_chain_tip:
+      description: >
+        Get the latest block's full details in one call: fetches the tip hash then resolves it to an
+        extended block object (with pool, fees, reward).
+      timeout: 15s
+      depends_on: [get_block_tip_hash, get_block_extended]
+      code: |
+        const hash = await api.get_block_tip_hash();
+        const cleanHash = typeof hash === "string" ? hash.trim() : hash;
+        return await api.get_block_extended({ hash: cleanHash });
+
+    get_address_full_history:
+      description: >
+        Get a Bitcoin address with all of its UTXOs and its most recent confirmed transactions
+        in a single payload — { address, utxos, recent_txs }. recent_txs is capped at the limit.
+      params:
+        address:
+          type: string
+          required: true
+        limit:
+          type: integer
+          default: 25
+      timeout: 30s
+      depends_on: [get_address, get_address_utxo, get_address_txs]
+      code: |
+        const [info, utxos, txs] = await Promise.all([
+          api.get_address({ address: params.address }),
+          api.get_address_utxo({ address: params.address }),
+          api.get_address_txs({ address: params.address }),
+        ]);
+        return {
+          address: info,
+          utxos: utxos,
+          recent_txs: (txs || []).slice(0, params.limit || 25),
+        };
+
+    wait_for_tx_confirmation:
+      description: >
+        Poll a transaction's status up to max_attempts times, returning the status object as soon as
+        the tx is confirmed or all attempts are exhausted. Sleeps between calls are NOT possible in the
+        sandbox — this composite simply calls get_tx_status repeatedly (back-to-back) and is intended
+        for short-burst checks (e.g. just after broadcast). For long waits use Temporal workflows.
+      params:
+        txid:
+          type: string
+          required: true
+        max_attempts:
+          type: integer
+          default: 10
+      timeout: 30s
+      depends_on: [get_tx_status]
+      code: |
+        let last = null;
+        const attempts = Math.min(params.max_attempts || 10, 30);
+        for (let i = 0; i < attempts; i++) {
+          last = await api.get_tx_status({ txid: params.txid });
+          if (last && last.confirmed) return last;
+        }
+        return last;
+
+    get_fee_dashboard:
+      description: >
+        Get a complete fee dashboard in one call: recommended fees, projected next mempool blocks,
+        and current mempool stats. Returns { recommended, projected_blocks, mempool }.
+      timeout: 15s
+      depends_on: [get_recommended_fees, get_mempool_blocks_fees, get_mempool]
+      code: |
+        const [recommended, projected, mempool] = await Promise.all([
+          api.get_recommended_fees(),
+          api.get_mempool_blocks_fees(),
+          api.get_mempool(),
+        ]);
+        return { recommended, projected_blocks: projected, mempool };
+
+    get_block_with_first_txs:
+      description: >
+        Get a block and its first N transactions in one call. Useful for inspecting the coinbase plus
+        early transactions in a block. Capped at 50 transactions (2 paginated calls).
+      params:
+        hash:
+          type: string
+          required: true
+        tx_limit:
+          type: integer
+          default: 25
+      timeout: 30s
+      depends_on: [get_block_extended, get_block_txs]
+      code: |
+        const block = await api.get_block_extended({ hash: params.hash });
+        const limit = Math.min(params.tx_limit || 25, 50);
+        const firstPage = await api.get_block_txs({ hash: params.hash, start_index: 0 });
+        let txs = firstPage || [];
+        if (limit > 25) {
+          const secondPage = await api.get_block_txs({ hash: params.hash, start_index: 25 });
+          txs = txs.concat(secondPage || []);
+        }
+        return { block, txs: txs.slice(0, limit) };
+
+  # ── Examples ─────────────────────────────────────────────────────
+
+  examples:
+    - name: "Check current Bitcoin fees"
+      description: "Get recommended fee rates and the projected next mempool blocks"
+      code: |
+        const fees = await api.get_recommended_fees();
+        const projected = await api.get_mempool_blocks_fees();
+        return {
+          fastestFee_sat_vB: fees.fastestFee,
+          halfHourFee_sat_vB: fees.halfHourFee,
+          hourFee_sat_vB: fees.hourFee,
+          next_block_median_fee: projected[0] ? projected[0].medianFee : null,
+        };
+
+    - name: "Inspect an address"
+      description: "Fetch summary, UTXOs, and recent transactions for an address"
+      code: |
+        return await api.get_address_full_history({
+          address: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+          limit: 10,
+        });
+
+    - name: "Track a transaction until confirmed"
+      description: "Poll status for a recent broadcast"
+      code: |
+        const status = await api.wait_for_tx_confirmation({
+          txid: "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+          max_attempts: 5,
+        });
+        return status;
+
+    - name: "Latest block details"
+      description: "Get the chain tip with full mining metadata"
+      code: |
+        return await api.get_chain_tip();
+
+    - name: "Broadcast a signed transaction"
+      description: "Push a raw hex transaction to the network"
+      code: |
+        const txid = await api.broadcast_tx({
+          tx_hex: "0200000001abcd...ef00000000",
+        });
+        return { txid };
+
+    - name: "Estimate acceleration cost"
+      description: "Get a quote for accelerating a stuck transaction"
+      code: |
+        return await api.estimate_acceleration({
+          txInput: "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+        });
+
+    - name: "Top Lightning nodes by capacity"
+      description: "List the top 100 LN nodes by total channel capacity"
+      code: |
+        return await api.get_lightning_top_nodes_by_liquidity();
+
+    - name: "Historical BTC price snapshot"
+      description: "Get the BTC price in EUR at a specific Unix timestamp"
+      code: |
+        return await api.get_historical_price({
+          currency: "EUR",
+          timestamp: 1704067200,
+        });
+
+  # ── Hints ────────────────────────────────────────────────────────
+
+  hints:
+    get_address_txs:
+      pagination: "first call returns up to 50 mempool + 25 confirmed; subsequent calls use after_txid query param with the last confirmed txid"
+      address_formats: "supports legacy (1...), P2SH (3...), bech32 (bc1q...), taproot (bc1p...)"
+    get_address_utxo:
+      values: "value field is in satoshis (1 BTC = 100M sats)"
+    get_tx:
+      vin_prevout: "each vin includes a 'prevout' object showing what was being spent"
+      witness: "witness data is hex-encoded array for SegWit inputs"
+    broadcast_tx:
+      body_format: "raw hex string, NOT JSON-wrapped — content_type is text/plain"
+      success_response: "plain text txid on success; error string on failure (parse stderr-style)"
+    get_block_tip_height:
+      return_type: "plain text integer — parse before comparing"
+    get_block_tip_hash:
+      return_type: "plain text 64-char hex string — trim() before reuse"
+    get_block_height:
+      return_type: "plain text 64-char hex block hash"
+    get_mining_pools:
+      time_period_values: "24h | 3d | 1w | 1m | 3m | 6m | 1y | 2y | 3y"
+    get_mining_pool:
+      slug_format: "lowercase hyphenated (antpool, f2pool, foundryusa, viabtc, etc.)"
+    get_lightning_statistics:
+      interval_values: "latest | 24h | 3d | 1w | 1m | 3m | 6m | 1y | 2y | 3y"
+    get_lightning_node:
+      pubkey_format: "66-char hex (compressed secp256k1 key starting with 02 or 03)"
+    get_lightning_channel:
+      channel_id_format: "short channel ID format BLOCK x TX_INDEX x OUTPUT_INDEX (e.g. 850000x1234x0)"
+    get_lightning_nodes_in_country:
+      country_format: "ISO 3166-1 alpha-2 lowercase (us, de, jp, ...)"
+    estimate_acceleration:
+      auth: "X-Mempool-Auth optional — personalizes estimate against your prepaid balance"
+    accelerate_transaction:
+      auth: "X-Mempool-Auth REQUIRED — fails 401 without valid token"
+      balance: "deducts from prepaid balance; check get_available_balance first"
+    cancel_acceleration:
+      auth: "X-Mempool-Auth REQUIRED"
+      timing: "only cancellable while status='requested' — irrevocable once miners pick it up"
+    get_historical_price:
+      currencies: "USD, EUR, GBP, CAD, CHF, AUD, JPY"
+      timestamp_unit: "Unix epoch SECONDS (not ms)"
+    get_block_timestamp:
+      timestamp_unit: "Unix epoch SECONDS"
+    get_transaction_times:
+      array_param: "repeat txId[] in the query string for each txid; only works for UNCONFIRMED transactions"
+    get_blocks_bulk:
+      max_range: "10,000 blocks per request on public mempool.space; sponsor for larger"
