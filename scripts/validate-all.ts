@@ -3,6 +3,8 @@ import { join, basename } from "path";
 import Ajv from "ajv";
 import { parse as parseYaml } from "yaml";
 
+const PATH_PLACEHOLDER_RE = /\{([^/}]+)\}/g;
+
 function findMergeKeys(obj: any, path = ""): string[] {
   const found: string[] = [];
   if (obj && typeof obj === "object") {
@@ -16,6 +18,71 @@ function findMergeKeys(obj: any, path = ""): string[] {
     }
   }
   return found;
+}
+
+// findPathParamIssues catches the class of bugs where a tool's URL template
+// and its `params` map disagree about path parameters. Both directions matter:
+//
+//   1. A `{placeholder}` in `path:` without a matching `in: path` param means
+//      ToolMesh has no value to substitute and the literal `{name}` is sent to
+//      the backend, which typically responds with an opaque 404 that looks
+//      unrelated to the DADL.
+//   2. An `in: path` param whose name does not appear as a `{placeholder}` in
+//      `path:` is dead weight — ToolMesh enforces "required path param" but
+//      never substitutes anywhere, so callers get a confusing "missing param"
+//      error for a parameter that does not actually shape the URL.
+//
+// We also reject path-bound params without `required: true`, because optional
+// path segments produce malformed URLs that vary by backend.
+function findPathParamIssues(doc: any): string[] {
+  const issues: string[] = [];
+  const tools = doc?.backend?.tools;
+  if (!tools || typeof tools !== "object") return issues;
+
+  for (const [toolName, toolRaw] of Object.entries(tools)) {
+    const tool = toolRaw as any;
+    if (!tool || typeof tool !== "object") continue;
+    const path = typeof tool.path === "string" ? tool.path : "";
+    if (!path) continue;
+
+    const params: Record<string, any> =
+      tool.params && typeof tool.params === "object" ? tool.params : {};
+
+    const placeholders = new Set<string>();
+    for (const m of path.matchAll(PATH_PLACEHOLDER_RE)) {
+      placeholders.add(m[1]);
+    }
+
+    for (const placeholder of placeholders) {
+      const def = params[placeholder];
+      if (!def) {
+        issues.push(
+          `tool "${toolName}": path uses {${placeholder}} but no param of that name is declared`,
+        );
+        continue;
+      }
+      if (def.in && def.in !== "path") {
+        issues.push(
+          `tool "${toolName}": path uses {${placeholder}} but param is declared as in="${def.in}"`,
+        );
+      } else if (def.required !== true) {
+        issues.push(
+          `tool "${toolName}": path parameter "${placeholder}" must be declared with required: true`,
+        );
+      }
+    }
+
+    for (const [paramName, defRaw] of Object.entries(params)) {
+      const def = defRaw as any;
+      if (def && def.in === "path" && !placeholders.has(paramName)) {
+        issues.push(
+          `tool "${toolName}": param "${paramName}" is in=path but path "${path}" has no {${paramName}} placeholder`,
+        );
+      }
+    }
+  }
+
+  return issues;
 }
 
 const ROOT_DIR = join(import.meta.dirname, "..");
@@ -71,6 +138,11 @@ for (const file of files) {
     for (const err of validate.errors) {
       errors.push(`Schema: ${err.instancePath || "/"} ${err.message}`);
     }
+  }
+
+  // Path placeholder ↔ param consistency
+  for (const issue of findPathParamIssues(doc)) {
+    errors.push(issue);
   }
 
   // Filename must match backend.name
