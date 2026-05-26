@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "validate": "tsx scripts/validate-all.ts"
+    "validate": "tsx scripts/validate-all.ts",
+    "test:path-params": "tsx scripts/test-path-param-linter.ts",
+    "test": "npm run validate && npm run test:path-params"
   },
   "devDependencies": {
     "ajv": "^8.17.1",
