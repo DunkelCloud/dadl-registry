@@ -1,0 +1,1420 @@
+# zulip.dadl — Zulip REST API for ToolMesh
+# Zulip is a threaded team chat platform (open source, self-hostable or Zulip Cloud).
+#
+# Domain Notes for LLM consumers:
+# - Authentication: HTTP Basic Auth with EMAIL + API_KEY (NOT a Bearer token).
+#   The "username" is the user's email address (e.g. bot@your-org.zulipchat.com),
+#   the "password" is the API key from Settings → Account → API key.
+#   ToolMesh constructs the `Authorization: Basic base64(email:api_key)` header automatically.
+# - Base URL: Zulip is multi-tenant. Cloud users have https://YOUR-ORG.zulipchat.com,
+#   self-hosted users have their own domain. Set `url` in backends.yaml per deployment.
+#   All API paths live under `/api/v1`.
+# - Response envelope: every response has `result: "success"|"error"` + `msg`.
+#   On error, also `code` (machine-readable, e.g. STREAM_DOES_NOT_EXIST). Always check `code`,
+#   not `msg`, since `msg` is internationalized.
+# - IDs are integers everywhere (stream_id, user_id, message_id, group_id, queue_id).
+#   The legacy term "stream" is used in API paths and field names but the UI now says "channel".
+#   They are the same thing. We keep "stream" in identifiers for API compatibility.
+# - Topics: every channel message belongs to a topic (a thread title). Topic is REQUIRED
+#   for type=channel/stream messages. Empty topic is allowed in newer Zulip versions
+#   (feature level 334+); pass `allow_empty_topic_name=true` if you want to support that.
+# - Message types: "channel" (formerly "stream") for public/private channel messages,
+#   "direct" (formerly "private") for DMs. Both names work; "channel"/"direct" are newer.
+# - The `to` field in send_message accepts: a channel name (string), a channel ID (integer),
+#   a JSON array of user IDs `[3, 7]` for group DM, or a single user ID/email for 1:1 DM.
+# - Pagination: NO standard pagination wrapper. Each endpoint that returns a list returns
+#   the full result in a single response. The exception is `get_messages`, which uses
+#   anchor-based pagination via `anchor`, `num_before`, `num_after` (max 5000 per request,
+#   recommended ≤1000). For other lists (users, streams, members), there is no paging —
+#   just one response. We set `pagination: none` everywhere and expose anchor params directly
+#   on message-list tools.
+# - The `narrow` parameter (used by get_messages and update_message_flags_for_narrow) is a
+#   JSON array of {operator, operand, negated?} objects. Operators: channel, topic, sender,
+#   search, is (unread|dm|muted|followed), has (reaction|attachment|link|image), dm,
+#   dm-including, id, with. Example:
+#     [{"operator":"channel","operand":"general"},{"operator":"search","operand":"deploy"}]
+# - File uploads return a URL relative to the server (e.g. /user_uploads/1/4e/.../file.txt).
+#   To share, include the URL inside a message: `[caption](url)`.
+# - Real-time updates use a register/long-poll/delete event queue pattern, NOT WebSockets.
+#   This is heavy and stateful — prefer polling get_messages for most agent use cases unless
+#   you specifically need event-driven flows.
+# - Rate limits: Zulip applies per-user and per-IP limits. On 429 the response includes
+#   a `retry-after` header (seconds). Limits are typically generous (200 req/min/user).
+# - Knowledge / docs: Zulip has no built-in wiki or KB. The closest analogues are
+#   message search via `narrow` (full-text across all readable history) and "saved snippets"
+#   (personal reusable text fragments, since Zulip 10.0 / feature level 297). Both are
+#   covered below — heavily, since this is a frequent LLM use case.
+# - Permissions: most mutating endpoints are gated by group-based permissions on the
+#   target channel/realm (e.g. can_administer_channel_group, can_send_message_group).
+#   A 403 usually means the bot/user lacks the relevant group membership.
+# - Channel creation: Zulip has NO dedicated POST /streams endpoint. To create a channel,
+#   call subscribe (POST /users/me/subscriptions) with a name that doesn't exist yet —
+#   the server creates it on the fly. Permissions and privacy are passed via the same call.
+# - Bots: API keys can belong to bot accounts. Bots cannot do everything humans can —
+#   in particular, cross-realm and admin-only endpoints may behave differently. Generic
+#   bots are the most common; incoming/outgoing webhook bots have a narrower API surface.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH"
+
+source_name: "Zulip REST API"
+source_url: "https://zulip.com/api/rest"
+date: "2026-05-28"
+
+backend:
+  name: zulip
+  type: rest
+  version: "1.0"
+  base_url: "{ZULIP_URL}"
+  description: "Zulip REST API — messages, channels (streams), topics, users, user groups, subscriptions, reactions, drafts, scheduled messages, saved snippets, presence, real-time events, invitations, attachments, custom emoji, linkifiers, and server settings. Self-hosted or Zulip Cloud."
+
+  auth:
+    type: basic
+    username_credential: zulip_email
+    password_credential: zulip_api_key
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/x-www-form-urlencoded
+    errors:
+      format: json
+      message_path: "$.msg"
+      code_path: "$.code"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 405, 409]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      rate_limit:
+        retry_after_header: Retry-After
+
+  coverage:
+    endpoints: 84
+    total_endpoints: 165
+    percentage: 51
+    focus: "messages (send + get + get-one + update + delete + render + history + reactions + flags + flags-for-narrow + mark-as-read + read-receipts), channels/streams (list + get-by-id + get-id-by-name + update + archive + topics + subscribers + delete-topic + subscription-status + email-address), subscriptions (list + subscribe-or-create + unsubscribe + update-settings), users (list + get + by-email + own + create + update + deactivate + reactivate + presence + status), user groups (list + create + update + deactivate + members + subgroups), personal preferences (mute/unmute user, topic visibility policy follow/mute/unmute, alert words CRUD), drafts (CRUD), saved snippets (CRUD), scheduled messages (CRUD), real-time events (register + get + delete), invitations (send + list + resend + revoke + multi-use), attachments (list + delete), files (upload), server/realm (server settings + linkifiers + custom emoji)"
+    missing: "OAuth/SAML auth flows, mobile push device registration, video call providers, navigation views, message reminders, default channels admin, custom profile fields admin, realm playgrounds, realm domains, BotConfig data, export/import, billing endpoints, scim, hotspots, tutorials, full-text reorder of linkifiers, code playground admin"
+    last_reviewed: "2026-05-28"
+
+  setup:
+    credential_steps:
+      - "Decide whether you want to use a human user account or a dedicated bot (recommended for production)."
+      - "For a bot: log into Zulip → click your avatar → Personal Settings → Bots → Add a new bot."
+      - "Choose type 'Generic bot' (most flexible). Give it a name and email. Click Create."
+      - "Click the download icon next to the new bot to view its API key, or click the copy icon."
+      - "For a human account: Personal Settings → Account & privacy → API key → Manage your API key → enter your password → copy the key."
+      - "Store BOTH the email address and the API key — they are used together as HTTP Basic credentials."
+      - "Subscribe the bot to any channels it needs to read or post in (channels → settings → Add subscribers)."
+      - "Note your organization URL: https://YOUR-ORG.zulipchat.com (Zulip Cloud) or your self-hosted domain."
+      - "Set BOTH env vars in your ToolMesh deployment:"
+      - "  CREDENTIAL_ZULIP_EMAIL=<bot or user email address>  (used as HTTP Basic username)"
+      - "  CREDENTIAL_ZULIP_API_KEY=<api key>                  (used as HTTP Basic password)"
+    env_var: CREDENTIAL_ZULIP_API_KEY
+    backends_yaml: |
+      - name: zulip
+        transport: rest
+        dadl: zulip.dadl
+        url: "https://your-org.zulipchat.com"
+    required_scopes:
+      - "Bot must be subscribed to channels it needs to access"
+    optional_scopes:
+      - "Organization owner/admin role for admin endpoints (create_user, update_realm, archive_stream, delete_topic, send_invites)"
+      - "Moderator role for some topic/message management"
+    docs_url: "https://zulip.com/api/api-keys"
+    notes: "Two credentials are needed: zulip_email (the bot's or user's email) and zulip_api_key (the API key string). Both are sent as HTTP Basic auth — ToolMesh handles the base64 encoding. The url in backends.yaml is the bare org URL WITHOUT the /api/v1 suffix (the DADL adds it). For Zulip Cloud orgs the URL pattern is https://<slug>.zulipchat.com; for self-hosted it is whatever the admin configured. Anyone with the API key can impersonate the bot — treat it as a secret."
+
+  hints:
+    send_message:
+      to_format: "channel: pass channel name (string) or stream_id (integer); direct: JSON array of user IDs like '[3,7]' or single user email/ID"
+      topic_required: "topic is REQUIRED for type=channel/stream messages, IGNORED for type=direct"
+      type_aliases: "type 'channel' === 'stream' (newer name), type 'direct' === 'private'"
+    get_messages:
+      anchor_special: "anchor accepts message ID (integer as string) or special values: 'newest', 'oldest', 'first_unread'"
+      pagination: "anchor-based — set num_before/num_after; max 5000 total, recommended ≤1000. Watch found_oldest/found_newest in response."
+      narrow_json: "narrow MUST be a JSON-encoded string when sent as form data; example: '[{\"operator\":\"channel\",\"operand\":\"general\"}]'"
+    update_message:
+      propagate_mode: "change_one (default) edits only this message; change_later edits this + later in same topic; change_all edits the whole topic"
+      move_topic: "to move messages between topics, set new topic (or stream_id) and choose propagate_mode"
+    delete_topic:
+      admin_only: "only organization administrators can call this; processes in batches — if complete=false, RETRY the same request"
+    register_queue:
+      heavy: "stateful; the server allocates resources. Always call delete_queue when done. For most agent use cases, polling get_messages is simpler."
+    upload_file:
+      content_type: "DO NOT use application/json. The upload must be multipart/form-data with the file in a form field. ToolMesh handles the multipart encoding when type=file_url is used."
+      url_is_relative: "response url is relative to the server (e.g. /user_uploads/...). To share, embed in a message as [name](url)."
+    create_or_subscribe:
+      creates_implicitly: "if 'subscriptions' contains a channel name that doesn't exist, Zulip creates it. Pass invite_only/is_web_public/description on the same call."
+    narrow_construction:
+      operators: "channel, topic, sender, search, is, has, dm, dm-including, id, with, near"
+      negate: "set negated=true on any filter object to invert it"
+
+  # ──────────────────────────────────────────────────────────────
+  tools:
+
+    # ── Messages ─────────────────────────────────────────────────
+
+    send_message:
+      method: POST
+      path: /api/v1/messages
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Send a message to a channel topic or as a direct message. For channel messages set
+        type=channel (or 'stream'), to=<channel name or stream_id>, topic=<topic name>, content=<markdown>.
+        For DMs set type=direct (or 'private'), to=<user email/id or JSON array of user IDs>,
+        content=<markdown>. Returns {id, automatic_new_visibility_policy?}.
+      params:
+        type: { type: string, in: body, required: true, description: "channel (alias stream) for channel messages, direct (alias private) for DMs" }
+        to: { type: string, in: body, required: true, description: "Channel name or stream_id for channel msgs; user ID, email, or JSON array '[3,7]' for direct" }
+        content: { type: string, in: body, required: true, description: "Message body in Zulip-flavored Markdown (max ~10000 chars; check server's max_message_length)" }
+        topic: { type: string, in: body, description: "Topic name — required for channel messages, ignored for direct" }
+        queue_id: { type: string, in: body, description: "Event queue ID (optional; supports local echo for clients)" }
+        local_id: { type: string, in: body, description: "Client-supplied local ID for local-echo deduplication" }
+        read_by_sender: { type: boolean, in: body, description: "Mark message as read by sender automatically (default true for human accounts, false for bots)" }
+
+    get_messages:
+      method: GET
+      path: /api/v1/messages
+      access: read
+      description: >
+        Fetch a range of messages around an anchor. Use anchor + num_before + num_after to page;
+        anchor can be a message ID or one of: 'newest', 'oldest', 'first_unread'.
+        narrow is a JSON-encoded array of filter objects, e.g.
+        '[{"operator":"channel","operand":"general"},{"operator":"topic","operand":"deploys"}]'.
+        Operators: channel, topic, sender, search, is, has, dm, dm-including, id, with.
+        Max 5000 messages per request (recommend ≤1000). Response includes
+        {messages, anchor, found_oldest, found_newest, found_anchor, history_limited}.
+      params:
+        anchor: { type: string, in: query, description: "Message ID (as string) or special: newest, oldest, first_unread, date" }
+        anchor_date: { type: string, in: query, description: "ISO datetime when anchor=date (Zulip 12.0+)" }
+        num_before: { type: integer, in: query, default: 50, description: "Messages before anchor (0-5000)" }
+        num_after: { type: integer, in: query, default: 50, description: "Messages after anchor (0-5000)" }
+        narrow: { type: string, in: query, description: "JSON-encoded array of filter objects" }
+        include_anchor: { type: boolean, in: query, default: true, description: "Include the anchor message in the response" }
+        client_gravatar: { type: boolean, in: query, default: false, description: "Compute gravatar URLs client-side to save bandwidth" }
+        apply_markdown: { type: boolean, in: query, default: true, description: "true = HTML rendered, false = raw Markdown" }
+        message_ids: { type: string, in: query, description: "JSON array of specific message IDs to fetch instead of using anchor (Zulip 9.0+)" }
+        allow_empty_topic_name: { type: boolean, in: query, default: false, description: "Return empty-string topics literally (Zulip 10.0+)" }
+      response:
+        result_path: "$.messages"
+        max_items: 200
+        allow_jq_override: true
+
+    get_message:
+      method: GET
+      path: /api/v1/messages/{message_id}
+      access: read
+      description: "Fetch a single message by ID. Returns the message object with content, sender info, topic, channel, reactions, flags, and timestamps."
+      params:
+        message_id: { type: integer, in: path, required: true }
+        apply_markdown: { type: boolean, in: query, default: true, description: "true = HTML, false = raw Markdown" }
+        allow_empty_topic_name: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.message"
+
+    update_message:
+      method: PATCH
+      path: /api/v1/messages/{message_id}
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Edit a message's content, topic, or move it to a different channel. propagate_mode controls scope:
+        change_one (default, this message), change_later (this + later in same topic),
+        change_all (entire topic). Only the sender or users with appropriate permissions can edit.
+      params:
+        message_id: { type: integer, in: path, required: true }
+        content: { type: string, in: body, description: "New message content (markdown)" }
+        topic: { type: string, in: body, description: "New topic name (for moving)" }
+        stream_id: { type: integer, in: body, description: "Target channel ID for moving the message" }
+        propagate_mode: { type: string, in: body, default: "change_one", description: "change_one | change_later | change_all" }
+        send_notification_to_old_thread: { type: boolean, in: body, description: "Post a 'this was moved' notice in the old topic" }
+        send_notification_to_new_thread: { type: boolean, in: body, description: "Post a 'this was moved' notice in the new topic" }
+        prev_content_sha256: { type: string, in: body, description: "SHA-256 of the prior content for conflict detection (optional)" }
+
+    delete_message:
+      method: DELETE
+      path: /api/v1/messages/{message_id}
+      access: dangerous
+      description: "Permanently delete a message. Only the sender (within edit window) or organization administrators can delete. Cannot be undone."
+      params:
+        message_id: { type: integer, in: path, required: true }
+
+    render_message:
+      method: POST
+      path: /api/v1/messages/render
+      content_type: application/x-www-form-urlencoded
+      access: read
+      description: "Render a Markdown string to HTML using Zulip-flavored Markdown, without sending it. Useful for previewing how a message will look."
+      params:
+        content: { type: string, in: body, required: true, description: "Markdown content to render" }
+
+    get_message_history:
+      method: GET
+      path: /api/v1/messages/{message_id}/history
+      access: read
+      description: "Get the edit history of a message. Returns array of snapshots (oldest first) including topic, content, rendered_content, timestamp, user_id, and prev_* fields where changed."
+      params:
+        message_id: { type: integer, in: path, required: true }
+        allow_empty_topic_name: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.message_history"
+        allow_jq_override: true
+
+    add_reaction:
+      method: POST
+      path: /api/v1/messages/{message_id}/reactions
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Add an emoji reaction to a message. emoji_name is the Zulip emoji name (e.g. 'thumbs_up', 'octopus')."
+      params:
+        message_id: { type: integer, in: path, required: true }
+        emoji_name: { type: string, in: body, required: true, description: "Zulip emoji name without colons (e.g. 'thumbs_up')" }
+        emoji_code: { type: string, in: body, description: "Code identifying the specific emoji (Unicode codepoint or realm emoji ID); optional, defaults inferred from name" }
+        reaction_type: { type: string, in: body, description: "unicode_emoji | realm_emoji | zulip_extra_emoji (optional, default inferred)" }
+
+    remove_reaction:
+      method: DELETE
+      path: /api/v1/messages/{message_id}/reactions
+      access: write
+      description: "Remove your own emoji reaction from a message."
+      params:
+        message_id: { type: integer, in: path, required: true }
+        emoji_name: { type: string, in: query, description: "Emoji name to remove (provide name, code, or both)" }
+        emoji_code: { type: string, in: query, description: "Emoji code (alternative to name)" }
+        reaction_type: { type: string, in: query, description: "unicode_emoji | realm_emoji | zulip_extra_emoji" }
+
+    update_message_flags:
+      method: POST
+      path: /api/v1/messages/flags
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Add or remove a flag on a batch of messages by ID. Flags: read, starred, collapsed.
+        Some flags are read-only and change automatically (mentioned, has_alert_word, etc.).
+        op is 'add' or 'remove'.
+      params:
+        messages: { type: string, in: body, required: true, description: "JSON array of message IDs, e.g. '[4,8,15]'" }
+        op: { type: string, in: body, required: true, description: "add | remove" }
+        flag: { type: string, in: body, required: true, description: "read | starred | collapsed | (read-only: mentioned, stream_wildcard_mentioned, topic_wildcard_mentioned, has_alert_word, historical, wildcard_mentioned)" }
+
+    update_message_flags_for_narrow:
+      method: POST
+      path: /api/v1/messages/flags/narrow
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Add or remove a flag across all messages matching a narrow. Useful for 'mark all unread in this channel as read'.
+        anchor + num_before + num_after define the scope (same semantics as get_messages).
+        Returns processed_count, updated_count, first/last_processed_id, found_oldest/found_newest.
+      params:
+        anchor: { type: string, in: body, required: true, description: "Message ID or newest|oldest|first_unread" }
+        num_before: { type: integer, in: body, required: true }
+        num_after: { type: integer, in: body, required: true }
+        narrow: { type: string, in: body, required: true, description: "JSON-encoded array of filter objects" }
+        op: { type: string, in: body, required: true, description: "add | remove" }
+        flag: { type: string, in: body, required: true, description: "read | starred | collapsed" }
+        include_anchor: { type: boolean, in: body, default: true }
+
+    mark_all_as_read:
+      method: POST
+      path: /api/v1/mark_all_as_read
+      access: write
+      description: "Mark every unread message visible to the current user as read. Deprecated — prefer update_message_flags_for_narrow with anchor=oldest, num_after=large."
+
+    mark_stream_as_read:
+      method: POST
+      path: /api/v1/mark_stream_as_read
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Mark all unread messages in a channel as read. Deprecated — prefer update_message_flags_for_narrow with a channel narrow."
+      params:
+        stream_id: { type: integer, in: body, required: true }
+
+    mark_topic_as_read:
+      method: POST
+      path: /api/v1/mark_topic_as_read
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Mark all unread messages in a topic as read. Deprecated — prefer update_message_flags_for_narrow with channel + topic narrow."
+      params:
+        stream_id: { type: integer, in: body, required: true }
+        topic_name: { type: string, in: body, required: true }
+
+    get_read_receipts:
+      method: GET
+      path: /api/v1/messages/{message_id}/read_receipts
+      access: read
+      description: "Get the list of user IDs who have read a message. Excludes the sender, users with send_read_receipts disabled, and muted users."
+      params:
+        message_id: { type: integer, in: path, required: true }
+      response:
+        result_path: "$.user_ids"
+
+    # ── Channels (Streams) ────────────────────────────────────
+
+    get_streams:
+      method: GET
+      path: /api/v1/streams
+      access: read
+      description: >
+        List channels visible to the authenticated user. Filters control which categories are included
+        (public, subscribed, default, archived). Returns array of stream objects with stream_id, name,
+        description, invite_only, is_web_public, history_public_to_subscribers, message_retention_days,
+        and permission groups.
+      params:
+        include_public: { type: boolean, in: query, default: true, description: "Include all public channels" }
+        include_subscribed: { type: boolean, in: query, default: true, description: "Include channels the user is subscribed to" }
+        include_all: { type: boolean, in: query, default: false, description: "Admins only — include all channels regardless of access" }
+        include_default: { type: boolean, in: query, default: false, description: "Include realm default channels" }
+        include_owner_subscribed: { type: boolean, in: query, default: false, description: "Bots only — include channels the bot owner is subscribed to" }
+        exclude_archived: { type: boolean, in: query, default: true, description: "Exclude archived (deleted) channels" }
+      response:
+        result_path: "$.streams"
+        max_items: 500
+        allow_jq_override: true
+
+    get_stream:
+      method: GET
+      path: /api/v1/streams/{stream_id}
+      access: read
+      description: "Get full details of a channel by its numeric ID. Returns stream object with name, description, privacy, retention, permission groups, subscriber_count, stream_weekly_traffic."
+      params:
+        stream_id: { type: integer, in: path, required: true }
+      response:
+        result_path: "$.stream"
+
+    get_stream_id:
+      method: GET
+      path: /api/v1/get_stream_id
+      access: read
+      description: "Look up a channel's numeric ID by its exact name. Returns {stream_id}. Returns code=BAD_REQUEST if the channel does not exist or is not accessible."
+      params:
+        stream: { type: string, in: query, required: true, description: "Exact channel name" }
+
+    update_stream:
+      method: PATCH
+      path: /api/v1/streams/{stream_id}
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Update a channel's settings. Requires channel admin permission. All body params optional —
+        only fields you pass are changed. Permission group settings take a JSON-encoded object
+        like {"new":"role:everyone"} or a group ID.
+      params:
+        stream_id: { type: integer, in: path, required: true }
+        new_name: { type: string, in: body, description: "Rename the channel" }
+        description: { type: string, in: body, description: "Channel description (Zulip-flavored Markdown)" }
+        is_private: { type: boolean, in: body, description: "Make channel private (invite-only)" }
+        is_web_public: { type: boolean, in: body, description: "Make channel readable without authentication (web-public)" }
+        history_public_to_subscribers: { type: boolean, in: body, description: "New subscribers see prior history (default true for public, false for private)" }
+        message_retention_days: { type: string, in: body, description: "Integer (days) or 'realm_default' or 'unlimited' (JSON-encoded)" }
+        topics_policy: { type: string, in: body, description: "allow_empty_topic | disable_empty_topic | empty_topic_only | inherit" }
+        can_administer_channel_group: { type: string, in: body, description: "JSON: group ID or {new: group_id}" }
+        can_add_subscribers_group: { type: string, in: body }
+        can_remove_subscribers_group: { type: string, in: body }
+        can_send_message_group: { type: string, in: body }
+        can_subscribe_group: { type: string, in: body }
+        can_resolve_topics_group: { type: string, in: body }
+        can_move_messages_within_channel_group: { type: string, in: body }
+        can_move_messages_out_of_channel_group: { type: string, in: body }
+        can_delete_any_message_group: { type: string, in: body }
+        can_delete_own_message_group: { type: string, in: body }
+
+    archive_stream:
+      method: DELETE
+      path: /api/v1/streams/{stream_id}
+      access: dangerous
+      description: "Archive (delete) a channel. Messages remain in the database but the channel is hidden. Organization admins can unarchive via update_stream. Irreversible from the API side without admin recovery."
+      params:
+        stream_id: { type: integer, in: path, required: true }
+
+    get_stream_topics:
+      method: GET
+      path: /api/v1/users/me/{stream_id}/topics
+      access: read
+      description: "List topics in a channel, ordered by recency (most recent first). Returns array of {name, max_id (last message ID)}. The user must have access to the channel."
+      params:
+        stream_id: { type: integer, in: path, required: true }
+        allow_empty_topic_name: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.topics"
+        allow_jq_override: true
+
+    get_subscribers:
+      method: GET
+      path: /api/v1/streams/{stream_id}/members
+      access: read
+      description: "List user IDs subscribed to a channel. Returns array of integers."
+      params:
+        stream_id: { type: integer, in: path, required: true }
+      response:
+        result_path: "$.subscribers"
+
+    delete_topic:
+      method: POST
+      path: /api/v1/streams/{stream_id}/delete_topic
+      content_type: application/x-www-form-urlencoded
+      access: dangerous
+      description: >
+        Delete an entire topic and all its messages. Admin-only. Processes in batches — the response
+        contains 'complete' (boolean); if false, RETRY the same call until complete=true.
+      params:
+        stream_id: { type: integer, in: path, required: true }
+        topic_name: { type: string, in: body, required: true }
+
+    get_subscription_status:
+      method: GET
+      path: /api/v1/users/{user_id}/subscriptions/{stream_id}
+      access: read
+      description: "Check whether a specific user is subscribed to a specific channel. Returns {is_subscribed}."
+      params:
+        user_id: { type: integer, in: path, required: true }
+        stream_id: { type: integer, in: path, required: true }
+
+    get_stream_email_address:
+      method: GET
+      path: /api/v1/streams/{stream_id}/email_address
+      access: read
+      description: "Get the email address that, when emailed, posts to a channel. Used for email integrations."
+      params:
+        stream_id: { type: integer, in: path, required: true }
+        sender_id: { type: integer, in: query, description: "Optional sender user ID for the integration address" }
+
+    # ── Subscriptions ────────────────────────────────────────
+
+    get_subscriptions:
+      method: GET
+      path: /api/v1/users/me/subscriptions
+      access: read
+      description: >
+        List channels the current user/bot is subscribed to, with all subscription-specific
+        settings (notifications, color, pin, mute). include_subscribers='partial' returns
+        subscribers only for bots and recently-active users (faster for big orgs).
+      params:
+        include_subscribers: { type: string, in: query, default: "false", description: "true | false | partial" }
+      response:
+        result_path: "$.subscriptions"
+        max_items: 500
+        allow_jq_override: true
+
+    create_or_subscribe:
+      method: POST
+      path: /api/v1/users/me/subscriptions
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Subscribe one or more users to one or more channels. CREATES channels that don't yet exist
+        (this is the only way to create a channel via the API). principals is a JSON array of user
+        IDs or emails — omit to subscribe yourself.
+      params:
+        subscriptions: { type: string, in: body, required: true, description: "JSON array of objects: '[{\"name\":\"new-channel\",\"description\":\"...\"}]'" }
+        principals: { type: string, in: body, description: "JSON array of user IDs or emails, e.g. '[3,7]' or '[\"a@b.com\"]'. Omit to subscribe self." }
+        authorization_errors_fatal: { type: boolean, in: body, default: true, description: "If false, returns 200 with unauthorized channels listed separately" }
+        announce: { type: boolean, in: body, default: false, description: "Post a notification in the announce channel when creating a new channel" }
+        invite_only: { type: boolean, in: body, default: false, description: "Create as private (invite-only) channel" }
+        is_web_public: { type: boolean, in: body, default: false, description: "Create as web-public channel" }
+        history_public_to_subscribers: { type: boolean, in: body, description: "New subscribers see prior history" }
+        message_retention_days: { type: string, in: body, description: "Integer days, 'realm_default', or 'unlimited'" }
+        topics_policy: { type: string, in: body, description: "allow_empty_topic | disable_empty_topic | empty_topic_only | inherit" }
+        can_administer_channel_group: { type: string, in: body }
+        can_add_subscribers_group: { type: string, in: body }
+        can_remove_subscribers_group: { type: string, in: body }
+        can_send_message_group: { type: string, in: body }
+        can_subscribe_group: { type: string, in: body }
+        send_new_subscription_messages: { type: boolean, in: body, default: true, description: "Send a welcome message to newly subscribed users" }
+
+    unsubscribe:
+      method: DELETE
+      path: /api/v1/users/me/subscriptions
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Unsubscribe one or more users from channels. principals defaults to the current user. Cannot remove admins from public channels they administer."
+      params:
+        subscriptions: { type: string, in: body, required: true, description: "JSON array of channel names: '[\"general\",\"announce\"]'" }
+        principals: { type: string, in: body, description: "JSON array of user IDs or emails — omit to unsubscribe self" }
+
+    update_subscription_settings:
+      method: POST
+      path: /api/v1/users/me/subscriptions/properties
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Update per-channel subscription preferences (color, pin_to_top, audible_notifications,
+        desktop_notifications, push_notifications, email_notifications, is_muted, in_home_view).
+        subscription_data is a JSON array of {stream_id, property, value} objects.
+      params:
+        subscription_data: { type: string, in: body, required: true, description: "JSON array: '[{\"stream_id\":1,\"property\":\"pin_to_top\",\"value\":true}]'" }
+
+    # ── Users ────────────────────────────────────────────────
+
+    get_users:
+      method: GET
+      path: /api/v1/users
+      access: read
+      description: "List all users in the organization. Returns array of user objects with id, email, full_name, is_bot, is_active, role, avatar_url, timezone, date_joined."
+      params:
+        client_gravatar: { type: boolean, in: query, default: false }
+        include_custom_profile_fields: { type: boolean, in: query, default: false, description: "Include custom profile field values" }
+        user_ids: { type: string, in: query, description: "JSON array of specific user IDs to fetch (Zulip 11.0+); omit for all users" }
+      response:
+        result_path: "$.members"
+        max_items: 1000
+        allow_jq_override: true
+
+    get_user:
+      method: GET
+      path: /api/v1/users/{user_id}
+      access: read
+      description: "Get one user by numeric ID. Preferred over get_user_by_email because email can change."
+      params:
+        user_id: { type: integer, in: path, required: true }
+        client_gravatar: { type: boolean, in: query, default: false }
+        include_custom_profile_fields: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.user"
+
+    get_user_by_email:
+      method: GET
+      path: /api/v1/users/{email}
+      access: read
+      description: "Get one user by email address. Email can be the real address or the dummy user{id}@{host} form."
+      params:
+        email: { type: string, in: path, required: true }
+        client_gravatar: { type: boolean, in: query, default: false }
+        include_custom_profile_fields: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.user"
+
+    get_own_user:
+      method: GET
+      path: /api/v1/users/me
+      access: read
+      description: "Get the currently authenticated user (or bot). Returns identity, role, custom profile data, and account flags. The simplest test that auth is configured correctly."
+      response:
+        result_path: "$"
+
+    create_user:
+      method: POST
+      path: /api/v1/users
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Create a new user. Admin-only. The new user receives an email to set their password unless full_name and password are pre-set."
+      params:
+        email: { type: string, in: body, required: true }
+        full_name: { type: string, in: body, required: true }
+        password: { type: string, in: body, description: "Initial password (admin-set) — if omitted, user goes through invite flow" }
+
+    update_user:
+      method: PATCH
+      path: /api/v1/users/{user_id}
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Update a user's profile or role. Admins can change role and custom fields; users can update their own profile via this endpoint too (some fields)."
+      params:
+        user_id: { type: integer, in: path, required: true }
+        full_name: { type: string, in: body, description: "New display name" }
+        role: { type: integer, in: body, description: "100=owner, 200=admin, 300=moderator, 400=member, 600=guest" }
+        profile_data: { type: string, in: body, description: "JSON array of {id, value} for custom profile fields" }
+        new_email: { type: string, in: body, description: "Change the user's email (admin only; Zulip 10.0+)" }
+
+    deactivate_user:
+      method: DELETE
+      path: /api/v1/users/{user_id}
+      content_type: application/x-www-form-urlencoded
+      access: dangerous
+      description: "Deactivate a user. They can no longer log in or use the API. Their messages remain. Reversible via reactivate_user."
+      params:
+        user_id: { type: integer, in: path, required: true }
+        deactivation_notification_comment: { type: string, in: body, description: "Optional message to send to the user notifying them of deactivation" }
+
+    reactivate_user:
+      method: POST
+      path: /api/v1/users/{user_id}/reactivate
+      access: admin
+      description: "Reactivate a previously deactivated user. Admin only."
+      params:
+        user_id: { type: integer, in: path, required: true }
+
+    get_user_presence:
+      method: GET
+      path: /api/v1/users/{user_id_or_email}/presence
+      access: read
+      description: "Get a single user's current presence (active/idle, last update timestamp). Path accepts either user ID or email."
+      params:
+        user_id_or_email: { type: string, in: path, required: true, description: "User ID or email" }
+
+    get_realm_presence:
+      method: GET
+      path: /api/v1/realm/presence
+      access: read
+      description: "Get presence for all users the current user can access. Returns server_timestamp and presences keyed by email."
+
+    update_presence:
+      method: POST
+      path: /api/v1/users/me/presence
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Update the current user's presence (active/idle/offline). Most clients call this every minute while open."
+      params:
+        status: { type: string, in: body, required: true, description: "active | idle | offline" }
+        ping_only: { type: boolean, in: body, default: false, description: "If true, only refresh presence timestamp without changing data" }
+        new_user_input: { type: boolean, in: body, default: false, description: "Has the user interacted since last presence update?" }
+        slim_presence: { type: boolean, in: body, default: false, description: "Return a smaller presences object" }
+        last_update_id: { type: integer, in: body, description: "Latest presence update ID the client has seen, for incremental updates" }
+        history_limit_days: { type: integer, in: body, description: "Limit returned presence data to last N days" }
+
+    get_user_status:
+      method: GET
+      path: /api/v1/users/{user_id}/status
+      access: read
+      description: "Get a user's custom status (status_text, emoji, away flag)."
+      params:
+        user_id: { type: integer, in: path, required: true }
+
+    update_status:
+      method: POST
+      path: /api/v1/users/me/status
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Set your own custom status — a short text + optional emoji. Pass empty status_text to clear."
+      params:
+        status_text: { type: string, in: body, description: "Max 60 unicode code points; '' clears the status" }
+        emoji_name: { type: string, in: body, description: "Emoji name (required if emoji_code is set)" }
+        emoji_code: { type: string, in: body, description: "Emoji unique code within its namespace" }
+        reaction_type: { type: string, in: body, description: "unicode_emoji | realm_emoji | zulip_extra_emoji" }
+        away: { type: boolean, in: body, description: "Deprecated — inverse of presence_enabled (Zulip 6.0+)" }
+
+    # ── User Groups ──────────────────────────────────────────
+
+    get_user_groups:
+      method: GET
+      path: /api/v1/user_groups
+      access: read
+      description: "List all user groups in the organization. Returns array of group objects with id, name, description, members (user IDs), direct_subgroup_ids, deactivated."
+      params:
+        include_deactivated_groups: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.user_groups"
+        allow_jq_override: true
+
+    create_user_group:
+      method: POST
+      path: /api/v1/user_groups/create
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Create a new user group with an initial set of members. can_*_group fields accept a JSON-encoded group ID or 'role:everyone'/'role:members' etc."
+      params:
+        name: { type: string, in: body, required: true }
+        description: { type: string, in: body, required: true }
+        members: { type: string, in: body, required: true, description: "JSON array of user IDs, e.g. '[3,7]'" }
+        subgroups: { type: string, in: body, description: "JSON array of subgroup IDs (Zulip 10.0+)" }
+        can_add_members_group: { type: string, in: body, description: "Group setting (Zulip 10.0+)" }
+        can_join_group: { type: string, in: body }
+        can_leave_group: { type: string, in: body }
+        can_manage_group: { type: string, in: body }
+        can_mention_group: { type: string, in: body }
+        can_remove_members_group: { type: string, in: body }
+
+    update_user_group:
+      method: PATCH
+      path: /api/v1/user_groups/{user_group_id}
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Update a user group's name, description, or permission settings. Admin-only or has_manage permission."
+      params:
+        user_group_id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        can_add_members_group: { type: string, in: body }
+        can_join_group: { type: string, in: body }
+        can_leave_group: { type: string, in: body }
+        can_manage_group: { type: string, in: body }
+        can_mention_group: { type: string, in: body }
+        can_remove_members_group: { type: string, in: body }
+
+    deactivate_user_group:
+      method: DELETE
+      path: /api/v1/user_groups/{user_group_id}
+      access: dangerous
+      description: "Deactivate (soft-delete) a user group. The group remains in the database but is hidden. Cannot deactivate system groups."
+      params:
+        user_group_id: { type: integer, in: path, required: true }
+
+    update_user_group_members:
+      method: POST
+      path: /api/v1/user_groups/{user_group_id}/members
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Add or remove members from a user group. Pass JSON arrays of user IDs for 'add' and 'delete'."
+      params:
+        user_group_id: { type: integer, in: path, required: true }
+        add: { type: string, in: body, description: "JSON array of user IDs to add, e.g. '[3,7]'" }
+        delete: { type: string, in: body, description: "JSON array of user IDs to remove" }
+
+    update_user_group_subgroups:
+      method: POST
+      path: /api/v1/user_groups/{user_group_id}/subgroups
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Add or remove nested subgroups from a user group. Pass JSON arrays of group IDs."
+      params:
+        user_group_id: { type: integer, in: path, required: true }
+        add: { type: string, in: body, description: "JSON array of subgroup IDs to add" }
+        delete: { type: string, in: body, description: "JSON array of subgroup IDs to remove" }
+
+    get_user_group_members:
+      method: GET
+      path: /api/v1/user_groups/{user_group_id}/members
+      access: read
+      description: "List all member user IDs of a group. Set direct_member_only=true to exclude transitively-included members from subgroups."
+      params:
+        user_group_id: { type: integer, in: path, required: true }
+        direct_member_only: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.members"
+
+    # ── Personal Preferences (mutes, alerts, topic visibility) ───
+
+    mute_user:
+      method: POST
+      path: /api/v1/users/me/muted_users/{muted_user_id}
+      access: write
+      description: >
+        Mute another user from the current user's perspective. Messages sent by muted users are
+        automatically marked as read and hidden in the UI. Mute state is per-user — only affects
+        the calling account. There is no dedicated "list muted users" endpoint; the current list
+        is delivered via the muted_users key in register_queue fetch.
+      params:
+        muted_user_id: { type: integer, in: path, required: true, description: "User ID to mute" }
+
+    unmute_user:
+      method: DELETE
+      path: /api/v1/users/me/muted_users/{muted_user_id}
+      access: write
+      description: "Unmute a previously muted user. Returns an error if the user is not currently muted."
+      params:
+        muted_user_id: { type: integer, in: path, required: true }
+
+    update_user_topic_visibility:
+      method: POST
+      path: /api/v1/user_topics
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Set the current user's visibility policy for a specific channel + topic. This is the modern
+        replacement for the deprecated /users/me/subscriptions/muted_topics endpoint. Supports both
+        muting (hide notifications) and following (boost notifications), plus unmute and reset.
+      params:
+        stream_id: { type: integer, in: body, required: true }
+        topic: { type: string, in: body, required: true, description: "Topic name" }
+        visibility_policy: { type: integer, in: body, required: true, description: "0=None (reset to default), 1=Muted, 2=Unmuted, 3=Followed" }
+
+    get_alert_words:
+      method: GET
+      path: /api/v1/users/me/alert_words
+      access: read
+      description: >
+        Get the current user's configured alert words. Alert words trigger a notification when
+        they appear in any message visible to the user. Case-insensitive, max 100 chars per word.
+      response:
+        result_path: "$.alert_words"
+
+    add_alert_words:
+      method: POST
+      path: /api/v1/users/me/alert_words
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Add one or more alert words. alert_words is a JSON-encoded array of strings, e.g. '[\"deploy\",\"incident\"]'."
+      params:
+        alert_words: { type: string, in: body, required: true, description: "JSON array of strings to add (each up to 100 chars, case-insensitive)" }
+      response:
+        result_path: "$.alert_words"
+
+    remove_alert_words:
+      method: DELETE
+      path: /api/v1/users/me/alert_words
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Remove one or more alert words. alert_words is a JSON-encoded array of strings to remove. Returns the remaining alert words."
+      params:
+        alert_words: { type: string, in: body, required: true, description: "JSON array of strings to remove" }
+      response:
+        result_path: "$.alert_words"
+
+    # ── Drafts ───────────────────────────────────────────────
+
+    get_drafts:
+      method: GET
+      path: /api/v1/drafts
+      access: read
+      description: "Get all drafts saved by the current user (ordered by most recently edited)."
+      response:
+        result_path: "$.drafts"
+        allow_jq_override: true
+
+    create_drafts:
+      method: POST
+      path: /api/v1/drafts
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Create one or more drafts. drafts is a JSON array of draft objects: {type, to, topic, content, timestamp}."
+      params:
+        drafts: { type: string, in: body, required: true, description: "JSON array of draft objects" }
+
+    edit_draft:
+      method: PATCH
+      path: /api/v1/drafts/{draft_id}
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Replace an existing draft's contents."
+      params:
+        draft_id: { type: integer, in: path, required: true }
+        draft: { type: string, in: body, required: true, description: "JSON-encoded draft object: '{\"type\":\"stream\",\"to\":[1],\"topic\":\"x\",\"content\":\"...\",\"timestamp\":...}'" }
+
+    delete_draft:
+      method: DELETE
+      path: /api/v1/drafts/{draft_id}
+      access: dangerous
+      description: "Delete a draft permanently."
+      params:
+        draft_id: { type: integer, in: path, required: true }
+
+    # ── Saved Snippets (Zulip 10.0+) ─────────────────────────
+
+    get_saved_snippets:
+      method: GET
+      path: /api/v1/saved_snippets
+      access: read
+      description: "List the current user's saved snippets — reusable text fragments (e.g. canned responses, command incantations, KB-style notes). Returns array of {id, title, content, date_created}."
+      response:
+        result_path: "$.saved_snippets"
+        allow_jq_override: true
+
+    create_saved_snippet:
+      method: POST
+      path: /api/v1/saved_snippets
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Create a saved snippet. Returns {saved_snippet_id}."
+      params:
+        title: { type: string, in: body, required: true, description: "Short label for the snippet (e.g. 'standup template')" }
+        content: { type: string, in: body, required: true, description: "Markdown content of the snippet" }
+
+    edit_saved_snippet:
+      method: PATCH
+      path: /api/v1/saved_snippets/{saved_snippet_id}
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Edit a saved snippet's title or content."
+      params:
+        saved_snippet_id: { type: integer, in: path, required: true }
+        title: { type: string, in: body }
+        content: { type: string, in: body }
+
+    delete_saved_snippet:
+      method: DELETE
+      path: /api/v1/saved_snippets/{saved_snippet_id}
+      access: dangerous
+      description: "Permanently delete a saved snippet."
+      params:
+        saved_snippet_id: { type: integer, in: path, required: true }
+
+    # ── Scheduled Messages ───────────────────────────────────
+
+    get_scheduled_messages:
+      method: GET
+      path: /api/v1/scheduled_messages
+      access: read
+      description: "List the current user's pending scheduled messages, ordered by delivery time."
+      response:
+        result_path: "$.scheduled_messages"
+        allow_jq_override: true
+
+    create_scheduled_message:
+      method: POST
+      path: /api/v1/scheduled_messages
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Schedule a message for later delivery. scheduled_delivery_timestamp is a UNIX timestamp in UTC seconds."
+      params:
+        type: { type: string, in: body, required: true, description: "channel | direct (or alias stream | private)" }
+        to: { type: string, in: body, required: true, description: "Channel name/ID or JSON array of user IDs" }
+        content: { type: string, in: body, required: true }
+        topic: { type: string, in: body, description: "Required for channel messages" }
+        scheduled_delivery_timestamp: { type: integer, in: body, required: true, description: "UNIX timestamp (UTC seconds) when the message should be sent" }
+
+    update_scheduled_message:
+      method: PATCH
+      path: /api/v1/scheduled_messages/{scheduled_message_id}
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Update a pending scheduled message. Can change content, topic, recipients, or scheduled time. Pass only the fields you want to change."
+      params:
+        scheduled_message_id: { type: integer, in: path, required: true }
+        type: { type: string, in: body }
+        to: { type: string, in: body }
+        content: { type: string, in: body }
+        topic: { type: string, in: body }
+        scheduled_delivery_timestamp: { type: integer, in: body }
+
+    delete_scheduled_message:
+      method: DELETE
+      path: /api/v1/scheduled_messages/{scheduled_message_id}
+      access: dangerous
+      description: "Cancel a pending scheduled message before it is delivered."
+      params:
+        scheduled_message_id: { type: integer, in: path, required: true }
+
+    # ── Real-time Events ─────────────────────────────────────
+
+    register_queue:
+      method: POST
+      path: /api/v1/register
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Register an event queue and fetch initial state. The server returns queue_id, last_event_id, and
+        snapshots of requested data. Use get_events to long-poll for new events. Always call delete_queue
+        when finished — queues consume server resources. event_types and fetch_event_types are
+        JSON-encoded arrays of strings.
+      params:
+        event_types: { type: string, in: body, description: "JSON array of event categories to subscribe to, e.g. '[\"message\",\"reaction\"]'" }
+        fetch_event_types: { type: string, in: body, description: "JSON array of event categories to fetch initial snapshot for" }
+        narrow: { type: string, in: body, description: "JSON array of narrow filters to scope the message events" }
+        all_public_streams: { type: boolean, in: body, default: false, description: "Subscribe to events from all public channels (not just subscribed ones)" }
+        apply_markdown: { type: boolean, in: body, default: true }
+        client_gravatar: { type: boolean, in: body, default: false }
+        slim_presence: { type: boolean, in: body, default: false }
+        client_capabilities: { type: string, in: body, description: "JSON object describing client feature support" }
+        include_subscribers: { type: boolean, in: body, default: false }
+        queue_lifespan_secs: { type: integer, in: body, description: "Override how long an idle queue lives" }
+
+    get_events:
+      method: GET
+      path: /api/v1/events
+      access: read
+      description: >
+        Long-poll for new events on a registered queue. queue_id from register_queue. last_event_id
+        is the highest event ID already processed (-1 for first call). dont_block=true returns
+        immediately (possibly with empty events). Default behavior blocks up to ~10 minutes.
+      params:
+        queue_id: { type: string, in: query, required: true }
+        last_event_id: { type: integer, in: query, default: -1 }
+        dont_block: { type: boolean, in: query, default: false, description: "Return immediately even if no events are available" }
+      response:
+        result_path: "$.events"
+        max_items: 200
+        allow_jq_override: true
+
+    delete_queue:
+      method: DELETE
+      path: /api/v1/events
+      access: write
+      description: "Delete a previously registered event queue. Always call this when done with register_queue to free server resources."
+      params:
+        queue_id: { type: string, in: query, required: true }
+
+    # ── Invitations ──────────────────────────────────────────
+
+    send_invites:
+      method: POST
+      path: /api/v1/invites
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Send email invitations to join the organization. invite_as: 100=owner, 200=admin,
+        300=moderator, 400=member (default), 600=guest. stream_ids is a JSON array of channels
+        to auto-subscribe. Requires admin role typically.
+      params:
+        invitee_emails: { type: string, in: body, required: true, description: "Comma- or newline-separated email addresses" }
+        stream_ids: { type: string, in: body, required: true, description: "JSON array of channel IDs the invitee will join on accept" }
+        invite_expires_in_minutes: { type: integer, in: body, default: 14400, description: "Default 10 days; null means never expires" }
+        invite_as: { type: integer, in: body, default: 400, description: "Role on accept: 100|200|300|400|600" }
+        group_ids: { type: string, in: body, description: "JSON array of user group IDs to auto-add" }
+        include_realm_default_subscriptions: { type: boolean, in: body, default: false }
+        notify_referrer_on_join: { type: boolean, in: body, default: true }
+        welcome_message_custom_text: { type: string, in: body, description: "Custom Welcome Bot message (Markdown)" }
+
+    create_multi_use_invite_link:
+      method: POST
+      path: /api/v1/invites/multiuse
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Create a reusable invite link that anyone can use to join the org. Returns {invite_link}."
+      params:
+        stream_ids: { type: string, in: body, description: "JSON array of channel IDs to auto-subscribe" }
+        invite_expires_in_minutes: { type: integer, in: body, default: 14400 }
+        invite_as: { type: integer, in: body, default: 400 }
+        group_ids: { type: string, in: body, description: "JSON array of user group IDs" }
+        include_realm_default_subscriptions: { type: boolean, in: body, default: false }
+
+    list_invites:
+      method: GET
+      path: /api/v1/invites
+      access: read
+      description: "List pending email and multi-use invitations."
+      response:
+        result_path: "$.invites"
+        allow_jq_override: true
+
+    resend_invite:
+      method: POST
+      path: /api/v1/invites/{prereg_id}/resend
+      access: admin
+      description: "Resend the invitation email for a pending email invitation."
+      params:
+        prereg_id: { type: integer, in: path, required: true }
+
+    revoke_invite:
+      method: DELETE
+      path: /api/v1/invites/{prereg_id}
+      access: dangerous
+      description: "Revoke a pending email invitation."
+      params:
+        prereg_id: { type: integer, in: path, required: true }
+
+    revoke_multi_use_invite:
+      method: DELETE
+      path: /api/v1/invites/multiuse/{invite_id}
+      access: dangerous
+      description: "Revoke a multi-use invite link."
+      params:
+        invite_id: { type: integer, in: path, required: true }
+
+    # ── Files & Attachments ──────────────────────────────────
+
+    upload_file:
+      method: POST
+      path: /api/v1/user_uploads
+      access: write
+      content_type: multipart/form-data
+      description: >
+        Upload a file. Pass file as a file_url — ToolMesh will fetch and forward it as multipart.
+        Response includes a relative url like /user_uploads/1/4e/.../filename. To share, embed in
+        a message as [name](url). For files >25MB use the tus resumable upload endpoint (not modeled).
+      params:
+        file: { type: file_url, in: body, required: true, description: "URL of the file to upload" }
+      max_body_size: 25MB
+
+    get_attachments:
+      method: GET
+      path: /api/v1/attachments
+      access: read
+      description: "List the current user's uploaded attachments. Returns {attachments: [...], upload_space_used}."
+      response:
+        result_path: "$.attachments"
+        max_items: 500
+        allow_jq_override: true
+
+    delete_attachment:
+      method: DELETE
+      path: /api/v1/attachments/{attachment_id}
+      access: dangerous
+      description: "Delete an uploaded attachment by ID. The file is removed from storage; messages referencing it will show a broken link."
+      params:
+        attachment_id: { type: integer, in: path, required: true }
+
+    # ── Server & Realm Settings ──────────────────────────────
+
+    get_server_settings:
+      method: GET
+      path: /api/v1/server_settings
+      access: read
+      description: "Get public server configuration including zulip_version, zulip_feature_level, available auth methods, and realm branding. Works WITHOUT authentication — useful for discovery."
+
+    get_realm_linkifiers:
+      method: GET
+      path: /api/v1/realm/linkifiers
+      access: read
+      description: "List linkifiers (regex → URL template rules) configured for the realm. Clients should process them in order. Returns array of {pattern, url_template, id, example_input, ...}."
+      response:
+        result_path: "$.linkifiers"
+        allow_jq_override: true
+
+    get_custom_emoji:
+      method: GET
+      path: /api/v1/realm/emoji
+      access: read
+      description: "Get all custom emoji defined in the realm. Returns map of emoji_id → {id, name, source_url, still_url, deactivated, author_id}."
+      response:
+        result_path: "$.emoji"
+
+    deactivate_custom_emoji:
+      method: DELETE
+      path: /api/v1/realm/emoji/{emoji_name}
+      access: dangerous
+      description: "Deactivate (hide) a realm custom emoji. The image data remains but the emoji is no longer selectable."
+      params:
+        emoji_name: { type: string, in: path, required: true }
+
+  # ──────────────────────────────────────────────────────────────
+  composites:
+
+    send_channel_message:
+      description: >
+        Convenience wrapper around send_message for the common case of posting to a channel topic.
+        Pass channel_name OR stream_id (one is required) plus topic and content.
+      params:
+        channel_name: { type: string, description: "Channel name (will be resolved to stream_id if needed)" }
+        stream_id: { type: integer, description: "Channel ID (alternative to channel_name)" }
+        topic: { type: string, required: true }
+        content: { type: string, required: true }
+      depends_on: [get_stream_id, send_message]
+      code: |
+        let to;
+        if (params.stream_id) {
+          to = String(params.stream_id);
+        } else if (params.channel_name) {
+          const r = await api.get_stream_id({ stream: params.channel_name });
+          to = String(r.stream_id);
+        } else {
+          throw new Error("Either channel_name or stream_id is required");
+        }
+        return await api.send_message({
+          type: "channel",
+          to,
+          topic: params.topic,
+          content: params.content,
+        });
+
+    search_messages:
+      description: >
+        Search for messages by free-text query, optionally within a channel and/or topic.
+        Returns up to `limit` matching messages, newest first. Wraps get_messages with a
+        constructed narrow.
+      params:
+        query: { type: string, required: true, description: "Full-text search string" }
+        channel: { type: string, description: "Restrict to this channel name" }
+        topic: { type: string, description: "Restrict to this topic (requires channel)" }
+        sender: { type: string, description: "Restrict to this sender email or ID" }
+        limit: { type: integer, default: 50 }
+      depends_on: [get_messages]
+      timeout: 30s
+      code: |
+        const narrow = [{ operator: "search", operand: params.query }];
+        if (params.channel) narrow.push({ operator: "channel", operand: params.channel });
+        if (params.topic) narrow.push({ operator: "topic", operand: params.topic });
+        if (params.sender) narrow.push({ operator: "sender", operand: params.sender });
+        const r = await api.get_messages({
+          anchor: "newest",
+          num_before: params.limit || 50,
+          num_after: 0,
+          narrow: JSON.stringify(narrow),
+        });
+        return r;
+
+    get_recent_in_topic:
+      description: >
+        Get the N most recent messages in a specific channel + topic. Convenience wrapper around
+        get_messages with a channel+topic narrow anchored at 'newest'.
+      params:
+        channel: { type: string, required: true, description: "Channel name" }
+        topic: { type: string, required: true, description: "Topic name" }
+        limit: { type: integer, default: 20 }
+      depends_on: [get_messages]
+      code: |
+        const narrow = [
+          { operator: "channel", operand: params.channel },
+          { operator: "topic", operand: params.topic },
+        ];
+        const r = await api.get_messages({
+          anchor: "newest",
+          num_before: params.limit || 20,
+          num_after: 0,
+          narrow: JSON.stringify(narrow),
+        });
+        return r;
+
+    mark_all_in_channel_read:
+      description: "Mark every unread message in a channel as read (preferred replacement for mark_stream_as_read)."
+      params:
+        channel: { type: string, description: "Channel name (or pass stream_id)" }
+        stream_id: { type: integer }
+      depends_on: [get_stream_id, update_message_flags_for_narrow]
+      code: |
+        let channelName = params.channel;
+        if (!channelName && params.stream_id) {
+          const s = await api.get_stream({ stream_id: params.stream_id });
+          channelName = s.name;
+        }
+        if (!channelName) throw new Error("Either channel or stream_id is required");
+        const narrow = [
+          { operator: "channel", operand: channelName },
+          { operator: "is", operand: "unread" },
+        ];
+        return await api.update_message_flags_for_narrow({
+          anchor: "oldest",
+          num_before: 0,
+          num_after: 5000,
+          narrow: JSON.stringify(narrow),
+          op: "add",
+          flag: "read",
+          include_anchor: true,
+        });
+
+    search_users:
+      description: >
+        Find users by a prefix match on full_name or email (Zulip has no dedicated user-search
+        endpoint, so this fetches the org user list and filters client-side). Bots and inactive
+        users are excluded by default.
+      params:
+        query: { type: string, required: true, description: "Substring to match against full_name or email (case-insensitive)" }
+        limit: { type: integer, default: 20 }
+        include_bots: { type: boolean, default: false }
+        include_inactive: { type: boolean, default: false }
+      depends_on: [get_users]
+      code: |
+        const all = await api.get_users({});
+        const q = (params.query || "").toLowerCase();
+        if (!q) return [];
+        const filtered = all
+          .filter(u => params.include_bots || !u.is_bot)
+          .filter(u => params.include_inactive || u.is_active)
+          .filter(u =>
+            (u.full_name || "").toLowerCase().includes(q) ||
+            (u.email || "").toLowerCase().includes(q) ||
+            (u.delivery_email || "").toLowerCase().includes(q)
+          )
+          .slice(0, params.limit || 20)
+          .map(u => ({
+            user_id: u.user_id,
+            full_name: u.full_name,
+            email: u.email,
+            is_bot: u.is_bot,
+            is_active: u.is_active,
+            role: u.role,
+            timezone: u.timezone,
+          }));
+        return filtered;
+
+    daily_summary:
+      description: >
+        Build a digest of unread message activity for the authenticated user — total unread count,
+        breakdown by channel, top topics, and DM senders. Uses get_messages with an is:unread
+        narrow; for very busy accounts, raise `max_scan` (Zulip caps at 5000 per request).
+      params:
+        max_scan: { type: integer, default: 500, description: "Max unread messages to scan (1-5000)" }
+        include_dm_senders: { type: boolean, default: true }
+      timeout: 30s
+      depends_on: [get_messages]
+      code: |
+        const cap = Math.max(1, Math.min(5000, params.max_scan || 500));
+        const r = await api.get_messages({
+          anchor: "oldest",
+          num_before: 0,
+          num_after: cap,
+          narrow: JSON.stringify([{ operator: "is", operand: "unread" }]),
+          apply_markdown: false,
+        });
+        const messages = r.messages || r || [];
+        const byChannel = {};
+        const dmSenders = {};
+        let dmCount = 0;
+        for (const m of messages) {
+          if (m.type === "stream" || m.type === "channel") {
+            const ch = m.display_recipient || "(unknown)";
+            const topic = m.subject || "(no topic)";
+            byChannel[ch] = byChannel[ch] || { count: 0, topics: {} };
+            byChannel[ch].count += 1;
+            byChannel[ch].topics[topic] = (byChannel[ch].topics[topic] || 0) + 1;
+          } else {
+            dmCount += 1;
+            const s = m.sender_full_name + " <" + m.sender_email + ">";
+            dmSenders[s] = (dmSenders[s] || 0) + 1;
+          }
+        }
+        const channels = Object.entries(byChannel)
+          .map(([name, data]) => ({
+            channel: name,
+            unread: data.count,
+            top_topics: Object.entries(data.topics)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 5)
+              .map(([t, c]) => ({ topic: t, count: c })),
+          }))
+          .sort((a, b) => b.unread - a.unread);
+        const result = {
+          total_scanned: messages.length,
+          truncated: messages.length >= cap,
+          unread_dm_count: dmCount,
+          channels,
+        };
+        if (params.include_dm_senders !== false) {
+          result.top_dm_senders = Object.entries(dmSenders)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map(([sender, count]) => ({ sender, count }));
+        }
+        return result;
+
+  # ──────────────────────────────────────────────────────────────
+  examples:
+
+    - name: "Send a message to a channel"
+      description: "Post 'Hello, world!' to the #general channel in topic 'greetings'."
+      code: |
+        const r = await api.send_message({
+          type: "channel",
+          to: "general",
+          topic: "greetings",
+          content: "Hello, world!",
+        });
+        return { message_id: r.id };
+
+    - name: "Find recent deploy notifications"
+      description: "Search the 'ops' channel for the 10 most recent messages mentioning 'deploy'."
+      code: |
+        return await api.search_messages({
+          query: "deploy",
+          channel: "ops",
+          limit: 10,
+        });
+
+    - name: "React with a thumbs-up to a message"
+      description: "Add an emoji reaction to a specific message ID."
+      code: |
+        await api.add_reaction({
+          message_id: 12345,
+          emoji_name: "thumbs_up",
+        });
+        return { ok: true };
+
+    - name: "Catch up on a topic"
+      description: "Fetch the 20 most recent messages in a topic and summarize."
+      code: |
+        const r = await api.get_recent_in_topic({
+          channel: "general",
+          topic: "release planning",
+          limit: 20,
+        });
+        return r.messages.map(m => ({
+          id: m.id,
+          sender: m.sender_full_name,
+          when: m.timestamp,
+          excerpt: (m.content || "").slice(0, 200),
+        }));
+
+    - name: "Create a private channel and invite a user"
+      description: "Create a new invite-only channel and subscribe two users."
+      code: |
+        return await api.create_or_subscribe({
+          subscriptions: JSON.stringify([{ name: "incident-2026-05", description: "Incident war room" }]),
+          principals: JSON.stringify([3, 7]),
+          invite_only: true,
+          history_public_to_subscribers: true,
+        });
+
+    - name: "Move a message to a different topic"
+      description: "Move a message and everything after it in the same topic to a new topic."
+      code: |
+        return await api.update_message({
+          message_id: 12345,
+          topic: "moved-from-general",
+          propagate_mode: "change_later",
+          send_notification_to_old_thread: true,
+          send_notification_to_new_thread: true,
+        });
