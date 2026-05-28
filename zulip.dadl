@@ -93,7 +93,7 @@ backend:
         retry_after_header: Retry-After
 
   coverage:
-    endpoints: 110
+    endpoints: 111
     total_endpoints: 165
     percentage: 67
     focus: "messages (send + get + get-one + update + delete + render + history + reactions + flags + flags-for-narrow + mark-as-read + read-receipts + typing + matches-narrow), channels/streams (list + get-by-id + get-id-by-name + update + archive + topics + subscribers + delete-topic + subscription-status + email-address), subscriptions (list + subscribe-or-create + unsubscribe + update-settings), users (list + get + by-email + own + create + update + deactivate + reactivate + presence + status + regenerate-own-api-key + update-own-settings), user groups (list + create + update + deactivate + members + subgroups), personal preferences (mute/unmute user, topic visibility policy follow/mute/unmute, alert words CRUD), drafts (CRUD), saved snippets (CRUD), scheduled messages (CRUD), real-time events (register + get + delete), invitations (send + list + resend + revoke + multi-use), attachments (list + delete), files (upload + custom emoji upload), org admin (update_realm + user_settings_defaults + linkifiers full CRUD + reorder + custom profile fields full CRUD + reorder + code playgrounds + realm domains + default streams + bot CRUD + regenerate bot api key), server/realm (server settings + linkifiers list + custom emoji list + deactivate)"
