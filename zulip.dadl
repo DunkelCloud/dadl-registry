@@ -93,11 +93,11 @@ backend:
         retry_after_header: Retry-After
 
   coverage:
-    endpoints: 84
+    endpoints: 110
     total_endpoints: 165
-    percentage: 51
-    focus: "Zulip REST API: messages (send, get, get-one, update, delete, render, history, reactions, flags, flags-for-narrow, mark-as-read, read-receipts), channels/streams (list, get-by-id, get-id-by-name, update, archive, topics, subscribers, delete-topic, subscription-status, email-address), subscriptions (list, subscribe-or-create, unsubscribe, update-settings), users (list, get, by-email, own, create, update, deactivate, reactivate, presence, status), user groups (list, create, update, deactivate, members, subgroups), personal preferences (mute/unmute user, topic visibility policy follow/mute/unmute, alert words CRUD), drafts (CRUD), saved snippets (CRUD), scheduled messages (CRUD), real-time events (register, get, delete), invitations (send, list, resend, revoke, multi-use), attachments (list, delete), files (upload), server/realm (server settings, linkifiers, custom emoji)"
-    missing: "OAuth/SAML auth flows, mobile push device registration, video call providers, navigation views, message reminders, default channels admin, custom profile fields admin, realm playgrounds, realm domains, BotConfig data, export/import, billing endpoints, scim, hotspots, tutorials, full-text reorder of linkifiers, code playground admin"
+    percentage: 67
+    focus: "messages (send + get + get-one + update + delete + render + history + reactions + flags + flags-for-narrow + mark-as-read + read-receipts + typing + matches-narrow), channels/streams (list + get-by-id + get-id-by-name + update + archive + topics + subscribers + delete-topic + subscription-status + email-address), subscriptions (list + subscribe-or-create + unsubscribe + update-settings), users (list + get + by-email + own + create + update + deactivate + reactivate + presence + status + regenerate-own-api-key + update-own-settings), user groups (list + create + update + deactivate + members + subgroups), personal preferences (mute/unmute user, topic visibility policy follow/mute/unmute, alert words CRUD), drafts (CRUD), saved snippets (CRUD), scheduled messages (CRUD), real-time events (register + get + delete), invitations (send + list + resend + revoke + multi-use), attachments (list + delete), files (upload + custom emoji upload), org admin (update_realm + user_settings_defaults + linkifiers full CRUD + reorder + custom profile fields full CRUD + reorder + code playgrounds + realm domains + default streams + bot CRUD + regenerate bot api key), server/realm (server settings + linkifiers list + custom emoji list + deactivate)"
+    missing: "OAuth/SAML/external auth flows, mobile push device registration (APNS/FCM tokens), email confirmation flows, password reset flows, video call provider connection setup (the realm setting is covered, the per-call plumbing isn't), navigation views, message reminders (3 endpoints), realm export/import requests, SCIM provisioning, in-app hotspots & tutorial step tracking, BotConfig per-bot key-value storage (3 endpoints), some dev-only endpoints, billing/plan management"
     last_reviewed: "2026-05-28"
 
   setup:
@@ -353,6 +353,36 @@ backend:
         message_id: { type: integer, in: path, required: true }
       response:
         result_path: "$.user_ids"
+
+    set_typing_status:
+      method: POST
+      path: /api/v1/typing
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Send a "user is typing" notification. Clients call this every few seconds while typing,
+        then send op=stop when done. type=direct needs `to` (JSON array of user IDs);
+        type=channel needs stream_id + topic.
+      params:
+        op: { type: string, in: body, required: true, description: "start | stop" }
+        type: { type: string, in: body, default: "direct", description: "direct | channel (alias stream)" }
+        to: { type: string, in: body, description: "JSON array of user IDs for direct, e.g. '[3,7]'" }
+        stream_id: { type: integer, in: body, description: "Channel ID for type=channel" }
+        topic: { type: string, in: body, description: "Topic for type=channel" }
+
+    check_messages_match_narrow:
+      method: GET
+      path: /api/v1/messages/matches_narrow
+      access: read
+      description: >
+        Test which of a given set of message IDs match a narrow. Useful for selectively highlighting
+        search hits in a list. Returns a dict keyed by message ID with match_content + match_subject
+        (HTML, with search keyword highlighting). Messages that don't match are omitted.
+      params:
+        msg_ids: { type: string, in: query, required: true, description: "JSON array of message IDs, e.g. '[12,34]'" }
+        narrow: { type: string, in: query, required: true, description: "JSON-encoded narrow filter array" }
+      response:
+        result_path: "$.messages"
 
     # ── Channels (Streams) ────────────────────────────────────
 
@@ -687,6 +717,49 @@ backend:
         emoji_code: { type: string, in: body, description: "Emoji unique code within its namespace" }
         reaction_type: { type: string, in: body, description: "unicode_emoji | realm_emoji | zulip_extra_emoji" }
         away: { type: boolean, in: body, description: "Deprecated — inverse of presence_enabled (Zulip 6.0+)" }
+
+    regenerate_own_api_key:
+      method: POST
+      path: /api/v1/users/me/api_key/regenerate
+      access: dangerous
+      description: >
+        Generate a new API key for the authenticated user. Returns {api_key}. WARNING: the old key
+        stops working immediately and all devices using it (including this connection) must be
+        re-authenticated. Use sparingly.
+
+    update_own_settings:
+      method: PATCH
+      path: /api/v1/settings
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Update the authenticated user's own preferences (display, notifications, behavior, privacy).
+        Pass only the fields you want to change. Admins can also use target_users to bulk-update
+        settings for others (Zulip 12.0+).
+      params:
+        full_name: { type: string, in: body, description: "Display name" }
+        email: { type: string, in: body, description: "Change email (may require re-confirmation)" }
+        old_password: { type: string, in: body, description: "Required when changing password" }
+        new_password: { type: string, in: body }
+        color_scheme: { type: integer, in: body, description: "1=auto, 2=dark, 3=light" }
+        emojiset: { type: string, in: body, description: "google | twitter | text" }
+        timezone: { type: string, in: body, description: "IANA tz name, e.g. Europe/Berlin" }
+        default_language: { type: string, in: body, description: "Locale code, e.g. en, de, fr" }
+        twenty_four_hour_time: { type: boolean, in: body }
+        web_home_view: { type: string, in: body, description: "recent | inbox | all_messages" }
+        enter_sends: { type: boolean, in: body, description: "Enter sends the message instead of newline" }
+        send_read_receipts: { type: boolean, in: body }
+        send_private_typing_notifications: { type: boolean, in: body }
+        send_stream_typing_notifications: { type: boolean, in: body }
+        presence_enabled: { type: boolean, in: body }
+        email_address_visibility: { type: integer, in: body, description: "1=everyone, 2=members, 3=admins, 4=nobody, 5=moderators" }
+        allow_private_data_export: { type: boolean, in: body }
+        enable_desktop_notifications: { type: boolean, in: body }
+        enable_sounds: { type: boolean, in: body }
+        enable_offline_email_notifications: { type: boolean, in: body }
+        enable_offline_push_notifications: { type: boolean, in: body }
+        enable_digest_emails: { type: boolean, in: body }
+        target_users: { type: string, in: body, description: "Admin-only bulk update: JSON object {user_ids: [...], user_group_ids: [...]} (Zulip 12.0+)" }
 
     # ── User Groups ──────────────────────────────────────────
 
@@ -1150,6 +1223,322 @@ backend:
       description: "Deactivate (hide) a realm custom emoji. The image data remains but the emoji is no longer selectable."
       params:
         emoji_name: { type: string, in: path, required: true }
+
+    upload_custom_emoji:
+      method: POST
+      path: /api/v1/realm/emoji/{emoji_name}
+      content_type: multipart/form-data
+      access: admin
+      description: >
+        Upload a new custom emoji to the realm. emoji_name allows letters/digits/dashes/spaces.
+        File goes in the request body as form data. Server limits file size (default 5 MB) and
+        accepts common image/gif formats.
+      params:
+        emoji_name: { type: string, in: path, required: true, description: "Identifier for the new emoji (letters/digits/dashes/spaces)" }
+        file: { type: file_url, in: body, required: true, description: "URL of the emoji image to upload" }
+      max_body_size: 5MB
+
+    # ── Org Admin & Setup ────────────────────────────────────
+
+    update_realm:
+      method: PATCH
+      path: /api/v1/realm
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Update org-wide (realm) settings. Admin/owner only. Only fields you pass are changed.
+        Setting target_users on the related update_own_settings is for per-user defaults; this
+        endpoint changes org-wide policy. The full realm settings surface is ~80 fields; the most
+        commonly-tuned ones are exposed here. For uncommon fields, pass via this same endpoint.
+      params:
+        name: { type: string, in: body, description: "Organization name" }
+        description: { type: string, in: body, description: "Org description (Markdown)" }
+        invite_required: { type: boolean, in: body, description: "Require invitation to join (true) or open signup (false)" }
+        emails_restricted_to_domains: { type: boolean, in: body, description: "Only accept signups from domains listed in realm_domains" }
+        disallow_disposable_email_addresses: { type: boolean, in: body }
+        require_unique_names: { type: boolean, in: body }
+        invite_to_realm_policy: { type: integer, in: body, description: "Who can send invites: 1=all, 2=admins_only, 3=full_members, 4=moderators_only, 5=members, 6=nobody" }
+        default_language: { type: string, in: body, description: "Default org locale, e.g. 'en', 'de'" }
+        message_retention_days: { type: string, in: body, description: "Default retention in days, or 'unlimited'" }
+        max_invites: { type: integer, in: body, description: "Max pending invitations" }
+        digest_emails_enabled: { type: boolean, in: body }
+        digest_weekday: { type: integer, in: body, description: "0=Mon..6=Sun" }
+        message_content_edit_limit_seconds: { type: integer, in: body, description: "Edit window for own messages (0 = no limit)" }
+        message_content_delete_limit_seconds: { type: integer, in: body, description: "Self-delete window (0 = no limit)" }
+        allow_message_editing: { type: boolean, in: body }
+        allow_edit_history: { type: boolean, in: body }
+        wildcard_mention_policy: { type: integer, in: body, description: "Who can use @all/@everyone/@channel" }
+        notifications_stream_id: { type: integer, in: body, description: "Channel for new-user/admin notifications, -1 to disable" }
+        signup_notifications_stream_id: { type: integer, in: body }
+        video_chat_provider: { type: integer, in: body, description: "1=Jitsi (built-in), 2=BigBlueButton, 3=Zoom, 0=disabled" }
+        giphy_rating: { type: integer, in: body, description: "GIPHY content rating filter" }
+        bot_creation_policy: { type: integer, in: body, description: "Who can create bots: 1=everyone, 2=admins_only, 3=limit_generic" }
+        waiting_period_threshold: { type: integer, in: body, description: "Days a new account must exist before becoming a 'full member'" }
+        default_code_block_language: { type: string, in: body, description: "Pygments language for unmarked code blocks" }
+
+    update_realm_user_settings_defaults:
+      method: PATCH
+      path: /api/v1/realm/user_settings_defaults
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Update the default per-user settings applied to newly-created accounts in the realm.
+        Does NOT change settings of existing users. Admin/owner only.
+      params:
+        emojiset: { type: string, in: body, description: "google | twitter | text" }
+        color_scheme: { type: integer, in: body, description: "1=auto, 2=dark, 3=light" }
+        web_home_view: { type: string, in: body, description: "recent | inbox | all_messages" }
+        enter_sends: { type: boolean, in: body }
+        twenty_four_hour_time: { type: boolean, in: body }
+        enable_digest_emails: { type: boolean, in: body }
+        enable_offline_email_notifications: { type: boolean, in: body }
+        enable_offline_push_notifications: { type: boolean, in: body }
+        left_side_userlist: { type: boolean, in: body }
+        default_language: { type: string, in: body }
+
+    add_linkifier:
+      method: POST
+      path: /api/v1/realm/filters
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Add a new linkifier (regex → URL template). Used to auto-link ticket IDs like 'JIRA-1234',
+        commit hashes, internal references, etc. url_template uses RFC 6570 with named variables
+        captured from the regex (e.g. '{ticket_id}').
+      params:
+        pattern: { type: string, in: body, required: true, description: "Python regex with named groups, e.g. 'JIRA-(?P<id>\\\\d+)'" }
+        url_template: { type: string, in: body, required: true, description: "RFC 6570 template, e.g. 'https://jira.example.com/browse/JIRA-{id}'" }
+        example_input: { type: string, in: body, description: "Sample text that matches the pattern" }
+        reverse_template: { type: string, in: body, description: "Template for reverse-linkification (URL → Markdown)" }
+        alternative_url_templates: { type: string, in: body, description: "JSON array of additional URL templates for reverse linkification" }
+
+    update_linkifier:
+      method: PATCH
+      path: /api/v1/realm/filters/{filter_id}
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Update an existing linkifier's pattern, template, or auxiliary fields. Pass only fields to change."
+      params:
+        filter_id: { type: integer, in: path, required: true }
+        pattern: { type: string, in: body }
+        url_template: { type: string, in: body }
+        example_input: { type: string, in: body }
+        reverse_template: { type: string, in: body }
+        alternative_url_templates: { type: string, in: body }
+
+    remove_linkifier:
+      method: DELETE
+      path: /api/v1/realm/filters/{filter_id}
+      access: dangerous
+      description: "Delete a linkifier. Existing messages keep their rendered links but new messages won't auto-link this pattern."
+      params:
+        filter_id: { type: integer, in: path, required: true }
+
+    reorder_linkifiers:
+      method: PATCH
+      path: /api/v1/realm/filters
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Reorder linkifiers. Order matters when patterns overlap — earlier wins. Pass a JSON array
+        of all linkifier IDs in the desired order.
+      params:
+        ordered_linkifier_ids: { type: string, in: body, required: true, description: "JSON array of all linkifier IDs in desired order, e.g. '[3,1,2]'" }
+
+    get_custom_profile_fields:
+      method: GET
+      path: /api/v1/realm/profile_fields
+      access: read
+      description: >
+        List custom profile fields configured for the realm. Returns array of {id, type, name,
+        hint, field_data, order, ...}. Field types: 1=short text, 2=paragraph, 3=dropdown,
+        4=date, 5=link, 6=users, 7=external account, 8=pronouns.
+      response:
+        result_path: "$.custom_fields"
+        allow_jq_override: true
+
+    create_custom_profile_field:
+      method: POST
+      path: /api/v1/realm/profile_fields
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Create a new custom profile field that users can fill in their profile. field_data is type-specific JSON (e.g. choices for dropdown)."
+      params:
+        name: { type: string, in: body, required: true, description: "Visible field label" }
+        hint: { type: string, in: body, description: "Help text shown under the field" }
+        field_type: { type: integer, in: body, required: true, description: "1=short_text, 2=paragraph, 3=dropdown, 4=date, 5=link, 6=users, 7=external_account, 8=pronouns" }
+        field_data: { type: string, in: body, description: "JSON config for dropdown/external_account types" }
+        display_in_profile_summary: { type: boolean, in: body, description: "Show in the profile preview popover (limit ~2 fields)" }
+        required: { type: boolean, in: body }
+
+    update_custom_profile_field:
+      method: PATCH
+      path: /api/v1/realm/profile_fields/{field_id}
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Update a custom profile field. Cannot change field_type after creation."
+      params:
+        field_id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        hint: { type: string, in: body }
+        field_data: { type: string, in: body }
+        display_in_profile_summary: { type: boolean, in: body }
+        required: { type: boolean, in: body }
+
+    delete_custom_profile_field:
+      method: DELETE
+      path: /api/v1/realm/profile_fields/{field_id}
+      access: dangerous
+      description: "Delete a custom profile field. All user values for this field are lost. Cannot be undone."
+      params:
+        field_id: { type: integer, in: path, required: true }
+
+    reorder_custom_profile_fields:
+      method: PATCH
+      path: /api/v1/realm/profile_fields
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Reorder custom profile fields. Pass a JSON array of field IDs in the desired display order."
+      params:
+        order: { type: string, in: body, required: true, description: "JSON array of profile field IDs in desired order" }
+
+    add_realm_playground:
+      method: POST
+      path: /api/v1/realm/playgrounds
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Add a code playground integration — clicking the "View in playground" button on a code
+        block of the matching language opens the code in an external editor (e.g. play.rust-lang.org).
+        url_template must contain exactly one `{code}` variable.
+      params:
+        name: { type: string, in: body, required: true, description: "Display name (e.g. 'Rust Playground')" }
+        pygments_language: { type: string, in: body, required: true, description: "Pygments language ID (e.g. 'rust', 'python', 'javascript')" }
+        url_template: { type: string, in: body, required: true, description: "RFC 6570 template with single {code} variable" }
+
+    remove_realm_playground:
+      method: DELETE
+      path: /api/v1/realm/playgrounds/{playground_id}
+      access: dangerous
+      description: "Remove a code playground integration."
+      params:
+        playground_id: { type: integer, in: path, required: true }
+
+    add_realm_domain:
+      method: POST
+      path: /api/v1/realm/domains
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Add an email domain to the org's allowed-signup list (only effective when realm setting
+        emails_restricted_to_domains=true). Use to lock self-signup to your company domain.
+      params:
+        domain: { type: string, in: body, required: true, description: "Email domain, e.g. 'example.com'" }
+        allow_subdomains: { type: boolean, in: body, default: false, description: "Also accept @anything.example.com" }
+
+    update_realm_domain:
+      method: PATCH
+      path: /api/v1/realm/domains/{domain}
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: "Toggle allow_subdomains on an existing realm domain entry."
+      params:
+        domain: { type: string, in: path, required: true }
+        allow_subdomains: { type: boolean, in: body, required: true }
+
+    remove_realm_domain:
+      method: DELETE
+      path: /api/v1/realm/domains/{domain}
+      access: dangerous
+      description: "Remove an email domain from the allowed-signup list."
+      params:
+        domain: { type: string, in: path, required: true }
+
+    add_default_stream:
+      method: POST
+      path: /api/v1/default_streams
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Mark a channel as a default channel — new users are auto-subscribed on signup (unless
+        include_realm_default_subscriptions is overridden in the invite).
+      params:
+        stream_id: { type: integer, in: body, required: true }
+
+    remove_default_stream:
+      method: DELETE
+      path: /api/v1/default_streams
+      access: admin
+      description: "Remove a channel from the realm's default channel list. Existing subscribers are not affected."
+      params:
+        stream_id: { type: integer, in: query, required: true }
+
+    get_bots:
+      method: GET
+      path: /api/v1/bots
+      access: read
+      description: >
+        List bots owned by the current user. Returns array of {user_id, username, full_name,
+        api_key, default_sending_stream, default_events_register_stream, default_all_public_streams,
+        avatar_url, services}. IMPORTANT: this endpoint and the other /bots endpoints are for
+        HUMAN accounts only — bot accounts cannot list/manage other bots (Zulip returns
+        'This endpoint does not accept bot requests'). Connect with a human user's API key
+        to manage bots.
+      response:
+        result_path: "$.bots"
+        allow_jq_override: true
+
+    create_bot:
+      method: POST
+      path: /api/v1/bots
+      content_type: multipart/form-data
+      access: write
+      description: >
+        Create a new bot owned by the current user. bot_type: 1=Generic, 2=Incoming webhook,
+        3=Outgoing webhook, 4=Embedded. Generic is the most flexible.
+      params:
+        full_name: { type: string, in: body, required: true }
+        short_name: { type: string, in: body, required: true, description: "Used as the bot's email prefix; must be unique" }
+        bot_type: { type: integer, in: body, default: 1, description: "1=Generic, 2=Incoming webhook, 3=Outgoing webhook, 4=Embedded" }
+        payload_url: { type: string, in: body, description: "For outgoing webhook bots — URL to POST events to" }
+        service_name: { type: string, in: body, description: "For incoming webhook bots — integration name (e.g. 'github', 'slack')" }
+        config_data: { type: string, in: body, description: "JSON-encoded bot config data" }
+        default_sending_stream: { type: string, in: body, description: "Default channel for send_message when 'to' is omitted" }
+        default_events_register_stream: { type: string, in: body }
+        default_all_public_streams: { type: boolean, in: body }
+
+    update_bot:
+      method: PATCH
+      path: /api/v1/bots/{bot_id}
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: "Update settings of a bot owned by the current user (or any bot, for admins)."
+      params:
+        bot_id: { type: integer, in: path, required: true, description: "Bot user_id" }
+        full_name: { type: string, in: body }
+        role: { type: integer, in: body, description: "100/200/300/400/600" }
+        default_sending_stream: { type: string, in: body }
+        default_events_register_stream: { type: string, in: body }
+        default_all_public_streams: { type: boolean, in: body }
+        config_data: { type: string, in: body }
+        service_payload_url: { type: string, in: body }
+        service_interface: { type: integer, in: body, description: "Outgoing webhook interface: 1=Generic, 2=Slack-compatible" }
+
+    regenerate_bot_api_key:
+      method: POST
+      path: /api/v1/bots/{bot_id}/api_key/regenerate
+      access: dangerous
+      description: "Generate a new API key for one of your bots. Old key stops working immediately."
+      params:
+        bot_id: { type: integer, in: path, required: true }
+
+    deactivate_bot:
+      method: DELETE
+      path: /api/v1/bots/{bot_id}
+      access: dangerous
+      description: "Deactivate (delete) a bot owned by the current user. Reversible by re-activating the bot user."
+      params:
+        bot_id: { type: integer, in: path, required: true }
 
   # ──────────────────────────────────────────────────────────────
   composites:
