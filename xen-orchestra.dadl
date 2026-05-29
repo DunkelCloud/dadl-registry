@@ -11,6 +11,7 @@
 # - A "host" is a physical XCP-ng hypervisor machine within a pool.
 # - A "VM" is a virtual machine identified by UUID.
 # - A "VM template" is a stamp from which new VMs are cloned (separate /vm-templates collection).
+# - A "VM controller" is the dom0 control-domain VM of a host (separate /vm-controllers collection, XO 6.5+).
 # - A "VM snapshot" is a point-in-time copy of a VM (separate /vm-snapshots collection).
 # - A "VDI snapshot" is a point-in-time copy of a VDI (separate /vdi-snapshots collection).
 # - A "SR" (Storage Repository) is a storage backend (local disk, NFS, iSCSI, etc.).
@@ -35,6 +36,11 @@
 # - Use ?ndjson for newline-delimited JSON; add &watch for real-time streaming on /tasks.
 # - Use ?markdown=true (XO 6.4+) for markdown-formatted collection responses (LLM-friendly).
 # - Actions are async by default -- add ?sync to get the result directly (blocks; risk of timeout for long ops).
+# - VM property writes: PATCH /vms/{id} (update_vm) partially updates name, CPU, memory, boot firmware, tags, etc.
+#   (added XO 6.5). There is still no PATCH /vdis/{id} -- rename VDIs via tags or the JSON-RPC API.
+# - Snapshot revert: POST /vms/{id}/actions/revert_snapshot (revert_vm_to_snapshot); set snapshotBefore to make it undoable.
+# - SDN traffic rules: /plugins/sdn-controller/{networks|vifs}/{id}/actions/{add|delete}_traffic_rule -- only present
+#   when the xo-server-sdn-controller plugin is loaded; calls fail with 404 otherwise.
 # - Tags: add with PUT /<type>/{id}/tags/{tag}, remove with DELETE.
 # - Sub-resources: alarms, messages, tasks are exposed per-object as /<type>/{id}/{alarms|messages|tasks}.
 # - Stats: /vms/{id}/stats and /hosts/{id}/stats accept ?granularity=seconds|minutes|hours|days.
@@ -53,15 +59,15 @@ credits:
 
 source_name: "Xen Orchestra REST API"
 source_url: "https://docs.xen-orchestra.com/restapi"
-date: "2026-05-02"
+date: "2026-05-28"
 
 backend:
   name: xen-orchestra
   type: rest
-  version: "3.0"
+  version: "3.1"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
-  description: "Xen Orchestra REST API (XO 6.4+) -- complete coverage: VMs, hosts, pools, storage (SR/VDI/VBD), networks (VIF/PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges), proxies, servers, dashboards, auth tokens, health check"
+  description: "Xen Orchestra REST API (XO 6.4+, current through 6.5) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts, pools, storage (SR/VDI/VBD), networks (VIF/PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges), proxies, servers, dashboards, auth tokens, SDN traffic rules, health check"
 
   auth:
     type: bearer
@@ -95,12 +101,12 @@ backend:
       max_items: 500
 
   coverage:
-    endpoints: 229
-    total_endpoints: 229
+    endpoints: 245
+    total_endpoints: 245
     percentage: 100
-    focus: "Complete REST API coverage for XO 6.4+: all object types (VMs, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, power, snapshot/clone/migrate, export/import, hotplug), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges), backups (archives, jobs, logs, restore-logs, repositories, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update, management reconfigure, audit logs, missing patches), XOA appliance (dashboard, ping, gui-routes). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
-    missing: "Generic PATCH /vms/{id} and PATCH /vdis/{id} -- the typed REST API does not yet expose XAPI property writes (use tags or JSON-RPC for renames). SDN-controller plugin endpoints (network/VIF traffic rules under /plugins/sdn-controller/*) -- only available when xo-server-sdn-controller plugin is installed; deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13"
-    last_reviewed: "2026-05-02"
+    focus: "Complete REST API coverage for XO 6.4+ (current through 6.5): all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update, power, snapshot/clone/migrate/revert, export/import, hotplug), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges), backups (archives, jobs, logs, restore-logs, repositories, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
+    missing: "PATCH /vdis/{id} does not exist in the API -- VDIs cannot be renamed via REST (use tags or the JSON-RPC API). SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13"
+    last_reviewed: "2026-05-28"
 
   setup:
     credential_steps:
@@ -132,7 +138,14 @@ backend:
       required: "name_label + template UUID are minimum required params"
       memory: "Memory in bytes (e.g. 2147483648 = 2 GB)"
       cloud_config: "Cloud-init config as string for automatic guest setup"
-      note: "CPU settings not yet available via REST API"
+      note: "CPU count cannot be set at creation -- create the VM, then adjust cpus/cpusStaticMax via update_vm (PATCH /vms/{id})"
+    update_vm:
+      note: "PATCH semantics -- only the fields you send are changed. Cold-change fields (cpusStaticMax, memoryStaticMax, secureBoot, virtualizationMode) require the VM to be halted; live fields (nameLabel, cpus within static max, tags) work while running."
+      tags: "tags replaces the entire tag list. To add/remove a single tag without rewriting, use add_vm_tag / remove_vm_tag instead."
+    delete_vm:
+      note: "Destroys the VM and its VDIs -- irreversible, always synchronous (no sync/async toggle). On VMs with large disks the call may exceed the HTTP client timeout ('context deadline exceeded') even though XO completes the deletion server-side -- confirm by re-reading: get_vm then returns HTTP 404 'no such VM <uuid>'."
+    revert_vm_to_snapshot:
+      note: "Set snapshotBefore=true to auto-snapshot the current state before reverting, so the operation is undoable. Returns a task reference; use ?sync for the direct result."
     snapshot_vm:
       note: "Returns a task reference by default; use ?sync for direct result with snapshot id"
     clone_vm:
@@ -146,7 +159,7 @@ backend:
       formats: "VHD is default; set raw query param for raw disk images"
     list_tasks:
       watch_mode: "Use ndjson=true&watch=true for real-time task monitoring"
-      wait: "On single task: ?wait=result blocks until completion"
+      wait: "On a single task (get_task): ?wait=true long-polls until the task completes, then returns its final state"
     delete_tasks:
       note: "Bulk delete: removes ALL tasks the current user has 'task:delete' privilege on. Irreversible."
     create_vbd:
@@ -155,6 +168,7 @@ backend:
       note: "Moves a VDI between SRs without VM downtime (live storage migration). Large disks can take minutes -- avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
     migrate_vm:
       note: "Live-migrates a VM to another host, optionally with storage migration. For large VMs avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
+      cross_pool: "For cross-pool moves, use srIdByVdiId to place each disk on a specific target SR and networkIdByVifId to re-map each VIF to a target network; srId sets a single default SR for all disks."
     emergency_shutdown_pool:
       warning: "Shuts down ALL VMs and hosts in the pool. Use only in emergencies."
     rolling_reboot_pool:
@@ -185,6 +199,16 @@ backend:
       flow: "1) Create role via POST /acl-roles. 2) Add privileges via POST /acl-privileges (with roleId). 3) Attach role to user/group via PUT /acl-roles/{id}/{users|groups}/{userId|groupId}."
     add_server:
       note: "Registers a new XCP-ng/XenServer pool master to XO. body.host is the IP/hostname, body.username/password are XAPI credentials. Use connect_server afterwards to establish the connection."
+    delete_sr:
+      warning: "Destroys the SR AND all data on the underlying storage -- irreversible. The SR must be detached/unplugged first. To keep the data and only remove it from XO, use forget_sr instead."
+    add_network_traffic_rule:
+      note: "Requires the xo-server-sdn-controller plugin; returns 404 if not loaded. Applies to private (tunnel) networks managed by the SDN controller. allow=false drops matching traffic."
+    delete_network_traffic_rule:
+      note: "Identify the rule to remove by matching its direction + ipRange + protocol + port. Requires the SDN controller plugin."
+    add_vif_traffic_rule:
+      note: "Per-VIF variant of add_network_traffic_rule -- scopes the rule to a single VM interface. Requires the SDN controller plugin."
+    get_mcp_status:
+      note: "Unauthenticated. Reports whether XO's built-in Model Context Protocol server is enabled (HTTP 200) or disabled (HTTP 503)."
 
   tools:
 
@@ -213,6 +237,13 @@ backend:
       path: /gui-routes
       access: read
       description: "Returns the URLs of the legacy XO5 (xo5) and modern XO6 (xo6) web UIs. Useful for clients that need to deep-link into the GUI."
+      pagination: none
+
+    get_mcp_status:
+      method: GET
+      path: /mcp/status
+      access: read
+      description: "Report whether XO's built-in MCP server is enabled. Unauthenticated. Returns 200 when enabled, 503 when disabled. Requires a recent XO build (REST route added after 6.5.0); returns 404 on older instances."
       pagination: none
 
     # =========================================================================
@@ -631,9 +662,50 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
-    # Note: There is no generic PATCH /vms/{uuid} for renaming etc. (the typed REST API
-    # does not expose XAPI property writes yet). Use add_vm_tag/remove_vm_tag for tags;
-    # for name_label/description changes, use the JSON-RPC endpoint or xo-cli.
+    update_vm:
+      method: PATCH
+      path: /vms/{uuid}
+      access: write
+      description: "Partially update a VM's properties (rename, resize CPU/RAM, boot firmware, tags, etc.). Only the fields you pass are changed. Some fields require the VM to be halted. Requires XO 6.5+ (PATCH /vms route returns 404 on older builds)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        nameLabel: { type: string, in: body, description: "New display name" }
+        nameDescription: { type: string, in: body, description: "New description" }
+        notes: { type: string, in: body, description: "Free-form notes (null to clear)" }
+        tags: { type: array, in: body, description: "Replace the full tag list (array of strings)" }
+        cpus: { type: integer, in: body, description: "Number of vCPUs currently assigned" }
+        cpusStaticMax: { type: integer, in: body, description: "Max vCPUs (cold change; requires halted VM)" }
+        coresPerSocket: { type: integer, in: body, description: "vCPU cores per socket (null for auto)" }
+        cpuCap: { type: integer, in: body, description: "CPU cap (null for none)" }
+        cpuWeight: { type: integer, in: body, description: "CPU scheduling weight (null for default)" }
+        cpuMask: { type: array, in: body, description: "Pin vCPUs to host physical cores (array of integers)" }
+        memory: { type: integer, in: body, description: "Dynamic memory target in bytes" }
+        memoryMin: { type: integer, in: body, description: "Dynamic memory minimum in bytes" }
+        memoryMax: { type: integer, in: body, description: "Dynamic memory maximum in bytes" }
+        memoryStaticMax: { type: integer, in: body, description: "Static memory maximum in bytes (cold change)" }
+        affinityHost: { type: string, in: body, description: "Preferred host UUID (null to clear)" }
+        suspendSr: { type: string, in: body, description: "SR UUID used to store suspend memory image (null for default)" }
+        startDelay: { type: integer, in: body, description: "Delay in seconds before auto-start" }
+        autoPoweron: { type: boolean, in: body, description: "Start this VM automatically when the pool boots" }
+        highAvailability: { type: string, in: body, description: "HA restart priority: 'best-effort', 'restart', or '' (disabled)" }
+        blockedOperations: { type: object, in: body, description: "Map of VM operations to block (e.g. {\"destroy\": true})" }
+        hvmBootFirmware: { type: string, in: body, description: "HVM boot firmware: 'bios' or 'uefi'" }
+        secureBoot: { type: boolean, in: body, description: "Enable UEFI Secure Boot" }
+        uefiMode: { type: string, in: body, description: "UEFI mode: 'setup' or 'user'" }
+        virtualizationMode: { type: string, in: body, description: "'pv' or 'hvm'" }
+        nestedVirt: { type: boolean, in: body, description: "Expose virtualization extensions to the guest" }
+        expNestedHvm: { type: boolean, in: body, description: "Experimental nested HVM support" }
+        viridian: { type: boolean, in: body, description: "Enable Viridian (Hyper-V) enlightenments for Windows guests" }
+        hasVendorDevice: { type: boolean, in: body, description: "Expose the Xen PV vendor device (Windows Update drivers)" }
+        nicType: { type: string, in: body, description: "Emulated NIC type (null for default)" }
+        vga: { type: string, in: body, description: "Emulated graphics: 'std' or 'cirrus'" }
+        videoram: { type: integer, in: body, description: "Video RAM in MiB: 1, 2, 4, 8 or 16" }
+        PV_args: { type: string, in: body, description: "PV kernel command-line arguments" }
+        xenStoreData: { type: object, in: body, description: "Key/value map written to the guest's xenstore" }
+        creation: { type: object, in: body, description: "Creation metadata, e.g. {\"user\": \"<user-id>\"}" }
+        resourceSet: { type: string, in: body, description: "Assign the VM to a resource set (null to remove)" }
+        share: { type: boolean, in: body, description: "Share the VM with all members of its resource set" }
+      pagination: none
 
     delete_vm:
       method: DELETE
@@ -754,6 +826,18 @@ backend:
         sync: { type: boolean, in: query }
       pagination: none
 
+    revert_vm_to_snapshot:
+      method: POST
+      path: /vms/{uuid}/actions/revert_snapshot
+      access: write
+      description: "Revert a VM to one of its snapshots. Optionally take a fresh snapshot of the current state first (snapshotBefore) so the revert is undoable. Requires XO 6.5+ (route returns 404 on older builds)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        snapshotId: { type: string, in: body, required: true, description: "UUID of the snapshot to revert to" }
+        snapshotBefore: { type: boolean, in: body, description: "Snapshot the current state before reverting" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
     clone_vm:
       method: POST
       path: /vms/{uuid}/actions/clone
@@ -772,11 +856,14 @@ backend:
       method: POST
       path: /vms/{uuid}/actions/migrate
       access: write
-      description: "Live-migrate a VM to another host. Supports cross-SR storage migration via srId."
+      description: "Live-migrate a VM to another host. Supports cross-SR storage migration and per-disk / per-VIF placement for cross-pool moves."
       params:
         uuid: { type: string, in: path, required: true }
-        hostId: { type: string, in: body, description: "Target host UUID" }
-        srId: { type: string, in: body, description: "Target SR for storage migration" }
+        hostId: { type: string, in: body, required: true, description: "Target host UUID" }
+        migrationNetworkId: { type: string, in: body, description: "Network UUID to use for the migration traffic" }
+        srId: { type: string, in: body, description: "Default target SR for storage migration (all VDIs)" }
+        srIdByVdiId: { type: object, in: body, description: "Per-VDI target SR map: {\"<vdi-uuid>\": \"<sr-uuid>\"} (overrides srId per disk)" }
+        networkIdByVifId: { type: object, in: body, description: "Per-VIF target network map: {\"<vif-uuid>\": \"<network-uuid>\"} (cross-pool)" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1172,6 +1259,103 @@ backend:
       path: /vm-templates/{uuid}/tags/{tag}
       access: write
       description: "Remove a tag from a VM template."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # VM CONTROLLERS -- dom0 control domains (new collection in XO 6.5+)
+    # =========================================================================
+
+    list_vm_controllers:
+      method: GET
+      path: /vm-controllers
+      access: read
+      description: "List VM controllers (the dom0 control-domain VM of each host). Returns URLs by default; use fields for objects."
+      params:
+        fields: { type: string, in: query, description: "Comma-separated fields" }
+        filter: { type: string, in: query, description: "XO filter expression" }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_vm_controller:
+      method: GET
+      path: /vm-controllers/{uuid}
+      access: read
+      description: "Get full details of a VM controller (dom0 control domain)."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    list_vm_controller_alarms:
+      method: GET
+      path: /vm-controllers/{uuid}/alarms
+      access: read
+      description: "List XAPI alarms for a VM controller."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_controller_vdis:
+      method: GET
+      path: /vm-controllers/{uuid}/vdis
+      access: read
+      description: "List VDIs attached to a VM controller."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_controller_messages:
+      method: GET
+      path: /vm-controllers/{uuid}/messages
+      access: read
+      description: "List XAPI messages for a VM controller."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_vm_controller_tasks:
+      method: GET
+      path: /vm-controllers/{uuid}/tasks
+      access: read
+      description: "List tasks scoped to a VM controller."
+      params:
+        uuid: { type: string, in: path, required: true }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    add_vm_controller_tag:
+      method: PUT
+      path: /vm-controllers/{uuid}/tags/{tag}
+      access: write
+      description: "Add a tag to a VM controller."
+      params:
+        uuid: { type: string, in: path, required: true }
+        tag: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_vm_controller_tag:
+      method: DELETE
+      path: /vm-controllers/{uuid}/tags/{tag}
+      access: write
+      description: "Remove a tag from a VM controller."
       params:
         uuid: { type: string, in: path, required: true }
         tag: { type: string, in: path, required: true }
@@ -1594,6 +1778,15 @@ backend:
         uuid: { type: string, in: path, required: true }
       pagination: none
 
+    delete_sr:
+      method: DELETE
+      path: /srs/{uuid}
+      access: dangerous
+      description: "Destroy an SR and all data on its underlying storage. Irreversible -- the SR must be detached/unplugged first. To keep the data, use forget_sr instead. Requires XO 6.5+ (DELETE /srs route returns 404 on older builds)."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
     list_sr_alarms:
       method: GET
       path: /srs/{uuid}/alarms
@@ -1718,6 +1911,7 @@ backend:
         name_label: { type: string, in: body, required: true }
         name_description: { type: string, in: body }
         size: { type: integer, in: body, required: true, description: "Size in bytes" }
+        other_config: { type: object, in: body, description: "Optional XAPI other_config key/value map (no longer required as of XO 6.5)" }
       pagination: none
 
     delete_vdi:
@@ -2272,6 +2466,69 @@ backend:
         markdown: { type: boolean, in: query }
 
     # =========================================================================
+    # SDN CONTROLLER -- Network traffic rules (xo-server-sdn-controller plugin)
+    # These routes only exist when the SDN Controller plugin is loaded.
+    # =========================================================================
+
+    add_network_traffic_rule:
+      method: POST
+      path: /plugins/sdn-controller/networks/{uuid}/actions/add_traffic_rule
+      access: write
+      description: "Add a traffic (OpenFlow) rule to a private SDN network. Requires the SDN Controller plugin."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Network UUID" }
+        allow: { type: boolean, in: body, required: true, description: "true to allow matching traffic, false to drop it" }
+        direction: { type: string, in: body, required: true, description: "Traffic direction: 'from' or 'to'" }
+        ipRange: { type: string, in: body, required: true, description: "IP range in CIDR notation (e.g. 10.0.0.0/24)" }
+        protocol: { type: string, in: body, required: true, description: "Protocol, e.g. 'TCP', 'UDP', 'ICMP'" }
+        port: { type: integer, in: body, description: "Port number (for TCP/UDP)" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    delete_network_traffic_rule:
+      method: POST
+      path: /plugins/sdn-controller/networks/{uuid}/actions/delete_traffic_rule
+      access: write
+      description: "Remove a traffic rule from a private SDN network. Match the existing rule by direction/ipRange/protocol/port. Requires the SDN Controller plugin."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Network UUID" }
+        direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to remove: 'from' or 'to'" }
+        ipRange: { type: string, in: body, required: true, description: "IP range of the rule to remove" }
+        protocol: { type: string, in: body, required: true, description: "Protocol of the rule to remove" }
+        port: { type: integer, in: body, description: "Port of the rule to remove (for TCP/UDP)" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    add_vif_traffic_rule:
+      method: POST
+      path: /plugins/sdn-controller/vifs/{uuid}/actions/add_traffic_rule
+      access: write
+      description: "Add a traffic (OpenFlow) rule to a VIF connected to a private SDN network. Requires the SDN Controller plugin."
+      params:
+        uuid: { type: string, in: path, required: true, description: "VIF UUID" }
+        allow: { type: boolean, in: body, required: true, description: "true to allow matching traffic, false to drop it" }
+        direction: { type: string, in: body, required: true, description: "Traffic direction: 'from' or 'to'" }
+        ipRange: { type: string, in: body, required: true, description: "IP range in CIDR notation (e.g. 10.0.0.0/24)" }
+        protocol: { type: string, in: body, required: true, description: "Protocol, e.g. 'TCP', 'UDP', 'ICMP'" }
+        port: { type: integer, in: body, description: "Port number (for TCP/UDP)" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    delete_vif_traffic_rule:
+      method: POST
+      path: /plugins/sdn-controller/vifs/{uuid}/actions/delete_traffic_rule
+      access: write
+      description: "Remove a traffic rule from a VIF connected to a private SDN network. Match the existing rule by direction/ipRange/protocol/port. Requires the SDN Controller plugin."
+      params:
+        uuid: { type: string, in: path, required: true, description: "VIF UUID" }
+        direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to remove: 'from' or 'to'" }
+        ipRange: { type: string, in: body, required: true, description: "IP range of the rule to remove" }
+        protocol: { type: string, in: body, required: true, description: "Protocol of the rule to remove" }
+        port: { type: integer, in: body, description: "Port of the rule to remove (for TCP/UDP)" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
     # PIFs -- Physical Network Interfaces
     # =========================================================================
 
@@ -2467,10 +2724,10 @@ backend:
       method: GET
       path: /tasks/{id}
       access: read
-      description: "Get a task. Use wait=result to block until completion."
+      description: "Get a task. Set wait=true to block until the task finishes (long-poll), then return its final state."
       params:
         id: { type: string, in: path, required: true }
-        wait: { type: string, in: query, description: "'result' to wait" }
+        wait: { type: boolean, in: query, description: "Block until the task completes before responding" }
       pagination: none
 
     delete_task:
