@@ -1,0 +1,551 @@
+# elitedomains.dadl -- ELITEDOMAINS REST API for ToolMesh
+# ELITEDOMAINS (ELITEDOMAINS GmbH) is a German domain registrar / reseller with a
+# strong focus on DENIC .de domains, RGP backorder ("catcher") and domain trading.
+#
+# Domain Notes for LLM consumers:
+# - AUTH: Bearer Personal Access Token in the Authorization header ("Bearer {token}").
+#   API access is opt-in -- it must be enabled for the account by ELITEDOMAINS support
+#   before tokens can be created in the dashboard account settings.
+# - SANDBOX: append ?sandbox=1 to ANY request to dry-run it. In sandbox mode no database
+#   writes and no registry/DENIC calls happen -- ideal before register/delete/catcher
+#   operations. Every write/dangerous tool here exposes an optional `sandbox` query param.
+# - IDENTIFIERS: domains are addressed by their fully-qualified `name` (e.g. "example.de"),
+#   NOT by a numeric id. Handles (contacts) are addressed by numeric `id` and linked to a
+#   domain via `handle_id`. Omit `handle_id` on register/update to use the account default.
+# - REGISTER vs TRANSFER: both go through POST /domains. For an inbound transfer supply the
+#   `authinfo` (transfer/AuthInfo code) issued by the losing registrar; for a fresh
+#   registration omit it. `period` is the term in MONTHS (default 12).
+# - AUTHINFO (KK / AuthInfo1): GET /domains/authinfo generates/returns the outbound transfer
+#   code with an `expires_at`. AUTHINFO2 is the DENIC paper-letter procedure for .de domains
+#   when AuthInfo1 cannot be used -- it is only available to accounts on monthly invoicing
+#   (Sammelrechnung). Always call check_domain_authinfo2 before order_domain_authinfo2.
+# - REDIRECTOR: `redirector_settings` decides what a domain does / how it is hosted. Four
+#   modes via `type`: "redirect" (HTTP redirect, method 301|302|meta|js|frame + `url`),
+#   "landing" (parking/sale page, method redirect_sale_page|whitescreen|default|4sale),
+#   "external" (delegate to external nameservers, `ns` array of 2-13 hosts -- those NS must
+#   already answer AUTHORITATIVELY for the zone or DENIC rejects the change with HTTP 400),
+#   "dns" (manage records inline via the `dns` array + DNSSEC in `options`; hosted on
+#   ELITEDOMAINS' own nameservers, so no authoritative-NS precheck applies).
+# - CATCHER (RGP backorder): reserve a domain you want to grab the moment it drops. `price`
+#   is your MAX bid in EUR (minimum 2). The response `users` is how many parties also back-
+#   order it; `dropdate_at` is the expected drop. During DROPTIME (02:00-04:00 UTC) catcher
+#   add/remove is blocked with HTTP 405 and the global rate limit tightens to 10 req/min.
+# - OFFERS: domain sale pages / marketplace listings ("paynow" fixed-price vs "4sale"
+#   make-offer). List/filter them via GET /offers. POST /domains/sedo additionally lists a
+#   domain on the external Sedo marketplace (`price` is a EUR amount > 0).
+# - PAGINATION: page-based. List responses wrap rows in `data` alongside `current_page` and
+#   `per_page`; only /offers also returns `total` and `last_page`. The other lists have no
+#   has_more flag -- keep fetching until a page returns fewer rows than `per_page`.
+# - ERRORS: JSON `{ "message": "...", "error": { "<field>": ["..."] } }`. Notable codes:
+#   400 invalid/missing input, 403 registry rejection / account restriction, 404 not found,
+#   405 droptime restriction, 409 already added / already registered.
+# - GOTCHA: handles are written with `country_iso` (ISO 3166 alpha-2, e.g. "DE") but READ
+#   back as `country_id`, the ISO 3166-1 NUMERIC code (e.g. "276" for Germany).
+# - GOTCHA: domain check returns message "free" (available) or "connect" (already
+#   registered), NOT "taken".
+# - TIMESTAMPS: list timestamps (`created_at`, `expires_at`, `paid_until`, `dropdate_at`)
+#   are ISO 8601 strings -- EXCEPT get_domain_authinfo's `expires_at`, which is German
+#   format "DD.MM.YYYY HH:mm:ss".
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "ELITEDOMAINS API"
+source_url: "https://app.elitedomains.de/docs"
+date: "2026-06-02"
+
+backend:
+  name: elitedomains
+  type: rest
+  version: "1.0"
+  base_url: https://api.elitedomains.de
+  description: "ELITEDOMAINS domain registrar API -- register/transfer/manage .de and gTLD domains, redirector & inline DNS, AuthInfo/AuthInfo2 transfer codes, RGP catcher backorders, contact handles, and marketplace offers (Sedo, sale pages)"
+
+  auth:
+    type: bearer
+    credential: elitedomains_token
+    inject_into: header
+    header_name: Authorization
+    prefix: "Bearer "
+
+  coverage:
+    endpoints: 17
+    total_endpoints: 17
+    percentage: 100
+    focus: "ELITEDOMAINS .de domain reseller: domains (register, transfer, AuthInfo, redirector, DNS records, tags), handles (PERSON, ORG, address validation), catcher (RGP backorders, dropdate, max bid), offers (Sedo marketplace, sale pages, visitor stats)."
+    missing: "no standalone DNS-record CRUD (records are managed inline via redirector_settings), no transfer-status polling endpoint, no billing/invoice or price-list endpoints"
+    last_reviewed: "2026-06-02"
+
+  setup:
+    credential_steps:
+      - "Ask ELITEDOMAINS support to enable API access for your account (the API is opt-in and off by default)."
+      - "Log in to the dashboard at https://app.elitedomains.de"
+      - "Open account settings and go to the API / Personal Access Tokens section."
+      - "Create a new personal access token and copy it immediately (it is shown only once)."
+      - "Store it in the ToolMesh credential store under the name 'elitedomains_token'."
+    env_var: CREDENTIAL_ELITEDOMAINS_TOKEN
+    backends_yaml: |
+      - name: elitedomains
+        transport: rest
+        dadl: elitedomains.dadl
+        url: "https://api.elitedomains.de"
+    docs_url: "https://app.elitedomains.de/docs"
+    notes: >-
+      Personal access tokens are account-scoped (no granular scopes). Append ?sandbox=1 to
+      any request to test without registry writes. Standard rate limit is 100 req/min and
+      1000 req/day; during droptime (02:00-04:00 UTC) it drops to 10 req/min and catcher
+      add/remove is rejected with HTTP 405. Ordering an AuthInfo2 letter requires an account
+      on monthly invoicing (Sammelrechnung).
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    pagination: &page-pagination
+      strategy: page
+      request:
+        page_param: page
+        limit_default: 50
+      # List responses wrap rows in "data" with current_page + per_page, but only /offers
+      # returns last_page/total. For the other lists there is no has_more flag -- paginate
+      # until a page returns fewer than per_page rows.
+      behavior: expose
+      max_pages: 20
+    errors: &standard-errors
+      format: json
+      message_path: "$.message"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 405, 409]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+    response:
+      result_path: "$.data"
+      max_items: 200
+      allow_jq_override: true
+
+  # Type definitions (no openapi_source) -- used for the generated TypeScript interfaces.
+  types:
+    DnsRecord:
+      type: object
+      description: "A single DNS resource record managed inline on a domain (redirector type=dns)."
+      properties:
+        type: { type: string, description: "Record type: A, AAAA, CNAME, MX, TXT, NS, SRV, CAA, ..." }
+        name: { type: string, description: "Host/subdomain relative to the domain ('@' for the apex, 'www', 'mail', ...)" }
+        value: { type: string, description: "Record value (IPv4/IPv6, target hostname, or text content)" }
+        prio: { type: integer, description: "Priority -- used by MX and SRV records" }
+        ttl: { type: integer, description: "Time to live in seconds" }
+      required: [type, name, value]
+    RedirectorSettings:
+      type: object
+      description: >-
+        Controls what a domain does when visited / how it is hosted. The required `method`
+        depends on `type`. Only one mode is active at a time.
+      properties:
+        type:
+          type: string
+          enum: [redirect, landing, external, dns]
+          description: "redirect=HTTP redirect, landing=parking/sale page, external=external NS, dns=inline DNS records"
+        method:
+          type: string
+          description: "redirect -> 301|302|meta|js|frame ; landing -> redirect_sale_page|whitescreen|default|4sale"
+        url: { type: string, description: "Target URL (required when type=redirect)" }
+        ns:
+          type: array
+          items: { type: string }
+          description: "2-13 external nameserver hostnames (required when type=external)"
+        dns:
+          type: array
+          items: { type: object }
+          description: "Array of DnsRecord objects (when type=dns)"
+        options:
+          type: object
+          description: "DNSSEC config: dnssec-active, dnssec-key, dnssec-algorithm, dnssec-flags"
+      required: [type, method]
+
+  tools:
+
+    # ── Domains ───────────────────────────────────────────────────
+    # Core registrar operations. Domains are addressed by `name`, never a numeric id.
+
+    list_domains:
+      method: GET
+      path: /domains
+      access: read
+      description: >-
+        List all domains in the account (paginated). Each row includes `name`,
+        `redirector_settings`, `authinfo`, `auto_expire`, `paid_until`, `expires_at`,
+        `tags` and `created_at`. Domains are keyed by `name` -- use it for every
+        other domain operation.
+      params:
+        page: { type: integer, in: query, description: "1-based page number" }
+      pagination: *page-pagination
+
+    check_domain:
+      method: GET
+      path: /domains/check
+      access: read
+      description: >-
+        Check whether a single domain is available for registration. Returns
+        { name, message } where `message` is "free" (available) or "connect"
+        (already registered -- only obtainable via transfer/connect, not new registration).
+      params:
+        name: { type: string, in: query, required: true, description: "Fully-qualified domain to check, e.g. example.de" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    register_domain:
+      method: POST
+      path: /domains
+      access: write
+      description: >-
+        Register a new domain OR transfer an existing one into the account. For a TRANSFER,
+        supply `authinfo` (the transfer code from the losing registrar); for a fresh
+        REGISTRATION omit it. `period` is the term in MONTHS (default 12). Optionally set the
+        owner contact via `handle_id` and initial hosting via `redirector_settings`.
+        Errors: 400 invalid input, 403 registry rejection, 409 already registered/owned.
+      params:
+        name: { type: string, in: body, required: true, description: "Fully-qualified domain, e.g. example.de" }
+        authinfo: { type: string, in: body, description: "Transfer/AuthInfo code -- present this only for inbound transfers" }
+        handle_id: { type: integer, in: body, description: "Owner contact handle id (account default handle is used if omitted)" }
+        period: { type: integer, in: body, default: 12, description: "Registration term in months" }
+        redirector_settings: { type: object, in: body, description: "Initial hosting/redirect config -- see the RedirectorSettings type" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run without a real registry call" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_domain:
+      method: PATCH
+      path: /domains
+      access: write
+      description: >-
+        Update an existing domain's settings: change its hosting/redirect via
+        `redirector_settings` and/or reassign the owner contact via `handle_id`.
+        Identify the domain by `name`. Errors: 400 validation, 404 not found.
+      params:
+        name: { type: string, in: body, required: true, description: "Domain to update, e.g. example.de" }
+        redirector_settings: { type: object, in: body, description: "New hosting/redirect config -- see the RedirectorSettings type" }
+        handle_id: { type: integer, in: body, description: "New owner contact handle id" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run without a real registry call" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_domain:
+      method: DELETE
+      path: /domains
+      access: dangerous
+      description: >-
+        Delete (give up) a domain, or put it into TRANSIT for an outbound transfer. With
+        `transit`=1 the domain is moved to the transit/KK-out state instead of being deleted.
+        A plain delete returns the domain to the registry and is irreversible. Errors:
+        400 missing name, 403 registry error, 404 not found.
+      params:
+        name: { type: string, in: body, required: true, description: "Domain to delete or transit, e.g. example.de" }
+        transit: { type: integer, in: body, description: "1 = move to transit (prepare outbound transfer) instead of deleting" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run without a real registry call" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_domain_tags:
+      method: POST
+      path: /domains/tags
+      access: write
+      description: >-
+        Set/replace the internal organizational tags on a domain. Returns the updated `tags`
+        array and a confirmation `message`. Errors: 400 invalid domain, 404 not found.
+      params:
+        name: { type: string, in: body, required: true, description: "Domain to tag, e.g. example.de" }
+        tags: { type: array, in: body, required: true, description: "Array of tag strings" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_domain_authinfo:
+      method: GET
+      path: /domains/authinfo
+      access: read
+      description: >-
+        Get or generate the outbound AuthInfo (KK / transfer) code for a domain you own --
+        needed to transfer it to another registrar. Returns { message, name, authinfo,
+        expires_at }. The code is time-limited; note `expires_at` here is German format
+        "DD.MM.YYYY HH:mm:ss" (unlike the ISO 8601 timestamps elsewhere). Errors:
+        400 missing name, 403 registry error, 404 not found.
+      params:
+        name: { type: string, in: query, required: true, description: "Domain to issue the AuthInfo code for" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    check_domain_authinfo2:
+      method: GET
+      path: /domains/authinfo2/check
+      access: read
+      description: >-
+        Check whether a DENIC AuthInfo2 letter can be ordered for a .de domain. Returns
+        { name, available, message }. AuthInfo2 is the paper-letter fallback used when an
+        AuthInfo1 code is not obtainable. Only relevant for monthly-invoice (Sammelrechnung)
+        accounts. Call this before order_domain_authinfo2.
+      params:
+        name: { type: string, in: query, required: true, description: "Domain to check AuthInfo2 orderability for" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    order_domain_authinfo2:
+      method: POST
+      path: /domains/authinfo2
+      access: write
+      description: >-
+        Order a DENIC AuthInfo2 letter for a .de domain (added to the next collective
+        invoice; confirmation arrives by email). Requires an account on monthly invoicing.
+        Errors: 400 not orderable, 403 account restriction.
+      depends_on: [check_domain_authinfo2]
+      params:
+        name: { type: string, in: body, required: true, description: "Domain to order the AuthInfo2 letter for" }
+        sandbox: { type: integer, in: body, description: "Set to 1 to simulate the order without billing it" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_domain_to_sedo:
+      method: POST
+      path: /domains/sedo
+      access: write
+      description: >-
+        List a domain for sale on the external Sedo marketplace at a fixed price. `price` is
+        a EUR amount greater than 0. Errors: 400 invalid input, 404 domain not found,
+        500 processing error.
+      params:
+        name: { type: string, in: body, required: true, description: "Domain to list on Sedo, e.g. example.de" }
+        price: { type: number, in: body, required: true, description: "Sale price in EUR (> 0)" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run the listing" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Catcher (RGP backorders) ──────────────────────────────────
+    # Reserve dropping domains. Blocked during droptime (02:00-04:00 UTC) with HTTP 405.
+
+    list_catcher_orders:
+      method: GET
+      path: /catcher
+      access: read
+      description: >-
+        List all RGP catcher (backorder) orders (paginated). Each row includes `name`,
+        `status`, `users` (number of competing backorderers), `price` (your max bid),
+        `dropdate_at` (expected drop) and `created_at`.
+      params:
+        page: { type: integer, in: query, description: "1-based page number" }
+      pagination: *page-pagination
+
+    add_catcher_order:
+      method: POST
+      path: /catcher
+      access: write
+      description: >-
+        Place an RGP catcher (backorder) on a dropping domain. `price` is your MAXIMUM bid in
+        EUR (minimum 2). Requires a valid contact handle on the account. Errors: 400 missing/
+        invalid domain or missing handle, 405 droptime restriction (02:00-04:00 UTC),
+        409 already added.
+      params:
+        name: { type: string, in: body, required: true, description: "Domain to backorder, e.g. example.de" }
+        price: { type: integer, in: body, required: true, description: "Maximum bid in EUR (minimum 2)" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run without placing the order" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_catcher_order:
+      method: DELETE
+      path: /catcher
+      access: write
+      description: >-
+        Cancel a catcher (backorder) order for a domain. This only removes your backorder; it
+        is reversible by re-adding. Errors: 400 missing name, 404 not found, 405 droptime
+        restriction (02:00-04:00 UTC).
+      params:
+        name: { type: string, in: body, required: true, description: "Domain whose backorder to cancel" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run the cancellation" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Offers (marketplace / sale pages) ─────────────────────────
+
+    list_offers:
+      method: GET
+      path: /offers
+      access: read
+      description: >-
+        List the account's domain offers / sale pages (paginated, richly filterable). Each
+        row includes `name`, `type` (paynow|4sale), `status`, `price`, `template`,
+        `is_internal`, `redirect_status`, `hide_on_marketplace`, `visitors`
+        (last_30_days/last_7_days/referrer_30_days), `template_data` and `tags`. Use the
+        filters to narrow by type, status, price band, traffic and template, and sort with
+        order_by/order_direction. This endpoint returns `total` and `last_page` for paging.
+      params:
+        page: { type: integer, in: query, description: "1-based page number" }
+        per_page: { type: integer, in: query, default: 50, description: "Rows per page (max 500)" }
+        type: { type: string, in: query, description: "Filter by offer type: paynow | 4sale" }
+        status: { type: string, in: query, description: "verified | hold | not_configured | unverified | inactive | deconnect" }
+        is_internal: { type: boolean, in: query, description: "true = internally-hosted sale pages, false = external" }
+        template: { type: string, in: query, description: "Filter by sale-page template name" }
+        min_price: { type: integer, in: query, description: "Minimum price filter (EUR)" }
+        max_price: { type: integer, in: query, description: "Maximum price filter (EUR)" }
+        min_visitors: { type: integer, in: query, description: "Minimum visitors in the last 30 days" }
+        order_by: { type: string, in: query, description: "created_at | name | price | visitors | status" }
+        order_direction: { type: string, in: query, description: "asc | desc" }
+      pagination:
+        strategy: page
+        request:
+          page_param: page
+          limit_param: per_page
+          limit_default: 50
+        # /offers (unlike the other lists) returns last_page/total, so has_more is reliable here.
+        response:
+          next_cursor: "$.current_page"
+          has_more: "$.current_page < $.last_page"
+        behavior: expose
+        max_pages: 20
+      response:
+        result_path: "$.data"
+        # Drop the bulky dynamic template_data blob; keep the fields that matter for triage.
+        transform: |
+          [.[] | {name, type, status, price, template, is_internal, visitors, tags}]
+        max_items: 200
+        allow_jq_override: true
+
+    # ── Handles (contacts) ────────────────────────────────────────
+    # Owner/admin contacts referenced from domains via handle_id. Keyed by numeric id.
+
+    list_handles:
+      method: GET
+      path: /handles
+      access: read
+      description: >-
+        List all contact handles in the account (paginated). Each row includes `id`, `alias`,
+        `type` (PERSON|ORG), `handle_name`, address fields (`street_name`, `street_number`,
+        `postalcode`, `city`, `country_id`), `email`, `phone` and `created_at`. Use a
+        handle's `id` as `handle_id` when registering/updating a domain. Note: the country is
+        read back as `country_id` but written as `country_iso`.
+      params:
+        page: { type: integer, in: query, description: "1-based page number" }
+      pagination: *page-pagination
+
+    create_handle:
+      method: POST
+      path: /handles
+      access: write
+      description: >-
+        Create a new contact handle (domain owner/admin contact). `type` is PERSON or ORG.
+        Set `address_suggest` to "keep" to bypass address auto-correction. Returns the full
+        handle object including the assigned `id`. Errors: 400 validation, 500 unknown error.
+      params:
+        alias: { type: string, in: body, required: true, description: "Internal alias to recognize this handle" }
+        type: { type: string, in: body, required: true, description: "PERSON or ORG" }
+        handle_name: { type: string, in: body, required: true, description: "Full personal name or company/organization name" }
+        street_name: { type: string, in: body, required: true, description: "Street name without house number" }
+        street_number: { type: string, in: body, required: true, description: "House number" }
+        postalcode: { type: string, in: body, required: true, description: "Postal / ZIP code" }
+        city: { type: string, in: body, required: true, description: "City" }
+        country_iso: { type: string, in: body, required: true, description: "ISO 3166 alpha-2 country code, e.g. DE" }
+        email: { type: string, in: body, required: true, description: "Contact email address" }
+        phone: { type: string, in: body, required: true, description: "Phone number in E.164 format, e.g. +49.301234567" }
+        general_request: { type: string, in: body, description: "General-request email (optional)" }
+        abuse_contact: { type: string, in: body, description: "Abuse-contact email (optional)" }
+        address_suggest: { type: string, in: body, description: "Set to 'keep' to skip address validation/auto-correction" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_handle:
+      method: PATCH
+      path: /handles/{id}
+      access: write
+      description: >-
+        Update an existing contact handle by numeric id. Any subset of the writable fields
+        may be supplied. (`type` cannot be changed after creation.) Returns the updated
+        handle object. Errors: 400 validation, 404 handle not found.
+      params:
+        id: { type: integer, in: path, required: true, description: "Handle id to update" }
+        alias: { type: string, in: body, description: "Internal alias" }
+        handle_name: { type: string, in: body, description: "Full personal name or company/organization name" }
+        street_name: { type: string, in: body, description: "Street name without house number" }
+        street_number: { type: string, in: body, description: "House number" }
+        postalcode: { type: string, in: body, description: "Postal / ZIP code" }
+        city: { type: string, in: body, description: "City" }
+        country_iso: { type: string, in: body, description: "ISO 3166 alpha-2 country code, e.g. DE" }
+        email: { type: string, in: body, description: "Contact email address" }
+        phone: { type: string, in: body, description: "Phone number in E.164 format" }
+        general_request: { type: string, in: body, description: "General-request email" }
+        abuse_contact: { type: string, in: body, description: "Abuse-contact email" }
+        address_suggest: { type: string, in: body, description: "Set to 'keep' to skip address validation/auto-correction" }
+      response:
+        result_path: "$"
+      pagination: none
+
+  hints:
+    check_domain:
+      message_values: "'free' = available to register; 'connect' = already registered (obtainable only via transfer), NOT 'taken'"
+    get_domain_authinfo:
+      authinfo_levels: "this returns AuthInfo1 (KK code); AuthInfo2 is the DENIC paper-letter fallback via order_domain_authinfo2"
+      date_format: "expires_at is German format DD.MM.YYYY HH:mm:ss, not ISO 8601"
+    register_domain:
+      transfer_vs_register: "supply `authinfo` ONLY for inbound transfers; omit it for new registrations"
+      period_unit: "period is in MONTHS, default 12"
+      sandbox: "add sandbox=1 (query) to validate without touching the registry"
+    update_domain:
+      redirector_external_ns: "redirector_settings type=external needs NS that already answer authoritatively for the zone, else DENIC returns HTTP 400 'Nameserver nicht autoritativ'; use type=dns to host records on ELITEDOMAINS' own NS without that precheck"
+    delete_domain:
+      transit_flag: "transit=1 prepares an outbound transfer (KK-out); a plain delete is irreversible"
+    order_domain_authinfo2:
+      account_requirement: "only available on monthly-invoice (Sammelrechnung) accounts; check with check_domain_authinfo2 first"
+    add_catcher_order:
+      price_floor: "price is the max bid in EUR, minimum 2"
+      droptime: "blocked 02:00-04:00 UTC with HTTP 405; rate limit also drops to 10 req/min then"
+    create_handle:
+      country_field: "written as country_iso (alpha-2, e.g. DE) but read back as country_id (ISO 3166-1 numeric, e.g. 276)"
+      phone_format: "E.164, e.g. +49.301234567"
+      address_suggest: "set to 'keep' to keep the address exactly as given (skip auto-correction)"
+    list_offers:
+      offer_types: "paynow = fixed-price buy-now, 4sale = make-an-offer"
+      max_per_page: "per_page max is 500 (default 50)"
+
+  examples:
+    - name: "Check availability then register a .de domain"
+      description: "Verify a domain is free and, if so, register it for 12 months on the default handle."
+      code: |
+        const check = await api.check_domain({ name: "example.de" });
+        if (check.message !== "free") return check;
+        return await api.register_domain({ name: "example.de", period: 12 });
+
+    - name: "Point a domain at external nameservers"
+      description: "Switch a domain to external NS delegation via redirector_settings."
+      code: |
+        return await api.update_domain({
+          name: "example.de",
+          redirector_settings: {
+            type: "external",
+            method: "default",
+            ns: ["ns1.example.net", "ns2.example.net"]
+          }
+        });
+
+    - name: "Transfer a domain out"
+      description: "Generate the AuthInfo code and put the domain into transit for an outbound transfer."
+      code: |
+        const auth = await api.get_domain_authinfo({ name: "example.de" });
+        await api.delete_domain({ name: "example.de", transit: 1 });
+        return auth.authinfo;
+
+    - name: "Backorder a dropping domain"
+      description: "Place an RGP catcher with a max bid of 25 EUR."
+      code: |
+        return await api.add_catcher_order({ name: "dropping.de", price: 25 });
