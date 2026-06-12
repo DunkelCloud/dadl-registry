@@ -1,0 +1,1211 @@
+# bookstack.dadl -- BookStack REST API for ToolMesh
+# BookStack is a self-hosted, open-source wiki / documentation platform.
+#
+# Domain Notes for LLM consumers:
+# - Content hierarchy: Shelves > Books > Chapters > Pages. Shelves group books
+#   (many-to-many). Books contain chapters and/or pages directly. Chapters
+#   contain pages. Pages hold the actual content as HTML or Markdown.
+# - Authentication: "Authorization: Token <token_id>:<token_secret>". The
+#   credential value stored in ToolMesh must be the Token ID and Token Secret
+#   joined with a colon (e.g. "C6mdvEQT...:NOvD3Vlz..."). The API user needs
+#   the "Access System API" role permission; all content visibility and write
+#   access is limited by that user's roles -- the API never sees more than
+#   the token's user would see in the UI.
+# - All IDs are numeric integers. Slugs exist in responses but lookups are by ID.
+# - Listing endpoints return {"data": [...], "total": N}. Standard params:
+#   count (default 100, max 500), offset (default 0), sort ("+name" /
+#   "-updated_at"; most response fields work), and filter[<field>] /
+#   filter[<field>:<op>] with ops eq, ne, gt, lt, gte, lte, like
+#   (% = wildcard, e.g. filter[name:like]=%guide%). Filter params are literal
+#   bracket-keys -- in Code Mode use JS bracket notation:
+#   api.list_pages({ "filter[book_id]": 42 }). Only filters declared as params
+#   on each tool are exposed, the API itself accepts any listed response field.
+# - Detail (get_*) responses contain more fields than listings: pages add
+#   html/raw_html/markdown + a comments tree, books add a "contents" tree,
+#   chapters embed their pages, shelves embed their books.
+# - Page content round-trip: 'html' is the RENDERED output (include-tags
+#   resolved, escaped); 'raw_html' is the stored source -- edit raw_html and
+#   write back via the 'html' param. 'markdown' is only present when the page
+#   was last saved with the Markdown editor.
+# - Tags are attached to shelves/books/chapters/pages as an array of
+#   {"name": "...", "value": "..."} objects. Setting tags on update REPLACES
+#   the existing tag set.
+# - Deleting shelves/books/chapters/pages is SOFT -- items go to the recycle
+#   bin and can be restored. Deleting attachments, images, comments, users and
+#   roles is PERMANENT. purge_recycle_bin_item permanently destroys items.
+# - Timestamps are UTC. Date filters accept plain dates,
+#   e.g. filter[created_at:gte]=2026-01-01.
+# - Errors: {"error": {"code": <http_status>, "message": "..."}}. Validation
+#   failures (422) add a "validation" object keyed by field name.
+# - Rate limit: 180 requests/min per user by default (env API_REQUESTS_PER_MIN);
+#   X-RateLimit-Remaining header + Retry-After on 429.
+# - Exports: books, chapters and pages export to html/markdown/plaintext
+#   (returned as text) and pdf/zip (returned as a download file_url). The zip
+#   format is BookStack's portable format and can be re-imported via the
+#   imports endpoints on any instance.
+# - Version gates: the tags endpoints (list_tag_names, list_tag_values)
+#   require BookStack >= v26.05; everything else works on >= v26.03
+#   (comments API) and most tools on much older versions too.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "BookStack REST API"
+source_url: "https://demo.bookstackapp.com/api/docs"
+date: "2026-06-12"
+
+# ── Reusable fragments (YAML anchors; whole-value aliases only) ──────────────
+
+_fragments:
+  count_param: &count_param
+    type: integer
+    in: query
+    required: false
+    description: "Number of records to return (server default 100, max 500)"
+
+  offset_param: &offset_param
+    type: integer
+    in: query
+    required: false
+    description: "Number of records to skip (default 0). Page by raising offset until it reaches the response 'total'."
+
+  sort_param: &sort_param
+    type: string
+    in: query
+    required: false
+    description: "Sort field with +/- direction prefix, e.g. '-updated_at' or '+name' (default ascending). Most fields of the listing response are valid."
+
+  id_path: &id_path
+    type: integer
+    in: path
+    required: true
+    description: "Numeric ID of the item"
+
+  tags_param: &tags_param
+    type: array
+    in: body
+    required: false
+    description: "Array of tag objects [{\"name\": \"Department\", \"value\": \"Engineering\"}]. On update this replaces the existing tag set."
+
+  export_format_text: &export_format_text
+    type: string
+    in: path
+    required: true
+    description: "Export format: 'html', 'markdown' or 'plaintext'. Result is the raw exported text."
+
+  export_format_file: &export_format_file
+    type: string
+    in: path
+    required: true
+    description: "Export format: 'pdf' or 'zip' (BookStack portable ZIP, re-importable via create_import)."
+
+  file_response: &file_response
+    type: file_url
+
+  list_pagination: &list_pagination
+    strategy: offset
+    request:
+      cursor_param: offset
+      limit_param: count
+      limit_default: 100
+    # BookStack returns no next-page link, only {"data": [...], "total": N}.
+    # With behavior: expose the LLM pages manually via offset/count until
+    # offset >= total.
+    behavior: expose
+    max_pages: 10
+
+backend:
+  name: bookstack
+  type: rest
+  version: "1.0"
+  # base_url intentionally omitted -- BookStack is self-hosted. Supply via
+  # backends.yaml, INCLUDING the /api suffix: url: "https://wiki.example.com/api"
+  description: "BookStack wiki and documentation platform REST API -- shelves, books, chapters, pages (HTML/Markdown content), attachments, image gallery, comments, cross-entity search, exports (HTML/Markdown/PDF/ZIP), ZIP imports, users, roles, content permissions, recycle bin, audit log and tags. Hierarchy: shelves > books > chapters > pages."
+
+  auth:
+    type: apikey
+    credential: bookstack_token
+    inject_into: header
+    header_name: Authorization
+    # BookStack token format is "Token <token_id>:<token_secret>".
+    # The stored credential must already be the colon-joined "id:secret" pair;
+    # ToolMesh concatenates prefix + credential value.
+    prefix: "Token "
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    errors:
+      format: json
+      message_path: "$.error.message"
+      code_path: "$.error.code"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 422]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      rate_limit:
+        header: X-RateLimit-Remaining
+        retry_after_header: Retry-After
+    response:
+      max_items: 500
+      allow_jq_override: true
+
+  tools:
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    search_content:
+      method: GET
+      path: /search
+      access: read
+      description: >
+        Search across all content types (shelves, books, chapters, pages) using
+        the same query syntax as the BookStack UI search bar. Returns
+        {data, total}; each result has a 'type' property (bookshelf, book,
+        chapter, page), tags, parent references (book/chapter), and a
+        'preview_html' object with highlighted name/content snippets.
+        Uses its own page/count paging -- sort and filter params are NOT
+        supported here.
+      params:
+        query: { type: string, in: query, required: true, description: "Search query, e.g. 'cats {created_by:me}', '\"exact phrase\"', '[tag=value]', '{type:page}', '{updated_after:2026-01-01}', '{in_name:term}'" }
+        page: { type: integer, in: query, required: false, description: "1-based result page" }
+        count: { type: integer, in: query, required: false, description: "Results per page (default 20, max 100)" }
+
+    # ── Shelves ───────────────────────────────────────────────────────────────
+
+    list_shelves:
+      method: GET
+      path: /shelves
+      access: read
+      description: >
+        List all shelves visible to the API user. Returns id, name, slug,
+        description, created_at, updated_at, created_by, updated_by, owned_by
+        per shelf in {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by shelf name, % wildcards, e.g. %handbook%" }
+
+    get_shelf:
+      method: GET
+      path: /shelves/{id}
+      access: read
+      description: >
+        Get a single shelf with tags, cover image info, description_html and
+        the visible books on it (id, name, slug each).
+      params:
+        id: *id_path
+
+    create_shelf:
+      method: POST
+      path: /shelves
+      access: write
+      description: >
+        Create a new shelf. Optionally assign books by ID -- they appear on the
+        shelf in the order given. Provide description (plain text) or
+        description_html, not both.
+      params:
+        name: { type: string, in: body, required: true, description: "Shelf name (max 255 chars)" }
+        description: { type: string, in: body, required: false, description: "Plain-text description (max 1900 chars)" }
+        description_html: { type: string, in: body, required: false, description: "HTML description (max 2000 chars); takes precedence over description" }
+        books: { type: array, in: body, required: false, description: "Array of book IDs to place on the shelf, in display order, e.g. [105, 263]" }
+        tags: *tags_param
+
+    update_shelf:
+      method: PUT
+      path: /shelves/{id}
+      access: write
+      description: >
+        Update a shelf. Providing 'books' REPLACES the entire book assignment
+        with the given list -- fetch current books via get_shelf first when
+        only adding/removing one.
+      params:
+        id: *id_path
+        name: { type: string, in: body, required: false, description: "Shelf name (max 255 chars)" }
+        description: { type: string, in: body, required: false, description: "Plain-text description (max 1900 chars)" }
+        description_html: { type: string, in: body, required: false, description: "HTML description (max 2000 chars); takes precedence over description" }
+        books: { type: array, in: body, required: false, description: "Array of book IDs -- replaces all existing assignments in given order" }
+        tags: *tags_param
+
+    delete_shelf:
+      method: DELETE
+      path: /shelves/{id}
+      access: dangerous
+      description: "Delete a shelf (sent to the recycle bin; books on it are NOT deleted). Returns 204."
+      params:
+        id: *id_path
+
+    # ── Books ─────────────────────────────────────────────────────────────────
+
+    list_books:
+      method: GET
+      path: /books
+      access: read
+      description: >
+        List all books visible to the API user. Returns id, name, slug,
+        description, created_at, updated_at, created_by, updated_by, owned_by
+        plus cover image info per book in {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by book name, % wildcards, e.g. %guide%" }
+        "filter[created_by]": { type: integer, in: query, required: false, description: "Filter by creator user ID" }
+
+    get_book:
+      method: GET
+      path: /books/{id}
+      access: read
+      description: >
+        Get a single book with tags, cover, description_html, shelves it is on,
+        and a 'contents' tree listing its direct chapters and pages in display
+        order -- each entry has a 'type' (chapter/page); chapters nest their
+        pages. Use this to navigate a book's structure before reading pages.
+      params:
+        id: *id_path
+
+    create_book:
+      method: POST
+      path: /books
+      access: write
+      description: >
+        Create a new book. Provide description (plain text) or
+        description_html. Cover-image upload requires multipart and is not
+        supported here.
+      params:
+        name: { type: string, in: body, required: true, description: "Book name (max 255 chars)" }
+        description: { type: string, in: body, required: false, description: "Plain-text description (max 1900 chars)" }
+        description_html: { type: string, in: body, required: false, description: "HTML description (max 2000 chars); takes precedence over description" }
+        default_template_id: { type: integer, in: body, required: false, description: "Page ID to use as default template for new pages in this book" }
+        tags: *tags_param
+
+    update_book:
+      method: PUT
+      path: /books/{id}
+      access: write
+      description: "Update a book's details. Same writable fields as create_book."
+      params:
+        id: *id_path
+        name: { type: string, in: body, required: false, description: "Book name (max 255 chars)" }
+        description: { type: string, in: body, required: false, description: "Plain-text description (max 1900 chars)" }
+        description_html: { type: string, in: body, required: false, description: "HTML description (max 2000 chars); takes precedence over description" }
+        default_template_id: { type: integer, in: body, required: false, description: "Page ID to use as default template for new pages in this book" }
+        tags: *tags_param
+
+    delete_book:
+      method: DELETE
+      path: /books/{id}
+      access: dangerous
+      description: "Delete a book including its chapters and pages (sent to the recycle bin). Returns 204."
+      params:
+        id: *id_path
+
+    export_book:
+      method: GET
+      path: /books/{id}/export/{format}
+      access: read
+      description: >
+        Export a whole book (all chapters and pages compiled) as text. The
+        result is the raw exported content -- HTML document, Markdown, or plain
+        text. For PDF/ZIP use export_book_file.
+      params:
+        id: *id_path
+        format: *export_format_text
+
+    export_book_file:
+      method: GET
+      path: /books/{id}/export/{format}
+      access: read
+      description: >
+        Export a whole book as a binary file -- 'pdf' or 'zip' (portable
+        BookStack ZIP). Returns a download URL via the ToolMesh file broker.
+      params:
+        id: *id_path
+        format: *export_format_file
+      response: *file_response
+
+    # ── Chapters ──────────────────────────────────────────────────────────────
+
+    list_chapters:
+      method: GET
+      path: /chapters
+      access: read
+      description: >
+        List all chapters visible to the API user. Returns id, book_id, name,
+        slug, description, priority, created_at, updated_at, created_by,
+        updated_by, owned_by per chapter in {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[book_id]": { type: integer, in: query, required: false, description: "Only chapters of this book" }
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by chapter name, % wildcards" }
+
+    get_chapter:
+      method: GET
+      path: /chapters/{id}
+      access: read
+      description: >
+        Get a single chapter with tags, description_html, book_slug and its
+        visible pages (listing-level fields each).
+      params:
+        id: *id_path
+
+    create_chapter:
+      method: POST
+      path: /chapters
+      access: write
+      description: "Create a new chapter inside a book."
+      params:
+        book_id: { type: integer, in: body, required: true, description: "ID of the parent book" }
+        name: { type: string, in: body, required: true, description: "Chapter name (max 255 chars)" }
+        description: { type: string, in: body, required: false, description: "Plain-text description (max 1900 chars)" }
+        description_html: { type: string, in: body, required: false, description: "HTML description (max 2000 chars); takes precedence over description" }
+        priority: { type: integer, in: body, required: false, description: "Order position within the book (lower = earlier)" }
+        default_template_id: { type: integer, in: body, required: false, description: "Page ID to use as default template for new pages in this chapter" }
+        tags: *tags_param
+
+    update_chapter:
+      method: PUT
+      path: /chapters/{id}
+      access: write
+      description: >
+        Update a chapter. Passing a different book_id MOVES the chapter (and
+        its pages) into that book -- requires delete permission on the chapter.
+      params:
+        id: *id_path
+        book_id: { type: integer, in: body, required: false, description: "Parent book ID -- changing it moves the chapter" }
+        name: { type: string, in: body, required: false, description: "Chapter name (max 255 chars)" }
+        description: { type: string, in: body, required: false, description: "Plain-text description (max 1900 chars)" }
+        description_html: { type: string, in: body, required: false, description: "HTML description (max 2000 chars); takes precedence over description" }
+        priority: { type: integer, in: body, required: false, description: "Order position within the book (lower = earlier)" }
+        default_template_id: { type: integer, in: body, required: false, description: "Page ID to use as default template for new pages in this chapter" }
+        tags: *tags_param
+
+    delete_chapter:
+      method: DELETE
+      path: /chapters/{id}
+      access: dangerous
+      description: "Delete a chapter including its pages (sent to the recycle bin). Returns 204."
+      params:
+        id: *id_path
+
+    export_chapter:
+      method: GET
+      path: /chapters/{id}/export/{format}
+      access: read
+      description: >
+        Export a chapter (all its pages compiled) as text -- HTML document,
+        Markdown, or plain text. For PDF/ZIP use export_chapter_file.
+      params:
+        id: *id_path
+        format: *export_format_text
+
+    export_chapter_file:
+      method: GET
+      path: /chapters/{id}/export/{format}
+      access: read
+      description: >
+        Export a chapter as a binary file -- 'pdf' or 'zip' (portable
+        BookStack ZIP). Returns a download URL via the ToolMesh file broker.
+      params:
+        id: *id_path
+        format: *export_format_file
+      response: *file_response
+
+    # ── Pages ─────────────────────────────────────────────────────────────────
+
+    list_pages:
+      method: GET
+      path: /pages
+      access: read
+      description: >
+        List all pages visible to the API user. Returns id, book_id, chapter_id
+        (0 when directly in a book), name, slug, priority, draft, template,
+        created_at, updated_at, created_by, updated_by, owned_by per page in
+        {data, total}. Content is NOT included -- call get_page for that.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[book_id]": { type: integer, in: query, required: false, description: "Only pages of this book" }
+        "filter[chapter_id]": { type: integer, in: query, required: false, description: "Only pages of this chapter" }
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by page name, % wildcards" }
+        "filter[draft]": { type: boolean, in: query, required: false, description: "true/1 = only drafts, false/0 = only published pages" }
+        "filter[template]": { type: boolean, in: query, required: false, description: "true/1 = only template pages" }
+        "filter[updated_at:gte]": { type: string, in: query, required: false, description: "Only pages updated on/after this date, e.g. 2026-01-01" }
+
+    get_page:
+      method: GET
+      path: /pages/{id}
+      access: read
+      description: >
+        Get a single page with full content: 'html' (rendered output, includes
+        resolved), 'raw_html' (stored source -- use as editing basis),
+        'markdown' (only if last saved with the Markdown editor), tags, and a
+        'comments' object with 'active' and 'archived' comment trees.
+      params:
+        id: *id_path
+
+    create_page:
+      method: POST
+      path: /pages
+      access: write
+      description: >
+        Create a new page. Exactly ONE of book_id (page directly in book) or
+        chapter_id (page inside chapter) is required, and exactly ONE of html
+        or markdown content. Keep HTML to a single-block depth of plain
+        elements for editor compatibility; base64 data-URI images are extracted
+        into the image gallery automatically.
+      params:
+        book_id: { type: integer, in: body, required: false, description: "Parent book ID (required when chapter_id is not given)" }
+        chapter_id: { type: integer, in: body, required: false, description: "Parent chapter ID (required when book_id is not given)" }
+        name: { type: string, in: body, required: true, description: "Page name (max 255 chars)" }
+        html: { type: string, in: body, required: false, description: "Page content as HTML (required when markdown is not given)" }
+        markdown: { type: string, in: body, required: false, description: "Page content as Markdown (required when html is not given)" }
+        priority: { type: integer, in: body, required: false, description: "Order position within parent (lower = earlier)" }
+        tags: *tags_param
+
+    update_page:
+      method: PUT
+      path: /pages/{id}
+      access: write
+      description: >
+        Update a page's details or content. Passing book_id or chapter_id MOVES
+        the page to that parent (requires delete permission on the page). When
+        updating content, base your edit on 'raw_html' from get_page and send
+        it via 'html' -- the rendered 'html' field has include-tags resolved
+        and round-trips badly.
+      params:
+        id: *id_path
+        book_id: { type: integer, in: body, required: false, description: "Parent book ID -- changing it moves the page" }
+        chapter_id: { type: integer, in: body, required: false, description: "Parent chapter ID -- changing it moves the page" }
+        name: { type: string, in: body, required: false, description: "Page name (max 255 chars)" }
+        html: { type: string, in: body, required: false, description: "New page content as HTML" }
+        markdown: { type: string, in: body, required: false, description: "New page content as Markdown" }
+        priority: { type: integer, in: body, required: false, description: "Order position within parent (lower = earlier)" }
+        tags: *tags_param
+
+    delete_page:
+      method: DELETE
+      path: /pages/{id}
+      access: dangerous
+      description: "Delete a page (sent to the recycle bin). Returns 204."
+      params:
+        id: *id_path
+
+    export_page:
+      method: GET
+      path: /pages/{id}/export/{format}
+      access: read
+      description: >
+        Export a single page as text -- HTML document, Markdown, or plain text.
+        For PDF/ZIP use export_page_file. Note: get_page already returns
+        html/markdown content; exports add standalone document wrapping.
+      params:
+        id: *id_path
+        format: *export_format_text
+
+    export_page_file:
+      method: GET
+      path: /pages/{id}/export/{format}
+      access: read
+      description: >
+        Export a single page as a binary file -- 'pdf' or 'zip' (portable
+        BookStack ZIP). Returns a download URL via the ToolMesh file broker.
+      params:
+        id: *id_path
+        format: *export_format_file
+      response: *file_response
+
+    # ── Attachments ───────────────────────────────────────────────────────────
+
+    list_attachments:
+      method: GET
+      path: /attachments
+      access: read
+      description: >
+        List attachments visible to the API user. Returns id, name, extension,
+        uploaded_to (page ID), external (true = link attachment, false = file
+        upload), order, created_at, updated_at, created_by, updated_by in
+        {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[uploaded_to]": { type: integer, in: query, required: false, description: "Only attachments of this page ID" }
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by attachment name, % wildcards" }
+        "filter[extension]": { type: string, in: query, required: false, description: "Filter by file extension, e.g. pdf" }
+
+    get_attachment:
+      method: GET
+      path: /attachments/{id}
+      access: read
+      description: >
+        Get details and content of an attachment. 'content' holds the link URL
+        for external attachments, or the FULL base64-encoded file data for
+        uploads -- which can be very large; strip it with a jq override when
+        you only need metadata. 'links' provides ready-made HTML and Markdown
+        embed snippets.
+      params:
+        id: *id_path
+
+    create_attachment:
+      method: POST
+      path: /attachments
+      access: write
+      description: >
+        Attach an external LINK to a page. For uploading a file as attachment
+        use upload_attachment instead.
+      params:
+        name: { type: string, in: body, required: true, description: "Display name of the attachment (max 255 chars)" }
+        uploaded_to: { type: integer, in: body, required: true, description: "ID of the page to attach to" }
+        link: { type: string, in: body, required: true, description: "Target URL of the link attachment (max 2000 chars)" }
+
+    upload_attachment:
+      method: POST
+      path: /attachments
+      access: write
+      content_type: multipart/form-data
+      max_body_size: 50MB
+      description: >
+        Upload a FILE as attachment to a page (multipart request). The file is
+        fetched from the given URL by ToolMesh and uploaded to BookStack.
+      params:
+        name: { type: string, in: body, required: true, description: "Display name of the attachment (max 255 chars)" }
+        uploaded_to: { type: integer, in: body, required: true, description: "ID of the page to attach to" }
+        file: { type: file_url, in: body, required: true, description: "URL of the file to fetch and upload" }
+
+    update_attachment:
+      method: PUT
+      path: /attachments/{id}
+      access: write
+      description: >
+        Update an attachment's name, target link, or move it to another page.
+        Replacing an uploaded FILE requires a multipart PUT which is not
+        modeled -- delete and re-create via upload_attachment instead.
+      params:
+        id: *id_path
+        name: { type: string, in: body, required: false, description: "Display name (max 255 chars)" }
+        uploaded_to: { type: integer, in: body, required: false, description: "Move the attachment to this page ID" }
+        link: { type: string, in: body, required: false, description: "New target URL (link attachments only)" }
+
+    delete_attachment:
+      method: DELETE
+      path: /attachments/{id}
+      access: dangerous
+      description: "Permanently delete an attachment (no recycle bin). Returns 204."
+      params:
+        id: *id_path
+
+    # ── Image gallery ─────────────────────────────────────────────────────────
+
+    list_images:
+      method: GET
+      path: /image-gallery
+      access: read
+      description: >
+        List images in the system (page gallery images and drawio diagrams).
+        Returns id, name, url, path, type (gallery|drawio), uploaded_to (page
+        ID), created_by, updated_by, created_at, updated_at in {data, total}.
+        Visibility requires access to the page each image was uploaded to.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[uploaded_to]": { type: integer, in: query, required: false, description: "Only images uploaded to this page ID" }
+        "filter[type]": { type: string, in: query, required: false, description: "'gallery' (page images) or 'drawio' (diagrams)" }
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by image name, % wildcards" }
+
+    get_image:
+      method: GET
+      path: /image-gallery/{id}
+      access: read
+      description: >
+        Get details of a single image: url, 'thumbs' (scaled variants) and
+        'content' with ready-made HTML/Markdown embed snippets as BookStack
+        would insert them. Image file data is NOT included -- use
+        get_image_data or the 'url' property.
+      params:
+        id: *id_path
+
+    create_image:
+      method: POST
+      path: /image-gallery
+      access: write
+      content_type: multipart/form-data
+      max_body_size: 50MB
+      description: >
+        Upload a new image to the gallery of a page (multipart request). Use
+        type 'gallery' for normal page images; 'drawio' ONLY for PNG files
+        with embedded diagrams.net data. If name is omitted the filename is
+        used.
+      params:
+        image: { type: file_url, in: body, required: true, description: "URL of the image file to fetch and upload" }
+        type: { type: string, in: body, required: true, description: "'gallery' or 'drawio'" }
+        uploaded_to: { type: integer, in: body, required: true, description: "ID of the page this image belongs to" }
+        name: { type: string, in: body, required: false, description: "Image name (max 180 chars); defaults to the filename" }
+
+    update_image:
+      method: PUT
+      path: /image-gallery/{id}
+      access: write
+      description: >
+        Update an image's name. Replacing the image FILE requires a multipart
+        PUT which is not modeled -- upload a new image instead.
+      params:
+        id: *id_path
+        name: { type: string, in: body, required: false, description: "Image name (max 180 chars)" }
+
+    delete_image:
+      method: DELETE
+      path: /image-gallery/{id}
+      access: dangerous
+      description: >
+        Permanently delete an image and its thumbnails (no recycle bin). Usage
+        is NOT checked -- pages referencing the image will show broken
+        references. Returns 204.
+      params:
+        id: *id_path
+
+    get_image_data:
+      method: GET
+      path: /image-gallery/{id}/data
+      access: read
+      description: >
+        Download the raw image file data for an image ID. Returns a download
+        URL via the ToolMesh file broker instead of JSON.
+      params:
+        id: *id_path
+      response: *file_response
+
+    get_image_data_by_url:
+      method: GET
+      path: /image-gallery/url/data
+      access: read
+      description: >
+        Download raw image file data identified by its public BookStack image
+        URL (as found in page content src attributes) instead of an ID.
+        Returns a download URL via the ToolMesh file broker.
+      params:
+        url: { type: string, in: query, required: true, description: "Full BookStack image URL, e.g. https://wiki.example.com/uploads/images/gallery/2026-06/photo.png" }
+      response: *file_response
+
+    # ── Comments ──────────────────────────────────────────────────────────────
+
+    list_comments:
+      method: GET
+      path: /comments
+      access: read
+      description: >
+        List comments visible to the API user. Returns id, commentable_id (page
+        ID), commentable_type, parent_id, local_id, content_ref, created_by,
+        updated_by, created_at, updated_at in {data, total}. Comment HTML is
+        NOT included -- use get_comment. For a page's full comment tree prefer
+        get_page (comments property).
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[commentable_id]": { type: integer, in: query, required: false, description: "Only comments on this page ID" }
+        "filter[created_by]": { type: integer, in: query, required: false, description: "Only comments by this user ID" }
+
+    get_comment:
+      method: GET
+      path: /comments/{id}
+      access: read
+      description: >
+        Get a single comment (with safe HTML content) plus its direct replies.
+        Note: 'local_id' is page-scoped; 'parent_id' of replies refers to the
+        parent's local_id, not the global id.
+      params:
+        id: *id_path
+
+    create_comment:
+      method: POST
+      path: /comments
+      access: write
+      description: >
+        Create a comment on a page. To reply to an existing comment set
+        reply_to to the parent comment's LOCAL_ID (page-scoped), not its
+        global id.
+      params:
+        page_id: { type: integer, in: body, required: true, description: "ID of the page to comment on" }
+        html: { type: string, in: body, required: true, description: "Comment content as HTML" }
+        reply_to: { type: integer, in: body, required: false, description: "local_id of the parent comment when replying" }
+        content_ref: { type: string, in: body, required: false, description: "In-page content reference anchor (as used by the UI for inline comments)" }
+
+    update_comment:
+      method: PUT
+      path: /comments/{id}
+      access: write
+      description: >
+        Update a comment's content and/or archive state. Only provide
+        'archived' when actively changing it; only top-level comments
+        (non-replies) can be archived/unarchived.
+      params:
+        id: *id_path
+        html: { type: string, in: body, required: false, description: "New comment content as HTML" }
+        archived: { type: boolean, in: body, required: false, description: "true = archive, false = unarchive (top-level comments only)" }
+
+    delete_comment:
+      method: DELETE
+      path: /comments/{id}
+      access: dangerous
+      description: "Permanently delete a comment (no recycle bin). Returns 204."
+      params:
+        id: *id_path
+
+    # ── Users & roles (admin) ─────────────────────────────────────────────────
+
+    list_users:
+      method: GET
+      path: /users
+      access: admin
+      description: >
+        List all users. Requires 'Manage users' permission. Returns id, name,
+        slug, email, external_auth_id, created_at, updated_at,
+        last_activity_at plus profile/avatar URLs in {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[email]": { type: string, in: query, required: false, description: "Filter by exact email address" }
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by user name, % wildcards" }
+
+    get_user:
+      method: GET
+      path: /users/{id}
+      access: admin
+      description: "Get a single user including their assigned roles (id + display_name). Requires 'Manage users' permission."
+      params:
+        id: *id_path
+
+    create_user:
+      method: POST
+      path: /users
+      access: admin
+      description: >
+        Create a new user. Requires 'Manage users' permission. Either set a
+        password or send_invite=true so the user sets their own via email.
+      params:
+        name: { type: string, in: body, required: true, description: "Display name (max 100 chars)" }
+        email: { type: string, in: body, required: true, description: "Unique email address" }
+        password: { type: string, in: body, required: false, description: "Initial password (min 8 chars); omit when using send_invite" }
+        roles: { type: array, in: body, required: false, description: "Array of role IDs to assign, e.g. [2, 5]" }
+        send_invite: { type: boolean, in: body, required: false, description: "Send an invitation email asking the user to set a password" }
+        external_auth_id: { type: string, in: body, required: false, description: "External auth system ID (LDAP/SAML/OIDC)" }
+        language: { type: string, in: body, required: false, description: "UI language code, e.g. en, de, fr" }
+
+    update_user:
+      method: PUT
+      path: /users/{id}
+      access: admin
+      description: "Update a user. Requires 'Manage users' permission. 'roles' replaces the full role assignment."
+      params:
+        id: *id_path
+        name: { type: string, in: body, required: false, description: "Display name (max 100 chars)" }
+        email: { type: string, in: body, required: false, description: "Unique email address" }
+        password: { type: string, in: body, required: false, description: "New password (min 8 chars)" }
+        roles: { type: array, in: body, required: false, description: "Array of role IDs -- replaces all existing assignments" }
+        external_auth_id: { type: string, in: body, required: false, description: "External auth system ID (LDAP/SAML/OIDC)" }
+        language: { type: string, in: body, required: false, description: "UI language code, e.g. en, de, fr" }
+
+    delete_user:
+      method: DELETE
+      path: /users/{id}
+      access: dangerous
+      description: >
+        Permanently delete a user. Requires 'Manage users' permission. Pass
+        migrate_ownership_id to transfer ownership of their content to another
+        user first. Returns 204.
+      params:
+        id: *id_path
+        migrate_ownership_id: { type: integer, in: body, required: false, description: "User ID that becomes the new owner of the deleted user's content" }
+
+    list_roles:
+      method: GET
+      path: /roles
+      access: admin
+      description: >
+        List all roles. Requires 'Manage roles' permission. Returns
+        display_name, description, mfa_enforced, external_auth_id, timestamps
+        plus permissions_count and users_count in {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[display_name:like]": { type: string, in: query, required: false, description: "Filter by role display name, % wildcards" }
+
+    get_role:
+      method: GET
+      path: /roles/{id}
+      access: admin
+      description: >
+        Get a single role including its granted permission name strings and a
+        high-level list of assigned users. Requires 'Manage roles' permission.
+      params:
+        id: *id_path
+
+    create_role:
+      method: POST
+      path: /roles
+      access: admin
+      description: >
+        Create a new role. Permissions are given as an array of permission
+        name strings (e.g. 'access-api', 'page-create-all', 'book-view-own') --
+        inspect an existing role via get_role for the full vocabulary.
+      params:
+        display_name: { type: string, in: body, required: true, description: "Role name (3-180 chars)" }
+        description: { type: string, in: body, required: false, description: "Role description (max 180 chars)" }
+        mfa_enforced: { type: boolean, in: body, required: false, description: "Require multi-factor authentication for users of this role" }
+        external_auth_id: { type: string, in: body, required: false, description: "External auth ID for LDAP/SAML group sync (max 180 chars)" }
+        permissions: { type: array, in: body, required: false, description: "Array of permission name strings to grant" }
+
+    update_role:
+      method: PUT
+      path: /roles/{id}
+      access: admin
+      description: >
+        Update a role. CAUTION: 'permissions' replaces ALL granted permissions
+        and an empty array clears them -- fetch current permissions via
+        get_role and send the modified full set.
+      params:
+        id: *id_path
+        display_name: { type: string, in: body, required: false, description: "Role name (3-180 chars)" }
+        description: { type: string, in: body, required: false, description: "Role description (max 180 chars)" }
+        mfa_enforced: { type: boolean, in: body, required: false, description: "Require multi-factor authentication for users of this role" }
+        external_auth_id: { type: string, in: body, required: false, description: "External auth ID for LDAP/SAML group sync (max 180 chars)" }
+        permissions: { type: array, in: body, required: false, description: "Array of permission name strings -- replaces all granted permissions" }
+
+    delete_role:
+      method: DELETE
+      path: /roles/{id}
+      access: dangerous
+      description: "Permanently delete a role (users keep their other roles). Requires 'Manage roles' permission. Returns 204."
+      params:
+        id: *id_path
+
+    # ── Recycle bin (admin) ───────────────────────────────────────────────────
+
+    list_recycle_bin:
+      method: GET
+      path: /recycle-bin
+      access: admin
+      description: >
+        List items in the recycle bin. Requires permission to manage both
+        system settings and permissions. Each entry has a deletion id (use for
+        restore/purge), deleted_by, deletable_type (page/chapter/book/
+        bookshelf), deletable_id and a 'deletable' object with child counts
+        (books/chapters) or parent info (chapters/pages).
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[deletable_type]": { type: string, in: query, required: false, description: "page, chapter, book or bookshelf" }
+        "filter[deleted_by]": { type: integer, in: query, required: false, description: "Filter by deleting user ID" }
+
+    restore_recycle_bin_item:
+      method: PUT
+      path: /recycle-bin/{deletion_id}
+      access: admin
+      description: >
+        Restore a deletion from the recycle bin, including all child content.
+        Takes the DELETION id from list_recycle_bin, not the content's own ID.
+        Returns {restore_count}.
+      params:
+        deletion_id: { type: integer, in: path, required: true, description: "Deletion ID from list_recycle_bin" }
+
+    purge_recycle_bin_item:
+      method: DELETE
+      path: /recycle-bin/{deletion_id}
+      access: dangerous
+      description: >
+        PERMANENTLY destroy a deletion from the recycle bin including all child
+        content -- this cannot be undone. Takes the DELETION id from
+        list_recycle_bin. Returns {delete_count}.
+      params:
+        deletion_id: { type: integer, in: path, required: true, description: "Deletion ID from list_recycle_bin" }
+
+    # ── Content permissions (admin) ───────────────────────────────────────────
+
+    get_content_permissions:
+      method: GET
+      path: /content-permissions/{content_type}/{content_id}
+      access: admin
+      description: >
+        Read the content-level permission OVERRIDES for one item: owner,
+        role_permissions (per-role view/create/update/delete flags) and
+        fallback_permissions ('inheriting': true means no override; its flag
+        values are null then). Shows only overrides on this item -- not
+        evaluated/inherited permissions.
+      params:
+        content_type: { type: string, in: path, required: true, description: "One of: page, chapter, book, bookshelf" }
+        content_id: { type: integer, in: path, required: true, description: "ID of the content item" }
+
+    update_content_permissions:
+      method: PUT
+      path: /content-permissions/{content_type}/{content_id}
+      access: admin
+      description: >
+        Update content-level permission overrides for one item. OMIT owner_id /
+        role_permissions / fallback_permissions entirely to leave that category
+        unchanged. CAUTION: an empty role_permissions array CLEARS all
+        configured role overrides -- read existing permissions first and send
+        the merged result.
+      params:
+        content_type: { type: string, in: path, required: true, description: "One of: page, chapter, book, bookshelf" }
+        content_id: { type: integer, in: path, required: true, description: "ID of the content item" }
+        owner_id: { type: integer, in: body, required: false, description: "User ID of the new owner" }
+        role_permissions: { type: array, in: body, required: false, description: "Array of {role_id, view, create, update, delete} objects; all five fields required per entry; replaces all existing role overrides" }
+        fallback_permissions: { type: object, in: body, required: false, description: "{inheriting: bool, view, create, update, delete} -- the four flags are required when inheriting is false" }
+
+    # ── Audit log (admin) ─────────────────────────────────────────────────────
+
+    list_audit_log:
+      method: GET
+      path: /audit-log
+      access: admin
+      description: >
+        List audit log events. Requires permission to manage both users and
+        system settings. Returns id, type (e.g. page_create, auth_login,
+        permissions_update), detail, user_id (plus user object), loggable_id,
+        loggable_type, ip, created_at in {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[type]": { type: string, in: query, required: false, description: "Event type, e.g. page_create, page_update, auth_login, user_delete" }
+        "filter[user_id]": { type: integer, in: query, required: false, description: "Only events by this user ID" }
+        "filter[created_at:gte]": { type: string, in: query, required: false, description: "Only events on/after this date, e.g. 2026-06-01" }
+
+    # ── Tags ──────────────────────────────────────────────────────────────────
+
+    list_tag_names:
+      method: GET
+      path: /tags/names
+      access: read
+      description: >
+        List distinct tag NAMES used across visible content, with usage
+        totals: name, values (count of distinct values), usages, page_count,
+        chapter_count, book_count, shelf_count. Only 'name' is filterable.
+        Requires BookStack >= v26.05 -- older instances return a 404 HTML page.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[name:like]": { type: string, in: query, required: false, description: "Filter by tag name, % wildcards" }
+
+    list_tag_values:
+      method: GET
+      path: /tags/values-for-name
+      access: read
+      description: >
+        List the distinct VALUES set for one tag name across visible content,
+        with usage totals per value. Only 'value' is filterable.
+        Requires BookStack >= v26.05 -- older instances return a 404 HTML page.
+      pagination: *list_pagination
+      params:
+        name: { type: string, in: query, required: true, description: "The tag name to list values for" }
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+        "filter[value:like]": { type: string, in: query, required: false, description: "Filter by tag value, % wildcards" }
+
+    # ── ZIP imports ───────────────────────────────────────────────────────────
+
+    list_imports:
+      method: GET
+      path: /imports
+      access: read
+      description: >
+        List pending ZIP imports visible to the user. Requires 'Import content'
+        permission. Returns id, name, size, type (book/chapter/page),
+        created_by, created_at, updated_at in {data, total}.
+      pagination: *list_pagination
+      params:
+        count: *count_param
+        offset: *offset_param
+        sort: *sort_param
+
+    create_import:
+      method: POST
+      path: /imports
+      access: write
+      content_type: multipart/form-data
+      max_body_size: 100MB
+      description: >
+        Upload and validate a BookStack portable ZIP file (from export_*_file
+        zip exports) as a pending import. Does NOT import yet -- call
+        run_import afterwards. Requires 'Import content' permission.
+      params:
+        file: { type: file_url, in: body, required: true, description: "URL of the BookStack-compatible ZIP file to fetch and upload" }
+
+    get_import:
+      method: GET
+      path: /imports/{id}
+      access: read
+      description: >
+        Read a pending ZIP import including a 'details' property with metadata
+        about the ZIP content (structure varies by import type).
+      params:
+        id: *id_path
+
+    run_import:
+      method: POST
+      path: /imports/{id}
+      access: write
+      depends_on: [create_import]
+      description: >
+        Execute a pending ZIP import. parent_type + parent_id are REQUIRED when
+        the import's type is 'chapter' or 'page' (check via get_import); book
+        imports need no parent. Returns the imported item on success.
+      params:
+        id: *id_path
+        parent_type: { type: string, in: body, required: false, description: "'book' or 'chapter' -- required for chapter/page imports" }
+        parent_id: { type: integer, in: body, required: false, description: "ID of the parent to import into -- required for chapter/page imports" }
+
+    delete_import:
+      method: DELETE
+      path: /imports/{id}
+      access: dangerous
+      description: "Delete a pending ZIP import (the staged upload, not imported content). Returns 204."
+      params:
+        id: *id_path
+
+    # ── System ────────────────────────────────────────────────────────────────
+
+    get_system_info:
+      method: GET
+      path: /system
+      access: read
+      description: >
+        Read instance details: version, instance_id, app_name, app_logo (may be
+        null), base_url. Useful for verifying connectivity and version-gated
+        features.
+
+  hints:
+    search_content:
+      syntax: "full UI search syntax: terms, \"exact phrases\", [tag] / [tag=value], {type:page|chapter|book|bookshelf}, {created_by:me}, {in_name:term}, {updated_after:2026-01-01} -- see https://www.bookstackapp.com/docs/user/searching/"
+      paging: "uses page+count (max 100), NOT offset; sort/filter unsupported here"
+    get_page:
+      editing: "edit 'raw_html' (stored source), write back via update_page html param; the 'html' field is rendered output with include-tags resolved and round-trips badly"
+      markdown: "'markdown' is only populated when the page was last saved with the Markdown editor; html is always present"
+    create_page:
+      parent: "exactly one of book_id or chapter_id is required"
+      content: "exactly one of html or markdown is required"
+    list_pages:
+      chapter_id_null: "chapter_id is null (0 in some versions) for pages sitting directly in a book -- treat both as 'no chapter'"
+    get_attachment:
+      content_size: "for file attachments 'content' is the FULL base64 file data -- use a jq override like 'del(.content)' when you only need metadata"
+    create_comment:
+      reply_to: "reply_to takes the parent comment's page-scoped 'local_id', NOT the global 'id'"
+    create_image:
+      drawio: "type 'drawio' only for PNG files with embedded diagrams.net data; otherwise use 'gallery'"
+    update_role:
+      permissions_replace: "permissions replaces ALL grants; empty array clears the role -- merge with get_role output first"
+    update_content_permissions:
+      merge_semantics: "omit a category (owner_id/role_permissions/fallback_permissions) to leave it untouched; empty role_permissions array clears all role overrides"
+    delete_user:
+      ownership: "set migrate_ownership_id to keep the deleted user's content owned by a real user"
+    run_import:
+      parent: "chapter/page imports require parent_type+parent_id; book imports do not"
+    purge_recycle_bin_item:
+      irreversible: "permanently destroys content -- unlike delete_* tools there is no way back"
+
+  examples:
+    - name: "Create a book with a chapter and a page"
+      description: "Build the shelves > books > chapters > pages hierarchy top-down"
+      code: |
+        const book = await api.create_book({
+          name: "Team Handbook",
+          description: "Internal team handbook",
+          tags: [{ name: "Department", value: "Engineering" }]
+        });
+        const chapter = await api.create_chapter({ book_id: book.id, name: "Onboarding" });
+        const page = await api.create_page({
+          chapter_id: chapter.id,
+          name: "First Week",
+          markdown: "# First Week\n\nWelcome to the team!"
+        });
+        return { book_id: book.id, chapter_id: chapter.id, page_id: page.id };
+
+    - name: "Search and read full page content"
+      description: "Find pages via UI search syntax, then fetch the full content of the best hit"
+      code: |
+        const results = await api.search_content({ query: "onboarding {type:page}", count: 5 });
+        const hit = results.data.find(r => r.type === "page");
+        if (!hit) return "no page found";
+        const page = await api.get_page({ id: hit.id });
+        return page.markdown || page.raw_html;
+
+    - name: "List all pages of a book via offset paging"
+      description: "Use filter[book_id] with bracket-notation and page until total is reached"
+      code: |
+        const all = [];
+        let offset = 0;
+        while (true) {
+          const res = await api.list_pages({
+            count: 200, offset, sort: "+priority", "filter[book_id]": 42
+          });
+          all.push(...res.data);
+          if (all.length >= res.total || res.data.length === 0) break;
+          offset += res.data.length;
+        }
+        return all.map(p => ({ id: p.id, name: p.name }));
+
+  coverage:
+    endpoints: 69
+    total_endpoints: 77
+    percentage: 98
+    focus: "BookStack full API: books (CRUD, exports), pages (CRUD, HTML, markdown, exports), chapters (CRUD, exports), shelves (CRUD, book assignment), attachments (links, uploads), images (gallery, drawio, file data), comments (threads, replies, archiving), search (cross-entity), users (CRUD, invites), roles (permissions, MFA), recycle-bin (restore, purge), content-permissions (role overrides, fallback), audit-log, tags, ZIP imports."
+    missing: "Cover-image upload on book/shelf create/update and file replacement on attachment/image update (multipart facets of covered endpoints); the _method=PUT form workaround. All 77 documented endpoints are otherwise reachable -- the 15 export endpoints are collapsed into 6 parameterized tools."
+    last_reviewed: "2026-06-12"
+
+  setup:
+    credential_steps:
+      - "Log in to your BookStack instance as the user the API should act as (its roles define what the API can see and do)"
+      - "Ensure one of the user's roles grants the 'Access System API' permission: Settings > Roles > (role) > System Permissions"
+      - "Open the user's profile (avatar top-right > 'Edit Profile') and scroll to the 'API Tokens' section"
+      - "Click 'Create Token', enter a name and expiry date, then Save -- the Token ID and Token Secret are shown"
+      - "Join both values with a colon to form the credential: '<token_id>:<token_secret>' -- store this single string as bookstack_token"
+    env_var: CREDENTIAL_BOOKSTACK_TOKEN
+    backends_yaml: |
+      - name: bookstack
+        transport: rest
+        dadl: bookstack.dadl
+        url: "https://wiki.example.com/api"
+    required_scopes:
+      - "access-api (role permission 'Access System API')"
+    optional_scopes:
+      - "users-manage (users endpoints)"
+      - "user-roles-manage (roles endpoints)"
+      - "settings-manage + restrictions-manage-all (recycle bin)"
+      - "settings-manage + users-manage (audit log)"
+      - "restrictions-manage-all or restrictions-manage-own (content permissions)"
+      - "content-import (ZIP imports)"
+    docs_url: "https://demo.bookstackapp.com/api/docs"
+    notes: >
+      The backends.yaml url MUST include the /api suffix. The header sent is
+      "Authorization: Token <token_id>:<token_secret>" -- the credential value
+      is the colon-joined pair, ToolMesh prepends the "Token " prefix. Content
+      visibility mirrors the token user's roles exactly; for read-mostly agents
+      prefer a dedicated low-privilege user. Default rate limit is 180
+      requests/min per user (env API_REQUESTS_PER_MIN).
