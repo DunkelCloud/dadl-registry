@@ -61,7 +61,7 @@ backend:
   type: rest
   version: "1.0"
   base_url: https://api.elitedomains.de
-  description: "Beta — the REST API is not yet stable and may still change. ELITEDOMAINS domain registrar API -- register/transfer/manage .de and gTLD domains, redirector & inline DNS, AuthInfo/AuthInfo2 transfer codes, RGP catcher backorders, contact handles, and marketplace offers (Sedo, sale pages)"
+  description: "ELITEDOMAINS domain registrar API -- register/transfer/manage .de and gTLD domains, redirector & inline DNS, AuthInfo/AuthInfo2 transfer codes, RGP catcher backorders, contact handles, and marketplace offers (Sedo, sale pages)"
 
   auth:
     type: bearer
@@ -74,7 +74,7 @@ backend:
     endpoints: 17
     total_endpoints: 17
     percentage: 100
-    focus: "ELITEDOMAINS .de domain reseller: domains (register, transfer, AuthInfo, redirector, DNS records, tags), handles (PERSON, ORG, address validation), catcher (RGP backorders, dropdate, max bid), offers (Sedo marketplace, sale pages, visitor stats)."
+    focus: "Beta — REST API not yet stable. ELITEDOMAINS .de domain reseller: domains (register, transfer, AuthInfo, redirector, DNS records, tags), handles (PERSON, ORG, address validation), catcher (RGP backorders, dropdate, max bid), offers (Sedo marketplace, sale pages, visitor stats)."
     missing: "no standalone DNS-record CRUD (records are managed inline via redirector_settings), no transfer-status polling endpoint, no billing/invoice or price-list endpoints"
     last_reviewed: "2026-06-02"
 
