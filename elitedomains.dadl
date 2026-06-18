@@ -61,7 +61,7 @@ backend:
   type: rest
   version: "1.0"
   base_url: https://api.elitedomains.de
-  description: "ELITEDOMAINS domain registrar API -- register/transfer/manage .de and gTLD domains, redirector & inline DNS, AuthInfo/AuthInfo2 transfer codes, RGP catcher backorders, contact handles, and marketplace offers (Sedo, sale pages)"
+  description: "Beta — the REST API is not yet stable and may still change. ELITEDOMAINS domain registrar API -- register/transfer/manage .de and gTLD domains, redirector & inline DNS, AuthInfo/AuthInfo2 transfer codes, RGP catcher backorders, contact handles, and marketplace offers (Sedo, sale pages)"
 
   auth:
     type: bearer
