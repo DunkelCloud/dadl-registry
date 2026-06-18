@@ -14,28 +14,35 @@ backend:
   description: "Vikunja open-source task management — project planning, kanban boards, and task tracking"
 
   coverage:
-    endpoints: 19
+    endpoints: 21
     total_endpoints: 80
-    percentage: 24
-    focus: "projects, tasks, views, buckets, labels, comments, positions"
-    missing: "teams, users, shares, attachments, notifications, webhooks, subscriptions, filters, saved filters"
-    last_reviewed: "2026-03-31"
+    percentage: 26
+    focus: "projects, tasks, views, buckets, labels, comments, positions, filters"
+    missing: "teams, users, shares, attachments, assignees, task relations, reactions, notifications, webhooks, subscriptions, saved filters"
+    last_reviewed: "2026-06-18"
 
   setup:
     credential_steps:
-      - "Navigate to Vikunja → User Settings → API Tokens"
-      - "Click 'Create a token', enter a name and select permissions"
-      - "Copy the generated token (starts with tk_)"
+      - "Log in to the Vikunja web UI"
+      - "Open Settings → API Tokens (user menu, top right)"
+      - "Click 'Create a token', enter a name and an optional expiry"
+      - "Under Permissions grant at least: Projects (read & write), Tasks (read & write), Labels (read & write), Task Comments (read & write)"
+      - "Click Create and copy the token immediately — it is shown only once (format: tk_…)"
     env_var: CREDENTIAL_VIKUNJA_API_TOKEN
     backends_yaml: |
       - name: vikunja
         transport: rest
-        dadl: /app/dadl/vikunja.dadl
+        dadl: vikunja.dadl
         url: "https://your-vikunja-instance.com/api/v1"
     required_scopes:
-      - "read/write access to projects and tasks"
+      - "Projects: read & write"
+      - "Tasks: read & write"
+      - "Labels: read & write"
+      - "Task Comments: read & write"
+    optional_scopes:
+      - "Project Views: read (kanban buckets, positions)"
     docs_url: "https://vikunja.io/docs/api-tokens"
-    notes: "Vikunja is self-hosted. Replace the URL with your instance address."
+    notes: "Vikunja is self-hosted — replace the URL with your instance address, including the /api/v1 suffix. API tokens are shown only once at creation and their granted permissions cap what these tools can do (a read-only token returns 403 on create/update/delete)."
 
   auth:
     type: bearer
@@ -84,12 +91,25 @@ backend:
   #   NOT a flat task list. Use list_buckets to get bucket metadata.
   #   Moving a task between buckets requires move_task_to_bucket
   #   (NOT update_task — bucket_id in update_task has no effect).
+  #   An empty bucket is returned as {bucket_id, title, tasks: []}.
+  #   list_project_tasks is NOT auto-paginated (pagination: none) — one call
+  #   returns one page. On a kanban view each bucket holds up to per_page tasks
+  #   (default 50); raise per_page for fuller buckets, or page through manually.
+  #   For large flat lists or cross-project queries prefer list_tasks (global).
   #
   # Position values:
   #   Positions are float64 values. To insert a task between two others,
   #   use the midpoint: (pos_above + pos_below) / 2.
   #   set_task_position requires the project_view_id to know which
   #   view's ordering to update.
+  #   Position is saved PER VIEW: a task's order in the List view is independent
+  #   of its order on the Kanban board. For the board order, read/write the
+  #   position against the Kanban view_id (from list_views). list_project_tasks
+  #   returns this per-view position with each task, so "insert between two
+  #   cards" is now readable, not just writable.
+  #   CAVEAT: position is only populated when tasks are fetched through a VIEW
+  #   endpoint (list_project_tasks). The position field from get_task and
+  #   list_tasks is always 0 — it is NOT the per-view ordering, so never sort by it.
   #
   # Priority values:
   #   0 = unset, 1 = low, 2 = medium, 3 = high, 4 = urgent, 5 = critical
@@ -99,6 +119,35 @@ backend:
   #   Vikunja's raw POST /tasks/{id} resets missing fields to zero,
   #   so the composite reads the current state first and only overwrites
   #   fields that were explicitly provided. Safe for partial updates.
+  #   update_project works the same way (GET → merge → POST via get_project).
+  #
+  # Timestamps & dates:
+  #   created, updated, done_at, due_date, start_date, end_date are RFC 3339 strings.
+  #   IMPORTANT: an UNSET date is serialized as "0001-01-01T00:00:00Z" (Go zero value),
+  #   NOT null. For velocity/ETA treat year 0001 as "no value" — e.g. done_at stays
+  #   0001-01-01… until the task is completed (done_at is system-set when done → true).
+  #
+  # Filtering & analytics:
+  #   list_tasks (GET /tasks) queries tasks across ALL projects — the go-to endpoint for
+  #   reporting. list_project_tasks is scoped to one project view. Both accept a Vikunja
+  #   `filter` DSL string, e.g. "done = true && done_at > now-30d" or "priority >= 3".
+  #   Use filter_timezone (IANA tz, e.g. Europe/Berlin) for relative date math and
+  #   filter_include_nulls to keep rows whose filtered field is null. sort_by accepts
+  #   done_at, created, updated, due_date, percent_done, priority (+ order_by asc|desc).
+  #
+  # Projects & hierarchy:
+  #   Projects form a tree via parent_project_id (0 / absent = top-level). list_projects
+  #   returns parent_project_id and position so hierarchy and ordering are visible.
+  #   identifier (≤10 chars) is the prefix used to build task identifiers (e.g. OPS-42).
+  #
+  # Views & saved filters:
+  #   A project view can carry its own persisted `filter` query; it is returned in full
+  #   by list_views (incl. view_kind). Standalone "saved filters" (/filters/*) are a
+  #   separate resource and are not yet exposed.
+  #
+  # Labels:
+  #   create_label uses PUT /labels (Vikunja creates labels with PUT, not POST).
+  #   hex_color is a 6-digit hex string WITHOUT a leading '#'. Handy for S/M/L labels.
   #
   # Typical workflow:
   #   1. list_projects → pick project_id
@@ -108,6 +157,7 @@ backend:
   # ──────────────────────────────────────────────────────────────
 
   tools:
+    # ─────────────── Tasks ───────────────
     set_task_position:
       method: POST
       path: /tasks/{id}/position
@@ -132,10 +182,38 @@ backend:
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 50 }
         filter: { type: string, in: query }
+        filter_timezone: { type: string, in: query }
+        filter_include_nulls: { type: boolean, in: query }
+        expand: { type: string, in: query }
         s: { type: string, in: query }
       response:
         transform: |
-          [.[] | if .tasks then {bucket_id: .id, title: .title, tasks: [.tasks[]? | {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, labels: [.labels[]?.title]}]} else {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, labels: [.labels[]?.title]} end]
+          [.[] | if (has("done") | not) then {bucket_id: .id, title: .title, tasks: [.tasks[]? | {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title]}]} else {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title]} end]
+        allow_jq_override: true
+      pagination: none
+
+    list_tasks:
+      method: GET
+      path: /tasks
+      access: read
+      description: >
+        Query tasks across ALL projects the user can access (not scoped to a single view).
+        Supports the Vikunja filter DSL, full-text search (s) and multi-field sorting —
+        the best endpoint for analytics/reporting (velocity, ETA, throughput): filter or
+        sort by done_at, created, updated, due_date, percent_done. Returns a flat task array.
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 50 }
+        s: { type: string, in: query }
+        sort_by: { type: string, in: query, default: "id" }
+        order_by: { type: string, in: query, default: "asc" }
+        filter: { type: string, in: query }
+        filter_timezone: { type: string, in: query }
+        filter_include_nulls: { type: boolean, in: query }
+        expand: { type: string, in: query }
+      response:
+        transform: |
+          [.[] | {id, identifier, title, done, done_at, due_date, priority, percent_done, project_id, bucket_id, position, created, updated, labels: [.labels[]?.title], assignees: [.assignees[]?.username]}]
         allow_jq_override: true
 
     get_task:
@@ -147,7 +225,7 @@ backend:
         id: { type: integer, in: path, required: true }
       response:
         transform: |
-          {id, identifier, title, description, done, priority, due_date, project_id, bucket_id, position, percent_done, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks}
+          {id, identifier, title, description, done, priority, due_date, done_at, created, updated, project_id, bucket_id, position, percent_done, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks}
         allow_jq_override: true
       pagination: none
 
@@ -205,11 +283,12 @@ backend:
         id: { type: integer, in: path, required: true }
       pagination: none
 
+    # ─────────────── Projects & views ───────────────
     list_projects:
       method: GET
       path: /projects
       access: read
-      description: "List all projects accessible to the authenticated user."
+      description: "List all projects accessible to the authenticated user. Projection now also includes parent_project_id and position (hierarchy + ordering), plus hex_color and owner (username)."
       params:
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 50 }
@@ -217,13 +296,61 @@ backend:
         is_archived: { type: boolean, in: query }
       response:
         transform: |
-          [.[] | {id: .id, title: .title, description: .description, is_archived: .is_archived, views: [.views[]? | {id: .id, title: .title, view_kind: .view_kind}]}]
+          [.[] | {id: .id, title: .title, description: .description, is_archived: .is_archived, parent_project_id: .parent_project_id, position: .position, hex_color: .hex_color, owner: (.owner.username? // null), views: [.views[]? | {id: .id, title: .title, view_kind: .view_kind}]}]
 
     get_project:
       method: GET
       path: /projects/{id}
       access: read
       description: "Get a single project by ID."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_project:
+      method: PUT
+      path: /projects
+      access: write
+      description: >
+        Create a new project. Only 'title' is required. Set parent_project_id to nest it
+        under another project (hierarchy). 'identifier' (≤10 chars) is the short prefix
+        used to build task identifiers (e.g. OPS-1); omit to auto-derive. hex_color is a
+        6-digit hex string without a leading '#'.
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        hex_color: { type: string, in: body }
+        identifier: { type: string, in: body }
+        parent_project_id: { type: integer, in: body }
+        is_archived: { type: boolean, in: body }
+        is_favorite: { type: boolean, in: body }
+      pagination: none
+
+    _update_project_raw:
+      method: POST
+      path: /projects/{id}
+      access: write
+      description: "Internal: raw project update (sends a full object — omitted fields are reset to zero). Use the update_project composite instead."
+      params:
+        id: { type: integer, in: path, required: true }
+        title: { type: string, in: body }
+        description: { type: string, in: body }
+        hex_color: { type: string, in: body }
+        identifier: { type: string, in: body }
+        parent_project_id: { type: integer, in: body }
+        is_archived: { type: boolean, in: body }
+        is_favorite: { type: boolean, in: body }
+        position: { type: number, in: body }
+      pagination: none
+
+    delete_project:
+      method: DELETE
+      path: /projects/{id}
+      access: dangerous
+      description: >
+        Permanently delete a project and all of its tasks, views and buckets. Irreversible.
+        Verify the project_id with get_project first. (There is no delete for labels — those
+        must be removed in the Vikunja UI.)
       params:
         id: { type: integer, in: path, required: true }
       pagination: none
@@ -258,15 +385,30 @@ backend:
         title: { type: string, in: body, required: true }
       pagination: none
 
+    # ─────────────── Labels ───────────────
     list_labels:
       method: GET
       path: /labels
       access: read
-      description: "List all labels."
+      description: "List all labels the user has access to. Returns id, title, description, hex_color."
       params:
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 50 }
         s: { type: string, in: query }
+
+    create_label:
+      method: PUT
+      path: /labels
+      access: write
+      description: >
+        Create a new label. NOTE: Vikunja creates labels with PUT (not POST). 'title' is
+        required. hex_color is a 6-digit hex string without a leading '#'. Useful for
+        setting up reusable S/M/L estimate labels.
+      params:
+        title: { type: string, in: body, required: true }
+        description: { type: string, in: body }
+        hex_color: { type: string, in: body }
+      pagination: none
 
     add_label_to_task:
       method: PUT
@@ -278,6 +420,7 @@ backend:
         label_id: { type: integer, in: body, required: true }
       pagination: none
 
+    # ─────────────── Comments ───────────────
     list_task_comments:
       method: GET
       path: /tasks/{task_id}/comments
@@ -295,6 +438,29 @@ backend:
         task_id: { type: integer, in: path, required: true }
         comment: { type: string, in: body, required: true }
       pagination: none
+
+  examples:
+    - name: "Throughput / velocity over the last 14 days"
+      description: "List tasks completed in the last 14 days (newest first) to estimate velocity and ETA."
+      code: |
+        const done = await api.list_tasks({
+          filter: "done = true && done_at > now-14d",
+          sort_by: "done_at",
+          order_by: "desc",
+          per_page: 50
+        });
+        // done[].done_at is RFC3339; group by calendar day for a burndown / velocity chart.
+        return done.map(t => ({ id: t.id, title: t.title, done_at: t.done_at }));
+    - name: "Bootstrap a project with S/M/L estimate labels"
+      description: "Create a project and a set of reusable size labels."
+      code: |
+        const project = await api.create_project({ title: "Q3 Roadmap", identifier: "Q3" });
+        const sizes = [["S", "4caf50"], ["M", "ff9800"], ["L", "f44336"]];
+        const labels = [];
+        for (const [title, hex_color] of sizes) {
+          labels.push(await api.create_label({ title, hex_color }));
+        }
+        return { project, labels };
 
   composites:
     update_task:
@@ -336,3 +502,52 @@ backend:
           position: params.position !== undefined ? params.position : current.position,
         };
         return await api._update_task_raw(merged);
+
+    update_project:
+      description: >
+        Update an existing project. Only include the fields you want to change — unchanged
+        fields are preserved (this composite does GET → merge → POST, because Vikunja's raw
+        project update resets omitted fields). Set parent_project_id to re-parent (0 =
+        top-level). To create a project use create_project.
+      params:
+        id:
+          type: number
+          required: true
+          description: "Project ID"
+        title:
+          type: string
+          description: "New title"
+        description:
+          type: string
+          description: "New description"
+        hex_color:
+          type: string
+          description: "Hex color (6 digits, no leading #)"
+        identifier:
+          type: string
+          description: "Short identifier (≤10 chars), used to build task identifiers"
+        parent_project_id:
+          type: number
+          description: "Parent project ID for nesting (0 = top-level)"
+        is_archived:
+          type: boolean
+          description: "Archive or unarchive the project"
+        is_favorite:
+          type: boolean
+          description: "Mark as favorite"
+      timeout: 15s
+      depends_on: [get_project, _update_project_raw]
+      code: |
+        const current = await api.get_project({ id: params.id });
+        const merged = {
+          id: params.id,
+          title: params.title !== undefined ? params.title : current.title,
+          description: params.description !== undefined ? params.description : current.description,
+          hex_color: params.hex_color !== undefined ? params.hex_color : current.hex_color,
+          identifier: params.identifier !== undefined ? params.identifier : current.identifier,
+          parent_project_id: params.parent_project_id !== undefined ? params.parent_project_id : current.parent_project_id,
+          is_archived: params.is_archived !== undefined ? params.is_archived : current.is_archived,
+          is_favorite: params.is_favorite !== undefined ? params.is_favorite : current.is_favorite,
+          position: current.position,
+        };
+        return await api._update_project_raw(merged);
