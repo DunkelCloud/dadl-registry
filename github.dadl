@@ -13,18 +13,18 @@ backend:
   description: "GitHub REST API — repositories, issues, pull requests, commits, and code search"
 
   coverage:
-    endpoints: 205
-    total_endpoints: 900
-    percentage: 23
-    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + artifacts + dispatch), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions)"
-    missing: "projects v2, codespaces, copilot, security advisories, rate limit API, git LFS, autolinks, repository rulesets"
-    last_reviewed: "2026-04-02"
+    endpoints: 249
+    total_endpoints: 1000
+    percentage: 25
+    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions + types), sub-issues (hierarchy + reprioritize), issue dependencies (blocked_by + blocking), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), rulesets (repo + org full CRUD + branch rules + rule suites), custom properties (org schema + repo/org values), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + artifacts + dispatch), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, traffic (views + clones + paths + referrers), statistics (contributors + commit activity + code frequency + participation + punch card), code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions)"
+    missing: "projects v2, codespaces, copilot, security advisories, rate limit API, git LFS, autolinks"
+    last_reviewed: "2026-06-19"
 
   setup:
     credential_steps:
       - "Navigate to GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)"
       - "Click 'Generate new token (classic)'"
-      - "Select scopes: repo (full access), read:org (list organizations), workflow (actions), admin:repo_hook (webhooks), delete_repo (delete repos), gist, notifications, read:packages, write:packages, delete:packages"
+      - "Select scopes: repo (full access), read:org (list organizations), admin:org (org rulesets, custom properties, issue types), workflow (actions), admin:repo_hook (webhooks), delete_repo (delete repos), gist, notifications, read:packages, write:packages, delete:packages"
       - "Copy the token (starts with ghp_ or github_pat_)"
     env_var: CREDENTIAL_GITHUB_TOKEN
     backends_yaml: |
@@ -36,6 +36,7 @@ backend:
       - repo
       - read:org
     optional_scopes:
+      - admin:org
       - read:user
       - workflow
       - admin:repo_hook
@@ -110,6 +111,39 @@ backend:
   # Permissions:
   #   Some endpoints require specific token scopes (e.g. delete_repo,
   #   admin:repo_hook). Check setup.optional_scopes for details.
+  #
+  # Issue ID vs issue_number (IMPORTANT):
+  #   Most issue endpoints address an issue by its issue_number (the
+  #   #N shown in the UI). But sub-issues and dependencies reference
+  #   the related issue by its database id — the "id" field returned
+  #   by get_issue, a large integer like 2372948531. Pass that id to
+  #   sub_issue_id / issue_id, NOT the issue_number, or you get a 404.
+  #
+  # Issue types:
+  #   Issue types are defined per organization (list_issue_types) and
+  #   assigned to an issue through the `type` field (a string name,
+  #   e.g. "Bug") on create_issue / update_issue. Pass null to clear.
+  #
+  # Rulesets vs branch protection:
+  #   Rulesets (repo + org) are the modern policy layer that
+  #   supersedes branch protection. enforcement is one of
+  #   "disabled", "active", "evaluate". `rules`, `bypass_actors` and
+  #   `conditions` are structured objects (see create_repo_ruleset).
+  #   Org rulesets can target repos by custom property via
+  #   conditions.repository_property.
+  #
+  # Statistics 202:
+  #   The /stats/* endpoints are computed asynchronously. On a cold
+  #   cache the first call returns 202 Accepted with an empty body
+  #   while GitHub builds the data; the request must be retried until
+  #   it returns 200. These tools add 202 to retry_on so ToolMesh
+  #   re-requests automatically. Stat timestamps are Unix epoch
+  #   SECONDS; weekly buckets start on Sunday.
+  #
+  # Traffic:
+  #   Traffic endpoints cover a rolling 14-day window and require
+  #   push (write) access to the repository even though they read.
+  #   Counts come as total and "uniques" (de-duplicated by actor).
   # ──────────────────────────────────────────────────────────────
 
   tools:
@@ -590,7 +624,7 @@ backend:
       method: POST
       path: /repos/{owner}/{repo}/issues
       access: write
-      description: "Create a new issue. Labels are an array of label name strings."
+      description: "Create a new issue. Labels are an array of label name strings. type is the org issue-type name (string, e.g. 'Bug') — see list_issue_types."
       params:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
@@ -599,13 +633,14 @@ backend:
         labels: { type: array, in: body }
         assignees: { type: array, in: body }
         milestone: { type: integer, in: body }
+        type: { type: string, in: body }
       pagination: none
 
     update_issue:
       method: PATCH
       path: /repos/{owner}/{repo}/issues/{issue_number}
       access: write
-      description: "Update an issue. Set state to 'closed' to close it. Only include fields you want to change."
+      description: "Update an issue. Set state to 'closed' to close it. Only include fields you want to change. type sets the org issue-type by name (string), or null to clear it."
       params:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
@@ -617,6 +652,7 @@ backend:
         labels: { type: array, in: body }
         assignees: { type: array, in: body }
         milestone: { type: integer, in: body }
+        type: { type: string, in: body }
       pagination: none
 
     lock_issue:
@@ -2692,3 +2728,639 @@ backend:
         package_name: { type: string, in: path, required: true }
         package_version_id: { type: integer, in: path, required: true }
       pagination: none
+
+    # ── Sub-Issues ────────────────────────────────────────────
+    #
+    # Parent/child hierarchy between issues. sub_issue_id is the
+    # issue's database id (the "id" field of get_issue), NOT the
+    # issue_number shown in the UI.
+
+    get_issue_parent:
+      method: GET
+      path: /repos/{owner}/{repo}/issues/{issue_number}/parent
+      access: read
+      description: "Get the parent issue of a sub-issue. Returns the full parent issue object, or 404 if the issue has no parent."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_sub_issues:
+      method: GET
+      path: /repos/{owner}/{repo}/issues/{issue_number}/sub_issues
+      access: read
+      description: "List the sub-issues of an issue, in their manual priority order. Returns full issue objects."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    add_sub_issue:
+      method: POST
+      path: /repos/{owner}/{repo}/issues/{issue_number}/sub_issues
+      access: write
+      description: "Add a sub-issue under a parent issue. sub_issue_id is the database id (the 'id' field of get_issue), NOT the issue_number. Set replace_parent=true to move a sub-issue that already belongs to a different parent."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        sub_issue_id: { type: integer, in: body, required: true }
+        replace_parent: { type: boolean, in: body }
+      pagination: none
+
+    remove_sub_issue:
+      method: DELETE
+      path: /repos/{owner}/{repo}/issues/{issue_number}/sub_issue
+      access: write
+      description: "Remove a sub-issue from its parent. Note the singular 'sub_issue' in the path. sub_issue_id is the database id, not the issue_number. Only the parent/child link is removed — the issue itself is not deleted."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        sub_issue_id: { type: integer, in: body, required: true }
+      pagination: none
+
+    reprioritize_sub_issue:
+      method: PATCH
+      path: /repos/{owner}/{repo}/issues/{issue_number}/sub_issues/priority
+      access: write
+      description: "Reorder a sub-issue within its parent's list. Provide after_id OR before_id (another sub-issue's database id) to position it — they are mutually exclusive. sub_issue_id is the database id of the sub-issue being moved."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        sub_issue_id: { type: integer, in: body, required: true }
+        after_id: { type: integer, in: body }
+        before_id: { type: integer, in: body }
+      pagination: none
+
+    # ── Issue Dependencies ────────────────────────────────────
+    #
+    # "blocked by" / "blocking" relationships between issues. Like
+    # sub-issues, the related issue is referenced by its database id
+    # (issue_id), NOT its issue_number.
+
+    list_issue_blocked_by:
+      method: GET
+      path: /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by
+      access: read
+      description: "List the issues that block the given issue (its 'blocked by' dependencies). Returns full issue objects."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    add_issue_blocked_by:
+      method: POST
+      path: /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by
+      access: write
+      description: "Mark issue_number as blocked by another issue. issue_id (body) is the database id (the 'id' field of get_issue) of the blocking issue, NOT its issue_number."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        issue_id: { type: integer, in: body, required: true }
+      pagination: none
+
+    remove_issue_blocked_by:
+      method: DELETE
+      path: /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by/{issue_id}
+      access: write
+      description: "Remove a 'blocked by' dependency. issue_id (path) is the database id of the blocking issue. Only the dependency link is removed; neither issue is deleted."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        issue_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_issue_blocking:
+      method: GET
+      path: /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocking
+      access: read
+      description: "List the issues that the given issue is blocking (the inverse of blocked_by). Returns full issue objects."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        issue_number: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    # ── Issue Types (Organization) ────────────────────────────
+    #
+    # Defined at the org level, then assigned to an issue via the
+    # `type` field (a string name) on create_issue / update_issue.
+    # Managing the definitions requires org admin.
+
+    list_issue_types:
+      method: GET
+      path: /orgs/{org}/issue-types
+      access: read
+      description: "List the issue types defined for an organization (id, name, description, color, is_enabled). Assign one to an issue via the `type` field of create_issue/update_issue."
+      params:
+        org: { type: string, in: path, required: true }
+      pagination: none
+
+    create_issue_type:
+      method: POST
+      path: /orgs/{org}/issue-types
+      access: admin
+      description: "Create a new issue type for an organization. color is one of gray, blue, green, yellow, orange, red, pink, purple (or null)."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        is_enabled: { type: boolean, in: body, required: true }
+        description: { type: string, in: body }
+        color: { type: string, in: body }
+      pagination: none
+
+    update_issue_type:
+      method: PUT
+      path: /orgs/{org}/issue-types/{issue_type_id}
+      access: admin
+      description: "Update an organization issue type. The API requires name and is_enabled even for partial edits — resend the current values for fields you are not changing."
+      params:
+        org: { type: string, in: path, required: true }
+        issue_type_id: { type: integer, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        is_enabled: { type: boolean, in: body, required: true }
+        description: { type: string, in: body }
+        color: { type: string, in: body }
+      pagination: none
+
+    delete_issue_type:
+      method: DELETE
+      path: /orgs/{org}/issue-types/{issue_type_id}
+      access: dangerous
+      description: "Delete an organization issue type. Any issues currently using it lose their type."
+      params:
+        org: { type: string, in: path, required: true }
+        issue_type_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── Repository Rulesets ───────────────────────────────────
+    #
+    # Modern replacement for branch protection: named policies with
+    # branch/tag/push targets and enforcement disabled|active|evaluate.
+    # `rules`, `bypass_actors` and `conditions` are structured —
+    # see create_repo_ruleset.
+
+    list_repo_rulesets:
+      method: GET
+      path: /repos/{owner}/{repo}/rulesets
+      access: read
+      description: "List the rulesets for a repository. includes_parents=true (default) also returns inherited org-level rulesets. targets filters by comma-separated target types (branch,tag,push)."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        includes_parents: { type: boolean, in: query, default: true }
+        targets: { type: string, in: query }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_repo_ruleset:
+      method: GET
+      path: /repos/{owner}/{repo}/rulesets/{ruleset_id}
+      access: read
+      description: "Get a single repository ruleset by id, including its full rules and conditions."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        ruleset_id: { type: integer, in: path, required: true }
+        includes_parents: { type: boolean, in: query, default: true }
+      pagination: none
+
+    create_repo_ruleset:
+      method: POST
+      path: /repos/{owner}/{repo}/rulesets
+      access: admin
+      description: >
+        Create a repository ruleset. enforcement is one of disabled, active,
+        evaluate. target is branch (default), tag, or push. rules is an array
+        of rule objects, each with a `type` (e.g. pull_request,
+        required_status_checks, required_signatures, non_fast_forward,
+        commit_message_pattern, required_linear_history) and an optional
+        `parameters` object. bypass_actors is an array of {actor_id,
+        actor_type (Team|Integration|RepositoryRole|OrganizationAdmin|DeployKey|User),
+        bypass_mode (always|pull_request)}. conditions is
+        {ref_name:{include:[...], exclude:[...]}}; refs use refs/heads/* or the
+        ~DEFAULT_BRANCH / ~ALL placeholders.
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        enforcement: { type: string, in: body, required: true }
+        target: { type: string, in: body, default: "branch" }
+        bypass_actors: { type: array, in: body }
+        conditions: { type: object, in: body }
+        rules: { type: array, in: body }
+      pagination: none
+
+    update_repo_ruleset:
+      method: PUT
+      path: /repos/{owner}/{repo}/rulesets/{ruleset_id}
+      access: admin
+      description: "Update a repository ruleset. Same writable fields as create_repo_ruleset; send only the fields you want to change (each provided field replaces its previous value)."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        ruleset_id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        enforcement: { type: string, in: body }
+        target: { type: string, in: body }
+        bypass_actors: { type: array, in: body }
+        conditions: { type: object, in: body }
+        rules: { type: array, in: body }
+      pagination: none
+
+    delete_repo_ruleset:
+      method: DELETE
+      path: /repos/{owner}/{repo}/rulesets/{ruleset_id}
+      access: dangerous
+      description: "Delete a repository ruleset. Removes the policy and its protections immediately."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        ruleset_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    get_branch_rules:
+      method: GET
+      path: /repos/{owner}/{repo}/rules/branches/{branch}
+      access: read
+      description: "Get the effective rules that apply to a branch, aggregated across all active rulesets (repo + inherited org). Each entry names the rule type and the ruleset it comes from."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        branch: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    list_repo_rule_suites:
+      method: GET
+      path: /repos/{owner}/{repo}/rulesets/rule-suites
+      access: read
+      description: "List rule evaluation runs (rule suites) for a repository — the audit log of ruleset enforcement. Filter by ref, time_period (hour|day|week|month), actor_name, rule_suite_result (pass|fail|bypass|all), evaluate_status (all|active|evaluate)."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        ref: { type: string, in: query }
+        time_period: { type: string, in: query, default: "day" }
+        actor_name: { type: string, in: query }
+        rule_suite_result: { type: string, in: query, default: "all" }
+        evaluate_status: { type: string, in: query, default: "all" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_repo_rule_suite:
+      method: GET
+      path: /repos/{owner}/{repo}/rulesets/rule-suites/{rule_suite_id}
+      access: read
+      description: "Get a single repository rule suite (one evaluation run), including the per-rule pass/fail/bypass results."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        rule_suite_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── Organization Rulesets ─────────────────────────────────
+    #
+    # Target repositories across the org. Beyond ref_name, org-level
+    # conditions can target by repository_name, repository_id, or
+    # repository_property (custom properties — see below). Requires
+    # org admin.
+
+    list_org_rulesets:
+      method: GET
+      path: /orgs/{org}/rulesets
+      access: read
+      description: "List all organization-level rulesets. targets filters by comma-separated target types (branch,tag,push,repository)."
+      params:
+        org: { type: string, in: path, required: true }
+        targets: { type: string, in: query }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_org_ruleset:
+      method: GET
+      path: /orgs/{org}/rulesets/{ruleset_id}
+      access: read
+      description: "Get a single organization ruleset by id, including rules and conditions."
+      params:
+        org: { type: string, in: path, required: true }
+        ruleset_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_org_ruleset:
+      method: POST
+      path: /orgs/{org}/rulesets
+      access: admin
+      description: >
+        Create an organization ruleset. enforcement is disabled|active|evaluate.
+        target is branch (default), tag, push, or repository. conditions may
+        target refs (ref_name) and repositories (repository_name:{include,exclude},
+        repository_id, or repository_property to match custom properties). rules
+        and bypass_actors have the same shape as repository rulesets — see
+        create_repo_ruleset.
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        enforcement: { type: string, in: body, required: true }
+        target: { type: string, in: body, default: "branch" }
+        bypass_actors: { type: array, in: body }
+        conditions: { type: object, in: body }
+        rules: { type: array, in: body }
+      pagination: none
+
+    update_org_ruleset:
+      method: PUT
+      path: /orgs/{org}/rulesets/{ruleset_id}
+      access: admin
+      description: "Update an organization ruleset. Same writable fields as create_org_ruleset; send only the fields you want to change."
+      params:
+        org: { type: string, in: path, required: true }
+        ruleset_id: { type: integer, in: path, required: true }
+        name: { type: string, in: body }
+        enforcement: { type: string, in: body }
+        target: { type: string, in: body }
+        bypass_actors: { type: array, in: body }
+        conditions: { type: object, in: body }
+        rules: { type: array, in: body }
+      pagination: none
+
+    delete_org_ruleset:
+      method: DELETE
+      path: /orgs/{org}/rulesets/{ruleset_id}
+      access: dangerous
+      description: "Delete an organization ruleset. Removes the policy from every targeted repository immediately."
+      params:
+        org: { type: string, in: path, required: true }
+        ruleset_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_org_rule_suites:
+      method: GET
+      path: /orgs/{org}/rulesets/rule-suites
+      access: read
+      description: "List rule evaluation runs (rule suites) across an organization's repositories — the org-wide enforcement audit log. Filter by repository_name, ref, time_period (hour|day|week|month), actor_name, rule_suite_result (pass|fail|bypass|all), evaluate_status (all|active|evaluate)."
+      params:
+        org: { type: string, in: path, required: true }
+        repository_name: { type: string, in: query }
+        ref: { type: string, in: query }
+        time_period: { type: string, in: query, default: "day" }
+        actor_name: { type: string, in: query }
+        rule_suite_result: { type: string, in: query, default: "all" }
+        evaluate_status: { type: string, in: query, default: "all" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_org_rule_suite:
+      method: GET
+      path: /orgs/{org}/rulesets/rule-suites/{rule_suite_id}
+      access: read
+      description: "Get a single organization rule suite (one evaluation run), including per-rule pass/fail/bypass results."
+      params:
+        org: { type: string, in: path, required: true }
+        rule_suite_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── Custom Properties ─────────────────────────────────────
+    #
+    # Org-defined metadata attached to repositories. The org owner
+    # defines the schema (property_name + value_type: string,
+    # single_select, multi_select, true_false), then values are set
+    # per repository. Org rulesets can target repos by these values
+    # via conditions.repository_property.
+
+    get_org_properties_schema:
+      method: GET
+      path: /orgs/{org}/properties/schema
+      access: read
+      description: "List all custom property definitions for an organization (property_name, value_type, required, allowed_values, default_value)."
+      params:
+        org: { type: string, in: path, required: true }
+      pagination: none
+
+    set_org_properties_schema:
+      method: PATCH
+      path: /orgs/{org}/properties/schema
+      access: admin
+      description: >
+        Create or update multiple custom property definitions in one call.
+        properties is an array of objects: {property_name (required), value_type
+        (string|single_select|multi_select|true_false, required), required (bool),
+        default_value, description, allowed_values, values_editable_by
+        (org_actors|org_and_repo_actors)}.
+      params:
+        org: { type: string, in: path, required: true }
+        properties: { type: array, in: body, required: true }
+      pagination: none
+
+    get_org_property:
+      method: GET
+      path: /orgs/{org}/properties/schema/{custom_property_name}
+      access: read
+      description: "Get a single custom property definition by name."
+      params:
+        org: { type: string, in: path, required: true }
+        custom_property_name: { type: string, in: path, required: true }
+      pagination: none
+
+    set_org_property:
+      method: PUT
+      path: /orgs/{org}/properties/schema/{custom_property_name}
+      access: admin
+      description: "Create or update a single custom property definition. value_type is string, single_select, multi_select, or true_false."
+      params:
+        org: { type: string, in: path, required: true }
+        custom_property_name: { type: string, in: path, required: true }
+        value_type: { type: string, in: body, required: true }
+        required: { type: boolean, in: body }
+        default_value: { type: string, in: body }
+        description: { type: string, in: body }
+        allowed_values: { type: array, in: body }
+        values_editable_by: { type: string, in: body }
+        require_explicit_values: { type: boolean, in: body }
+      pagination: none
+
+    remove_org_property:
+      method: DELETE
+      path: /orgs/{org}/properties/schema/{custom_property_name}
+      access: dangerous
+      description: "Remove a custom property definition from an organization. Also clears that property's values on all repositories."
+      params:
+        org: { type: string, in: path, required: true }
+        custom_property_name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_org_property_values:
+      method: GET
+      path: /orgs/{org}/properties/values
+      access: read
+      description: "List custom property values assigned to repositories across the org. repository_query filters repos using GitHub search syntax."
+      params:
+        org: { type: string, in: path, required: true }
+        repository_query: { type: string, in: query }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    set_org_property_values:
+      method: PATCH
+      path: /orgs/{org}/properties/values
+      access: write
+      description: >
+        Assign custom property values to a list of repositories in one call.
+        repository_names is an array of repo names (max 30 per call). properties
+        is an array of {property_name, value} — value is a string, an array
+        (multi_select), or null to clear.
+      params:
+        org: { type: string, in: path, required: true }
+        repository_names: { type: array, in: body, required: true }
+        properties: { type: array, in: body, required: true }
+      pagination: none
+
+    get_repo_property_values:
+      method: GET
+      path: /repos/{owner}/{repo}/properties/values
+      access: read
+      description: "Get all custom property values set on a single repository. Returns an array of {property_name, value}."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+
+    set_repo_property_values:
+      method: PATCH
+      path: /repos/{owner}/{repo}/properties/values
+      access: write
+      description: "Create or update custom property values on a single repository. properties is an array of {property_name, value}; value=null removes the property from the repo."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        properties: { type: array, in: body, required: true }
+      pagination: none
+
+    # ── Traffic ───────────────────────────────────────────────
+    #
+    # Rolling 14-day analytics. All four endpoints require push
+    # (write) access even though they only read. Counts come as total
+    # and "uniques" (de-duplicated by actor).
+
+    get_traffic_views:
+      method: GET
+      path: /repos/{owner}/{repo}/traffic/views
+      access: read
+      description: "Get page-view counts for the last 14 days. per is 'day' (default) or 'week'. Returns total count, uniques, and a per-period breakdown. Requires push access."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        per: { type: string, in: query, default: "day" }
+      pagination: none
+
+    get_traffic_clones:
+      method: GET
+      path: /repos/{owner}/{repo}/traffic/clones
+      access: read
+      description: "Get git clone counts for the last 14 days. per is 'day' (default) or 'week'. Returns total count, uniques, and a per-period breakdown. Requires push access."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        per: { type: string, in: query, default: "day" }
+      pagination: none
+
+    list_traffic_paths:
+      method: GET
+      path: /repos/{owner}/{repo}/traffic/popular/paths
+      access: read
+      description: "Get the top 10 most-visited content paths over the last 14 days (path, title, count, uniques). Requires push access."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+
+    list_traffic_referrers:
+      method: GET
+      path: /repos/{owner}/{repo}/traffic/popular/referrers
+      access: read
+      description: "Get the top 10 referrer sources over the last 14 days (referrer, count, uniques). Requires push access."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Repository Statistics ─────────────────────────────────
+    #
+    # Expensive aggregates GitHub computes asynchronously. On a cold
+    # cache the first request returns 202 Accepted (empty body) while
+    # a background job runs; it must be retried until it returns 200.
+    # The errors override below adds 202 to retry_on so ToolMesh
+    # re-requests automatically. All timestamps are Unix epoch
+    # SECONDS; weekly buckets start on Sunday.
+
+    get_stats_contributors:
+      method: GET
+      path: /repos/{owner}/{repo}/stats/contributors
+      access: read
+      description: "Per-contributor commit stats: total commits plus weekly added/deleted/commits buckets (w = week start, epoch seconds). Returns 202 on a cold cache — retried automatically."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+      errors: &stats-errors
+        format: json
+        message_path: "$.message"
+        retry_on: [202, 429, 502, 503]
+        terminal: [400, 401, 403, 404, 409, 422]
+        retry_strategy:
+          max_retries: 5
+          backoff: exponential
+          initial_delay: 2s
+
+    get_stats_commit_activity:
+      method: GET
+      path: /repos/{owner}/{repo}/stats/commit_activity
+      access: read
+      description: "Last 52 weeks of commit activity: per week {total, week (epoch seconds), days[7] from Sun..Sat}. Returns 202 on a cold cache — retried automatically."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+      errors: *stats-errors
+
+    get_stats_code_frequency:
+      method: GET
+      path: /repos/{owner}/{repo}/stats/code_frequency
+      access: read
+      description: "Weekly additions/deletions as an array of [week (epoch seconds), additions, deletions (negative)]. Returns 202 on a cold cache — retried automatically."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+      errors: *stats-errors
+
+    get_stats_participation:
+      method: GET
+      path: /repos/{owner}/{repo}/stats/participation
+      access: read
+      description: "Last 52 weeks of commit counts as {all:[...], owner:[...]} (oldest first). Returns 200 with data; may briefly return 202 on a cold cache."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+      errors: *stats-errors
+
+    get_stats_punch_card:
+      method: GET
+      path: /repos/{owner}/{repo}/stats/punch_card
+      access: read
+      description: "Commit counts per weekday/hour as an array of [day (0=Sun..6=Sat), hour (0-23), commits]. Returns 200 with data; may briefly return 202 on a cold cache."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+      errors: *stats-errors
