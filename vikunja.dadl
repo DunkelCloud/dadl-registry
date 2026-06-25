@@ -237,7 +237,7 @@ backend:
       params:
         project_id: { type: integer, in: path, required: true }
         title: { type: string, in: body, required: true }
-        description: { type: string, in: body }
+        description: { type: string, in: body, description: "HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <h2>, <ul><li>, <pre><code>, <strong>, <a>, <br>. Raw Markdown is rendered as one collapsed line." }
         done: { type: boolean, in: body }
         priority: { type: integer, in: body }
         due_date: { type: string, in: body }
@@ -255,7 +255,7 @@ backend:
       params:
         id: { type: integer, in: path, required: true }
         title: { type: string, in: body }
-        description: { type: string, in: body }
+        description: { type: string, in: body, description: "HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <h2>, <ul><li>, <pre><code>, <strong>, <a>, <br>. Raw Markdown is rendered as one collapsed line." }
         done: { type: boolean, in: body }
         priority: { type: integer, in: body }
         due_date: { type: string, in: body }
@@ -318,7 +318,7 @@ backend:
         6-digit hex string without a leading '#'.
       params:
         title: { type: string, in: body, required: true }
-        description: { type: string, in: body }
+        description: { type: string, in: body, description: "HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <ul><li>, <strong>, <a>, <br>. Raw Markdown is rendered as one collapsed line." }
         hex_color: { type: string, in: body }
         identifier: { type: string, in: body }
         parent_project_id: { type: integer, in: body }
@@ -334,7 +334,7 @@ backend:
       params:
         id: { type: integer, in: path, required: true }
         title: { type: string, in: body }
-        description: { type: string, in: body }
+        description: { type: string, in: body, description: "HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <ul><li>, <strong>, <a>, <br>. Raw Markdown is rendered as one collapsed line." }
         hex_color: { type: string, in: body }
         identifier: { type: string, in: body }
         parent_project_id: { type: integer, in: body }
@@ -436,7 +436,7 @@ backend:
       description: "Add a comment to a task."
       params:
         task_id: { type: integer, in: path, required: true }
-        comment: { type: string, in: body, required: true }
+        comment: { type: string, in: body, required: true, description: "Comment body as HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <ul><li>, <strong>, <a>, <br>." }
       pagination: none
 
   examples:
@@ -475,7 +475,7 @@ backend:
           description: "New title"
         description:
           type: string
-          description: "New description"
+          description: "New description as HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <h2>, <ul><li>, <pre><code>, <strong>, <a>, <br>. Raw Markdown is rendered as one collapsed line."
         done:
           type: boolean
           description: "Mark as done/undone"
@@ -519,7 +519,7 @@ backend:
           description: "New title"
         description:
           type: string
-          description: "New description"
+          description: "New description as HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <ul><li>, <strong>, <a>, <br>. Raw Markdown is rendered as one collapsed line."
         hex_color:
           type: string
           description: "Hex color (6 digits, no leading #)"
