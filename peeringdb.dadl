@@ -1,0 +1,1725 @@
+# peeringdb.dadl -- PeeringDB REST API (v2) for ToolMesh
+# PeeringDB is the public, freely-editable database of networks (ASNs), Internet
+# Exchanges (IXes) and colocation facilities used to coordinate peering worldwide.
+#
+# Domain Notes for LLM consumers:
+# - Authentication: PeeringDB uses API keys sent as "Authorization: Api-Key <key>".
+#   Read access works ANONYMOUSLY (lower, shared rate limits); a key raises limits
+#   and is REQUIRED for any create/update/delete and for non-public contact data.
+# - Response envelope: every response is {"meta": {...}, "data": [...]}. The actual
+#   object(s) are ALWAYS in the "data" array -- even a single-object GET returns a
+#   one-element array. Errors put a human message in meta.error.
+# - Object identity: every object has a numeric "id". Networks are additionally
+#   keyed by a globally-unique "asn" (integer, no "AS" prefix, e.g. 13335).
+# - Object tags ARE the endpoints. Primary records: org (organization),
+#   fac (facility/datacenter), net (network), ix (internet exchange),
+#   carrier, campus. Contacts: poc (point of contact). Relationship records:
+#   netixlan (a network's presence on an IX LAN -- the core "who peers where"),
+#   netfac (a network present in a facility), ixfac (an IX present in a facility),
+#   carrierfac (a carrier present in a facility), ixlan (an IX's peering LAN),
+#   ixpfx (an IP prefix announced on an IX LAN).
+# - Filtering: pass any field as ?field=value. Numeric fields accept the suffixes
+#   __lt __lte __gt __gte __in ; string fields accept __contains __startswith __in
+#   (all string matching is case-insensitive). Sets use comma lists, e.g.
+#   ?asn__in=13335,15169 or ?name__contains=google.
+# - depth (0|1|2): expand nested "*_set" relationship fields. 0 = flat (default),
+#   1 = expand sets to a list of IDs, 2 = expand sets to full objects. Any field
+#   ending in "_set" is a relation list (EXCEPT irr_as_set, which is a plain string).
+#   IMPORTANT: any query with depth > 0 is capped at 250 rows (excess is truncated) --
+#   narrow the filter or page through results.
+# - since=<unix-epoch-SECONDS>: incremental sync; returns objects updated since then.
+#   This result INCLUDES deleted objects -- detect them via status == "deleted".
+# - Pagination: two styles. (a) page + per_page (default per_page 250) returns a
+#   meta.pagination block with has_next / next / total_pages. (b) skip + limit.
+# - Caching: a request that does NOT filter (depth-only or bare list) is served from
+#   a cache refreshed ~every 15 min; spot it via meta.generated (epoch). Filtered /
+#   id-based queries are always live.
+# - Pending approval: newly created org, fac, net, ix (and the ixlan/ixpfx of a new
+#   ix) are flagged status == "pending" until PeeringDB staff approve them. Creating
+#   an org is restricted to PeeringDB staff.
+# - Permissions: writing an object requires create/update rights on one of its parent
+#   organizations; an API key's permissions bound what it can read or change.
+# - Timestamps "created"/"updated" are ISO 8601 strings; "since" uses epoch seconds.
+# - Updates use HTTP PUT and accept a PARTIAL set of writable fields (equivalent to
+#   the API's PATCH partial_update) -- send only the fields you want to change.
+# - netixlan: ipaddr4 / ipaddr6 are the network's peering IPs on the exchange LAN;
+#   speed is the port speed in Mbit/s; is_rs_peer marks route-server peering.
+# - ixpfx: prefix is a CIDR (e.g. 80.81.192.0/21); protocol is "IPv4" or "IPv6".
+# - Error format: lookup/permission/query errors and most 4xx come back as
+#   {"data": [], "meta": {"error": "<message>"}} (surfaced as the tool error).
+#   EXCEPTION: create/update VALIDATION failures (HTTP 400) return DRF field-keyed
+#   errors, e.g. {"ipaddr4": ["..."], "asn": ["..."]}, WITHOUT a meta.error key --
+#   so they may surface only as "HTTP 400: Bad Request". On a 400, re-check required
+#   fields, value formats, and referenced IDs: ipaddr4/ipaddr6 must fall inside an
+#   ixpfx of the target ixlan and be unique on that LAN; asn must match the net's
+#   asn; each parent *_id must exist and you must be permissioned on its org.
+# - Logos are managed via the asset endpoints (asset_type "logo"); file_data is a
+#   base64-encoded image/png or image/jpeg.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "PeeringDB API"
+source_url: "https://www.peeringdb.com/apidocs/"
+date: "2026-06-25"
+
+# ---------------------------------------------------------------------------
+# Reusable single-parameter anchors (underscore key -> ignored by ToolMesh).
+# Aliased into tools below; avoids YAML merge keys (forbidden by registry CI).
+# ---------------------------------------------------------------------------
+_anchors:
+  params:
+    depth:     &p_depth     { type: integer, in: query, description: "Expand *_set relations: 0=flat (default), 1=expand to IDs, 2=expand to objects. depth>0 caps live results at 250 rows." }
+    since:     &p_since     { type: integer, in: query, description: "Unix epoch SECONDS. Return only objects updated since then; result INCLUDES deleted objects (status='deleted')." }
+    limit:     &p_limit     { type: integer, in: query, description: "Max rows to return (skip/limit paging)." }
+    skip:      &p_skip      { type: integer, in: query, description: "Row offset for skip/limit paging." }
+    page:      &p_page      { type: integer, in: query, description: "1-based page number (page/per_page paging); response carries meta.pagination." }
+    per_page:  &p_per_page  { type: integer, in: query, description: "Rows per page for page-based paging (default 250)." }
+    id:        &p_id        { type: integer, in: query, description: "Filter by exact object id." }
+    id_in:     &p_id_in     { type: string,  in: query, description: "Filter by a set of ids, comma-separated, e.g. '1,5,9'. (Sends id__in.)" }
+
+backend:
+  name: peeringdb
+  type: rest
+  version: "1.0"
+  base_url: "https://www.peeringdb.com/api"
+  description: "PeeringDB v2 API -- the public peering database of networks (ASNs), Internet Exchanges, and colocation facilities: full CRUD over net, ix, fac, org, carrier, campus, point-of-contact records, and the netixlan/netfac/ixfac/carrierfac/ixlan/ixpfx relationships that map who peers where"
+
+  auth:
+    # PeeringDB API key -> header "Authorization: Api-Key <key>".
+    # Expressed as bearer with a custom prefix (the apikey type has no prefix field).
+    # credential may be "none" for anonymous read-only use (lower rate limits).
+    type: bearer
+    credential: peeringdb_api_key
+    inject_into: header
+    header_name: Authorization
+    prefix: "Api-Key "
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    pagination:
+      strategy: page
+      request:
+        cursor_param: page
+        limit_param: per_page
+        limit_default: 250
+      response:
+        next_cursor: "$.meta.pagination.page"
+        has_more: "$.meta.pagination.has_next"
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      message_path: "$.meta.error"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      terminal: [400, 401, 403, 404, 409]
+      rate_limit:
+        retry_after_header: Retry-After
+    response:
+      result_path: "$.data"
+      metadata_path: "$.meta"
+      max_items: 250
+      allow_jq_override: true
+
+  coverage:
+    endpoints: 80
+    total_endpoints: 80
+    percentage: 100
+    focus: "PeeringDB v2 peering database: net, ix, fac, org records, net (ASN, IRR as-set, peering policy, info prefixes), ix (Internet exchanges, ixlan, ixpfx), fac (datacenter facilities, address, geolocation), org (organizations, poc contacts, members, logos), netixlan (peering presence, IPv4, IPv6, port speed)."
+    missing: "None of the documented /api endpoints are omitted. Per-field filter parameters are documented (suffix system) rather than enumerated exhaustively; HTTP PATCH partial_update is served by the PUT-based update tools."
+    last_reviewed: "2026-06-25"
+
+  setup:
+    credential_steps:
+      - "Create a free account at https://www.peeringdb.com and log in."
+      - "USER KEY: click your username (top-right) -> Profile, open the 'API Keys' panel (https://www.peeringdb.com/profile/api_keys)."
+      - "Click 'Add API Key', give it a label, and choose the scope: leave it a normal key to mirror your account's write permissions, or tick 'read-only' for safe read access across your namespaces."
+      - "Click 'Add Key' and COPY the key value immediately -- it is shown only once. If lost, revoke it and create a new one."
+      - "ORG KEY (for automation not tied to a person): go to the organization's admin panel -> 'API Keys', add a key with an associated email and per-namespace permissions."
+      - "Provide only the raw key value to ToolMesh -- it sends the 'Authorization: Api-Key <key>' header automatically."
+      - "For anonymous read-only access, set the credential to 'none' (subject to lower shared rate limits)."
+    env_var: CREDENTIAL_PEERINGDB_API_KEY
+    backends_yaml: |
+      - name: peeringdb
+        transport: rest
+        dadl: peeringdb.dadl
+        url: "https://www.peeringdb.com/api"
+    required_scopes:
+      - "Read-only API key -- list/retrieve all public objects"
+    optional_scopes:
+      - "Full (normal) API key -- create/update/delete records you are permissioned for"
+      - "Organization API key with per-namespace permissions -- unattended automation"
+    docs_url: "https://docs.peeringdb.com/howto/api_keys/"
+    notes: "base_url is the public hosted instance (https://www.peeringdb.com/api). Reads work without a key but share a lower anonymous rate limit; a key raises limits and is required for writes and for private/contact data. Prefer a read-only key unless you intend to modify records. Interactive API docs: https://www.peeringdb.com/apidocs/ -- raw schema: https://www.peeringdb.com/s/2.80.1/api-schema.yaml"
+
+  hints:
+    list_nets:
+      lookup_by_asn: "ASN is unique -- ?asn=13335 returns exactly one network. Use ?asn__in=13335,15169 for several."
+      filtering: "Common filters: asn, name, name__contains, org_id, info_type, info_scope, irr_as_set. Add depth=1 to also pull netixlan/netfac/poc set IDs."
+    create_net:
+      required: "org_id, name, asn. asn is effectively set-once -- it cannot be changed after creation."
+      pending: "New networks are status='pending' until PeeringDB staff approve them."
+    list_ixes:
+      filtering: "Filter by name, name__contains, org_id, city, country, region_continent. depth=2 expands ixlan_set/fac_set into objects."
+    create_ix:
+      required: "org_id, name, city, country, and prefix (the initial IX LAN IP prefix in CIDR notation that bootstraps the exchange's ixlan/ixpfx)."
+    list_facs:
+      filtering: "Filter by name, name__contains, org_id, city, country, state, clli, npanxx, region_continent."
+    list_netixlans:
+      purpose: "This is the peering table: each row is one network (asn) present on one IX LAN with its ipaddr4/ipaddr6 and port speed (Mbit/s)."
+      filtering: "Filter by net_id, ix_id, ixlan_id, asn, ipaddr4, ipaddr6, is_rs_peer, operational, speed."
+    create_netixlan:
+      required: "net_id, ixlan_id, asn (must match the net's ASN), speed. Supply ipaddr4 and/or ipaddr6 for the LAN IP(s)."
+    list_ixpfxs:
+      filtering: "Filter by ixlan_id, prefix, protocol (IPv4|IPv6), in_dfz."
+    create_poc:
+      required: "net_id and role. visible controls who can see the contact: Private, Users, or Public."
+    create_org:
+      restricted: "Creating organizations is limited to PeeringDB administrative staff; normal keys will be rejected."
+    request_ixf_import:
+      effect: "Queues an IX-F member-list import for the exchange (id). Requires the ixlan to have ixf_ixp_member_list_url set and ixf_ixp_import_enabled."
+    get_asset:
+      path: "ref_tag is one of org|fac|net|ix|carrier|campus; ref_id is that object's id; asset_type is 'logo'."
+
+  tools:
+
+    # =========================================================================
+    # Organizations (org) -- top-level holder entity for nets, ixes, facilities,
+    # carriers and campuses. Also: per-organization user/membership management.
+    # =========================================================================
+
+    list_orgs:
+      method: GET
+      path: /org
+      access: read
+      description: "List organizations. Filter by name/city/country; expand owned net/ix/fac/carrier/campus sets with depth."
+      params:
+        name: { type: string, in: query, description: "Exact org name (add __contains / __startswith for partial)." }
+        name__contains: { type: string, in: query, description: "Substring match on org name (case-insensitive)." }
+        aka: { type: string, in: query }
+        city: { type: string, in: query }
+        country: { type: string, in: query, description: "ISO 3166-1 alpha-2 country code, e.g. DE." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_org:
+      method: GET
+      path: /org/{id}
+      access: read
+      description: "Retrieve a single organization by id. Returns a one-element data array. Use depth=2 to expand its net_set/ix_set/fac_set/carrier_set/campus_set."
+      params:
+        id: { type: integer, in: path, required: true, description: "Organization id." }
+        depth: *p_depth
+      pagination: none
+
+    create_org:
+      method: POST
+      path: /org
+      access: admin
+      description: "Create an organization. RESTRICTED to PeeringDB staff -- normal API keys are rejected. New orgs are status='pending'."
+      params:
+        name: { type: string, in: body, required: true, description: "Organization name (unique)." }
+        aka: { type: string, in: body, description: "Also-known-as / alternate name." }
+        name_long: { type: string, in: body, description: "Full legal/long name." }
+        website: { type: string, in: body, description: "Organization website URL." }
+        social_media: { type: array, in: body, description: "Array of {service, identifier}, e.g. [{\"service\":\"website\",\"identifier\":\"https://example.net\"}]. service in: website,facebook,x,instagram,linkedin,tiktok,bluesky,threads,youtube,mastodon,whatsapp,wechat,telegram,snapchat,douyin,kuaishou,reddit,weibo,qq,pinterest." }
+        notes: { type: string, in: body, description: "Public notes (markdown)." }
+        address1: { type: string, in: body }
+        address2: { type: string, in: body }
+        city: { type: string, in: body }
+        country: { type: string, in: body, description: "ISO 3166-1 alpha-2 country code." }
+        state: { type: string, in: body }
+        zipcode: { type: string, in: body }
+        floor: { type: string, in: body }
+        suite: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_org:
+      method: PUT
+      path: /org/{id}
+      access: write
+      description: "Update an organization (partial -- send only changed fields). Same writable fields as create_org."
+      params:
+        id: { type: integer, in: path, required: true, description: "Organization id." }
+        name: { type: string, in: body }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body, description: "Array of {service, identifier} objects." }
+        notes: { type: string, in: body }
+        address1: { type: string, in: body }
+        address2: { type: string, in: body }
+        city: { type: string, in: body }
+        country: { type: string, in: body, description: "ISO 3166-1 alpha-2 country code." }
+        state: { type: string, in: body }
+        zipcode: { type: string, in: body }
+        floor: { type: string, in: body }
+        suite: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_org:
+      method: DELETE
+      path: /org/{id}
+      access: dangerous
+      description: "Soft-delete an organization (marks status='deleted'). Only empty orgs (no active children) can be deleted."
+      params:
+        id: { type: integer, in: path, required: true, description: "Organization id." }
+      pagination: none
+
+    list_org_users:
+      method: GET
+      path: /org/{org_id}/users/
+      access: read
+      description: "List the user accounts (members/admins) attached to an organization. Requires admin rights on the org."
+      params:
+        org_id: { type: integer, in: path, required: true, description: "Organization id." }
+        name: { type: string, in: query, description: "Filter by user name (add __contains)." }
+        email: { type: string, in: query, description: "Filter by email (add __contains)." }
+        role: { type: string, in: query, description: "admin or member." }
+        depth: *p_depth
+        page: *p_page
+        per_page: *p_per_page
+
+    add_org_user:
+      method: POST
+      path: /org/{org_id}/users/add/
+      access: admin
+      description: "Add an existing PeeringDB user to an organization with a role. Identify the user by user_id (preferred) or email. Org-admin operation."
+      params:
+        org_id: { type: integer, in: path, required: true, description: "Organization id." }
+        user_id: { type: integer, in: body, description: "PeeringDB user id of the account to add." }
+        email: { type: string, in: body, description: "Email of the account to add (alternative to user_id)." }
+        role: { type: string, in: body, description: "Membership role: 'admin' or 'member' (default member)." }
+      pagination: none
+
+    update_org_user:
+      method: PUT
+      path: /org/{org_id}/users/{user_id}/
+      access: admin
+      description: "Update an organization member's role (admin <-> member). Org-admin operation."
+      params:
+        org_id: { type: integer, in: path, required: true, description: "Organization id." }
+        user_id: { type: integer, in: path, required: true, description: "User id within the organization." }
+        role: { type: string, in: body, description: "Membership role: 'admin' or 'member'." }
+      pagination: none
+
+    remove_org_user:
+      method: DELETE
+      path: /org/{org_id}/users/remove/
+      access: admin
+      description: "Remove a user from an organization's membership (does not delete the user account). Org-admin operation."
+      params:
+        org_id: { type: integer, in: path, required: true, description: "Organization id." }
+        user_id: { type: integer, in: body, description: "User id to remove from the organization." }
+      pagination: none
+
+    # =========================================================================
+    # Facilities (fac) -- colocation / datacenter sites. Parent: org.
+    # Related: netfac, ixfac, carrierfac, campus.
+    # =========================================================================
+
+    list_facs:
+      method: GET
+      path: /fac
+      access: read
+      description: "List facilities (datacenters). Filter by name, org_id, city, country, state, clli, npanxx; expand netfac/ixfac sets with depth."
+      params:
+        name: { type: string, in: query }
+        name__contains: { type: string, in: query, description: "Substring match on facility name." }
+        org_id: { type: integer, in: query, description: "Filter by owning organization id." }
+        city: { type: string, in: query }
+        country: { type: string, in: query, description: "ISO 3166-1 alpha-2 country code." }
+        state: { type: string, in: query }
+        clli: { type: string, in: query, description: "CLLI code." }
+        npanxx: { type: string, in: query, description: "NPA-NXX code." }
+        region_continent: { type: string, in: query }
+        campus_id: { type: integer, in: query }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_fac:
+      method: GET
+      path: /fac/{id}
+      access: read
+      description: "Retrieve a single facility by id (one-element data array). depth=2 expands its net/ix presence sets."
+      params:
+        id: { type: integer, in: path, required: true, description: "Facility id." }
+        depth: *p_depth
+      pagination: none
+
+    create_fac:
+      method: POST
+      path: /fac
+      access: write
+      description: "Create a facility under an organization. New facilities are status='pending' until staff approval."
+      params:
+        org_id: { type: integer, in: body, required: true, description: "Owning organization id." }
+        name: { type: string, in: body, required: true, description: "Facility name (unique)." }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        campus_id: { type: integer, in: body, description: "Campus id this facility belongs to (optional)." }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body, description: "Array of {service, identifier} objects." }
+        clli: { type: string, in: body, description: "CLLI code." }
+        npanxx: { type: string, in: body, description: "NPA-NXX code." }
+        notes: { type: string, in: body, description: "Public notes (markdown)." }
+        sales_email: { type: string, in: body }
+        sales_phone: { type: string, in: body, description: "E.164 format, e.g. +1-206-555-0100." }
+        tech_email: { type: string, in: body }
+        tech_phone: { type: string, in: body, description: "E.164 format." }
+        property: { type: string, in: body, description: "Ownership: 'Owner' or 'Lessee'." }
+        diverse_serving_substations: { type: boolean, in: body, description: "Served by two or more electrical substations." }
+        available_voltage_services: { type: array, in: body, description: "Subset of: 'No Power','48 VDC','400 VAC','480 VAC'." }
+        status_dashboard: { type: string, in: body, description: "URL of the facility status dashboard." }
+        suggest: { type: boolean, in: body, description: "Submit as a suggested (unaffiliated) facility." }
+        address1: { type: string, in: body }
+        address2: { type: string, in: body }
+        city: { type: string, in: body }
+        country: { type: string, in: body, description: "ISO 3166-1 alpha-2 country code." }
+        state: { type: string, in: body }
+        zipcode: { type: string, in: body }
+        floor: { type: string, in: body }
+        suite: { type: string, in: body }
+        latitude: { type: number, in: body, description: "Decimal degrees (-90..90)." }
+        longitude: { type: number, in: body, description: "Decimal degrees (-180..180)." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_fac:
+      method: PUT
+      path: /fac/{id}
+      access: write
+      description: "Update a facility (partial). Same writable fields as create_fac."
+      params:
+        id: { type: integer, in: path, required: true, description: "Facility id." }
+        org_id: { type: integer, in: body }
+        name: { type: string, in: body }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        campus_id: { type: integer, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body }
+        clli: { type: string, in: body }
+        npanxx: { type: string, in: body }
+        notes: { type: string, in: body }
+        sales_email: { type: string, in: body }
+        sales_phone: { type: string, in: body }
+        tech_email: { type: string, in: body }
+        tech_phone: { type: string, in: body }
+        property: { type: string, in: body, description: "'Owner' or 'Lessee'." }
+        diverse_serving_substations: { type: boolean, in: body }
+        available_voltage_services: { type: array, in: body, description: "Subset of: 'No Power','48 VDC','400 VAC','480 VAC'." }
+        status_dashboard: { type: string, in: body }
+        address1: { type: string, in: body }
+        address2: { type: string, in: body }
+        city: { type: string, in: body }
+        country: { type: string, in: body, description: "ISO 3166-1 alpha-2 country code." }
+        state: { type: string, in: body }
+        zipcode: { type: string, in: body }
+        floor: { type: string, in: body }
+        suite: { type: string, in: body }
+        latitude: { type: number, in: body }
+        longitude: { type: number, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_fac:
+      method: DELETE
+      path: /fac/{id}
+      access: dangerous
+      description: "Soft-delete a facility (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "Facility id." }
+      pagination: none
+
+    # =========================================================================
+    # Networks (net) -- a network/ASN record. Parent: org.
+    # Related: netixlan (IX presence), netfac (facility presence), poc (contacts).
+    # =========================================================================
+
+    list_nets:
+      method: GET
+      path: /net
+      access: read
+      description: "List networks. ASN is unique: ?asn=13335 returns one network. Also filter by name, org_id, info_type, info_scope, irr_as_set; expand peering/facility/contact sets with depth."
+      params:
+        asn: { type: integer, in: query, description: "Autonomous System Number (unique). Use asn__in for several." }
+        asn__in: { type: string, in: query, description: "Comma-separated ASNs, e.g. '13335,15169'." }
+        name: { type: string, in: query }
+        name__contains: { type: string, in: query, description: "Substring match on network name." }
+        org_id: { type: integer, in: query, description: "Filter by owning organization id." }
+        irr_as_set: { type: string, in: query, description: "IRR AS-SET / route-set handle." }
+        info_type: { type: string, in: query, description: "Legacy single network type, e.g. 'Content', 'NSP', 'Cable/DSL/ISP'." }
+        info_scope: { type: string, in: query, description: "Geographic scope, e.g. 'Global', 'Regional', 'Europe'." }
+        city: { type: string, in: query }
+        country: { type: string, in: query }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_net:
+      method: GET
+      path: /net/{id}
+      access: read
+      description: "Retrieve a single network by its internal id (NOT the ASN; query list_nets?asn=... to look up by ASN). One-element data array. depth=2 expands netixlan_set/netfac_set/poc_set."
+      params:
+        id: { type: integer, in: path, required: true, description: "Network internal id (pdb id, not ASN)." }
+        depth: *p_depth
+      pagination: none
+
+    create_net:
+      method: POST
+      path: /net
+      access: write
+      description: "Create a network under an organization. Requires org_id, name and asn. New networks are status='pending' until staff approval. ASN is set-once."
+      params:
+        org_id: { type: integer, in: body, required: true, description: "Owning organization id." }
+        name: { type: string, in: body, required: true, description: "Network name (unique)." }
+        asn: { type: integer, in: body, required: true, description: "Autonomous System Number (integer, no 'AS' prefix). Cannot be changed later." }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body, description: "Array of {service, identifier} objects." }
+        looking_glass: { type: string, in: body, description: "Looking-glass URL." }
+        route_server: { type: string, in: body, description: "Route-server URL." }
+        irr_as_set: { type: string, in: body, description: "IRR AS-SET / route-set, e.g. 'AS-EXAMPLE' or 'RIPE::AS-EXAMPLE'." }
+        info_type: { type: string, in: body, description: "DEPRECATED single type; prefer info_types. One of: NSP, Content, Cable/DSL/ISP, Enterprise, Educational/Research, Non-Profit, Route Server, Network Services, Route Collector, Government." }
+        info_types: { type: array, in: body, description: "Network types (multi). Subset of: NSP, Content, Cable/DSL/ISP, Enterprise, Educational/Research, Non-Profit, Route Server, Network Services, Route Collector, Government." }
+        info_prefixes4: { type: integer, in: body, description: "Self-reported count of announced IPv4 prefixes." }
+        info_prefixes6: { type: integer, in: body, description: "Self-reported count of announced IPv6 prefixes." }
+        info_traffic: { type: string, in: body, description: "Traffic level bucket, e.g. '1-5Gbps','100-200Gbps','1-5Tbps','100+Tbps' (or '')." }
+        info_ratio: { type: string, in: body, description: "Traffic ratio: 'Not Disclosed','Heavy Outbound','Mostly Outbound','Balanced','Mostly Inbound','Heavy Inbound'." }
+        info_scope: { type: string, in: body, description: "Geographic scope: 'Regional','North America','Asia Pacific','Europe','South America','Africa','Australia','Middle East','Global','Not Disclosed'." }
+        info_unicast: { type: boolean, in: body, description: "Supports unicast IPv4." }
+        info_multicast: { type: boolean, in: body, description: "Supports multicast." }
+        info_ipv6: { type: boolean, in: body, description: "Supports IPv6." }
+        info_never_via_route_servers: { type: boolean, in: body, description: "Network never peers via route servers." }
+        notes: { type: string, in: body, description: "Public notes (markdown)." }
+        policy_url: { type: string, in: body, description: "Peering policy URL." }
+        policy_general: { type: string, in: body, description: "General peering policy: 'Open','Selective','Restrictive','No'." }
+        policy_locations: { type: string, in: body, description: "Multiple/Required-locations policy, e.g. 'Not Required','Preferred','Required - US','Required - EU','Required - International'." }
+        policy_ratio: { type: boolean, in: body, description: "Whether a traffic ratio requirement applies." }
+        policy_contracts: { type: string, in: body, description: "Contract requirement: 'Not Required','Private Only','Required'." }
+        allow_ixp_update: { type: boolean, in: body, description: "Allow IXPs to update this network's netixlan entries via IX-F import." }
+        ixp_update_exclude: { type: object, in: body, description: "IX-F import exclusion rules object." }
+        ixp_update_exclude_speed: { type: boolean, in: body }
+        ixp_update_exclude_is_rs_peer: { type: boolean, in: body }
+        ixp_update_exclude_operational: { type: boolean, in: body }
+        status_dashboard: { type: string, in: body, description: "Network status dashboard URL." }
+        suggest: { type: boolean, in: body, description: "Submit as a suggested network." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_net:
+      method: PUT
+      path: /net/{id}
+      access: write
+      description: "Update a network (partial). Same writable fields as create_net. Note: asn cannot be changed after creation."
+      params:
+        id: { type: integer, in: path, required: true, description: "Network internal id." }
+        org_id: { type: integer, in: body }
+        name: { type: string, in: body }
+        asn: { type: integer, in: body, description: "Set-once; sending a different value will be rejected." }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body }
+        looking_glass: { type: string, in: body }
+        route_server: { type: string, in: body }
+        irr_as_set: { type: string, in: body }
+        info_type: { type: string, in: body, description: "DEPRECATED; prefer info_types." }
+        info_types: { type: array, in: body, description: "Network types (multi)." }
+        info_prefixes4: { type: integer, in: body }
+        info_prefixes6: { type: integer, in: body }
+        info_traffic: { type: string, in: body }
+        info_ratio: { type: string, in: body }
+        info_scope: { type: string, in: body }
+        info_unicast: { type: boolean, in: body }
+        info_multicast: { type: boolean, in: body }
+        info_ipv6: { type: boolean, in: body }
+        info_never_via_route_servers: { type: boolean, in: body }
+        notes: { type: string, in: body }
+        policy_url: { type: string, in: body }
+        policy_general: { type: string, in: body, description: "'Open','Selective','Restrictive','No'." }
+        policy_locations: { type: string, in: body }
+        policy_ratio: { type: boolean, in: body }
+        policy_contracts: { type: string, in: body, description: "'Not Required','Private Only','Required'." }
+        allow_ixp_update: { type: boolean, in: body }
+        ixp_update_exclude: { type: object, in: body }
+        ixp_update_exclude_speed: { type: boolean, in: body }
+        ixp_update_exclude_is_rs_peer: { type: boolean, in: body }
+        ixp_update_exclude_operational: { type: boolean, in: body }
+        status_dashboard: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_net:
+      method: DELETE
+      path: /net/{id}
+      access: dangerous
+      description: "Soft-delete a network (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "Network internal id." }
+      pagination: none
+
+    # =========================================================================
+    # Internet Exchanges (ix) -- an IXP record. Parent: org.
+    # Related: ixlan (peering LAN), ixfac (facility presence).
+    # =========================================================================
+
+    list_ixes:
+      method: GET
+      path: /ix
+      access: read
+      description: "List Internet Exchanges. Filter by name, org_id, city, country, region_continent; expand ixlan_set/fac_set with depth."
+      params:
+        name: { type: string, in: query }
+        name__contains: { type: string, in: query, description: "Substring match on exchange name." }
+        org_id: { type: integer, in: query }
+        city: { type: string, in: query }
+        country: { type: string, in: query, description: "ISO 3166-1 alpha-2 country code." }
+        region_continent: { type: string, in: query, description: "e.g. 'Europe','North America','Asia Pacific'." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_ix:
+      method: GET
+      path: /ix/{id}
+      access: read
+      description: "Retrieve a single Internet Exchange by id (one-element data array). depth=2 expands ixlan_set and fac_set."
+      params:
+        id: { type: integer, in: path, required: true, description: "Internet Exchange id." }
+        depth: *p_depth
+      pagination: none
+
+    create_ix:
+      method: POST
+      path: /ix
+      access: write
+      description: "Create an Internet Exchange. Requires org_id, name, city, country and prefix (the initial IX LAN CIDR, which bootstraps an ixlan + ixpfx). New IXes are status='pending'."
+      params:
+        org_id: { type: integer, in: body, required: true, description: "Owning organization id." }
+        name: { type: string, in: body, required: true, description: "Exchange name (unique)." }
+        city: { type: string, in: body, required: true }
+        country: { type: string, in: body, required: true, description: "ISO 3166-1 alpha-2 country code." }
+        prefix: { type: string, in: body, required: true, description: "Initial peering LAN prefix in CIDR notation (e.g. 80.81.192.0/21) used to create the exchange's ixlan/ixpfx." }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        region_continent: { type: string, in: body, description: "e.g. 'Europe','North America'." }
+        notes: { type: string, in: body, description: "Public notes (markdown)." }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body, description: "Array of {service, identifier} objects." }
+        url_stats: { type: string, in: body, description: "Traffic statistics URL." }
+        tech_email: { type: string, in: body }
+        tech_phone: { type: string, in: body, description: "E.164 format." }
+        policy_email: { type: string, in: body }
+        policy_phone: { type: string, in: body, description: "E.164 format." }
+        sales_email: { type: string, in: body }
+        sales_phone: { type: string, in: body, description: "E.164 format." }
+        ixf_ixp_member_list_url: { type: string, in: body, description: "URL of the IX-F member export (JSON)." }
+        service_level: { type: string, in: body, description: "'Not Disclosed','Best Effort (no SLA)','Normal Business Hours','24/7 Support'." }
+        terms: { type: string, in: body, description: "'Not Disclosed','No Commercial Terms','Bundled With Other Services','Non-recurring Fees Only','Recurring Fees'." }
+        status_dashboard: { type: string, in: body, description: "Exchange status dashboard URL." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_ix:
+      method: PUT
+      path: /ix/{id}
+      access: write
+      description: "Update an Internet Exchange (partial). Same writable fields as create_ix (the 'prefix' field only applies at creation)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Internet Exchange id." }
+        org_id: { type: integer, in: body }
+        name: { type: string, in: body }
+        city: { type: string, in: body }
+        country: { type: string, in: body, description: "ISO 3166-1 alpha-2 country code." }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        region_continent: { type: string, in: body }
+        notes: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body }
+        url_stats: { type: string, in: body }
+        tech_email: { type: string, in: body }
+        tech_phone: { type: string, in: body }
+        policy_email: { type: string, in: body }
+        policy_phone: { type: string, in: body }
+        sales_email: { type: string, in: body }
+        sales_phone: { type: string, in: body }
+        ixf_ixp_member_list_url: { type: string, in: body }
+        ixf_import_request_status: { type: string, in: body, description: "Status of a pending IX-F import request." }
+        service_level: { type: string, in: body }
+        terms: { type: string, in: body }
+        status_dashboard: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_ix:
+      method: DELETE
+      path: /ix/{id}
+      access: dangerous
+      description: "Soft-delete an Internet Exchange (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "Internet Exchange id." }
+      pagination: none
+
+    request_ixf_import:
+      method: POST
+      path: /ix/{id}/request_ixf_import
+      access: write
+      description: "Queue an IX-F member-list import for an exchange. Requires the exchange's ixlan to have ixf_ixp_member_list_url set and import enabled."
+      params:
+        id: { type: integer, in: path, required: true, description: "Internet Exchange id." }
+      pagination: none
+
+    # =========================================================================
+    # IX LANs (ixlan) -- the peering LAN(s) of an exchange. Created/removed with
+    # the parent ix; only list / retrieve / update are exposed.
+    # =========================================================================
+
+    list_ixlans:
+      method: GET
+      path: /ixlan
+      access: read
+      description: "List IX LANs. Filter by ix_id; expand ixpfx_set/net_set with depth."
+      params:
+        ix_id: { type: integer, in: query, description: "Filter by parent Internet Exchange id." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_ixlan:
+      method: GET
+      path: /ixlan/{id}
+      access: read
+      description: "Retrieve a single IX LAN by id (one-element data array). depth=2 expands ixpfx_set and net_set."
+      params:
+        id: { type: integer, in: path, required: true, description: "IX LAN id." }
+        depth: *p_depth
+      pagination: none
+
+    update_ixlan:
+      method: PUT
+      path: /ixlan/{id}
+      access: write
+      description: "Update an IX LAN (partial). IX LANs are created/deleted together with their parent exchange, so only update is available."
+      params:
+        id: { type: integer, in: path, required: true, description: "IX LAN id." }
+        name: { type: string, in: body, description: "LAN name." }
+        descr: { type: string, in: body, description: "LAN description." }
+        mtu: { type: integer, in: body, description: "MTU, e.g. 1500 or 9000." }
+        rs_asn: { type: integer, in: body, description: "Route-server ASN for this LAN." }
+        arp_sponge: { type: string, in: body, description: "ARP-sponge MAC address." }
+        ixf_ixp_member_list_url: { type: string, in: body, description: "IX-F member export URL." }
+        ixf_ixp_member_list_url_visible: { type: string, in: body, description: "Visibility of the IX-F URL: 'Private','Users','Public'." }
+        ixf_ixp_import_enabled: { type: boolean, in: body, description: "Enable automatic IX-F member-list import." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # =========================================================================
+    # IX Prefixes (ixpfx) -- an IP prefix announced on an IX LAN. Parent: ixlan.
+    # =========================================================================
+
+    list_ixpfxs:
+      method: GET
+      path: /ixpfx
+      access: read
+      description: "List IX LAN prefixes. Filter by ixlan_id, prefix, protocol (IPv4|IPv6), in_dfz."
+      params:
+        ixlan_id: { type: integer, in: query, description: "Filter by parent IX LAN id." }
+        prefix: { type: string, in: query, description: "CIDR prefix, e.g. 80.81.192.0/21." }
+        protocol: { type: string, in: query, description: "'IPv4' or 'IPv6'." }
+        in_dfz: { type: boolean, in: query, description: "Whether the prefix is in the default-free zone." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_ixpfx:
+      method: GET
+      path: /ixpfx/{id}
+      access: read
+      description: "Retrieve a single IX LAN prefix by id (one-element data array)."
+      params:
+        id: { type: integer, in: path, required: true, description: "IX prefix id." }
+        depth: *p_depth
+      pagination: none
+
+    create_ixpfx:
+      method: POST
+      path: /ixpfx
+      access: write
+      description: "Add an IP prefix to an IX LAN. Requires ixlan_id, protocol and prefix (CIDR)."
+      params:
+        ixlan_id: { type: integer, in: body, required: true, description: "Parent IX LAN id." }
+        protocol: { type: string, in: body, required: true, description: "'IPv4' or 'IPv6'." }
+        prefix: { type: string, in: body, required: true, description: "CIDR prefix, e.g. 80.81.192.0/21 or 2001:7f8:1::/64." }
+        in_dfz: { type: boolean, in: body, description: "Prefix is in the default-free zone (default true)." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_ixpfx:
+      method: PUT
+      path: /ixpfx/{id}
+      access: write
+      description: "Update an IX LAN prefix (partial). Same writable fields as create_ixpfx."
+      params:
+        id: { type: integer, in: path, required: true, description: "IX prefix id." }
+        ixlan_id: { type: integer, in: body }
+        protocol: { type: string, in: body, description: "'IPv4' or 'IPv6'." }
+        prefix: { type: string, in: body, description: "CIDR prefix." }
+        in_dfz: { type: boolean, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_ixpfx:
+      method: DELETE
+      path: /ixpfx/{id}
+      access: dangerous
+      description: "Soft-delete an IX LAN prefix (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "IX prefix id." }
+      pagination: none
+
+    # =========================================================================
+    # IX <-> Facility presence (ixfac) -- links an exchange to a facility.
+    # =========================================================================
+
+    list_ixfacs:
+      method: GET
+      path: /ixfac
+      access: read
+      description: "List IX-facility presences (an exchange present at a facility). Filter by ix_id, fac_id."
+      params:
+        ix_id: { type: integer, in: query, description: "Filter by Internet Exchange id." }
+        fac_id: { type: integer, in: query, description: "Filter by facility id." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_ixfac:
+      method: GET
+      path: /ixfac/{id}
+      access: read
+      description: "Retrieve a single IX-facility presence by id (one-element data array)."
+      params:
+        id: { type: integer, in: path, required: true, description: "ixfac id." }
+        depth: *p_depth
+      pagination: none
+
+    create_ixfac:
+      method: POST
+      path: /ixfac
+      access: write
+      description: "Record that an Internet Exchange is present at a facility. Requires ix_id and fac_id."
+      params:
+        ix_id: { type: integer, in: body, required: true, description: "Internet Exchange id." }
+        fac_id: { type: integer, in: body, required: true, description: "Facility id." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_ixfac:
+      method: PUT
+      path: /ixfac/{id}
+      access: write
+      description: "Update an IX-facility presence (partial). Repoints ix_id / fac_id."
+      params:
+        id: { type: integer, in: path, required: true, description: "ixfac id." }
+        ix_id: { type: integer, in: body }
+        fac_id: { type: integer, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_ixfac:
+      method: DELETE
+      path: /ixfac/{id}
+      access: dangerous
+      description: "Soft-delete an IX-facility presence (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "ixfac id." }
+      pagination: none
+
+    # =========================================================================
+    # Network <-> Facility presence (netfac) -- links a network to a facility.
+    # =========================================================================
+
+    list_netfacs:
+      method: GET
+      path: /netfac
+      access: read
+      description: "List network-facility presences (a network present at a facility). Filter by net_id, fac_id, local_asn."
+      params:
+        net_id: { type: integer, in: query, description: "Filter by network internal id." }
+        fac_id: { type: integer, in: query, description: "Filter by facility id." }
+        local_asn: { type: integer, in: query, description: "Filter by the network's ASN at the facility." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_netfac:
+      method: GET
+      path: /netfac/{id}
+      access: read
+      description: "Retrieve a single network-facility presence by id (one-element data array)."
+      params:
+        id: { type: integer, in: path, required: true, description: "netfac id." }
+        depth: *p_depth
+      pagination: none
+
+    create_netfac:
+      method: POST
+      path: /netfac
+      access: write
+      description: "Record that a network is present at a facility. Requires net_id and fac_id."
+      params:
+        net_id: { type: integer, in: body, required: true, description: "Network internal id." }
+        fac_id: { type: integer, in: body, required: true, description: "Facility id." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_netfac:
+      method: PUT
+      path: /netfac/{id}
+      access: write
+      description: "Update a network-facility presence (partial). Repoints net_id / fac_id."
+      params:
+        id: { type: integer, in: path, required: true, description: "netfac id." }
+        net_id: { type: integer, in: body }
+        fac_id: { type: integer, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_netfac:
+      method: DELETE
+      path: /netfac/{id}
+      access: dangerous
+      description: "Soft-delete a network-facility presence (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "netfac id." }
+      pagination: none
+
+    # =========================================================================
+    # Network <-> IX LAN presence (netixlan) -- the peering table: a network's
+    # presence (IPs + speed) on an IX LAN. This is the core "who peers where".
+    # =========================================================================
+
+    list_netixlans:
+      method: GET
+      path: /netixlan
+      access: read
+      description: "List peering presences: each row is a network (asn) on an IX LAN with its ipaddr4/ipaddr6 and port speed (Mbit/s). Filter by net_id, ix_id, ixlan_id, asn, ipaddr4, ipaddr6, is_rs_peer, operational, speed."
+      params:
+        net_id: { type: integer, in: query, description: "Filter by network internal id." }
+        ix_id: { type: integer, in: query, description: "Filter by Internet Exchange id." }
+        ixlan_id: { type: integer, in: query, description: "Filter by IX LAN id." }
+        asn: { type: integer, in: query, description: "Filter by the network's ASN." }
+        ipaddr4: { type: string, in: query, description: "IPv4 peering address." }
+        ipaddr6: { type: string, in: query, description: "IPv6 peering address." }
+        speed: { type: integer, in: query, description: "Port speed in Mbit/s (supports __gte/__lte)." }
+        is_rs_peer: { type: boolean, in: query, description: "Peers with the route server." }
+        operational: { type: boolean, in: query, description: "Connection is operational." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_netixlan:
+      method: GET
+      path: /netixlan/{id}
+      access: read
+      description: "Retrieve a single peering presence by id (one-element data array)."
+      params:
+        id: { type: integer, in: path, required: true, description: "netixlan id." }
+        depth: *p_depth
+      pagination: none
+
+    create_netixlan:
+      method: POST
+      path: /netixlan
+      access: write
+      description: "Add a network's peering presence on an IX LAN. Requires net_id, ixlan_id, asn (must match the net's ASN) and speed; supply ipaddr4 and/or ipaddr6."
+      params:
+        net_id: { type: integer, in: body, required: true, description: "Network internal id." }
+        ixlan_id: { type: integer, in: body, required: true, description: "IX LAN id to connect to." }
+        asn: { type: integer, in: body, required: true, description: "The network's ASN (must equal the net's asn)." }
+        speed: { type: integer, in: body, required: true, description: "Port speed in Mbit/s, e.g. 10000 for 10G." }
+        ipaddr4: { type: string, in: body, description: "IPv4 peering address on the LAN (must fall within an ixpfx)." }
+        ipaddr6: { type: string, in: body, description: "IPv6 peering address on the LAN (must fall within an ixpfx)." }
+        is_rs_peer: { type: boolean, in: body, description: "Peers with the route server." }
+        bfd_support: { type: boolean, in: body, description: "Supports BFD." }
+        operational: { type: boolean, in: body, description: "Connection is operational (default true)." }
+        notes: { type: string, in: body }
+        net_side_id: { type: integer, in: body, description: "Facility id of the network-side of the connection." }
+        ix_side_id: { type: integer, in: body, description: "Facility id of the IX-side of the connection." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_netixlan:
+      method: PUT
+      path: /netixlan/{id}
+      access: write
+      description: "Update a peering presence (partial). Same writable fields as create_netixlan."
+      params:
+        id: { type: integer, in: path, required: true, description: "netixlan id." }
+        net_id: { type: integer, in: body }
+        ixlan_id: { type: integer, in: body }
+        asn: { type: integer, in: body }
+        speed: { type: integer, in: body, description: "Port speed in Mbit/s." }
+        ipaddr4: { type: string, in: body }
+        ipaddr6: { type: string, in: body }
+        is_rs_peer: { type: boolean, in: body }
+        bfd_support: { type: boolean, in: body }
+        operational: { type: boolean, in: body }
+        notes: { type: string, in: body }
+        net_side_id: { type: integer, in: body }
+        ix_side_id: { type: integer, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_netixlan:
+      method: DELETE
+      path: /netixlan/{id}
+      access: dangerous
+      description: "Soft-delete a peering presence (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "netixlan id." }
+      pagination: none
+
+    set_netixlan_net_side:
+      method: POST
+      path: /netixlan/{id}/set-net-side
+      access: write
+      description: "Set the network-side facility of a peering presence (which facility the network's connection lands in). Requires fac_id."
+      params:
+        id: { type: integer, in: path, required: true, description: "netixlan id." }
+        fac_id: { type: integer, in: body, required: true, description: "Facility id for the network side." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    set_netixlan_ix_side:
+      method: POST
+      path: /netixlan/{id}/set-ix-side
+      access: write
+      description: "Set the IX-side facility of a peering presence (which facility the exchange's connection lands in). Requires fac_id."
+      params:
+        id: { type: integer, in: path, required: true, description: "netixlan id." }
+        fac_id: { type: integer, in: body, required: true, description: "Facility id for the IX side." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # =========================================================================
+    # Points of Contact (poc) -- contact records attached to a network.
+    # =========================================================================
+
+    list_pocs:
+      method: GET
+      path: /poc
+      access: read
+      description: "List network points of contact. Filter by net_id, role, name, email, phone. Private/Users-visibility contacts require an authorized key."
+      params:
+        net_id: { type: integer, in: query, description: "Filter by network internal id." }
+        role: { type: string, in: query, description: "Abuse, Maintenance, Policy, Technical, NOC, Public Relations, Sales." }
+        name: { type: string, in: query }
+        email: { type: string, in: query }
+        phone: { type: string, in: query }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_poc:
+      method: GET
+      path: /poc/{id}
+      access: read
+      description: "Retrieve a single point of contact by id (one-element data array)."
+      params:
+        id: { type: integer, in: path, required: true, description: "poc id." }
+        depth: *p_depth
+      pagination: none
+
+    create_poc:
+      method: POST
+      path: /poc
+      access: write
+      description: "Create a point of contact on a network. Requires net_id and role."
+      params:
+        net_id: { type: integer, in: body, required: true, description: "Network internal id this contact belongs to." }
+        role: { type: string, in: body, required: true, description: "Abuse, Maintenance, Policy, Technical, NOC, Public Relations, or Sales." }
+        visible: { type: string, in: body, description: "Visibility: 'Private','Users','Public' (default Public)." }
+        name: { type: string, in: body, description: "Contact name." }
+        phone: { type: string, in: body, description: "E.164 format, e.g. +1-206-555-0100." }
+        email: { type: string, in: body }
+        url: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_poc:
+      method: PUT
+      path: /poc/{id}
+      access: write
+      description: "Update a point of contact (partial). Same writable fields as create_poc."
+      params:
+        id: { type: integer, in: path, required: true, description: "poc id." }
+        net_id: { type: integer, in: body }
+        role: { type: string, in: body, description: "Abuse, Maintenance, Policy, Technical, NOC, Public Relations, Sales." }
+        visible: { type: string, in: body, description: "'Private','Users','Public'." }
+        name: { type: string, in: body }
+        phone: { type: string, in: body }
+        email: { type: string, in: body }
+        url: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_poc:
+      method: DELETE
+      path: /poc/{id}
+      access: dangerous
+      description: "Soft-delete a point of contact (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "poc id." }
+      pagination: none
+
+    # =========================================================================
+    # Carriers (carrier) -- carrier/transport-provider records. Parent: org.
+    # Related: carrierfac (facility presence).
+    # =========================================================================
+
+    list_carriers:
+      method: GET
+      path: /carrier
+      access: read
+      description: "List carriers. Filter by name, org_id; expand carrierfac_set with depth."
+      params:
+        name: { type: string, in: query }
+        name__contains: { type: string, in: query, description: "Substring match on carrier name." }
+        org_id: { type: integer, in: query }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_carrier:
+      method: GET
+      path: /carrier/{id}
+      access: read
+      description: "Retrieve a single carrier by id (one-element data array). depth=2 expands carrierfac_set."
+      params:
+        id: { type: integer, in: path, required: true, description: "Carrier id." }
+        depth: *p_depth
+      pagination: none
+
+    create_carrier:
+      method: POST
+      path: /carrier
+      access: write
+      description: "Create a carrier under an organization. Requires org_id and name."
+      params:
+        org_id: { type: integer, in: body, required: true, description: "Owning organization id." }
+        name: { type: string, in: body, required: true, description: "Carrier name (unique)." }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body, description: "Array of {service, identifier} objects." }
+        notes: { type: string, in: body, description: "Public notes (markdown)." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_carrier:
+      method: PUT
+      path: /carrier/{id}
+      access: write
+      description: "Update a carrier (partial). Same writable fields as create_carrier."
+      params:
+        id: { type: integer, in: path, required: true, description: "Carrier id." }
+        org_id: { type: integer, in: body }
+        name: { type: string, in: body }
+        aka: { type: string, in: body }
+        name_long: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body }
+        notes: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_carrier:
+      method: DELETE
+      path: /carrier/{id}
+      access: dangerous
+      description: "Soft-delete a carrier (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "Carrier id." }
+      pagination: none
+
+    # =========================================================================
+    # Carrier <-> Facility presence (carrierfac) -- links a carrier to a
+    # facility. Presence is staff/owner approved (approve / reject actions).
+    # =========================================================================
+
+    list_carrierfacs:
+      method: GET
+      path: /carrierfac
+      access: read
+      description: "List carrier-facility presences. Filter by carrier_id, fac_id."
+      params:
+        carrier_id: { type: integer, in: query, description: "Filter by carrier id." }
+        fac_id: { type: integer, in: query, description: "Filter by facility id." }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_carrierfac:
+      method: GET
+      path: /carrierfac/{id}
+      access: read
+      description: "Retrieve a single carrier-facility presence by id (one-element data array)."
+      params:
+        id: { type: integer, in: path, required: true, description: "carrierfac id." }
+        depth: *p_depth
+      pagination: none
+
+    create_carrierfac:
+      method: POST
+      path: /carrierfac
+      access: write
+      description: "Record that a carrier is present at a facility. Requires carrier_id and fac_id. The presence starts pending until the facility owner approves it."
+      params:
+        carrier_id: { type: integer, in: body, required: true, description: "Carrier id." }
+        fac_id: { type: integer, in: body, required: true, description: "Facility id." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_carrierfac:
+      method: PUT
+      path: /carrierfac/{id}
+      access: write
+      description: "Update a carrier-facility presence (partial). Repoints carrier_id / fac_id."
+      params:
+        id: { type: integer, in: path, required: true, description: "carrierfac id." }
+        carrier_id: { type: integer, in: body }
+        fac_id: { type: integer, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_carrierfac:
+      method: DELETE
+      path: /carrierfac/{id}
+      access: dangerous
+      description: "Soft-delete a carrier-facility presence (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "carrierfac id." }
+      pagination: none
+
+    approve_carrierfac:
+      method: POST
+      path: /carrierfac/{id}/approve
+      access: admin
+      description: "Approve a pending carrier-facility presence (facility-owner / staff action)."
+      params:
+        id: { type: integer, in: path, required: true, description: "carrierfac id." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    reject_carrierfac:
+      method: POST
+      path: /carrierfac/{id}/reject
+      access: admin
+      description: "Reject a pending carrier-facility presence (facility-owner / staff action)."
+      params:
+        id: { type: integer, in: path, required: true, description: "carrierfac id." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # =========================================================================
+    # Campuses (campus) -- group multiple nearby facilities. Parent: org.
+    # Add/remove member facilities via the dedicated actions.
+    # =========================================================================
+
+    list_campuses:
+      method: GET
+      path: /campus
+      access: read
+      description: "List campuses (groupings of nearby facilities). Filter by name, org_id; expand fac_set with depth."
+      params:
+        name: { type: string, in: query }
+        name__contains: { type: string, in: query, description: "Substring match on campus name." }
+        org_id: { type: integer, in: query }
+        id: *p_id
+        id__in: *p_id_in
+        depth: *p_depth
+        since: *p_since
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_campus:
+      method: GET
+      path: /campus/{id}
+      access: read
+      description: "Retrieve a single campus by id (one-element data array). depth=2 expands fac_set."
+      params:
+        id: { type: integer, in: path, required: true, description: "Campus id." }
+        depth: *p_depth
+      pagination: none
+
+    create_campus:
+      method: POST
+      path: /campus
+      access: write
+      description: "Create a campus under an organization. Requires org_id and name. A campus's location fields are derived from its member facilities."
+      params:
+        org_id: { type: integer, in: body, required: true, description: "Owning organization id." }
+        name: { type: string, in: body, required: true, description: "Campus name (unique)." }
+        name_long: { type: string, in: body }
+        aka: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body, description: "Array of {service, identifier} objects." }
+        notes: { type: string, in: body, description: "Public notes (markdown)." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    update_campus:
+      method: PUT
+      path: /campus/{id}
+      access: write
+      description: "Update a campus (partial). Same writable fields as create_campus."
+      params:
+        id: { type: integer, in: path, required: true, description: "Campus id." }
+        org_id: { type: integer, in: body }
+        name: { type: string, in: body }
+        name_long: { type: string, in: body }
+        aka: { type: string, in: body }
+        website: { type: string, in: body }
+        social_media: { type: array, in: body }
+        notes: { type: string, in: body }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    delete_campus:
+      method: DELETE
+      path: /campus/{id}
+      access: dangerous
+      description: "Soft-delete a campus (status='deleted')."
+      params:
+        id: { type: integer, in: path, required: true, description: "Campus id." }
+      pagination: none
+
+    add_campus_facility:
+      method: POST
+      path: /campus/{id}/add-facility/{fac_id}
+      access: write
+      description: "Add a facility to a campus. Both must belong to the same organization and be geographically close."
+      params:
+        id: { type: integer, in: path, required: true, description: "Campus id." }
+        fac_id: { type: integer, in: path, required: true, description: "Facility id to add." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    remove_campus_facility:
+      method: POST
+      path: /campus/{id}/remove-facility/{fac_id}
+      access: write
+      description: "Remove a facility from a campus (does not delete the facility)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Campus id." }
+        fac_id: { type: integer, in: path, required: true, description: "Facility id to remove." }
+      response:
+        result_path: "$.data"
+      pagination: none
+
+    # =========================================================================
+    # AS-SET (as_set) -- read-only mapping of ASN -> IRR as-set / route-set
+    # handle, derived from each network's irr_as_set field.
+    # =========================================================================
+
+    list_as_sets:
+      method: GET
+      path: /as_set
+      access: read
+      description: "List the ASN -> IRR as-set mapping for all networks (read-only). The data object maps each ASN to its irr_as_set string."
+      params:
+        depth: *p_depth
+        page: *p_page
+        per_page: *p_per_page
+        skip: *p_skip
+        limit: *p_limit
+
+    get_as_set:
+      method: GET
+      path: /as_set/{asn}
+      access: read
+      description: "Get the IRR as-set / route-set handle for a single ASN (read-only)."
+      params:
+        asn: { type: integer, in: path, required: true, description: "Autonomous System Number (integer, no 'AS' prefix)." }
+      pagination: none
+
+    # =========================================================================
+    # Logo assets (asset) -- get/set the logo image for an org/fac/net/ix/
+    # carrier/campus. file_data is base64-encoded image/png or image/jpeg.
+    # =========================================================================
+
+    get_asset:
+      method: GET
+      path: /asset/{ref_tag}/{ref_id}/{asset_type}/
+      access: read
+      description: "Retrieve an entity's asset (logo). file_data is returned base64-encoded."
+      params:
+        ref_tag: { type: string, in: path, required: true, description: "Entity type: org, fac, net, ix, carrier, or campus." }
+        ref_id: { type: integer, in: path, required: true, description: "Id of that entity." }
+        asset_type: { type: string, in: path, required: true, description: "Asset type (currently only 'logo')." }
+      response:
+        result_path: "$"
+      pagination: none
+
+    create_asset:
+      method: POST
+      path: /asset/{ref_tag}/{ref_id}/{asset_type}/
+      access: write
+      description: "Upload/set an entity's logo. Provide file_type (image/png or image/jpeg) and base64 file_data."
+      params:
+        ref_tag: { type: string, in: path, required: true, description: "Entity type: org, fac, net, ix, carrier, or campus." }
+        ref_id: { type: integer, in: path, required: true, description: "Id of that entity." }
+        asset_type: { type: string, in: path, required: true, description: "Asset type (currently only 'logo')." }
+        file_type: { type: string, in: body, required: true, description: "MIME type: 'image/png' or 'image/jpeg'." }
+        file_data: { type: string, in: body, required: true, description: "Base64-encoded image data." }
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_asset:
+      method: PUT
+      path: /asset/{ref_tag}/{ref_id}/{asset_type}/
+      access: write
+      description: "Replace an entity's logo. Same body fields as create_asset."
+      params:
+        ref_tag: { type: string, in: path, required: true, description: "Entity type: org, fac, net, ix, carrier, or campus." }
+        ref_id: { type: integer, in: path, required: true, description: "Id of that entity." }
+        asset_type: { type: string, in: path, required: true, description: "Asset type (currently only 'logo')." }
+        file_type: { type: string, in: body, required: true, description: "MIME type: 'image/png' or 'image/jpeg'." }
+        file_data: { type: string, in: body, required: true, description: "Base64-encoded image data." }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_asset:
+      method: DELETE
+      path: /asset/{ref_tag}/{ref_id}/{asset_type}/
+      access: dangerous
+      description: "Delete an entity's logo asset."
+      params:
+        ref_tag: { type: string, in: path, required: true, description: "Entity type: org, fac, net, ix, carrier, or campus." }
+        ref_id: { type: integer, in: path, required: true, description: "Id of that entity." }
+        asset_type: { type: string, in: path, required: true, description: "Asset type (currently only 'logo')." }
+      pagination: none
+
+  # ===========================================================================
+  # Composite tools -- common cross-endpoint PeeringDB lookups.
+  # ===========================================================================
+  composites:
+
+    find_net_by_asn:
+      description: "Look up a single network by its ASN (ASN is globally unique). Returns the network object or null if no network has that ASN."
+      params:
+        asn:
+          type: integer
+          description: "Autonomous System Number, e.g. 13335."
+      timeout: 20s
+      depends_on: [list_nets]
+      code: |
+        const nets = await api.list_nets({ asn: params.asn, depth: 0 });
+        return (nets && nets.length) ? nets[0] : null;
+
+    get_asn_presence:
+      description: "Map an ASN's peering footprint: the Internet Exchanges (with peering IPs/speed) and the facilities where the network is present. Returns {asn, name, net_id, exchanges[], facilities[]} or {found:false}."
+      params:
+        asn:
+          type: integer
+          description: "Autonomous System Number, e.g. 13335."
+      timeout: 30s
+      depends_on: [list_nets, list_netixlans, list_netfacs]
+      code: |
+        const nets = await api.list_nets({ asn: params.asn, depth: 0 });
+        if (!nets || !nets.length) return { asn: params.asn, found: false };
+        const net = nets[0];
+        const [ixlans, facs] = await Promise.all([
+          api.list_netixlans({ net_id: net.id, depth: 0 }),
+          api.list_netfacs({ net_id: net.id, depth: 0 })
+        ]);
+        return {
+          asn: net.asn,
+          name: net.name,
+          net_id: net.id,
+          exchanges: (ixlans || []).map(x => ({
+            ix_id: x.ix_id, name: x.name, ipaddr4: x.ipaddr4,
+            ipaddr6: x.ipaddr6, speed: x.speed, is_rs_peer: x.is_rs_peer
+          })),
+          facilities: (facs || []).map(f => ({
+            fac_id: f.fac_id, name: f.name, city: f.city, country: f.country
+          }))
+        };
+
+    score_net_completeness:
+      description: "Score a network's PeeringDB record for peering-readiness (0-100) against the fields IXes commonly require; returns the score, the failing checks, and the full checklist. NOTE: has_tech_contact/has_abuse depend on POC visibility -- contacts marked 'Users' or 'Private' are only returned to an authorized API key, so a low contact score can mean 'not visible to this key' rather than 'absent'."
+      params:
+        asn:
+          type: integer
+          description: "Autonomous System Number, e.g. 13335."
+      timeout: 20s
+      depends_on: [list_nets, list_pocs]
+      code: |
+        const nets = await api.list_nets({ asn: params.asn });
+        if (!nets || !nets.length) return { asn: params.asn, found: false };
+        const n = nets[0];
+        const pocs = await api.list_pocs({ net_id: n.id });
+        const checks = {
+          has_irr_as_set:   !!n.irr_as_set,
+          has_prefixes4:    n.info_prefixes4 > 0,
+          ipv6_consistent:  !n.info_ipv6 || n.info_prefixes6 > 0,
+          has_policy:       !!n.policy_general,
+          has_website:      !!n.website,
+          has_type:         !!(n.info_type || (n.info_types && n.info_types.length)),
+          has_tech_contact: (pocs || []).some(p => ["Technical", "NOC"].indexOf(p.role) >= 0 && (p.email || p.phone)),
+          has_abuse:        (pocs || []).some(p => p.role === "Abuse" && (p.email || p.phone)),
+          has_ix_presence:  n.ix_count > 0,
+          has_fac_presence: n.fac_count > 0
+        };
+        const passed = Object.keys(checks).filter(k => checks[k]).length;
+        const total  = Object.keys(checks).length;
+        return {
+          asn: n.asn, name: n.name, poc_count: (pocs || []).length,
+          score: Math.round(100 * passed / total),
+          failing: Object.keys(checks).filter(k => !checks[k]),
+          checks
+        };
+
+    audit_netixlan_ip_integrity:
+      description: "Data-quality audit of one Internet Exchange's peering table: flags netixlan IPs (IPv4 and IPv6) that fall outside the LAN's ixpfx prefixes, and duplicate IPv4/IPv6 addresses on the same LAN. Pages through all members; returns only the violations and sets truncated=true if a LAN exceeds the 40-page cap. Pass an ix_id from list_ixes."
+      params:
+        ix_id:
+          type: integer
+          description: "Internet Exchange id (see list_ixes)."
+      timeout: 60s
+      depends_on: [list_ixlans, list_ixpfxs, list_netixlans]
+      code: |
+        function ip2int(ip){ return ip.split(".").reduce((a, o) => ((a << 8) + (+o)) >>> 0, 0); }
+        function inCidr4(cidr, ip){
+          const p = cidr.split("/"), len = +p[1];
+          const m = len === 0 ? 0 : (~((1 << (32 - len)) - 1)) >>> 0;
+          return (ip2int(p[0]) & m) === (ip2int(ip) & m);
+        }
+        function expandV6(addr){
+          addr = addr.split("%")[0];
+          let head, tail;
+          if (addr.indexOf("::") >= 0){
+            const parts = addr.split("::");
+            head = parts[0] ? parts[0].split(":") : [];
+            tail = parts[1] ? parts[1].split(":") : [];
+          } else { head = addr.split(":"); tail = []; }
+          const missing = 8 - (head.length + tail.length);
+          if (missing < 0) return null;
+          const full = head.concat(new Array(missing).fill("0")).concat(tail);
+          if (full.length !== 8) return null;
+          return full.map(h => parseInt(h || "0", 16));
+        }
+        function inCidr6(cidr, ip){
+          const p = cidr.split("/"), len = +p[1];
+          const a = expandV6(p[0]), c = expandV6(ip);
+          if (!a || !c) return false;
+          let bits = len;
+          for (let i = 0; i < 8; i++){
+            if (bits <= 0) break;
+            const take = Math.min(16, bits);
+            const mask = take === 16 ? 0xffff : (~((1 << (16 - take)) - 1)) & 0xffff;
+            if ((a[i] & mask) !== (c[i] & mask)) return false;
+            bits -= 16;
+          }
+          return true;
+        }
+        const lans = await api.list_ixlans({ ix_id: params.ix_id });
+        const issues = [], seen = {};
+        let checked = 0, truncated = false;
+        for (const lan of (lans || [])){
+          const pfx = await api.list_ixpfxs({ ixlan_id: lan.id });
+          const v4 = (pfx || []).filter(p => p.protocol === "IPv4").map(p => p.prefix);
+          const v6 = (pfx || []).filter(p => p.protocol === "IPv6").map(p => p.prefix);
+          let page = 1, rows;
+          do {
+            rows = await api.list_netixlans({ ixlan_id: lan.id, page: page, per_page: 250 });
+            for (const x of (rows || [])){
+              checked++;
+              if (x.ipaddr4){
+                const k4 = lan.id + ":4:" + x.ipaddr4;
+                if (seen[k4]) issues.push({ type: "duplicate_ipv4", ixlan_id: lan.id, ip: x.ipaddr4, netixlans: [seen[k4], x.id] });
+                else seen[k4] = x.id;
+                if (v4.length && !v4.some(c => inCidr4(c, x.ipaddr4)))
+                  issues.push({ type: "ipv4_out_of_prefix", netixlan_id: x.id, asn: x.asn, ip: x.ipaddr4, prefixes: v4 });
+              }
+              if (x.ipaddr6){
+                const k6 = lan.id + ":6:" + x.ipaddr6.toLowerCase();
+                if (seen[k6]) issues.push({ type: "duplicate_ipv6", ixlan_id: lan.id, ip: x.ipaddr6, netixlans: [seen[k6], x.id] });
+                else seen[k6] = x.id;
+                if (v6.length && !v6.some(c => inCidr6(c, x.ipaddr6)))
+                  issues.push({ type: "ipv6_out_of_prefix", netixlan_id: x.id, asn: x.asn, ip: x.ipaddr6, prefixes: v6 });
+              }
+            }
+            page++;
+            if (page > 40){ truncated = true; break; }
+          } while (rows && rows.length === 250);
+        }
+        return { ix_id: params.ix_id, ixlans: (lans || []).length, netixlans_checked: checked,
+                 truncated: truncated, issue_count: issues.length, issues: issues };
+
+    audit_net_presence:
+      description: "Consistency audit of a network's peering presence: flags netixlan.asn that disagrees with the net's ASN, non-operational connections, rows with no IP address, invalid speeds, and the case where the net declares IPv6 (info_ipv6=true) but no netixlan carries an IPv6 address. Returns the net summary plus the list of issues. Pass an ASN."
+      params:
+        asn:
+          type: integer
+          description: "Autonomous System Number, e.g. 13030."
+      timeout: 30s
+      depends_on: [list_nets, list_netixlans]
+      code: |
+        const nets = await api.list_nets({ asn: params.asn });
+        if (!nets || !nets.length) return { asn: params.asn, found: false };
+        const n = nets[0];
+        let nx = [], page = 1, rows;
+        do {
+          rows = await api.list_netixlans({ net_id: n.id, page: page, per_page: 250 });
+          nx = nx.concat(rows || []);
+          page++;
+        } while (rows && rows.length === 250 && page <= 20);
+        const issues = [];
+        if (n.info_ipv6 && !nx.some(x => x.ipaddr6))
+          issues.push("net declares IPv6 (info_ipv6=true) but no netixlan has an IPv6 address");
+        for (const x of nx){
+          if (x.asn !== n.asn) issues.push("netixlan " + x.id + " (" + x.name + ") asn " + x.asn + " != net asn " + n.asn);
+          if (x.operational === false) issues.push("netixlan " + x.id + " (" + x.name + ") not operational");
+          if (!x.ipaddr4 && !x.ipaddr6) issues.push("netixlan " + x.id + " (" + x.name + ") has no IP address");
+          if (!(x.speed > 0)) issues.push("netixlan " + x.id + " (" + x.name + ") invalid speed: " + x.speed);
+        }
+        return { asn: n.asn, name: n.name, presence_count: nx.length, issue_count: issues.length, issues: issues };
+
+  examples:
+    - name: "Look up a network by ASN"
+      description: "Resolve Cloudflare's network record (AS13335) by ASN."
+      code: |
+        const nets = await api.list_nets({ asn: 13335 });
+        return nets[0];
+
+    - name: "List networks peering at an exchange"
+      description: "Find an IX by name, then list the networks present on its LAN with their peering IPs."
+      code: |
+        const ixes = await api.list_ixes({ name__contains: "DE-CIX Frankfurt" });
+        const ix = ixes[0];
+        const peers = await api.list_netixlans({ ix_id: ix.id });
+        return peers.map(p => ({
+          asn: p.asn, name: p.name, ipv4: p.ipaddr4, ipv6: p.ipaddr6, speed_mbps: p.speed
+        }));
+
+    - name: "Add a peering presence"
+      description: "Register a network on an IX LAN with IPv4/IPv6 addresses at 10G."
+      code: |
+        return await api.create_netixlan({
+          net_id: 7050, ixlan_id: 62, asn: 13335,
+          ipaddr4: "80.81.192.10", ipaddr6: "2001:7f8::3417:0:1",
+          speed: 10000, is_rs_peer: true, operational: true
+        });
