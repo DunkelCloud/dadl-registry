@@ -3,7 +3,7 @@
 #
 # Domain Notes for LLM consumers:
 # - Xen Orchestra (XO) is the web management UI for XCP-ng / XenServer hypervisors.
-# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added).
+# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added); current through XO 6.6 (June 2026).
 # - Swagger docs available at /rest/v0/docs (OpenAPI spec for runtime discovery).
 # - Access control: pre-6.4 was admin-only; XO 6.4+ uses fine-grained RBAC v2 (acl-privileges/acl-roles).
 #   Endpoints with no declared privilege still require admin -- see /users/me/acl-privileges to inspect yours.
@@ -37,10 +37,20 @@
 # - Use ?markdown=true (XO 6.4+) for markdown-formatted collection responses (LLM-friendly).
 # - Actions are async by default -- add ?sync to get the result directly (blocks; risk of timeout for long ops).
 # - VM property writes: PATCH /vms/{id} (update_vm) partially updates name, CPU, memory, boot firmware, tags, etc.
-#   (added XO 6.5). There is still no PATCH /vdis/{id} -- rename VDIs via tags or the JSON-RPC API.
+#   (added XO 6.5).
+# - VDI property writes: PATCH /vdis/{id} (update_vdi) was ADDED in XO 6.6 -- rename (name_label/name_description)
+#   and grow the disk (size). Before 6.6 VDIs could only be renamed via tags or the JSON-RPC API. Returns 404 on XO < 6.6.
+# - VIF property writes: PATCH /vifs/{id} (update_vif) was ADDED in XO 6.6 -- partially updates locking mode,
+#   allowed IPv4/IPv6 addresses, rate limit, and TX checksumming offload. Returns 404 on XO < 6.6.
 # - Snapshot revert: POST /vms/{id}/actions/revert_snapshot (revert_vm_to_snapshot); set snapshotBefore to make it undoable.
-# - SDN traffic rules: /plugins/sdn-controller/{networks|vifs}/{id}/actions/{add|delete}_traffic_rule -- only present
-#   when the xo-server-sdn-controller plugin is loaded; calls fail with 404 otherwise.
+# - SDN traffic rules: /plugins/sdn-controller/{networks|vifs}/{id}/actions/{add|delete|update}_traffic_rule -- only present
+#   when the xo-server-sdn-controller plugin is loaded; calls fail with 404 otherwise. The update_* variants were added in XO 6.6.
+# - Backup repositories ("remotes") became WRITABLE in XO 6.6: POST /backup-repositories (create),
+#   PATCH /backup-repositories/{id} (update), DELETE /backup-repositories/{id} (remove). Pre-6.6 they were read-only.
+# - XO 6.6 added two built-in RBAC v2 roles: "Storage Administrator" (full control of sr/vdi/vbd/pbd/backup-repository)
+#   and "Network Administrator" (full control of networks/bonds/PIFs/VIFs). Discover via list_acl_roles.
+# - Auth (XO 6.6): an unauthenticated request now returns HTTP 401 with a WWW-Authenticate header so browsers
+#   surface a native Basic Auth prompt -- ToolMesh injects the token cookie, so this only matters when debugging 401s.
 # - Tags: add with PUT /<type>/{id}/tags/{tag}, remove with DELETE.
 # - Sub-resources: alarms, messages, tasks are exposed per-object as /<type>/{id}/{alarms|messages|tasks}.
 # - Stats: /vms/{id}/stats and /hosts/{id}/stats accept ?granularity=seconds|minutes|hours|days.
@@ -59,15 +69,15 @@ credits:
 
 source_name: "Xen Orchestra REST API"
 source_url: "https://docs.xen-orchestra.com/restapi"
-date: "2026-05-28"
+date: "2026-06-30"
 
 backend:
   name: xen-orchestra
   type: rest
-  version: "3.1"
+  version: "3.2"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
-  description: "Xen Orchestra REST API (XO 6.4+, current through 6.5) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts, pools, storage (SR/VDI/VBD), networks (VIF/PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges), proxies, servers, dashboards, auth tokens, SDN traffic rules, health check"
+  description: "Xen Orchestra REST API (XO 6.4+, current through 6.6) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts, pools, storage (SR, VDI incl. PATCH update, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/writable repositories/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges), proxies, servers, dashboards, auth tokens, SDN traffic rules (add/delete/update), health check"
 
   auth:
     type: bearer
@@ -101,12 +111,12 @@ backend:
       max_items: 500
 
   coverage:
-    endpoints: 245
-    total_endpoints: 245
+    endpoints: 252
+    total_endpoints: 252
     percentage: 100
-    focus: "Complete REST API coverage for XO 6.4+ (current through 6.5): all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update, power, snapshot/clone/migrate/revert, export/import, hotplug), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges), backups (archives, jobs, logs, restore-logs, repositories, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
-    missing: "PATCH /vdis/{id} does not exist in the API -- VDIs cannot be renamed via REST (use tags or the JSON-RPC API). SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13"
-    last_reviewed: "2026-05-28"
+    focus: "Complete REST API coverage for XO 6.4+ (current through 6.6): all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges), backups (archives, jobs, logs, restore-logs, writable repositories, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
+    missing: "Host lifecycle power actions (start/shutdown/reboot/restart_toolstack) are NOT exposed over REST -- only disable/enable/management_reconfigure are; use pool-level rolling_reboot/rolling_update or the JSON-RPC API for host power. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13"
+    last_reviewed: "2026-06-30"
 
   setup:
     credential_steps:
@@ -209,6 +219,27 @@ backend:
       note: "Per-VIF variant of add_network_traffic_rule -- scopes the rule to a single VM interface. Requires the SDN controller plugin."
     get_mcp_status:
       note: "Unauthenticated. Reports whether XO's built-in Model Context Protocol server is enabled (HTTP 200) or disabled (HTTP 503)."
+    update_vdi:
+      added: "XO 6.6 -- PATCH /vdis/{id} returns 404 on older builds. Before 6.6, VDIs could not be renamed via REST."
+      note: "PATCH semantics. size can only grow (>= current size); shrinking is rejected by XAPI. Use add_vdi_tag/remove_vdi_tag for tags."
+    update_vif:
+      added: "XO 6.6 -- PATCH /vifs/{id} returns 404 on older builds."
+      note: "PATCH semantics -- only the fields you send change. lockingMode='locked' enforces the ipv4Allowed/ipv6Allowed whitelists; 'disabled' blocks all traffic; 'unlocked' allows everything; 'network_default' inherits the network setting."
+      rate_limit: "rateLimit is the egress cap in kbps (null/0 = unlimited)."
+      tx_checksumming: "txChecksumming toggles the ethtool tx-checksumming offload (maps to other_config ethtool-tx); disable it only to work around buggy guest drivers."
+    create_vif:
+      tx_checksumming: "txChecksumming (added XO 6.5, PR #9793) maps to the ethtool tx-checksumming / other_config value; omit for the host default."
+    create_backup_repository:
+      added: "XO 6.6 -- backup repositories ('remotes') became writable over REST."
+      note: "url encodes the backend: 'nfs://host:/path', 'smb://user:pass@host\\\\share', 's3://key:secret@endpoint/bucket', or 'file:///srv/backups' for a local mount. Returns {id}."
+    update_backup_repository:
+      note: "PATCH semantics. Set enabled=false to stop new backups writing here without deleting the target. options is a free-form per-backend settings map."
+    delete_backup_repository:
+      note: "Removes the repository registration from XO. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it."
+    update_network_traffic_rule:
+      note: "Requires the xo-server-sdn-controller plugin (404 otherwise). Identify the existing rule by direction+ipRange+protocol+port, then send the new allow value. Added XO 6.6."
+    update_vif_traffic_rule:
+      note: "Per-VIF variant of update_network_traffic_rule. Requires the SDN controller plugin. Added XO 6.6."
 
   tools:
 
@@ -878,7 +909,7 @@ backend:
       description: "Export a VM as XVA (XCP-ng native format). Streamed binary download."
       params:
         uuid: { type: string, in: path, required: true }
-        compress: { type: string, in: query, description: "'gzip' (universal, slow) or 'zstd' (XCP-ng only, fast)" }
+        compress: { type: string, in: query, description: "Compression method: 'gzip' (universal, slow), 'zstd' (XCP-ng only, fast), or omit/'undefined' for no compression (XO 6.6 made these explicit)" }
       response:
         binary: true
         content_type: application/octet-stream
@@ -1914,6 +1945,18 @@ backend:
         other_config: { type: object, in: body, description: "Optional XAPI other_config key/value map (no longer required as of XO 6.5)" }
       pagination: none
 
+    update_vdi:
+      method: PATCH
+      path: /vdis/{uuid}
+      access: write
+      description: "Partially update a VDI: rename (name_label / name_description) or grow the disk (size). Only the fields you pass are changed. Added in XO 6.6 -- returns 404 on older builds. Size can only be increased, never shrunk."
+      params:
+        uuid: { type: string, in: path, required: true }
+        name_label: { type: string, in: body, description: "New display name" }
+        name_description: { type: string, in: body, description: "New description" }
+        size: { type: integer, in: body, description: "New size in bytes (grow only; must be >= current size)" }
+      pagination: none
+
     delete_vdi:
       method: DELETE
       path: /vdis/{uuid}
@@ -1922,9 +1965,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
       pagination: none
-
-    # Note: No generic PATCH /vdis/{uuid} either -- use add_vdi_tag/remove_vdi_tag for
-    # tags; rename via JSON-RPC API.
 
     list_vdi_alarms:
       method: GET
@@ -2395,6 +2435,21 @@ backend:
         MAC: { type: string, in: body, description: "Optional MAC address (auto-generated if omitted)" }
         device: { type: string, in: body, description: "Optional device index (e.g. '0', '1')" }
         MTU: { type: integer, in: body, description: "Optional MTU override" }
+        txChecksumming: { type: boolean, in: body, description: "Toggle TX checksumming offload (added XO 6.5; maps to ethtool tx-checksumming / other_config). Omit for host default." }
+      pagination: none
+
+    update_vif:
+      method: PATCH
+      path: /vifs/{uuid}
+      access: write
+      description: "Partially update a VIF's properties (locking mode, allowed IPs, rate limit, TX checksumming). Only the fields you pass are changed. Added in XO 6.6 -- returns 404 on older builds. Does not move the VIF to another network; recreate it for that."
+      params:
+        uuid: { type: string, in: path, required: true }
+        lockingMode: { type: string, in: body, description: "'network_default' | 'locked' | 'unlocked' | 'disabled'. 'locked' enforces the ipv4Allowed/ipv6Allowed whitelists." }
+        ipv4Allowed: { type: array, in: body, description: "Allowed IPv4 addresses/CIDRs (array of strings) when lockingMode='locked'" }
+        ipv6Allowed: { type: array, in: body, description: "Allowed IPv6 addresses/CIDRs (array of strings) when lockingMode='locked'" }
+        rateLimit: { type: integer, in: body, description: "Egress rate limit in kbps (null or 0 for unlimited)" }
+        txChecksumming: { type: boolean, in: body, description: "Toggle the ethtool TX checksumming offload" }
       pagination: none
 
     delete_vif:
@@ -2499,6 +2554,21 @@ backend:
         sync: { type: boolean, in: query }
       pagination: none
 
+    update_network_traffic_rule:
+      method: POST
+      path: /plugins/sdn-controller/networks/{uuid}/actions/update_traffic_rule
+      access: write
+      description: "Update an existing traffic rule on a private SDN network -- match the rule by direction/ipRange/protocol/port, then set the new allow value. Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Network UUID" }
+        direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to update: 'from' or 'to'" }
+        ipRange: { type: string, in: body, required: true, description: "IP range of the rule to update" }
+        protocol: { type: string, in: body, required: true, description: "Protocol of the rule to update" }
+        port: { type: integer, in: body, description: "Port of the rule to update (for TCP/UDP)" }
+        allow: { type: boolean, in: body, required: true, description: "New value: true to allow matching traffic, false to drop it" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
     add_vif_traffic_rule:
       method: POST
       path: /plugins/sdn-controller/vifs/{uuid}/actions/add_traffic_rule
@@ -2525,6 +2595,21 @@ backend:
         ipRange: { type: string, in: body, required: true, description: "IP range of the rule to remove" }
         protocol: { type: string, in: body, required: true, description: "Protocol of the rule to remove" }
         port: { type: integer, in: body, description: "Port of the rule to remove (for TCP/UDP)" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    update_vif_traffic_rule:
+      method: POST
+      path: /plugins/sdn-controller/vifs/{uuid}/actions/update_traffic_rule
+      access: write
+      description: "Update an existing traffic rule on a VIF connected to a private SDN network -- match the rule by direction/ipRange/protocol/port, then set the new allow value. Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
+      params:
+        uuid: { type: string, in: path, required: true, description: "VIF UUID" }
+        direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to update: 'from' or 'to'" }
+        ipRange: { type: string, in: body, required: true, description: "IP range of the rule to update" }
+        protocol: { type: string, in: body, required: true, description: "Protocol of the rule to update" }
+        port: { type: integer, in: body, description: "Port of the rule to update (for TCP/UDP)" }
+        allow: { type: boolean, in: body, required: true, description: "New value: true to allow matching traffic, false to drop it" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2947,6 +3032,42 @@ backend:
         id: { type: string, in: path, required: true }
       pagination: none
 
+    create_backup_repository:
+      method: POST
+      path: /backup-repositories
+      access: write
+      description: "Register a new backup repository ('remote') where backups are written. Added in XO 6.6 (was read-only before). Returns {id}. The url encodes the backend type (nfs://, smb://, s3://, file://)."
+      params:
+        name: { type: string, in: body, required: true, description: "Friendly display name" }
+        url: { type: string, in: body, required: true, description: "Backend URL: 'nfs://host:/path', 'smb://user:pass@host\\\\share', 's3://key:secret@endpoint/bucket', or 'file:///srv/backups'" }
+        options: { type: object, in: body, description: "Optional per-backend settings (e.g. mount options, S3 region/forcePathStyle)" }
+        proxy: { type: string, in: body, description: "Optional XO Proxy UUID to route traffic through" }
+        enabled: { type: boolean, in: body, description: "Whether the repository is active (default true)" }
+      pagination: none
+
+    update_backup_repository:
+      method: PATCH
+      path: /backup-repositories/{id}
+      access: write
+      description: "Update a backup repository's properties (name, url, options, enabled). PATCH semantics -- only the fields you send change. Added in XO 6.6. Set enabled=false to stop new backups writing here without removing it."
+      params:
+        id: { type: string, in: path, required: true }
+        name: { type: string, in: body, description: "New display name" }
+        url: { type: string, in: body, description: "New backend URL" }
+        options: { type: object, in: body, description: "Per-backend settings map" }
+        proxy: { type: string, in: body, description: "XO Proxy UUID (null to clear)" }
+        enabled: { type: boolean, in: body, description: "Enable/disable the repository" }
+      pagination: none
+
+    delete_backup_repository:
+      method: DELETE
+      path: /backup-repositories/{id}
+      access: dangerous
+      description: "Remove a backup repository registration from XO. Added in XO 6.6. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
     # =========================================================================
     # SCHEDULES (Backup-job schedules / cron triggers)
     # =========================================================================
@@ -3217,3 +3338,23 @@ backend:
           api.get_dashboard()
         ]);
         return { alarms, dashboard };
+
+    - name: "Register an NFS backup repository (XO 6.6+)"
+      description: "Add a writable backup remote and verify it"
+      code: |
+        const repo = await api.create_backup_repository({
+          name: "nightly-nfs",
+          url: "nfs://192.168.100.20:/srv/backups",
+          enabled: true
+        });
+        return await api.get_backup_repository({ id: repo.id });
+
+    - name: "Lock down a VIF to a single IP (XO 6.6+)"
+      description: "Switch a VIF to locked mode and whitelist one address"
+      code: |
+        return await api.update_vif({
+          uuid: "vif-uuid-here",
+          lockingMode: "locked",
+          ipv4Allowed: ["10.0.0.42/32"],
+          rateLimit: 100000
+        });
