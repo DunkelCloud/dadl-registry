@@ -60,8 +60,9 @@
 #   write. (An earlier revision assumed writing an alpha-2 `country_iso`/"DE"; the live API
 #   ignores that and rejects the then-empty `country_id` with 400 "Bitte wähle ein Land aus."
 #   -- verified 2026-07-05.)
-# - GOTCHA: domain check returns message "free" (available) or "connect" (already
-#   registered), NOT "taken".
+# - GOTCHA: check_domain returns `message`/`status` = the registry status -- "free" (available)
+#   or "connect" (registered), also e.g. "transfer_lock"/"redemptionPeriod"/"transit"; NOT
+#   "taken". It also folds in order-preview + pricing fields (same set as check_domain_order).
 # - TIMESTAMPS: list timestamps (`created_at`, `expires_at`, `paid_until`, `dropdate_at`)
 #   are ISO 8601 strings -- EXCEPT get_domain_authinfo's `expires_at`, which is German
 #   format "DD.MM.YYYY HH:mm:ss".
@@ -90,11 +91,11 @@ backend:
     prefix: "Bearer "
 
   coverage:
-    endpoints: 17
-    total_endpoints: 17
+    endpoints: 20
+    total_endpoints: 20
     percentage: 100
     focus: "Beta — REST API not yet stable. ELITEDOMAINS .de domain reseller: domains (register, transfer, AuthInfo, redirector, DNS records, tags), handles (PERSON, ORG, address validation), catcher (RGP backorders, dropdate, max bid), offers (Sedo marketplace, sale pages, visitor stats)."
-    missing: "no standalone DNS-record CRUD (records are managed inline via redirector_settings), no transfer-status polling endpoint, no billing/invoice or price-list endpoints (per-domain pricing is only via check_domain), no get_domain and list_domains omits handle_id -- a domain's assigned owner handle cannot be read back via the API"
+    missing: "no standalone DNS-record CRUD (records are managed inline via redirector_settings), no transfer-status polling endpoint, no billing/invoice endpoint (though list_tld_prices covers TLD pricing), no get_domain and no single-handle GET (both list-only) -- and list_domains omits handle_id, so a domain's assigned owner handle cannot be read back; handles cannot be deleted"
     last_reviewed: "2026-07-05"
 
   setup:
@@ -216,19 +217,56 @@ backend:
       description: >-
         Check a single domain's availability AND its pricing / transfer terms -- the response
         is far richer than a yes/no. Core fields: `name`, `message` (a.k.a. status) "free"
-        (available to register) or "connect" (already registered -- obtainable only via
-        transfer/connect, not new registration), and `tld`. For a registrable/transferable name
+        (registrable) or "connect" (registered, transfer-only) -- but also other registry
+        statuses like "transfer_lock", "redemptionPeriod" or "transit" -- plus `tld`. For a
+        registrable/transferable name
         it additionally returns `action` (e.g. "transfer"), `authinfo_required` (whether an
         AuthInfo/transfer code is needed), `billing` (e.g. "instant"),
         `instant_payment_method_available`, `default_period` (months), a `periods` array of
         { months, price, price_gross } term/price options, the headline `price` / `price_gross`
-        (net/gross EUR) and `tax_rate`. Use it for transfer feasibility and price quotes, not
-        just availability -- it is the closest thing to a price endpoint (there is no separate
-        price-list API).
+        (net/gross EUR) and `tax_rate`. Use it for transfer feasibility and a single domain's
+        price quote; for the full per-TLD price table use list_tld_prices, and for a focused
+        order preview use check_domain_order.
       params:
         name: { type: string, in: query, required: true, description: "Fully-qualified domain to check, e.g. example.de" }
       response:
         result_path: "$"
+      pagination: none
+
+    check_domain_order:
+      method: GET
+      path: /domains/order/check
+      access: read
+      description: >-
+        Preview what ordering a domain via register_domain would do, BEFORE placing it: returns
+        `name`, `status`, `action` ("register" or "transfer"), the available `periods`
+        [{ months, price, price_gross }], the headline `price`/`price_gross` (net / incl. VAT at
+        your `tax_rate`) and `billing` ("instant" = charged to your stored payment method, or
+        "monthly_invoice"), plus `instant_payment_method_available`. For transfers the price is
+        independent of the period (and some TLDs allow no period on transfer -> `periods` empty).
+        check_domain already folds in these same preview fields; this is the focused variant.
+      params:
+        name: { type: string, in: query, required: true, description: "Fully-qualified domain to preview, e.g. example.com" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_tld_prices:
+      method: GET
+      path: /domains/prices
+      access: read
+      description: >-
+        List the per-year, net (excl. VAT) prices for all registrable TLDs. Each row: `tld`, a
+        `price` object with `reg`/`transfer`/`renew`/`restore` (the price CURRENTLY valid for
+        your account -- may be lower than list due to a promotion or an individually negotiated
+        rate), an `original_price` object with the standard list price, and a `custom` object
+        flagging per-action whether an individual price is configured. A price is null when that
+        action is not offered for the TLD. This IS the account price-list endpoint; for a single
+        domain's quote use check_domain / check_domain_order.
+      params:
+        tld: { type: string, in: query, description: "Filter to a single TLD; the leading dot is optional (e.g. 'de' or '.de')" }
+      response:
+        result_path: "$.data"
       pagination: none
 
     register_domain:
@@ -384,6 +422,21 @@ backend:
       params:
         page: { type: integer, in: query, description: "1-based page number" }
       pagination: *page-pagination
+
+    get_catcher_info:
+      method: GET
+      path: /catcher/info
+      access: read
+      description: >-
+        Get RGP catcher status for ANY dropping domain (it need not be in your own catcher
+        orders): returns `name`, `status` (e.g. "rgp"), `users` (how many parties are backordering
+        it) and `dropdate_at` (expected drop, format "YYYY-MM-DD HH:mm:ss"). Use it to gauge
+        competition and timing before placing an add_catcher_order. Errors: 400 missing name.
+      params:
+        name: { type: string, in: query, required: true, description: "Domain to look up in the catcher, e.g. example.de" }
+      response:
+        result_path: "$"
+      pagination: none
 
     add_catcher_order:
       method: POST
@@ -543,8 +596,13 @@ backend:
 
   hints:
     check_domain:
-      message_values: "'free' = available to register; 'connect' = already registered (obtainable only via transfer), NOT 'taken'"
-      rich_response: "beyond {name, message} the payload carries pricing + transfer terms: action, authinfo_required, billing, instant_payment_method_available, default_period, periods[{months, price, price_gross}], price, price_gross, tax_rate, tld -- use it for price quotes and transfer feasibility (verified for dunkel.gmbh, 2026-07-03)"
+      message_values: "message/status = registry status: 'free' (registrable) or 'connect' (registered, transfer-only), also 'transfer_lock'/'redemptionPeriod'/'transit'; NOT 'taken'"
+      rich_response: "beyond {name, message} the payload carries pricing + transfer terms: action, authinfo_required, billing, instant_payment_method_available, default_period, periods[{months, price, price_gross}], price, price_gross, tax_rate, tld -- use it for price quotes and transfer feasibility (verified 2026-07-05)"
+      pricing_sources: "for a full per-TLD price table use list_tld_prices; check_domain_order is the focused order-preview variant of these same fields"
+    check_domain_order:
+      relation: "returns the same order-preview fields check_domain folds in (status, action, periods[{months,price,price_gross}], price, price_gross, tax_rate, billing, instant_payment_method_available); call before register_domain"
+    list_tld_prices:
+      pricing_model: "prices are NET (excl. VAT) per year; price = your account's effective price (promo/negotiated), original_price = standard list, custom = per-action individual-price flags; a null price = that action not offered for the TLD; filter with tld (leading dot optional)"
     get_domain_authinfo:
       authinfo_levels: "this returns AuthInfo1 (KK code); AuthInfo2 is the DENIC paper-letter fallback via order_domain_authinfo2"
       date_format: "expires_at is German format DD.MM.YYYY HH:mm:ss, not ISO 8601"
@@ -561,6 +619,8 @@ backend:
       transit_flag: "transit=1 prepares an outbound transfer (KK-out); a plain delete is irreversible"
     order_domain_authinfo2:
       account_requirement: "only available on monthly-invoice (Sammelrechnung) accounts; check with check_domain_authinfo2 first"
+    get_catcher_info:
+      scope: "works for ANY dropping domain, not just your own catcher orders; fields: status (e.g. rgp), users (competing backorderers), dropdate_at 'YYYY-MM-DD HH:mm:ss'"
     add_catcher_order:
       price_floor: "price is the max bid in EUR, minimum 2"
       droptime: "blocked 02:00-04:00 UTC with HTTP 405; rate limit also drops to 10 req/min then"
