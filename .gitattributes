@@ -1,0 +1,10 @@
+# DADL files are content-hashed (SHA-256) by ToolMesh for telemetry and
+# de-duplication. ToolMesh normalizes CRLF->LF before hashing, so the canonical
+# copy in this registry must be LF on every platform — otherwise a Windows
+# checkout (core.autocrlf=true) carries CRLF and any tool that hashes the raw
+# bytes computes a hash that never matches field telemetry.
+*.dadl text eol=lf
+
+# Keep the schema and this file LF too.
+*.json text eol=lf
+.gitattributes text eol=lf
