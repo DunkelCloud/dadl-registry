@@ -12,9 +12,20 @@
 # - IDENTIFIERS: domains are addressed by their fully-qualified `name` (e.g. "example.de"),
 #   NOT by a numeric id. Handles (contacts) are addressed by numeric `id` and linked to a
 #   domain via `handle_id`. Omit `handle_id` on register/update to use the account default.
+# - HANDLES: a PERSON handle carries an individual's name in `handle_name`. An ORG handle
+#   carries the company name in `handle_name` AND requires a separate `contact_person`
+#   (Ansprechpartner) -- the responsible individual at the org. `contact_person` is MANDATORY
+#   for type=ORG, at least for non-.de domains (server-side rule added 2026-07-05); PERSON
+#   handles omit it. There is NO DELETE endpoint for handles -- they cannot be removed via the
+#   API, so do not create throwaway/test handles. `type` is fixed at creation.
 # - REGISTER vs TRANSFER: both go through POST /domains. For an inbound transfer supply the
 #   `authinfo` (transfer/AuthInfo code) issued by the losing registrar; for a fresh
-#   registration omit it. `period` is the term in MONTHS (default 12).
+#   registration omit it. `period` is the term in MONTHS (default 12). A gTLD transfer is not
+#   instant: while it is pending (the losing registrar must ACK, else ~5-day auto-ACK) the
+#   domain already appears in list_domains with its `redirector_settings` set but
+#   `expires_at`/`paid_until` still null -- that null is the de-facto transfer-status signal
+#   (there is no transfer-status polling endpoint). `redirector_settings` may be supplied on
+#   the transfer request itself and takes effect immediately.
 # - AUTHINFO (KK / AuthInfo1): GET /domains/authinfo generates/returns the outbound transfer
 #   code with an `expires_at`. AUTHINFO2 is the DENIC paper-letter procedure for .de domains
 #   when AuthInfo1 cannot be used -- it is only available to accounts on monthly invoicing
@@ -36,13 +47,22 @@
 # - PAGINATION: page-based. List responses wrap rows in `data` alongside `current_page` and
 #   `per_page`; only /offers also returns `total` and `last_page`. The other lists have no
 #   has_more flag -- keep fetching until a page returns fewer rows than `per_page`.
-# - ERRORS: JSON `{ "message": "...", "error": { "<field>": ["..."] } }`. Notable codes:
-#   400 invalid/missing input, 403 registry rejection / account restriction, 404 not found,
-#   405 droptime restriction, 409 already added / already registered.
-# - GOTCHA: handles are written with `country_iso` (ISO 3166 alpha-2, e.g. "DE") but READ
-#   back as `country_id`, the ISO 3166-1 NUMERIC code (e.g. "276" for Germany).
-# - GOTCHA: domain check returns message "free" (available) or "connect" (already
-#   registered), NOT "taken".
+# - ERRORS: JSON `{ "message": "...", "error": { "<field>": ["..."] } }`. The generic top-level
+#   `message` (e.g. "Your input is invalid or incomplete.") rarely says WHAT is wrong -- the
+#   actionable per-field reasons live in `error.<field>`. This DADL therefore sets the error
+#   `message_path` to `$.error`, so validation failures surface the offending fields, e.g.
+#   `map[contact_person:[The contact person field is required.]]` (ToolMesh falls back to the
+#   full response body when `error` is absent). Notable codes: 400 invalid/missing input,
+#   403 registry rejection / account restriction, 404 not found, 405 droptime restriction,
+#   409 already added / already registered.
+# - GOTCHA: the handle country field is `country_id` -- the ISO 3166-1 NUMERIC code as a
+#   string (e.g. "276" for Germany), the SAME value list_handles returns, for both read AND
+#   write. (An earlier revision assumed writing an alpha-2 `country_iso`/"DE"; the live API
+#   ignores that and rejects the then-empty `country_id` with 400 "Bitte wähle ein Land aus."
+#   -- verified 2026-07-05.)
+# - GOTCHA: check_domain returns `message`/`status` = the registry status -- "free" (available)
+#   or "connect" (registered), also e.g. "transfer_lock"/"redemptionPeriod"/"transit"; NOT
+#   "taken". It also folds in order-preview + pricing fields (same set as check_domain_order).
 # - TIMESTAMPS: list timestamps (`created_at`, `expires_at`, `paid_until`, `dropdate_at`)
 #   are ISO 8601 strings -- EXCEPT get_domain_authinfo's `expires_at`, which is German
 #   format "DD.MM.YYYY HH:mm:ss".
@@ -54,7 +74,7 @@ credits:
 
 source_name: "ELITEDOMAINS API"
 source_url: "https://app.elitedomains.de/docs"
-date: "2026-06-02"
+date: "2026-07-05"
 
 backend:
   name: elitedomains
@@ -71,12 +91,12 @@ backend:
     prefix: "Bearer "
 
   coverage:
-    endpoints: 17
-    total_endpoints: 17
+    endpoints: 20
+    total_endpoints: 20
     percentage: 100
     focus: "Beta — REST API not yet stable. ELITEDOMAINS .de domain reseller: domains (register, transfer, AuthInfo, redirector, DNS records, tags), handles (PERSON, ORG, address validation), catcher (RGP backorders, dropdate, max bid), offers (Sedo marketplace, sale pages, visitor stats)."
-    missing: "no standalone DNS-record CRUD (records are managed inline via redirector_settings), no transfer-status polling endpoint, no billing/invoice or price-list endpoints"
-    last_reviewed: "2026-06-02"
+    missing: "no standalone DNS-record CRUD (records are managed inline via redirector_settings), no transfer-status polling endpoint, no billing/invoice endpoint (though list_tld_prices covers TLD pricing), no get_domain and no single-handle GET (both list-only) -- and list_domains omits handle_id, so a domain's assigned owner handle cannot be read back; handles cannot be deleted"
+    last_reviewed: "2026-07-05"
 
   setup:
     credential_steps:
@@ -115,7 +135,13 @@ backend:
       max_pages: 20
     errors: &standard-errors
       format: json
-      message_path: "$.message"
+      # The API wraps the actionable, per-field validation reasons in `error.<field>` arrays,
+      # while the top-level `message` is only a generic "Your input is invalid or incomplete."
+      # Extract `$.error` so failures surface as e.g.
+      # `map[contact_person:[The contact person field is required.]]`; when a response carries
+      # no `error` object ToolMesh falls back to the full body (which still holds `message`).
+      # (code_path is parsed but never surfaced to the caller by ToolMesh, so it is unused.)
+      message_path: "$.error"
       retry_on: [429, 502, 503, 504]
       terminal: [400, 401, 403, 404, 405, 409]
       retry_strategy:
@@ -189,13 +215,58 @@ backend:
       path: /domains/check
       access: read
       description: >-
-        Check whether a single domain is available for registration. Returns
-        { name, message } where `message` is "free" (available) or "connect"
-        (already registered -- only obtainable via transfer/connect, not new registration).
+        Check a single domain's availability AND its pricing / transfer terms -- the response
+        is far richer than a yes/no. Core fields: `name`, `message` (a.k.a. status) "free"
+        (registrable) or "connect" (registered, transfer-only) -- but also other registry
+        statuses like "transfer_lock", "redemptionPeriod" or "transit" -- plus `tld`. For a
+        registrable/transferable name
+        it additionally returns `action` (e.g. "transfer"), `authinfo_required` (whether an
+        AuthInfo/transfer code is needed), `billing` (e.g. "instant"),
+        `instant_payment_method_available`, `default_period` (months), a `periods` array of
+        { months, price, price_gross } term/price options, the headline `price` / `price_gross`
+        (net/gross EUR) and `tax_rate`. Use it for transfer feasibility and a single domain's
+        price quote; for the full per-TLD price table use list_tld_prices, and for a focused
+        order preview use check_domain_order.
       params:
         name: { type: string, in: query, required: true, description: "Fully-qualified domain to check, e.g. example.de" }
       response:
         result_path: "$"
+      pagination: none
+
+    check_domain_order:
+      method: GET
+      path: /domains/order/check
+      access: read
+      description: >-
+        Preview what ordering a domain via register_domain would do, BEFORE placing it: returns
+        `name`, `status`, `action` ("register" or "transfer"), the available `periods`
+        [{ months, price, price_gross }], the headline `price`/`price_gross` (net / incl. VAT at
+        your `tax_rate`) and `billing` ("instant" = charged to your stored payment method, or
+        "monthly_invoice"), plus `instant_payment_method_available`. For transfers the price is
+        independent of the period (and some TLDs allow no period on transfer -> `periods` empty).
+        check_domain already folds in these same preview fields; this is the focused variant.
+      params:
+        name: { type: string, in: query, required: true, description: "Fully-qualified domain to preview, e.g. example.com" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_tld_prices:
+      method: GET
+      path: /domains/prices
+      access: read
+      description: >-
+        List the per-year, net (excl. VAT) prices for all registrable TLDs. Each row: `tld`, a
+        `price` object with `reg`/`transfer`/`renew`/`restore` (the price CURRENTLY valid for
+        your account -- may be lower than list due to a promotion or an individually negotiated
+        rate), an `original_price` object with the standard list price, and a `custom` object
+        flagging per-action whether an individual price is configured. A price is null when that
+        action is not offered for the TLD. This IS the account price-list endpoint; for a single
+        domain's quote use check_domain / check_domain_order.
+      params:
+        tld: { type: string, in: query, description: "Filter to a single TLD; the leading dot is optional (e.g. 'de' or '.de')" }
+      response:
+        result_path: "$.data"
       pagination: none
 
     register_domain:
@@ -206,8 +277,15 @@ backend:
         Register a new domain OR transfer an existing one into the account. For a TRANSFER,
         supply `authinfo` (the transfer code from the losing registrar); for a fresh
         REGISTRATION omit it. `period` is the term in MONTHS (default 12). Optionally set the
-        owner contact via `handle_id` and initial hosting via `redirector_settings`.
-        Errors: 400 invalid input, 403 registry rejection, 409 already registered/owned.
+        owner contact via `handle_id` and initial hosting via `redirector_settings` (the
+        redirector can be configured on the transfer request itself). A successful inbound
+        transfer responds { message: "Domain transfer initiated", name, payment: "captured",
+        period } -- but the transfer is NOT yet complete: a gTLD transfer stays pending until
+        the losing registrar ACKs (or ~5 days auto-ACK). While pending, the domain already
+        shows in list_domains with `redirector_settings` set but `expires_at`/`paid_until`
+        still null; poll list_domains and treat a non-null `expires_at` as "transfer done"
+        (there is no transfer-status endpoint). Errors: 400 invalid input, 403 registry
+        rejection, 409 already registered/owned.
       params:
         name: { type: string, in: body, required: true, description: "Fully-qualified domain, e.g. example.de" }
         authinfo: { type: string, in: body, description: "Transfer/AuthInfo code -- present this only for inbound transfers" }
@@ -345,6 +423,21 @@ backend:
         page: { type: integer, in: query, description: "1-based page number" }
       pagination: *page-pagination
 
+    get_catcher_info:
+      method: GET
+      path: /catcher/info
+      access: read
+      description: >-
+        Get RGP catcher status for ANY dropping domain (it need not be in your own catcher
+        orders): returns `name`, `status` (e.g. "rgp"), `users` (how many parties are backordering
+        it) and `dropdate_at` (expected drop, format "YYYY-MM-DD HH:mm:ss"). Use it to gauge
+        competition and timing before placing an add_catcher_order. Errors: 400 missing name.
+      params:
+        name: { type: string, in: query, required: true, description: "Domain to look up in the catcher, e.g. example.de" }
+      response:
+        result_path: "$"
+      pagination: none
+
     add_catcher_order:
       method: POST
       path: /catcher
@@ -433,8 +526,8 @@ backend:
         List all contact handles in the account (paginated). Each row includes `id`, `alias`,
         `type` (PERSON|ORG), `handle_name`, address fields (`street_name`, `street_number`,
         `postalcode`, `city`, `country_id`), `email`, `phone` and `created_at`. Use a
-        handle's `id` as `handle_id` when registering/updating a domain. Note: the country is
-        read back as `country_id` but written as `country_iso`.
+        handle's `id` as `handle_id` when registering/updating a domain. The country field is
+        `country_id` (ISO 3166-1 numeric string, e.g. "276" for Germany) for both read and write.
       params:
         page: { type: integer, in: query, description: "1-based page number" }
       pagination: *page-pagination
@@ -444,23 +537,30 @@ backend:
       path: /handles
       access: write
       description: >-
-        Create a new contact handle (domain owner/admin contact). `type` is PERSON or ORG.
-        Set `address_suggest` to "keep" to bypass address auto-correction. Returns the full
-        handle object including the assigned `id`. Errors: 400 validation, 500 unknown error.
+        Create a new contact handle (domain owner/admin contact). `type` is PERSON or ORG. For
+        an ORG handle put the company name in `handle_name` and the responsible individual in
+        `contact_person` (Ansprechpartner) -- `contact_person` is REQUIRED for type=ORG (at
+        least for non-.de domains) and is exactly what a bare company name lacks; PERSON handles
+        omit it. Set `address_suggest` to "keep" to bypass address auto-correction. Returns the
+        full handle object including the assigned `id`. NOTE: there is no delete_handle --
+        handles cannot be removed via the API, so avoid throwaway/test handles. Errors:
+        400 validation (see `error.<field>` for the offending fields), 500 unknown error.
       params:
         alias: { type: string, in: body, required: true, description: "Internal alias to recognize this handle" }
         type: { type: string, in: body, required: true, description: "PERSON or ORG" }
-        handle_name: { type: string, in: body, required: true, description: "Full personal name or company/organization name" }
+        handle_name: { type: string, in: body, required: true, description: "Full personal name (PERSON) or company/organization name (ORG)" }
+        contact_person: { type: string, in: body, description: "Responsible individual / Ansprechpartner at the organization. REQUIRED when type=ORG (at least for non-.de domains); omit for PERSON handles" }
         street_name: { type: string, in: body, required: true, description: "Street name without house number" }
         street_number: { type: string, in: body, required: true, description: "House number" }
         postalcode: { type: string, in: body, required: true, description: "Postal / ZIP code" }
         city: { type: string, in: body, required: true, description: "City" }
-        country_iso: { type: string, in: body, required: true, description: "ISO 3166 alpha-2 country code, e.g. DE" }
+        country_id: { type: string, in: body, required: true, description: "Country as ISO 3166-1 NUMERIC code (string), e.g. '276' for Germany -- the same value list_handles returns. The field is country_id, NOT an alpha-2 country_iso/'DE'" }
         email: { type: string, in: body, required: true, description: "Contact email address" }
         phone: { type: string, in: body, required: true, description: "Phone number in E.164 format, e.g. +49.301234567" }
         general_request: { type: string, in: body, description: "General-request email (optional)" }
         abuse_contact: { type: string, in: body, description: "Abuse-contact email (optional)" }
         address_suggest: { type: string, in: body, description: "Set to 'keep' to skip address validation/auto-correction" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run without persisting the handle (no id is created)" }
       response:
         result_path: "$"
       pagination: none
@@ -471,29 +571,38 @@ backend:
       access: write
       description: >-
         Update an existing contact handle by numeric id. Any subset of the writable fields
-        may be supplied. (`type` cannot be changed after creation.) Returns the updated
-        handle object. Errors: 400 validation, 404 handle not found.
+        may be supplied. (`type` cannot be changed after creation.) For ORG handles the same
+        `contact_person` (Ansprechpartner) rule as create_handle applies. Returns the updated
+        handle object. Errors: 400 validation (see `error.<field>`), 404 handle not found.
       params:
         id: { type: integer, in: path, required: true, description: "Handle id to update" }
         alias: { type: string, in: body, description: "Internal alias" }
         handle_name: { type: string, in: body, description: "Full personal name or company/organization name" }
+        contact_person: { type: string, in: body, description: "Responsible individual / Ansprechpartner at the organization. Required for type=ORG (at least for non-.de domains); not used for PERSON handles" }
         street_name: { type: string, in: body, description: "Street name without house number" }
         street_number: { type: string, in: body, description: "House number" }
         postalcode: { type: string, in: body, description: "Postal / ZIP code" }
         city: { type: string, in: body, description: "City" }
-        country_iso: { type: string, in: body, description: "ISO 3166 alpha-2 country code, e.g. DE" }
+        country_id: { type: string, in: body, description: "Country as ISO 3166-1 NUMERIC code (string), e.g. '276' for Germany (the value list_handles returns); the field is country_id, not an alpha-2 country_iso" }
         email: { type: string, in: body, description: "Contact email address" }
         phone: { type: string, in: body, description: "Phone number in E.164 format" }
         general_request: { type: string, in: body, description: "General-request email" }
         abuse_contact: { type: string, in: body, description: "Abuse-contact email" }
         address_suggest: { type: string, in: body, description: "Set to 'keep' to skip address validation/auto-correction" }
+        sandbox: { type: integer, in: query, description: "Set to 1 to dry-run the update without persisting changes" }
       response:
         result_path: "$"
       pagination: none
 
   hints:
     check_domain:
-      message_values: "'free' = available to register; 'connect' = already registered (obtainable only via transfer), NOT 'taken'"
+      message_values: "message/status = registry status: 'free' (registrable) or 'connect' (registered, transfer-only), also 'transfer_lock'/'redemptionPeriod'/'transit'; NOT 'taken'"
+      rich_response: "beyond {name, message} the payload carries pricing + transfer terms: action, authinfo_required, billing, instant_payment_method_available, default_period, periods[{months, price, price_gross}], price, price_gross, tax_rate, tld -- use it for price quotes and transfer feasibility (verified 2026-07-05)"
+      pricing_sources: "for a full per-TLD price table use list_tld_prices; check_domain_order is the focused order-preview variant of these same fields"
+    check_domain_order:
+      relation: "returns the same order-preview fields check_domain folds in (status, action, periods[{months,price,price_gross}], price, price_gross, tax_rate, billing, instant_payment_method_available); call before register_domain"
+    list_tld_prices:
+      pricing_model: "prices are NET (excl. VAT) per year; price = your account's effective price (promo/negotiated), original_price = standard list, custom = per-action individual-price flags; a null price = that action not offered for the TLD; filter with tld (leading dot optional)"
     get_domain_authinfo:
       authinfo_levels: "this returns AuthInfo1 (KK code); AuthInfo2 is the DENIC paper-letter fallback via order_domain_authinfo2"
       date_format: "expires_at is German format DD.MM.YYYY HH:mm:ss, not ISO 8601"
@@ -501,19 +610,28 @@ backend:
       transfer_vs_register: "supply `authinfo` ONLY for inbound transfers; omit it for new registrations"
       period_unit: "period is in MONTHS, default 12"
       sandbox: "add sandbox=1 (query) to validate without touching the registry"
+      transfer_success_shape: "inbound transfer returns { message: 'Domain transfer initiated', name, payment: 'captured', period } (verified .gmbh, 2026-07-03)"
+      transfer_status_via_list: "no polling endpoint: a pending gTLD transfer shows in list_domains with redirector_settings set but expires_at/paid_until null; expires_at turning non-null = transfer completed"
+      redirector_on_transfer: "redirector_settings (e.g. type=external with Cloudflare NS) can be passed on the transfer request and takes effect immediately"
     update_domain:
       redirector_external_ns: "redirector_settings type=external needs NS that already answer authoritatively for the zone, else DENIC returns HTTP 400 'Nameserver nicht autoritativ'; use type=dns to host records on ELITEDOMAINS' own NS without that precheck"
     delete_domain:
       transit_flag: "transit=1 prepares an outbound transfer (KK-out); a plain delete is irreversible"
     order_domain_authinfo2:
       account_requirement: "only available on monthly-invoice (Sammelrechnung) accounts; check with check_domain_authinfo2 first"
+    get_catcher_info:
+      scope: "works for ANY dropping domain, not just your own catcher orders; fields: status (e.g. rgp), users (competing backorderers), dropdate_at 'YYYY-MM-DD HH:mm:ss'"
     add_catcher_order:
       price_floor: "price is the max bid in EUR, minimum 2"
       droptime: "blocked 02:00-04:00 UTC with HTTP 405; rate limit also drops to 10 req/min then"
     create_handle:
-      country_field: "written as country_iso (alpha-2, e.g. DE) but read back as country_id (ISO 3166-1 numeric, e.g. 276)"
+      org_contact_person: "type=ORG REQUIRES `contact_person` (the Ansprechpartner) in addition to the company `handle_name`, at least for non-.de domains -- a server-side rule added 2026-07-05; PERSON handles omit it. Without it the API returns 400 with error.contact_person"
+      no_delete: "there is NO delete_handle endpoint -- handles cannot be removed via the API; do not create throwaway/test handles"
+      contact_person_write_only: "contact_person is required/validated on ORG create but is NOT echoed back in the create response or list_handles output (write-only from the read side, verified 2026-07-05)"
+      country_field: "the country field is country_id -- ISO 3166-1 NUMERIC as a string (e.g. '276' for Germany), the same value list_handles returns, for read AND write; NOT an alpha-2 country_iso/'DE'. Missing it returns 400 error.country_id 'Bitte wähle ein Land aus.'"
       phone_format: "E.164, e.g. +49.301234567"
       address_suggest: "set to 'keep' to keep the address exactly as given (skip auto-correction)"
+      sandbox: "add sandbox=1 (query) to dry-run; note a sandboxed create does NOT persist a handle or return a usable id"
     list_offers:
       offer_types: "paynow = fixed-price buy-now, 4sale = make-an-offer"
       max_per_page: "per_page max is 500 (default 50)"
@@ -549,3 +667,34 @@ backend:
       description: "Place an RGP catcher with a max bid of 25 EUR."
       code: |
         return await api.add_catcher_order({ name: "dropping.de", price: 25 });
+
+    - name: "Create an ORG owner handle"
+      description: "ORG handles need a contact_person (Ansprechpartner) on top of the company name; keep the address verbatim with address_suggest=keep."
+      code: |
+        return await api.create_handle({
+          type: "ORG",
+          alias: "DCGMBH",
+          handle_name: "Dunkel Cloud GmbH",
+          contact_person: "Axel Dunkel",
+          street_name: "Dompfaffweg", street_number: "12",
+          postalcode: "65719", city: "Hofheim", country_id: "276",
+          email: "kontakt@dunkel.cloud", phone: "+49.61929739940",
+          address_suggest: "keep"
+        });
+
+    - name: "Transfer a domain in with Cloudflare nameservers"
+      description: "Start an inbound gTLD transfer and delegate to external NS in one call, then poll list_domains until expires_at is non-null (transfer complete)."
+      code: |
+        await api.register_domain({
+          name: "example.gmbh",
+          authinfo: "AUTH-CODE-FROM-LOSING-REGISTRAR",
+          handle_id: 1453,
+          redirector_settings: {
+            type: "external",
+            method: "default",
+            ns: ["kara.ns.cloudflare.com", "rick.ns.cloudflare.com"]
+          }
+        });
+        // Pending until the losing registrar ACKs -- expires_at stays null in list_domains.
+        const domains = await api.list_domains();
+        return domains.find(d => d.name === "example.gmbh");
