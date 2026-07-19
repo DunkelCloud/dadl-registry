@@ -4,7 +4,7 @@ credits:
   - "Dunkel Cloud GmbH"
 source_name: "Vikunja REST API"
 source_url: "https://vikunja.io/docs/api/"
-date: "2026-03-29"
+date: "2026-07-19"
 
 backend:
   name: vikunja
@@ -14,12 +14,12 @@ backend:
   description: "Vikunja open-source task management — project planning, kanban boards, and task tracking"
 
   coverage:
-    endpoints: 21
+    endpoints: 28
     total_endpoints: 80
-    percentage: 26
-    focus: "projects, tasks, views, buckets, labels, comments, positions, filters"
-    missing: "teams, users, shares, attachments, assignees, task relations, reactions, notifications, webhooks, subscriptions, saved filters"
-    last_reviewed: "2026-06-18"
+    percentage: 35
+    focus: "projects, tasks, views, buckets, labels, comments, positions, filters, attachments"
+    missing: "teams, users, shares, assignees, task relations, reactions, notifications, webhooks, subscriptions, saved filters"
+    last_reviewed: "2026-07-19"
 
   setup:
     credential_steps:
@@ -154,6 +154,42 @@ backend:
   #   2. list_views(project_id) → pick view_id (e.g. kanban view)
   #   3. list_project_tasks(project_id, view_id) → see tasks in order
   #   4. set_task_position(id, position, project_view_id) → reorder
+  #
+  # Attachments:
+  #   Tasks can carry file attachments. upload_task_attachment takes a file_url —
+  #   ToolMesh fetches that URL and uploads the bytes to Vikunja as the multipart
+  #   form field "files" (PUT /tasks/{id}/attachments). list_task_attachments
+  #   returns metadata only (attachment id, uploader, file name/mime/size);
+  #   download_task_attachment returns a ToolMesh broker download URL (file_url),
+  #   not raw bytes. For image attachments, preview_size returns a scaled preview.
+  #
+  # Kanban default & done buckets (live on the VIEW, not the project):
+  #   A kanban view designates one bucket as the DEFAULT (default_bucket_id) — new
+  #   tasks without an explicit bucket land there — and optionally a DONE bucket
+  #   (done_bucket_id): moving a task into the done bucket marks it done, and
+  #   marking a task done moves it there. Configure both with set_default_bucket
+  #   (it reads the view first and preserves the rest, because the raw view update
+  #   replaces the whole object). Rename a bucket, set its WIP limit or change its
+  #   position with update_bucket. Column order is a float64 position (lower = further
+  #   left); set_bucket_position reorders a column relative to its siblings — e.g. to
+  #   pull an Inbox bucket to the very left ('first' = min/2). These are why "which
+  #   bucket is default" is a view-update, not a project-update, operation.
+  #
+  # create_task auto-appends on the kanban board:
+  #   Vikunja gives API-created tasks kanban position 0, so they jump to the TOP of
+  #   the board and corrupt an editorially maintained priority order (board order =
+  #   priority). The create_task composite therefore repositions each new task to
+  #   the END of its target bucket (max(position)+step) in the kanban view,
+  #   server-side, so it holds for every client. Pass bucket_id to drop the task
+  #   into a specific bucket (it is moved there, then appended); omit it to use the
+  #   view's default bucket.
+  #
+  # Moving a task between projects:
+  #   update_task accepts project_id — set it to move the task to another project
+  #   (Vikunja honors project_id in the POST /tasks/{id} body). CAVEAT: identifiers
+  #   (e.g. DADL-26) are project-local and are REASSIGNED on move; the source
+  #   project even recycles the freed index. Cross-reference tasks by their global
+  #   numeric id, never by identifier, whenever they might be moved.
   # ──────────────────────────────────────────────────────────────
 
   tools:
@@ -229,11 +265,11 @@ backend:
         allow_jq_override: true
       pagination: none
 
-    create_task:
+    _create_task_raw:
       method: PUT
       path: /projects/{project_id}/tasks
       access: write
-      description: "Create a new task in a project. Priority: 0=unset, 1=low, 2=medium, 3=high, 4=urgent, 5=critical."
+      description: "Internal: raw task creation (leaves the new card at kanban position 0, i.e. the top of the board). Use the create_task composite, which appends it to the end of its bucket."
       params:
         project_id: { type: integer, in: path, required: true }
         title: { type: string, in: body, required: true }
@@ -254,6 +290,7 @@ backend:
       description: "Internal: raw task update (sends full object). Use the update_task composite instead."
       params:
         id: { type: integer, in: path, required: true }
+        project_id: { type: integer, in: body, description: "Move the task to this project. Vikunja accepts project_id in the task-update body; identifiers are reassigned on move (reference by global id)." }
         title: { type: string, in: body }
         description: { type: string, in: body, description: "HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <h2>, <ul><li>, <pre><code>, <strong>, <a>, <br>. Raw Markdown is rendered as one collapsed line." }
         done: { type: boolean, in: body }
@@ -281,6 +318,62 @@ backend:
       description: "Permanently delete a task."
       params:
         id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ─────────────── Attachments ───────────────
+    list_task_attachments:
+      method: GET
+      path: /tasks/{task_id}/attachments
+      access: read
+      description: "List all attachments on a task (metadata only: attachment id, uploader, and file name/mime/size). Use download_task_attachment to fetch the bytes."
+      params:
+        task_id: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 50 }
+      response:
+        transform: |
+          [.[] | {id, task_id, created, created_by: (.created_by.username? // null), file: {id: .file.id?, name: .file.name?, mime: .file.mime?, size: .file.size?}}]
+        allow_jq_override: true
+
+    upload_task_attachment:
+      method: PUT
+      path: /tasks/{task_id}/attachments
+      access: write
+      content_type: multipart/form-data
+      max_body_size: 20MB
+      description: >
+        Upload a file as an attachment to a task. ToolMesh fetches the given URL and
+        uploads the bytes to Vikunja as the multipart form field "files". Returns the
+        created attachment together with its stored file metadata.
+      params:
+        task_id: { type: integer, in: path, required: true }
+        files: { type: file_url, in: body, required: true, description: "URL of the file to fetch and upload (Vikunja multipart form field 'files')." }
+      pagination: none
+
+    download_task_attachment:
+      method: GET
+      path: /tasks/{task_id}/attachments/{attachment_id}
+      access: read
+      description: >
+        Download one task attachment. Returns a ToolMesh file-broker URL (file_url)
+        to fetch the bytes, not the raw binary. For image attachments, pass
+        preview_size to get a scaled preview instead of the original.
+      params:
+        task_id: { type: integer, in: path, required: true }
+        attachment_id: { type: integer, in: path, required: true }
+        preview_size: { type: string, in: query, description: "Image preview size: sm (100px), md (200px), lg (400px) or xl (800px). Only applies to image attachments." }
+      response:
+        type: file_url
+      pagination: none
+
+    delete_task_attachment:
+      method: DELETE
+      path: /tasks/{task_id}/attachments/{attachment_id}
+      access: dangerous
+      description: "Permanently delete a task attachment."
+      params:
+        task_id: { type: integer, in: path, required: true }
+        attachment_id: { type: integer, in: path, required: true }
       pagination: none
 
     # ─────────────── Projects & views ───────────────
@@ -385,6 +478,55 @@ backend:
         title: { type: string, in: body, required: true }
       pagination: none
 
+    update_bucket:
+      method: POST
+      path: /projects/{project_id}/views/{view_id}/buckets/{bucket_id}
+      access: write
+      description: >
+        Rename a kanban bucket, set its WIP task limit, or set its position (column
+        order — lower position is further left). title is required (Vikunja rejects an
+        empty title); limit 0 means no limit. Sends a full bucket object, so pass the
+        current title/limit when changing only one field (set_bucket_position does this
+        for you). Which bucket is the DEFAULT or DONE bucket is a view property — use
+        set_default_bucket for that, not this.
+      params:
+        project_id: { type: integer, in: path, required: true }
+        view_id: { type: integer, in: path, required: true }
+        bucket_id: { type: integer, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        limit: { type: integer, in: body, description: "WIP limit: max tasks allowed in the bucket (0 = unlimited)." }
+        position: { type: number, in: body, description: "Bucket sort order within the view (float64, lower = further left). Use a value between two buckets to insert; see the set_bucket_position composite." }
+      pagination: none
+
+    delete_bucket:
+      method: DELETE
+      path: /projects/{project_id}/views/{view_id}/buckets/{bucket_id}
+      access: dangerous
+      description: "Permanently delete a kanban bucket. Its tasks are not deleted — they fall back to the view's default bucket."
+      params:
+        project_id: { type: integer, in: path, required: true }
+        view_id: { type: integer, in: path, required: true }
+        bucket_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    _update_view_raw:
+      method: POST
+      path: /projects/{project_id}/views/{view_id}
+      access: write
+      description: "Internal: raw project-view update. Vikunja replaces the full view object, so omitted fields reset to zero — use the set_default_bucket composite, which reads the current view and preserves the rest."
+      params:
+        project_id: { type: integer, in: path, required: true }
+        view_id: { type: integer, in: path, required: true }
+        title: { type: string, in: body }
+        view_kind: { type: string, in: body, description: "list | gantt | table | kanban" }
+        filter: { type: object, in: body, description: "The view's saved task filter (TaskCollection object); pass the current value through unchanged." }
+        position: { type: number, in: body }
+        bucket_configuration_mode: { type: string, in: body, description: "none | manual | filter" }
+        bucket_configuration: { type: array, in: body }
+        default_bucket_id: { type: integer, in: body }
+        done_bucket_id: { type: integer, in: body }
+      pagination: none
+
     # ─────────────── Labels ───────────────
     list_labels:
       method: GET
@@ -464,7 +606,12 @@ backend:
 
   composites:
     update_task:
-      description: "Update an existing task. Only include fields you want to change — unchanged fields are preserved. To move between kanban buckets, use move_task_to_bucket instead."
+      description: >
+        Update an existing task. Only include the fields you want to change —
+        unchanged fields are preserved (GET → merge → POST). Set project_id to MOVE
+        the task to another project (its identifier is reassigned on move — reference
+        by global id afterwards). To move between kanban buckets, use
+        move_task_to_bucket instead.
       params:
         id:
           type: number
@@ -488,6 +635,9 @@ backend:
         position:
           type: number
           description: "Sort position (float64)"
+        project_id:
+          type: number
+          description: "Move the task to this project (0 or omitted = leave in its current project)"
       timeout: 15s
       depends_on: [get_task, _update_task_raw]
       code: |
@@ -500,8 +650,185 @@ backend:
           priority: params.priority !== undefined ? params.priority : current.priority,
           due_date: params.due_date !== undefined ? params.due_date : current.due_date,
           position: params.position !== undefined ? params.position : current.position,
+          project_id: params.project_id !== undefined ? params.project_id : current.project_id,
         };
         return await api._update_task_raw(merged);
+
+    create_task:
+      description: >
+        Create a task in a project and append it to the END of its kanban bucket
+        (max position + step), server-side, so API-created tasks do not jump to the
+        top of the board and disturb the priority order (board order = priority).
+        Pass bucket_id to place it into a specific kanban bucket; omit to use the
+        view's default bucket. Priority: 0=unset, 1=low, 2=medium, 3=high, 4=urgent,
+        5=critical.
+      params:
+        project_id:
+          type: number
+          required: true
+          description: "Target project ID"
+        title:
+          type: string
+          required: true
+          description: "Task title"
+        description:
+          type: string
+          description: "HTML (Vikunja TipTap editor format), NOT Markdown — use <p>, <h2>, <ul><li>, <pre><code>, <strong>, <a>, <br>."
+        done:
+          type: boolean
+          description: "Create the task already marked done"
+        priority:
+          type: number
+          description: "0=unset, 1=low, 2=medium, 3=high, 4=urgent, 5=critical"
+        due_date:
+          type: string
+          description: "Due date (ISO 8601)"
+        labels:
+          type: array
+          description: "Label IDs to attach"
+        assignees:
+          type: array
+          description: "User IDs to assign"
+        bucket_id:
+          type: number
+          description: "Kanban bucket to place the task in (default: the view's default bucket)"
+        position:
+          type: number
+          description: "Explicit list-view position; the kanban position is set automatically to the bucket end"
+      timeout: 20s
+      depends_on: [_create_task_raw, list_views, list_project_tasks, move_task_to_bucket, set_task_position]
+      code: |
+        const task = await api._create_task_raw({
+          project_id: params.project_id,
+          title: params.title,
+          description: params.description,
+          done: params.done,
+          priority: params.priority,
+          due_date: params.due_date,
+          labels: params.labels,
+          assignees: params.assignees,
+          bucket_id: params.bucket_id,
+          position: params.position,
+        });
+        try {
+          const views = await api.list_views({ project_id: params.project_id });
+          const kanban = (views || []).find(v => v.view_kind === "kanban");
+          if (kanban) {
+            const board = await api.list_project_tasks({ project_id: params.project_id, view_id: kanban.id, per_page: 250, sort_by: "position", order_by: "desc" });
+            let targetBucket = params.bucket_id != null ? params.bucket_id : kanban.default_bucket_id;
+            if (params.bucket_id != null) {
+              await api.move_task_to_bucket({ project_id: params.project_id, view_id: kanban.id, bucket_id: params.bucket_id, task_id: task.id });
+            }
+            if (!targetBucket && Array.isArray(board) && board.length) targetBucket = board[0].bucket_id;
+            let maxPos = 0;
+            for (const b of (board || [])) {
+              if (b.bucket_id === targetBucket && Array.isArray(b.tasks)) {
+                for (const tk of b.tasks) {
+                  if (tk.id !== task.id && typeof tk.position === "number" && tk.position > maxPos) maxPos = tk.position;
+                }
+              }
+            }
+            const endPos = maxPos + 65536;
+            await api.set_task_position({ id: task.id, position: endPos, project_view_id: kanban.id });
+            task.position = endPos;
+          }
+        } catch (e) {
+          // positioning is best-effort — the task itself is already created
+        }
+        return task;
+
+    set_default_bucket:
+      description: >
+        Set which kanban bucket is the DEFAULT (where new tasks land) and, optionally,
+        the DONE bucket (moving a task there marks it done) for a project view. Reads
+        the current view first and preserves its title, kind, filter and layout, so
+        only the bucket assignments change. Get view_id from list_views (the kanban
+        view) and bucket IDs from list_buckets.
+      params:
+        project_id:
+          type: number
+          required: true
+          description: "Project ID"
+        view_id:
+          type: number
+          required: true
+          description: "Kanban view ID (from list_views)"
+        default_bucket_id:
+          type: number
+          required: true
+          description: "Bucket that receives new tasks without an explicit bucket"
+        done_bucket_id:
+          type: number
+          description: "Bucket that marks tasks done when they are moved into it (omit to leave unchanged)"
+      timeout: 15s
+      depends_on: [list_views, _update_view_raw]
+      code: |
+        const views = await api.list_views({ project_id: params.project_id });
+        const v = (views || []).find(x => x.id === params.view_id);
+        if (!v) throw new Error("View " + params.view_id + " not found in project " + params.project_id);
+        return await api._update_view_raw({
+          project_id: params.project_id,
+          view_id: params.view_id,
+          title: v.title,
+          view_kind: v.view_kind,
+          filter: v.filter,
+          position: v.position,
+          bucket_configuration_mode: v.bucket_configuration_mode,
+          bucket_configuration: v.bucket_configuration,
+          default_bucket_id: params.default_bucket_id,
+          done_bucket_id: params.done_bucket_id !== undefined ? params.done_bucket_id : v.done_bucket_id,
+        });
+
+    set_bucket_position:
+      description: >
+        Reorder a kanban bucket (column) within its view. Pass an explicit position
+        (float64, lower = further left), or place 'first' / 'last' to compute one from
+        the sibling buckets (first = min/2, last = max + step). Reads the bucket first
+        so its title and WIP limit are preserved (the raw bucket update would otherwise
+        need them). Use this to move an Inbox column to the very left.
+      params:
+        project_id:
+          type: number
+          required: true
+          description: "Project ID"
+        view_id:
+          type: number
+          required: true
+          description: "Kanban view ID (from list_views)"
+        bucket_id:
+          type: number
+          required: true
+          description: "Bucket to move (from list_buckets)"
+        place:
+          type: string
+          description: "'first' (leftmost, the default) or 'last' (rightmost). Ignored when position is given."
+        position:
+          type: number
+          description: "Explicit sort position (float64); overrides place. Use a value between two buckets to insert between them."
+      timeout: 15s
+      depends_on: [list_buckets, update_bucket]
+      code: |
+        const buckets = await api.list_buckets({ project_id: params.project_id, view_id: params.view_id });
+        const bucket = (buckets || []).find(b => b.id === params.bucket_id);
+        if (!bucket) throw new Error("Bucket " + params.bucket_id + " not found in view " + params.view_id);
+        let pos = params.position;
+        if (pos === undefined || pos === null) {
+          const positions = buckets.map(b => b.position).filter(p => typeof p === "number");
+          if (params.place === "last") {
+            pos = (positions.length ? Math.max.apply(null, positions) : 0) + 65536;
+          } else {
+            const min = positions.length ? Math.min.apply(null, positions) : 65536;
+            pos = min > 1 ? min / 2 : min - 65536;
+          }
+        }
+        return await api.update_bucket({
+          project_id: params.project_id,
+          view_id: params.view_id,
+          bucket_id: params.bucket_id,
+          title: bucket.title,
+          limit: bucket.limit,
+          position: pos,
+        });
 
     update_project:
       description: >
