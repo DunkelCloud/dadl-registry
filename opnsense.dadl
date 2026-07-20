@@ -1,0 +1,4357 @@
+# opnsense.dadl — OPNsense Firewall REST API for ToolMesh
+# Comprehensive DADL covering core modules: firewall, diagnostics,
+# interfaces, DNS, VPN, DHCP, system, firmware, and plugins.
+#
+# Domain Notes for LLM consumers:
+# - Self-hosted appliance: base_url is provided via backends.yaml with the
+#   actual OPNsense hostname/IP (e.g. https://192.168.1.1/api).
+#   Self-signed TLS certificates are common — configure accordingly.
+# - HTTP methods: OPNsense uses ONLY GET and POST. There is no PUT or DELETE.
+#   Deletions use POST to del_* endpoints. Updates use POST to set_* endpoints.
+# - Apply-after-change pattern: most configuration changes require calling the
+#   module's "reconfigure" endpoint to apply changes to the running service.
+#   Workflow: 1) add/set/del → modify stored config  2) reconfigure → apply.
+#   Without reconfigure, changes are saved but NOT active.
+# - Search endpoints (pagination): all search_* endpoints accept POST with
+#   JSON body: { "current": 1, "rowCount": 50, "searchPhrase": "", "sort": "field" }
+#   Response: { "rows": [...], "rowCount": 50, "total": 123, "current": 1 }
+# - UUID pattern: resources are identified by UUID (e.g. "a1b2c3d4-...").
+#   Use search endpoints to find UUIDs, then get/set/del by UUID.
+# - Toggle pattern: toggle endpoints accept UUID and optional enabled state
+#   (0 or 1) as query param. Without it, the current state is flipped.
+# - Response conventions: action responses return {"status":"ok"} or
+#   {"result":"saved"}. Validation errors: {"validations":{"field":"error msg"}}
+# - POST body encoding (IMPORTANT): OPNsense reads posted fields from PHP $_POST,
+#   which is populated ONLY for form-urlencoded / multipart bodies, NOT application/json.
+#   set_/add_ model endpoints therefore use content_type form-urlencoded and take the
+#   model node as a SINGLE nested object param (e.g. gateway_item) so it is encoded with
+#   PHP bracket notation: gateway_item[name]=...&gateway_item[monitor]=.... A JSON body or
+#   flat "node.field" keys produce a bare {"result":"failed"} with empty validations.
+# - SELECT fields (interface/ipprotocol on gateways, etc.): get_* returns them as option
+#   maps {opt:{value,selected}}; when posting back send the BARE selected key ("opt1",
+#   "inet"), not the map. Model set endpoints are full-replace — post the COMPLETE item.
+# - Authentication: HTTP Basic Auth with API key (username) + API secret (password).
+#   Generate via System → Access → Users → API keys section.
+# - HA config sync (hasync, //OPNsense/hasync): the model fields are `username` / `password`
+#   (NOT synchronizeusername/synchronizepassword) plus pfsync* / verifypeer / syncitems.
+#   `syncitems` is a MULTI-SELECT — the set of config sections XMLRPC-synced to the peer
+#   (aliases, ipsec, radvd, ndpproxy, kea, …). Posting it REPLACES the whole selection, so to
+#   flip individual sections (e.g. enable radvd + ndpproxy) use the update_hasync_settings
+#   composite (read-modify-write with enable_syncitems / disable_syncitems), never a bare set.
+# - HA "synchronize" action: saving any change with hasync targets set already pushes config
+#   to the backup. To force the HA-status "Synchronize and reconfigure all services" action,
+#   POST synchronize_ha_services (/core/hasync_status/restart_all) — it runs exec_sync (the
+#   XMLRPC config push) + reload_templates and restarts HA-managed services on the peer.
+#   get_ha_status_services / get_ha_status_version report peer sync state. There is NO lighter
+#   "sync-only" endpoint; exec_sync is reachable only via these hasync_status service actions.
+# - Router Advertisements (radvd, core module //OPNsense/radvd): per-interface RA config is an
+#   ArrayField `entries` — search/get/add/set/del/toggle by UUID under /radvd/settings/*_entry,
+#   apply with reconfigure_radvd (/radvd/service/reconfigure). add/set are full-replace (setBase):
+#   post the COMPLETE entry as the object param `entries`; prefer the update_radvd composite
+#   (read-modify-write). Fields incl. interface (bare), mode (router/unmanaged/managed/assist/
+#   stateless), Min/MaxRtrAdvInterval, RDNSS/DNSSL/routes (comma lists), Adv* lifetimes.
+# - NDP Proxy (os-ndp-proxy-go plugin, //OPNsense/ndpproxy): a `general` settings singleton
+#   (get/set via ndpproxy.general.*, partial-merge) — enabled, upstream (bare), downstream
+#   (bare, comma list), ra, routes, carp_depend_on (HA/CARP failover) — plus a per-alias
+#   ArrayField (aliases.alias); the `alias` field is the UUID of an EXTERNAL-type firewall
+#   alias. Apply with reconfigure_ndpproxy; get_ndpproxy_status for service state.
+# - Interface IP configuration is only PARTLY API-addressable: the modern MVC exposes interface
+#   ASSIGNMENT (device↔name), VLANs, VIPs and static neighbors, but the per-interface IPv6
+#   Configuration Type (SLAAC/DHCPv6/Static/Track) and dhcp6 options remain LEGACY config.xml
+#   (interfaces.php) — read-only here via get_interfaces_overview / get_interface_detail /
+#   export_interfaces. There is no set_interface tool because OPNsense ships no such endpoint.
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH"
+source_name: "OPNsense REST API"
+source_url: "https://docs.opnsense.org/development/api.html"
+date: "2026-07-20"
+
+backend:
+  name: opnsense
+  type: rest
+  version: "1.0"
+  # base_url intentionally omitted — self-hosted, provided via backends.yaml
+  description: "OPNsense firewall REST API — manage firewall rules, aliases, interfaces, VPN, DHCP, DNS, diagnostics, firmware, and services on OPNsense appliances"
+
+  auth:
+    type: basic
+    username_credential: opnsense_api_key
+    password_credential: opnsense_api_secret
+
+  defaults:
+    headers:
+      Accept: application/json
+
+    # OPNsense's API controllers read the request body from PHP $_POST
+    # (Mvc/Request::getPost()), which is ONLY populated for
+    # application/x-www-form-urlencoded / multipart bodies — a JSON body is
+    # invisible. Without this, set_*/add_* model writes fail silently with a
+    # bare {"result":"failed"} and search_* filters (searchPhrase) are ignored
+    # (all rows returned). Send every POST body form-urlencoded by default;
+    # a per-tool content_type still overrides should any endpoint ever need a
+    # different request encoding.
+    content_type: application/x-www-form-urlencoded
+
+    # Model endpoints take their fields under a node object (the addItem/setBase
+    # "<model>" convention), expressed in DADL as dotted body params like
+    # alias.name / rule.action. Nest those dotted keys into objects so the form
+    # encoder emits the PHP bracket fields ($_POST nodes) OPNsense expects —
+    # alias.name -> alias[name]. Flat params (searchPhrase) and single object
+    # params (gateway_item) contain no dots and are unaffected.
+    nest_body_keys: true
+
+    pagination: &default-pagination
+      strategy: page
+      request:
+        page_param: current
+        limit_param: rowCount
+        limit_default: 50
+      response:
+        total_path: "$.total"
+      behavior: expose
+      max_pages: 20
+
+    errors: &standard-errors
+      format: json
+      message_path: "$.message"
+      code_path: "$.status"
+      retry_on: [502, 503, 504]
+      terminal: [400, 401, 403, 404]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+
+    response: &default-response
+      result_path: "$.rows"
+      allow_jq_override: true
+
+  coverage:
+    endpoints: 311
+    total_endpoints: 1500
+    percentage: 21
+    focus: "firewall (aliases, filter rules, NAT), diagnostics (ARP, states, system), interfaces, Unbound DNS, WireGuard, OpenVPN, IPsec, Kea DHCP, routes/gateways, firmware, system/backup, HAProxy, IDS/IPS, traffic shaper, certificates, syslog, cron, HA (hasync syncitems, config sync), IPv6 RA (radvd), NDP proxy"
+    missing: "per-interface IPv4/IPv6 address config (IPv6 configuration type, dhcp6 options — legacy config.xml, no API), captive portal vouchers, BIND DNS, Caddy, Nginx, FRR routing, ACME client, Monit, collectd, CrowdSec, FreeRADIUS, most third-party plugins"
+    last_reviewed: "2026-07-20"
+
+  setup:
+    credential_steps:
+      - "Log in to OPNsense web UI as admin"
+      - "Navigate to System → Access → Users"
+      - "Edit the user you want to create API credentials for (or create a dedicated API user)"
+      - "Scroll down to 'API keys' section and click the '+' (add) button"
+      - "A key/secret pair is generated and downloaded as an apikey.txt file"
+      - "The file contains: key=<your-api-key> and secret=<your-api-secret>"
+      - "IMPORTANT: The secret is NOT stored on the system — save it securely"
+      - "Set env vars: CREDENTIAL_OPNSENSE_API_KEY=<key> and CREDENTIAL_OPNSENSE_API_SECRET=<secret>"
+    env_var: CREDENTIAL_OPNSENSE_API_KEY and CREDENTIAL_OPNSENSE_API_SECRET
+    backends_yaml: |
+      - name: opnsense
+        transport: rest
+        dadl: opnsense.dadl
+        url: "https://your-opnsense-host/api"
+    required_scopes:
+      - "GUI access to relevant OPNsense pages (permissions are page-based, not scope-based)"
+    docs_url: "https://docs.opnsense.org/development/how-tos/api.html"
+    notes: "OPNsense uses page-based permissions. The API user needs GUI access to the same pages they want to access via API. For full API access, assign the user to the 'admins' group. API key + secret are used as HTTP Basic Auth (key=username, secret=password)."
+
+  hints:
+    search_firewall_aliases:
+      search_body: "POST body: {current: 1, rowCount: 50, searchPhrase: 'myalias'}"
+    add_firewall_alias:
+      alias_types: "host, network, port, url, urltable, geoip, networkgroup, mac, asn, dynipv6host, authgroup, internal, external"
+      content_format: "newline-separated values in 'content' field"
+    search_firewall_rules:
+      search_body: "POST body: {current: 1, rowCount: 50, searchPhrase: ''}"
+      rule_ordering: "rules are evaluated top-to-bottom; use move_firewall_rule_before to reorder"
+    apply_firewall:
+      savepoint_note: "call savepoint_firewall first to get a rollback revision, then apply with that revision — auto-rollback if you don't confirm within 60s"
+    add_kea_dhcp4_reservation:
+      mac_format: "MAC address in aa:bb:cc:dd:ee:ff format"
+    search_unbound_host_overrides:
+      search_body: "POST body: {current: 1, rowCount: 50, searchPhrase: 'myhost'}"
+    get_wireguard_server_info:
+      key_pair: "call wireguard_key_pair first to generate a new keypair for the server"
+    update_gateway:
+      use_this: "preferred way to edit a gateway — read-modify-write preserves untouched fields (defaultgw, nosync, priority); set_gateway alone replaces the whole item"
+      select_fields: "interface and ipprotocol are SELECT fields — pass bare values (e.g. interface 'opt1', ipprotocol 'inet'), not the {selected,value} map from get_gateway"
+      apply: "save only stores config; pass apply:true or call reconfigure_gateways to activate"
+    set_gateway:
+      body_encoding: "must be form-urlencoded with a nested gateway_item object (gateway_item[field]=...); OPNsense reads PHP $_POST which ignores JSON bodies — a JSON post or flat dotted keys give a bare {\"result\":\"failed\"} (empty validations)"
+      full_replace: "setBase rebuilds the item from the POST — omitted fields reset to model defaults; always post the complete item (use update_gateway)"
+    update_hasync_settings:
+      use_this: "preferred way to change HA sync — read-modify-write; enable_syncitems/disable_syncitems flip individual synced sections without dropping the other ~35"
+      syncitems: "syncitems is a multi-select; a bare set_hasync_settings REPLACES the whole selection. Section keys include radvd (Router Advertisements) and ndpproxy (NDP Proxy)"
+      field_names: "the hasync model fields are username/password — NOT synchronizeusername/synchronizepassword"
+    synchronize_ha_services:
+      what: "the HA-status 'Synchronize and reconfigure all services' action — runs XMLRPC exec_sync to push config to the backup, then reloads templates and restarts HA services on the peer"
+      lighter_option: "a normal save with hasync targets set already auto-syncs; use this only to force a full resync/reconfigure"
+    update_radvd:
+      use_this: "preferred way to edit a radvd entry — read-modify-write preserves untouched fields; set_radvd alone replaces the whole entry"
+      select_fields: "interface, mode and the Adv* option fields are SELECT — pass bare values, not the {selected,value} maps from get_radvd"
+    set_ndpproxy_settings:
+      carp: "carp_depend_on=1 makes the proxy run only on the CARP master — required for HA failover"
+      apply: "call reconfigure_ndpproxy after set to (re)load the ndp-proxy-go service"
+    add_ndpproxy_alias:
+      alias_ref: "alias.alias is the UUID of an EXTERNAL-type firewall alias (search_firewall_aliases), not a name or IP"
+    reconfigure_pattern:
+      rule: "after any add/set/del change, call the module's reconfigure endpoint to apply"
+
+  tools:
+
+    # =========================================================================
+    # FIREWALL — ALIASES
+    # =========================================================================
+
+    search_firewall_aliases:
+      method: POST
+      path: /firewall/alias/searchItem
+      access: read
+      description: "Search firewall aliases (IP lists, port groups, URL tables, GeoIP, etc.)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+        sort: { type: string, in: body }
+
+    get_firewall_alias:
+      method: GET
+      path: /firewall/alias/getItem/{uuid}
+      access: read
+      description: "Get a single firewall alias by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_firewall_alias:
+      method: POST
+      path: /firewall/alias/addItem
+      access: write
+      description: "Create a new firewall alias"
+      params:
+        alias.enabled: { type: string, in: body, default: "1" }
+        alias.name: { type: string, in: body, required: true }
+        alias.type: { type: string, in: body, required: true, description: "host, network, port, url, urltable, geoip, networkgroup, mac, asn, dynipv6host" }
+        alias.content: { type: string, in: body, description: "Newline-separated values" }
+        alias.description: { type: string, in: body }
+        alias.proto: { type: string, in: body, description: "IPv4, IPv6 or empty for both" }
+        alias.updatefreq: { type: string, in: body, description: "Update frequency in days (for urltable type)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_firewall_alias:
+      method: POST
+      path: /firewall/alias/setItem/{uuid}
+      access: write
+      description: "Update an existing firewall alias"
+      params:
+        uuid: { type: string, in: path, required: true }
+        alias.enabled: { type: string, in: body }
+        alias.name: { type: string, in: body }
+        alias.type: { type: string, in: body }
+        alias.content: { type: string, in: body }
+        alias.description: { type: string, in: body }
+        alias.proto: { type: string, in: body }
+        alias.updatefreq: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_firewall_alias:
+      method: POST
+      path: /firewall/alias/delItem/{uuid}
+      access: dangerous
+      description: "Delete a firewall alias by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_firewall_alias:
+      method: POST
+      path: /firewall/alias/toggleItem/{uuid}
+      access: write
+      description: "Toggle a firewall alias on or off. Omit 'enabled' to flip the current state."
+      params:
+        uuid: { type: string, in: path, required: true }
+        enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_firewall_aliases:
+      method: POST
+      path: /firewall/alias/reconfigure
+      access: admin
+      description: "Apply alias changes to the running firewall"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_alias_uuid_by_name:
+      method: GET
+      path: /firewall/alias/getAliasUUID/{name}
+      access: read
+      description: "Look up alias UUID by name"
+      params:
+        name: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_alias_content:
+      method: GET
+      path: /firewall/alias_util/list/{alias}
+      access: read
+      description: "List the resolved content (IPs/networks) of an alias"
+      params:
+        alias: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_alias_entry:
+      method: POST
+      path: /firewall/alias_util/add/{alias}
+      access: write
+      description: "Add an entry to an alias at runtime (without modifying config)"
+      params:
+        alias: { type: string, in: path, required: true }
+        address: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_alias_entry:
+      method: POST
+      path: /firewall/alias_util/delete/{alias}
+      access: write
+      description: "Remove an entry from an alias at runtime"
+      params:
+        alias: { type: string, in: path, required: true }
+        address: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    flush_alias:
+      method: POST
+      path: /firewall/alias_util/flush/{alias}
+      access: dangerous
+      description: "Flush (clear) all entries from an alias at runtime"
+      params:
+        alias: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_network_aliases:
+      method: GET
+      path: /firewall/alias/listNetworkAliases
+      access: read
+      description: "List all aliases usable as network references"
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_alias_categories:
+      method: GET
+      path: /firewall/alias/listCategories
+      access: read
+      description: "List all alias categories"
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_geoip:
+      method: GET
+      path: /firewall/alias/getGeoIP
+      access: read
+      description: "Get GeoIP configuration and available countries"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL — FILTER RULES
+    # =========================================================================
+
+    search_firewall_rules:
+      method: POST
+      path: /firewall/filter/searchRule
+      access: read
+      description: "Search firewall filter rules"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+        sort: { type: string, in: body }
+
+    get_firewall_rule:
+      method: GET
+      path: /firewall/filter/getRule/{uuid}
+      access: read
+      description: "Get a single firewall filter rule by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_firewall_rule:
+      method: POST
+      path: /firewall/filter/addRule
+      access: write
+      description: "Create a new firewall filter rule"
+      params:
+        rule.enabled: { type: string, in: body, default: "1" }
+        rule.action: { type: string, in: body, required: true, description: "pass, block, reject" }
+        rule.quick: { type: string, in: body, default: "1", description: "1=first match wins" }
+        rule.interface: { type: string, in: body, required: true, description: "Interface name (e.g. lan, wan, opt1)" }
+        rule.direction: { type: string, in: body, required: true, description: "in, out" }
+        rule.ipprotocol: { type: string, in: body, default: "inet", description: "inet (IPv4), inet6 (IPv6), inet46 (both)" }
+        rule.protocol: { type: string, in: body, description: "TCP, UDP, ICMP, any, etc." }
+        rule.source_net: { type: string, in: body, description: "Source address/alias" }
+        rule.source_not: { type: string, in: body, description: "1=negate source" }
+        rule.source_port: { type: string, in: body }
+        rule.destination_net: { type: string, in: body, description: "Destination address/alias" }
+        rule.destination_not: { type: string, in: body }
+        rule.destination_port: { type: string, in: body }
+        rule.gateway: { type: string, in: body }
+        rule.log: { type: string, in: body, description: "1=log matching packets" }
+        rule.description: { type: string, in: body }
+        rule.categories: { type: string, in: body, description: "Comma-separated category UUIDs" }
+        rule.sequence: { type: integer, in: body, description: "Sort order" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_firewall_rule:
+      method: POST
+      path: /firewall/filter/setRule/{uuid}
+      access: write
+      description: "Update an existing firewall filter rule"
+      params:
+        uuid: { type: string, in: path, required: true }
+        rule.enabled: { type: string, in: body }
+        rule.action: { type: string, in: body }
+        rule.quick: { type: string, in: body }
+        rule.interface: { type: string, in: body }
+        rule.direction: { type: string, in: body }
+        rule.ipprotocol: { type: string, in: body }
+        rule.protocol: { type: string, in: body }
+        rule.source_net: { type: string, in: body }
+        rule.source_not: { type: string, in: body }
+        rule.source_port: { type: string, in: body }
+        rule.destination_net: { type: string, in: body }
+        rule.destination_not: { type: string, in: body }
+        rule.destination_port: { type: string, in: body }
+        rule.gateway: { type: string, in: body }
+        rule.log: { type: string, in: body }
+        rule.description: { type: string, in: body }
+        rule.categories: { type: string, in: body }
+        rule.sequence: { type: integer, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_firewall_rule:
+      method: POST
+      path: /firewall/filter/delRule/{uuid}
+      access: dangerous
+      description: "Delete a firewall filter rule"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_firewall_rule:
+      method: POST
+      path: /firewall/filter/toggleRule/{uuid}
+      access: write
+      description: "Toggle a firewall filter rule on or off. Omit 'enabled' to flip the current state."
+      params:
+        uuid: { type: string, in: path, required: true }
+        enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    move_firewall_rule_before:
+      method: POST
+      path: /firewall/filter/moveRuleBefore/{uuid}/{target_uuid}
+      access: write
+      description: "Move a firewall rule before another rule (reorder)"
+      params:
+        uuid: { type: string, in: path, required: true, description: "UUID of rule to move" }
+        target_uuid: { type: string, in: path, required: true, description: "UUID of target rule (moved rule will be placed before this)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firewall_interface_list:
+      method: GET
+      path: /firewall/filter/getInterfaceList
+      access: read
+      description: "List interfaces available for firewall rules"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firewall_rule_stats:
+      method: GET
+      path: /firewall/filter_util/ruleStats
+      access: read
+      description: "Get firewall rule hit statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Firewall apply/rollback ─────────────────────────────────
+
+    savepoint_firewall:
+      method: POST
+      path: /firewall/filter_base/savepoint
+      access: admin
+      description: "Create a savepoint before applying firewall changes (returns revision ID for rollback)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    apply_firewall:
+      method: POST
+      path: /firewall/filter_base/apply/{rollback_revision}
+      access: admin
+      description: "Apply firewall filter changes. Pass a rollback_revision from savepoint_firewall for auto-rollback safety (reverts after 60s unless confirmed via cancel_rollback_firewall)."
+      params:
+        rollback_revision: { type: string, in: path, required: true, description: "Revision from savepoint_firewall — auto-rollback if not confirmed within 60s" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_rollback_firewall:
+      method: POST
+      path: /firewall/filter_base/cancelRollback/{rollback_revision}
+      access: admin
+      description: "Confirm applied firewall changes (cancel auto-rollback)"
+      params:
+        rollback_revision: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    revert_firewall:
+      method: POST
+      path: /firewall/filter_base/revert/{revision}
+      access: admin
+      description: "Revert firewall to a previous revision"
+      params:
+        revision: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL — CATEGORIES
+    # =========================================================================
+
+    search_firewall_categories:
+      method: POST
+      path: /firewall/category/searchItem
+      access: read
+      description: "Search firewall rule categories"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_firewall_category:
+      method: POST
+      path: /firewall/category/addItem
+      access: write
+      description: "Create a new firewall rule category"
+      params:
+        category.name: { type: string, in: body, required: true }
+        category.auto: { type: string, in: body, default: "0" }
+        category.color: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_firewall_category:
+      method: POST
+      path: /firewall/category/setItem/{uuid}
+      access: write
+      description: "Update a firewall rule category"
+      params:
+        uuid: { type: string, in: path, required: true }
+        category.name: { type: string, in: body }
+        category.auto: { type: string, in: body }
+        category.color: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_firewall_category:
+      method: POST
+      path: /firewall/category/delItem/{uuid}
+      access: write
+      description: "Delete a firewall rule category"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL — NAT (DNAT / Port Forwarding)
+    # =========================================================================
+
+    search_dnat_rules:
+      method: POST
+      path: /firewall/dNat/searchRule
+      access: read
+      description: "Search destination NAT (port forwarding) rules"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_dnat_rule:
+      method: GET
+      path: /firewall/dNat/getRule/{uuid}
+      access: read
+      description: "Get a single DNAT rule by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_dnat_rule:
+      method: POST
+      path: /firewall/dNat/addRule
+      access: write
+      description: "Create a new destination NAT (port forwarding) rule"
+      params:
+        rule.enabled: { type: string, in: body, default: "1" }
+        rule.interface: { type: string, in: body, required: true }
+        rule.ipprotocol: { type: string, in: body, default: "inet" }
+        rule.protocol: { type: string, in: body }
+        rule.source_net: { type: string, in: body }
+        rule.source_port: { type: string, in: body }
+        rule.destination_net: { type: string, in: body }
+        rule.destination_port: { type: string, in: body }
+        rule.target: { type: string, in: body, required: true, description: "Internal target IP" }
+        rule.target_port: { type: string, in: body, description: "Internal target port" }
+        rule.log: { type: string, in: body }
+        rule.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_dnat_rule:
+      method: POST
+      path: /firewall/dNat/setRule/{uuid}
+      access: write
+      description: "Update an existing DNAT rule"
+      params:
+        uuid: { type: string, in: path, required: true }
+        rule.enabled: { type: string, in: body }
+        rule.interface: { type: string, in: body }
+        rule.ipprotocol: { type: string, in: body }
+        rule.protocol: { type: string, in: body }
+        rule.source_net: { type: string, in: body }
+        rule.source_port: { type: string, in: body }
+        rule.destination_net: { type: string, in: body }
+        rule.destination_port: { type: string, in: body }
+        rule.target: { type: string, in: body }
+        rule.target_port: { type: string, in: body }
+        rule.log: { type: string, in: body }
+        rule.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_dnat_rule:
+      method: POST
+      path: /firewall/dNat/delRule/{uuid}
+      access: dangerous
+      description: "Delete a destination NAT (port forwarding) rule by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_dnat_rule:
+      method: POST
+      path: /firewall/dNat/toggleRule/{uuid}
+      access: write
+      description: "Toggle a destination NAT rule on or off. Omit 'disabled' to flip the current state."
+      params:
+        uuid: { type: string, in: path, required: true }
+        disabled: { type: string, in: query, description: "1=disable, 0=enable — omit to toggle" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL — SOURCE NAT (Outbound NAT)
+    # =========================================================================
+
+    search_snat_rules:
+      method: POST
+      path: /firewall/sourceNat/searchRule
+      access: read
+      description: "Search source NAT (outbound NAT) rules"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_snat_rule:
+      method: POST
+      path: /firewall/sourceNat/addRule
+      access: write
+      description: "Create a new source NAT rule"
+      params:
+        rule.enabled: { type: string, in: body, default: "1" }
+        rule.interface: { type: string, in: body, required: true }
+        rule.ipprotocol: { type: string, in: body, default: "inet" }
+        rule.protocol: { type: string, in: body }
+        rule.source_net: { type: string, in: body }
+        rule.source_port: { type: string, in: body }
+        rule.destination_net: { type: string, in: body }
+        rule.destination_port: { type: string, in: body }
+        rule.target: { type: string, in: body, description: "NAT target IP/alias" }
+        rule.log: { type: string, in: body }
+        rule.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_snat_rule:
+      method: POST
+      path: /firewall/sourceNat/setRule/{uuid}
+      access: write
+      description: "Update a source NAT rule"
+      params:
+        uuid: { type: string, in: path, required: true }
+        rule.enabled: { type: string, in: body }
+        rule.interface: { type: string, in: body }
+        rule.ipprotocol: { type: string, in: body }
+        rule.protocol: { type: string, in: body }
+        rule.source_net: { type: string, in: body }
+        rule.source_port: { type: string, in: body }
+        rule.destination_net: { type: string, in: body }
+        rule.destination_port: { type: string, in: body }
+        rule.target: { type: string, in: body, description: "NAT target IP/alias" }
+        rule.log: { type: string, in: body }
+        rule.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_snat_rule:
+      method: POST
+      path: /firewall/sourceNat/delRule/{uuid}
+      access: dangerous
+      description: "Delete a source NAT rule"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # DIAGNOSTICS — FIREWALL
+    # =========================================================================
+
+    query_firewall_states:
+      method: POST
+      path: /diagnostics/firewall/query_states
+      access: read
+      description: "Query active pf firewall states (connections)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+        sort: { type: string, in: body }
+
+    get_pf_statistics:
+      method: GET
+      path: /diagnostics/firewall/pf_statistics/{section}
+      access: read
+      description: "Get pf firewall statistics. Available sections: info, memory, timeouts, interfaces, rules. Pass a section name or 'all' for everything."
+      params:
+        section: { type: string, in: path, required: true, description: "Section name: info, memory, timeouts, interfaces, rules, or 'all'" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firewall_stats:
+      method: GET
+      path: /diagnostics/firewall/stats
+      access: read
+      description: "Get firewall statistics summary"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firewall_log:
+      method: GET
+      path: /diagnostics/firewall/log
+      access: read
+      description: "Get recent firewall log entries. Use limit to control result size (default 1000, can be large). Use digest for pagination (value from previous response). No content filtering — filter client-side by action, src, dst, etc."
+      params:
+        limit: { type: integer, in: query, description: "Max entries to return (default 1000). Use small values (e.g. 50) to reduce response size." }
+        digest: { type: string, in: query, description: "Pagination cursor from previous response for fetching next batch" }
+      response:
+        result_path: "$"
+        transform: |
+          map({__timestamp__, action, interface, dir, src, dst, srcport, dstport, protoname})
+      pagination: none
+
+    get_firewall_log_filters:
+      method: GET
+      path: /diagnostics/firewall/log_filters
+      access: read
+      description: "Get available firewall log filter options"
+      response:
+        result_path: "$"
+      pagination: none
+
+    kill_firewall_states:
+      method: POST
+      path: /diagnostics/firewall/kill_states
+      access: dangerous
+      description: "Kill firewall states matching criteria"
+      params:
+        filter: { type: string, in: body, description: "Filter expression for states to kill" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    flush_firewall_states:
+      method: POST
+      path: /diagnostics/firewall/flush_states
+      access: dangerous
+      description: "Flush ALL firewall states"
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_firewall_state:
+      method: POST
+      path: /diagnostics/firewall/del_state/{stateid}/{creatorid}
+      access: dangerous
+      description: "Delete a specific firewall state"
+      params:
+        stateid: { type: string, in: path, required: true }
+        creatorid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_firewall_rule_ids:
+      method: GET
+      path: /diagnostics/firewall/list_rule_ids
+      access: read
+      description: "List all active pf rule IDs with descriptions"
+      response:
+        result_path: "$"
+      pagination: none
+
+    query_pf_top:
+      method: POST
+      path: /diagnostics/firewall/query_pf_top
+      access: read
+      description: "Query top firewall connections by various criteria"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # DIAGNOSTICS — INTERFACES & NETWORK
+    # =========================================================================
+
+    get_arp_table:
+      method: GET
+      path: /diagnostics/interface/get_arp
+      access: read
+      description: "Get the ARP table (IPv4 neighbor cache). Returns ALL entries (no server-side filtering). Fields are reduced to ip, mac, hostname, intf_description to keep response compact."
+      response:
+        result_path: "$"
+        transform: |
+          map({ip, mac, hostname, intf_description})
+      pagination: none
+
+    get_ndp_table:
+      method: GET
+      path: /diagnostics/interface/get_ndp
+      access: read
+      description: "Get the NDP table (IPv6 neighbor cache). Returns ALL entries (no server-side filtering). Fields are reduced to keep response compact."
+      response:
+        result_path: "$"
+        transform: |
+          map({ip: .ipv6, mac, intf_description})
+      pagination: none
+
+    flush_arp_table:
+      method: POST
+      path: /diagnostics/interface/flush_arp
+      access: dangerous
+      description: "Flush the entire ARP table"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_routes:
+      method: GET
+      path: /diagnostics/interface/get_routes
+      access: read
+      description: "Get the system routing table"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_interface_config:
+      method: GET
+      path: /diagnostics/interface/get_interface_config
+      access: read
+      description: "Get configuration of all network interfaces"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_interface_names:
+      method: GET
+      path: /diagnostics/interface/get_interface_names
+      access: read
+      description: "Get interface name mappings (physical ↔ friendly)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_interface_statistics:
+      method: GET
+      path: /diagnostics/interface/get_interface_statistics
+      access: read
+      description: "Get traffic statistics for all interfaces"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_vip_status:
+      method: GET
+      path: /diagnostics/interface/get_vip_status
+      access: read
+      description: "Get CARP/VIP status for high availability"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_pfsync_nodes:
+      method: GET
+      path: /diagnostics/interface/get_pfsync_nodes
+      access: read
+      description: "Get pfsync HA cluster node status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_route:
+      method: POST
+      path: /diagnostics/interface/del_route
+      access: dangerous
+      description: "Delete a route from the system routing table"
+      params:
+        destination: { type: string, in: body, required: true }
+        gateway: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_protocol_statistics:
+      method: GET
+      path: /diagnostics/interface/get_protocol_statistics
+      access: read
+      description: "Get protocol-level traffic statistics (TCP, UDP, ICMP, etc.)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_socket_statistics:
+      method: GET
+      path: /diagnostics/interface/get_socket_statistics
+      access: read
+      description: "Get active socket/connection statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_memory_statistics:
+      method: GET
+      path: /diagnostics/interface/get_memory_statistics
+      access: read
+      description: "Get network memory (mbuf) allocation statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_bpf_statistics:
+      method: GET
+      path: /diagnostics/interface/get_bpf_statistics
+      access: read
+      description: "Get BPF (Berkeley Packet Filter) statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # DIAGNOSTICS — SYSTEM
+    # =========================================================================
+
+    get_system_information:
+      method: GET
+      path: /diagnostics/system/system_information
+      access: read
+      description: "Get comprehensive system information (hostname, version, uptime, CPU, memory, etc.)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_resources:
+      method: GET
+      path: /diagnostics/system/system_resources
+      access: read
+      description: "Get system resource usage (CPU, memory, processes)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_memory:
+      method: GET
+      path: /diagnostics/system/memory
+      access: read
+      description: "Get detailed memory usage"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_disk:
+      method: GET
+      path: /diagnostics/system/system_disk
+      access: read
+      description: "Get disk usage for all filesystems"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_temperature:
+      method: GET
+      path: /diagnostics/system/system_temperature
+      access: read
+      description: "Get system temperature sensors"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_time:
+      method: GET
+      path: /diagnostics/system/system_time
+      access: read
+      description: "Get current system time and uptime"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_swap:
+      method: GET
+      path: /diagnostics/system/system_swap
+      access: read
+      description: "Get swap space usage statistics (total, used, free)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_mbuf:
+      method: GET
+      path: /diagnostics/system/system_mbuf
+      access: read
+      description: "Get mbuf (network memory buffer) statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Diagnostics: Activity & DNS ─────────────────────────────
+
+    get_activity:
+      method: GET
+      path: /diagnostics/activity/get_activity
+      access: read
+      description: "Get running processes and system activity"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reverse_dns_lookup:
+      method: GET
+      path: /diagnostics/dns/reverse_lookup
+      access: read
+      description: "Perform a reverse DNS lookup"
+      params:
+        address: { type: string, in: query, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # DIAGNOSTICS — TRAFFIC
+    # =========================================================================
+
+    get_traffic_interface:
+      method: GET
+      path: /diagnostics/traffic/_interface
+      access: read
+      description: "Get current traffic rates per interface"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_traffic_top:
+      method: GET
+      path: /diagnostics/traffic/_top/{interfaces}
+      access: read
+      description: "Get top traffic connections for specified interfaces"
+      params:
+        interfaces: { type: string, in: path, required: true, description: "Comma-separated interface names" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # INTERFACES
+    # =========================================================================
+
+    get_interfaces_overview:
+      method: GET
+      path: /interfaces/overview/interfaces_info
+      access: read
+      description: "Get detailed information about all configured interfaces"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_interface_detail:
+      method: GET
+      path: /interfaces/overview/get_interface/{if}
+      access: read
+      description: "Get details for a specific interface"
+      params:
+        if: { type: string, in: path, required: true, description: "Interface identifier (e.g. lan, wan, opt1)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    export_interfaces:
+      method: GET
+      path: /interfaces/overview/export
+      access: read
+      description: "Export interface configuration"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── VLANs ───────────────────────────────────────────────────
+
+    search_vlans:
+      method: POST
+      path: /interfaces/vlan_settings/search_item
+      access: read
+      description: "Search VLAN interfaces"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_vlan:
+      method: GET
+      path: /interfaces/vlan_settings/get_item/{uuid}
+      access: read
+      description: "Get a VLAN interface by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_vlan:
+      method: POST
+      path: /interfaces/vlan_settings/add_item
+      access: write
+      description: "Create a new VLAN interface"
+      params:
+        vlan.if: { type: string, in: body, required: true, description: "Parent interface" }
+        vlan.tag: { type: integer, in: body, required: true, description: "VLAN tag (1-4094)" }
+        vlan.pcp: { type: integer, in: body }
+        vlan.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_vlan:
+      method: POST
+      path: /interfaces/vlan_settings/set_item/{uuid}
+      access: write
+      description: "Update an existing VLAN interface"
+      params:
+        uuid: { type: string, in: path, required: true }
+        vlan.if: { type: string, in: body }
+        vlan.tag: { type: integer, in: body }
+        vlan.pcp: { type: integer, in: body }
+        vlan.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_vlan:
+      method: POST
+      path: /interfaces/vlan_settings/del_item/{uuid}
+      access: dangerous
+      description: "Delete a VLAN interface"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_vlans:
+      method: POST
+      path: /interfaces/vlan_settings/reconfigure
+      access: admin
+      description: "Apply VLAN interface changes to the running system configuration"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── VIPs (Virtual IPs / CARP) ───────────────────────────────
+
+    search_vips:
+      method: POST
+      path: /interfaces/vip_settings/search_item
+      access: read
+      description: "Search virtual IP addresses (CARP, IP alias, proxy ARP)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_vip:
+      method: POST
+      path: /interfaces/vip_settings/add_item
+      access: write
+      description: "Create a virtual IP address"
+      params:
+        vip.mode: { type: string, in: body, required: true, description: "ipalias, carp, proxyarp, other" }
+        vip.interface: { type: string, in: body, required: true }
+        vip.network: { type: string, in: body, required: true, description: "IP address with CIDR" }
+        vip.descr: { type: string, in: body }
+        vip.vhid: { type: string, in: body, description: "CARP VHID group" }
+        vip.advskew: { type: string, in: body, description: "CARP advertisement skew" }
+        vip.password: { type: string, in: body, description: "CARP password" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_vip:
+      method: POST
+      path: /interfaces/vip_settings/set_item/{uuid}
+      access: write
+      description: "Update a virtual IP address"
+      params:
+        uuid: { type: string, in: path, required: true }
+        vip.mode: { type: string, in: body, description: "ipalias, carp, proxyarp, other" }
+        vip.interface: { type: string, in: body }
+        vip.network: { type: string, in: body, description: "IP address with CIDR" }
+        vip.descr: { type: string, in: body }
+        vip.vhid: { type: string, in: body, description: "CARP VHID group" }
+        vip.advskew: { type: string, in: body, description: "CARP advertisement skew" }
+        vip.password: { type: string, in: body, description: "CARP password" }
+      response:
+        result_path: "$"
+      pagination: none
+    del_vip:
+      method: POST
+      path: /interfaces/vip_settings/del_item/{uuid}
+      access: dangerous
+      description: "Delete a virtual IP address"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_vips:
+      method: POST
+      path: /interfaces/vip_settings/reconfigure
+      access: admin
+      description: "Apply virtual IP changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # UNBOUND DNS
+    # =========================================================================
+
+    get_unbound_settings:
+      method: GET
+      path: /unbound/settings/get
+      access: read
+      description: "Get Unbound DNS resolver settings"
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_unbound_settings:
+      method: POST
+      path: /unbound/settings/set
+      access: write
+      description: "Update Unbound DNS resolver settings"
+      params:
+        unbound.general.enabled: { type: string, in: body }
+        unbound.general.port: { type: string, in: body }
+        unbound.general.dnssec: { type: string, in: body }
+        unbound.general.active_interface: { type: string, in: body }
+        unbound.general.outgoing_interface: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Unbound: Host Overrides ─────────────────────────────────
+
+    search_unbound_host_overrides:
+      method: POST
+      path: /unbound/settings/search_host_override
+      access: read
+      description: "Search DNS host overrides (local DNS records)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_unbound_host_override:
+      method: GET
+      path: /unbound/settings/get_host_override/{uuid}
+      access: read
+      description: "Get a DNS host override by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_unbound_host_override:
+      method: POST
+      path: /unbound/settings/add_host_override
+      access: write
+      description: "Create a DNS host override (local A/AAAA/MX record)"
+      params:
+        host.enabled: { type: string, in: body, default: "1" }
+        host.hostname: { type: string, in: body, required: true }
+        host.domain: { type: string, in: body, required: true }
+        host.rr: { type: string, in: body, default: "A", description: "Record type: A, AAAA, MX" }
+        host.server: { type: string, in: body, required: true, description: "Target IP address" }
+        host.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_unbound_host_override:
+      method: POST
+      path: /unbound/settings/set_host_override/{uuid}
+      access: write
+      description: "Update a DNS host override"
+      params:
+        uuid: { type: string, in: path, required: true }
+        host.enabled: { type: string, in: body }
+        host.hostname: { type: string, in: body }
+        host.domain: { type: string, in: body }
+        host.rr: { type: string, in: body }
+        host.server: { type: string, in: body }
+        host.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_unbound_host_override:
+      method: POST
+      path: /unbound/settings/del_host_override/{uuid}
+      access: write
+      description: "Delete a DNS host override"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Unbound: Forwards ───────────────────────────────────────
+
+    search_unbound_forwards:
+      method: POST
+      path: /unbound/settings/search_forward
+      access: read
+      description: "Search DNS forwarding domains"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_unbound_forward:
+      method: POST
+      path: /unbound/settings/add_forward
+      access: write
+      description: "Create a DNS forwarding entry (forward queries for a domain to specific servers)"
+      params:
+        forward.enabled: { type: string, in: body, default: "1" }
+        forward.domain: { type: string, in: body, required: true }
+        forward.server: { type: string, in: body, required: true, description: "Comma-separated DNS server IPs" }
+        forward.port: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_unbound_forward:
+      method: POST
+      path: /unbound/settings/set_forward/{uuid}
+      access: write
+      description: "Update a DNS forwarding entry"
+      params:
+        uuid: { type: string, in: path, required: true }
+        forward.enabled: { type: string, in: body }
+        forward.domain: { type: string, in: body }
+        forward.server: { type: string, in: body, description: "Comma-separated DNS server IPs" }
+        forward.port: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_unbound_forward:
+      method: POST
+      path: /unbound/settings/del_forward/{uuid}
+      access: write
+      description: "Delete a DNS forwarding entry"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Unbound: DNSBL (blocklists) ─────────────────────────────
+
+    search_unbound_dnsbl:
+      method: POST
+      path: /unbound/settings/search_dnsbl
+      access: read
+      description: "Search DNS blocklist entries"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    update_unbound_blocklist:
+      method: POST
+      path: /unbound/settings/update_blocklist
+      access: admin
+      description: "Trigger DNS blocklist update"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Unbound: Service ────────────────────────────────────────
+
+    get_unbound_service_status:
+      method: GET
+      path: /unbound/service/status
+      access: read
+      description: "Get Unbound DNS resolver service status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_unbound:
+      method: POST
+      path: /unbound/service/reconfigure
+      access: admin
+      description: "Apply Unbound DNS changes and restart"
+      response:
+        result_path: "$"
+      pagination: none
+
+    restart_unbound:
+      method: POST
+      path: /unbound/service/restart
+      access: admin
+      description: "Restart the Unbound DNS resolver"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Unbound: Diagnostics ────────────────────────────────────
+
+    get_unbound_cache:
+      method: GET
+      path: /unbound/diagnostics/dumpcache
+      access: read
+      description: "Dump the Unbound DNS cache"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_unbound_stats:
+      method: GET
+      path: /unbound/diagnostics/stats
+      access: read
+      description: "Get Unbound DNS resolver statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_unbound_local_data:
+      method: GET
+      path: /unbound/diagnostics/listlocaldata
+      access: read
+      description: "List Unbound local data entries"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_unbound_local_zones:
+      method: GET
+      path: /unbound/diagnostics/listlocalzones
+      access: read
+      description: "List Unbound local zones"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # WIREGUARD VPN
+    # =========================================================================
+
+    search_wireguard_servers:
+      method: POST
+      path: /wireguard/server/search_server
+      access: read
+      description: "Search WireGuard server (tunnel) instances"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_wireguard_server:
+      method: GET
+      path: /wireguard/server/get_server/{uuid}
+      access: read
+      description: "Get a WireGuard server instance by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_wireguard_server:
+      method: POST
+      path: /wireguard/server/add_server
+      access: write
+      description: "Create a new WireGuard server (tunnel interface)"
+      params:
+        server.enabled: { type: string, in: body, default: "1" }
+        server.name: { type: string, in: body, required: true }
+        server.pubkey: { type: string, in: body, description: "Public key (use wireguard_key_pair to generate)" }
+        server.privkey: { type: string, in: body, description: "Private key" }
+        server.port: { type: string, in: body, required: true, description: "Listen port" }
+        server.tunneladdress: { type: string, in: body, required: true, description: "Tunnel IP address(es), comma-separated" }
+        server.peers: { type: string, in: body, description: "Comma-separated peer UUIDs" }
+        server.dns: { type: string, in: body }
+        server.mtu: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_wireguard_server:
+      method: POST
+      path: /wireguard/server/set_server/{uuid}
+      access: write
+      description: "Update a WireGuard server instance"
+      params:
+        uuid: { type: string, in: path, required: true }
+        server.enabled: { type: string, in: body }
+        server.name: { type: string, in: body }
+        server.port: { type: string, in: body }
+        server.tunneladdress: { type: string, in: body }
+        server.peers: { type: string, in: body }
+        server.dns: { type: string, in: body }
+        server.mtu: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_wireguard_server:
+      method: POST
+      path: /wireguard/server/del_server/{uuid}
+      access: dangerous
+      description: "Delete a WireGuard server instance"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_wireguard_server:
+      method: POST
+      path: /wireguard/server/toggle_server/{uuid}
+      access: write
+      description: "Toggle a WireGuard server instance on/off"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    wireguard_key_pair:
+      method: GET
+      path: /wireguard/server/key_pair
+      access: read
+      description: "Generate a new WireGuard key pair (public + private)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── WireGuard: Clients (Peers) ──────────────────────────────
+
+    search_wireguard_clients:
+      method: POST
+      path: /wireguard/client/search_client
+      access: read
+      description: "Search WireGuard client (peer) configurations"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_wireguard_client:
+      method: GET
+      path: /wireguard/client/get_client/{uuid}
+      access: read
+      description: "Get a WireGuard client (peer) by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_wireguard_client:
+      method: POST
+      path: /wireguard/client/add_client
+      access: write
+      description: "Create a new WireGuard client (peer) — returns a new peer with generated keys"
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_wireguard_client:
+      method: POST
+      path: /wireguard/client/set_client/{uuid}
+      access: write
+      description: "Update a WireGuard client (peer)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        client.enabled: { type: string, in: body }
+        client.name: { type: string, in: body }
+        client.pubkey: { type: string, in: body }
+        client.psk: { type: string, in: body }
+        client.tunneladdress: { type: string, in: body }
+        client.serveraddress: { type: string, in: body }
+        client.serverport: { type: string, in: body }
+        client.keepalive: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_wireguard_client:
+      method: POST
+      path: /wireguard/client/del_client/{uuid}
+      access: dangerous
+      description: "Delete a WireGuard client (peer)"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_wireguard_client:
+      method: POST
+      path: /wireguard/client/toggle_client/{uuid}
+      access: write
+      description: "Toggle a WireGuard client (peer) on/off"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    wireguard_psk:
+      method: GET
+      path: /wireguard/client/psk
+      access: read
+      description: "Generate a new WireGuard pre-shared key"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── WireGuard: Service ──────────────────────────────────────
+
+    get_wireguard_status:
+      method: GET
+      path: /wireguard/service/status
+      access: read
+      description: "Get WireGuard service status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_wireguard:
+      method: POST
+      path: /wireguard/service/reconfigure
+      access: admin
+      description: "Apply WireGuard configuration changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    wireguard_show:
+      method: GET
+      path: /wireguard/service/show
+      access: read
+      description: "Show WireGuard tunnel status (equivalent to 'wg show')"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # OPENVPN
+    # =========================================================================
+
+    search_openvpn_instances:
+      method: POST
+      path: /openvpn/instances/search
+      access: read
+      description: "Search OpenVPN server/client instances"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_openvpn_instance:
+      method: GET
+      path: /openvpn/instances/get/{uuid}
+      access: read
+      description: "Get an OpenVPN instance by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_openvpn_instance:
+      method: POST
+      path: /openvpn/instances/add
+      access: write
+      description: "Create a new OpenVPN instance"
+      params:
+        instance.enabled: { type: string, in: body, default: "1" }
+        instance.role: { type: string, in: body, required: true, description: "server or client" }
+        instance.description: { type: string, in: body }
+        instance.proto: { type: string, in: body, default: "UDP", description: "UDP, UDP4, UDP6, TCP, TCP4, TCP6" }
+        instance.port: { type: string, in: body }
+        instance.server: { type: string, in: body, description: "Tunnel network (e.g. 10.0.8.0/24)" }
+        instance.local: { type: string, in: body, description: "Local IP/interface to bind" }
+        instance.remote: { type: string, in: body, description: "Remote server (for client mode)" }
+        instance.cert: { type: string, in: body, description: "Certificate UUID" }
+        instance.ca: { type: string, in: body, description: "CA UUID" }
+        instance.authmode: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_openvpn_instance:
+      method: POST
+      path: /openvpn/instances/set/{uuid}
+      access: write
+      description: "Update an OpenVPN instance"
+      params:
+        uuid: { type: string, in: path, required: true }
+        instance.enabled: { type: string, in: body }
+        instance.description: { type: string, in: body }
+        instance.proto: { type: string, in: body }
+        instance.port: { type: string, in: body }
+        instance.server: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_openvpn_instance:
+      method: POST
+      path: /openvpn/instances/del/{uuid}
+      access: dangerous
+      description: "Delete an OpenVPN instance"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_openvpn_instance:
+      method: POST
+      path: /openvpn/instances/toggle/{uuid}
+      access: write
+      description: "Toggle an OpenVPN server or client instance on or off. Omit 'enabled' to flip current state."
+      params:
+        uuid: { type: string, in: path, required: true }
+        enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_openvpn:
+      method: POST
+      path: /openvpn/service/reconfigure
+      access: admin
+      description: "Apply OpenVPN configuration changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_openvpn_sessions:
+      method: GET
+      path: /openvpn/service/search_sessions
+      access: read
+      description: "List active OpenVPN sessions/connections"
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_openvpn_routes:
+      method: GET
+      path: /openvpn/service/search_routes
+      access: read
+      description: "List OpenVPN routing table entries"
+      response:
+        result_path: "$"
+      pagination: none
+
+    kill_openvpn_session:
+      method: POST
+      path: /openvpn/service/kill_session
+      access: admin
+      description: "Kill an active OpenVPN session"
+      params:
+        session_id: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # IPSEC VPN
+    # =========================================================================
+
+    search_ipsec_connections:
+      method: POST
+      path: /ipsec/connections/search_connection
+      access: read
+      description: "Search IPsec connections (phase 1)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_ipsec_connection:
+      method: GET
+      path: /ipsec/connections/get_connection/{uuid}
+      access: read
+      description: "Get an IPsec connection by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_ipsec_connection:
+      method: POST
+      path: /ipsec/connections/add_connection
+      access: write
+      description: "Create a new IPsec connection"
+      params:
+        connection.enabled: { type: string, in: body, default: "1" }
+        connection.description: { type: string, in: body }
+        connection.version: { type: string, in: body, description: "IKE version: 1, 2" }
+        connection.proposals: { type: string, in: body, description: "IKE proposals (e.g. aes256-sha256-modp2048)" }
+        connection.rekey_time: { type: string, in: body }
+        connection.dpd_delay: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ipsec_connection:
+      method: POST
+      path: /ipsec/connections/set_connection/{uuid}
+      access: write
+      description: "Update an IPsec connection"
+      params:
+        uuid: { type: string, in: path, required: true }
+        connection.enabled: { type: string, in: body }
+        connection.description: { type: string, in: body }
+        connection.version: { type: string, in: body, description: "IKE version: 1, 2" }
+        connection.proposals: { type: string, in: body, description: "IKE proposals (e.g. aes256-sha256-modp2048)" }
+        connection.rekey_time: { type: string, in: body }
+        connection.dpd_delay: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_ipsec_connection:
+      method: POST
+      path: /ipsec/connections/del_connection/{uuid}
+      access: dangerous
+      description: "Delete an IPsec connection"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_ipsec_connection:
+      method: POST
+      path: /ipsec/connections/toggle_connection/{uuid}
+      access: write
+      description: "Toggle an IPsec connection on or off. Omit 'enabled' to flip the current state."
+      params:
+        uuid: { type: string, in: path, required: true }
+        enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── IPsec: Children (Phase 2 / SAs) ─────────────────────────
+
+    search_ipsec_children:
+      method: POST
+      path: /ipsec/connections/search_child
+      access: read
+      description: "Search IPsec child SAs (phase 2 / traffic selectors)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_ipsec_child:
+      method: POST
+      path: /ipsec/connections/add_child
+      access: write
+      description: "Create a new IPsec child SA"
+      params:
+        child.enabled: { type: string, in: body, default: "1" }
+        child.connection: { type: string, in: body, required: true, description: "Parent connection UUID" }
+        child.description: { type: string, in: body }
+        child.mode: { type: string, in: body, default: "tunnel", description: "tunnel, transport" }
+        child.proposals: { type: string, in: body, description: "ESP proposals" }
+        child.local_ts: { type: string, in: body, description: "Local traffic selector (e.g. 10.0.0.0/24)" }
+        child.remote_ts: { type: string, in: body, description: "Remote traffic selector" }
+        child.rekey_time: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ipsec_child:
+      method: POST
+      path: /ipsec/connections/set_child/{uuid}
+      access: write
+      description: "Update an IPsec child SA"
+      params:
+        uuid: { type: string, in: path, required: true }
+        child.enabled: { type: string, in: body }
+        child.connection: { type: string, in: body, description: "Parent connection UUID" }
+        child.description: { type: string, in: body }
+        child.mode: { type: string, in: body, description: "tunnel, transport" }
+        child.proposals: { type: string, in: body, description: "ESP proposals" }
+        child.local_ts: { type: string, in: body, description: "Local traffic selector (e.g. 10.0.0.0/24)" }
+        child.remote_ts: { type: string, in: body, description: "Remote traffic selector" }
+        child.rekey_time: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_ipsec_child:
+      method: POST
+      path: /ipsec/connections/del_child/{uuid}
+      access: dangerous
+      description: "Delete an IPsec child SA"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── IPsec: Sessions & Service ───────────────────────────────
+
+    search_ipsec_phase1:
+      method: GET
+      path: /ipsec/sessions/search_phase1
+      access: read
+      description: "List active IPsec phase 1 (IKE) sessions"
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_ipsec_phase2:
+      method: GET
+      path: /ipsec/sessions/search_phase2
+      access: read
+      description: "List active IPsec phase 2 (child SA) sessions"
+      response:
+        result_path: "$"
+      pagination: none
+
+    connect_ipsec:
+      method: POST
+      path: /ipsec/sessions/connect/{id}
+      access: admin
+      description: "Initiate an IPsec connection"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    disconnect_ipsec:
+      method: POST
+      path: /ipsec/sessions/disconnect/{id}
+      access: admin
+      description: "Disconnect an IPsec connection"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ipsec_status:
+      method: GET
+      path: /ipsec/service/status
+      access: read
+      description: "Get IPsec service status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_ipsec:
+      method: POST
+      path: /ipsec/service/reconfigure
+      access: admin
+      description: "Apply IPsec configuration changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── IPsec: Pre-Shared Keys ──────────────────────────────────
+
+    search_ipsec_psks:
+      method: POST
+      path: /ipsec/pre_shared_keys/search_item
+      access: read
+      description: "Search IPsec pre-shared keys"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_ipsec_psk:
+      method: POST
+      path: /ipsec/pre_shared_keys/add_item
+      access: write
+      description: "Create an IPsec pre-shared key"
+      params:
+        psk.identity: { type: string, in: body, required: true }
+        psk.type: { type: string, in: body, default: "PSK" }
+        psk.secret: { type: string, in: body, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ipsec_psk:
+      method: POST
+      path: /ipsec/pre_shared_keys/set_item/{uuid}
+      access: write
+      description: "Update an IPsec pre-shared key"
+      params:
+        uuid: { type: string, in: path, required: true }
+        psk.identity: { type: string, in: body }
+        psk.type: { type: string, in: body }
+        psk.secret: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_ipsec_psk:
+      method: POST
+      path: /ipsec/pre_shared_keys/del_item/{uuid}
+      access: dangerous
+      description: "Delete an IPsec pre-shared key"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # KEA DHCP (DHCPv4)
+    # =========================================================================
+
+    search_kea_dhcp4_subnets:
+      method: POST
+      path: /kea/dhcpv4/search_subnet
+      access: read
+      description: "Search Kea DHCPv4 subnets"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_kea_dhcp4_subnet:
+      method: GET
+      path: /kea/dhcpv4/get_subnet/{uuid}
+      access: read
+      description: "Get a Kea DHCPv4 subnet by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_kea_dhcp4_subnet:
+      method: POST
+      path: /kea/dhcpv4/add_subnet
+      access: write
+      description: "Create a new Kea DHCPv4 subnet"
+      params:
+        subnet.subnet: { type: string, in: body, required: true, description: "Subnet in CIDR (e.g. 192.168.1.0/24)" }
+        subnet.pools: { type: string, in: body, description: "IP pool range (e.g. 192.168.1.100-192.168.1.200)" }
+        subnet.option_data_routers: { type: string, in: body, description: "Default gateway" }
+        subnet.option_data_domain_name_servers: { type: string, in: body }
+        subnet.option_data_domain_name: { type: string, in: body }
+        subnet.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_kea_dhcp4_subnet:
+      method: POST
+      path: /kea/dhcpv4/set_subnet/{uuid}
+      access: write
+      description: "Update a Kea DHCPv4 subnet"
+      params:
+        uuid: { type: string, in: path, required: true }
+        subnet.subnet: { type: string, in: body }
+        subnet.pools: { type: string, in: body }
+        subnet.option_data_routers: { type: string, in: body }
+        subnet.option_data_domain_name_servers: { type: string, in: body }
+        subnet.option_data_domain_name: { type: string, in: body }
+        subnet.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_kea_dhcp4_subnet:
+      method: POST
+      path: /kea/dhcpv4/del_subnet/{uuid}
+      access: dangerous
+      description: "Delete a Kea DHCPv4 subnet"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Kea: Reservations ───────────────────────────────────────
+
+    search_kea_dhcp4_reservations:
+      method: POST
+      path: /kea/dhcpv4/search_reservation
+      access: read
+      description: "Search Kea DHCPv4 static reservations"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_kea_dhcp4_reservation:
+      method: POST
+      path: /kea/dhcpv4/add_reservation
+      access: write
+      description: "Create a Kea DHCPv4 static reservation"
+      params:
+        reservation.subnet: { type: string, in: body, required: true, description: "Subnet UUID" }
+        reservation.hw_address: { type: string, in: body, required: true, description: "MAC address (aa:bb:cc:dd:ee:ff)" }
+        reservation.ip_address: { type: string, in: body, required: true }
+        reservation.hostname: { type: string, in: body }
+        reservation.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_kea_dhcp4_reservation:
+      method: POST
+      path: /kea/dhcpv4/set_reservation/{uuid}
+      access: write
+      description: "Update a Kea DHCPv4 static reservation"
+      params:
+        uuid: { type: string, in: path, required: true }
+        reservation.subnet: { type: string, in: body }
+        reservation.hw_address: { type: string, in: body }
+        reservation.ip_address: { type: string, in: body }
+        reservation.hostname: { type: string, in: body }
+        reservation.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_kea_dhcp4_reservation:
+      method: POST
+      path: /kea/dhcpv4/del_reservation/{uuid}
+      access: write
+      description: "Delete a Kea DHCPv4 static reservation"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Kea: Leases & Service ───────────────────────────────────
+
+    search_kea_leases:
+      method: GET
+      path: /kea/leases/search
+      access: read
+      description: "Search active DHCP leases"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_kea_status:
+      method: GET
+      path: /kea/service/status
+      access: read
+      description: "Get Kea DHCP service status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_kea:
+      method: POST
+      path: /kea/service/reconfigure
+      access: admin
+      description: "Apply Kea DHCP configuration changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    restart_kea:
+      method: POST
+      path: /kea/service/restart
+      access: admin
+      description: "Restart Kea DHCP service"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # ROUTES & GATEWAYS
+    # =========================================================================
+
+    search_static_routes:
+      method: POST
+      path: /routes/routes/searchroute
+      access: read
+      description: "Search static routes"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_static_route:
+      method: GET
+      path: /routes/routes/getroute/{uuid}
+      access: read
+      description: "Get a static route by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_static_route:
+      method: POST
+      path: /routes/routes/addroute
+      access: write
+      description: "Create a new static route"
+      params:
+        route.disabled: { type: string, in: body, default: "0" }
+        route.network: { type: string, in: body, required: true, description: "Destination network (CIDR)" }
+        route.gateway: { type: string, in: body, required: true, description: "Gateway name" }
+        route.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_static_route:
+      method: POST
+      path: /routes/routes/setroute/{uuid}
+      access: write
+      description: "Update a static route"
+      params:
+        uuid: { type: string, in: path, required: true }
+        route.disabled: { type: string, in: body }
+        route.network: { type: string, in: body }
+        route.gateway: { type: string, in: body }
+        route.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_static_route:
+      method: POST
+      path: /routes/routes/delroute/{uuid}
+      access: dangerous
+      description: "Delete a static route"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_routes:
+      method: POST
+      path: /routes/routes/reconfigure
+      access: admin
+      description: "Apply static route changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_gateway_status:
+      method: GET
+      path: /routes/gateway/status
+      access: read
+      description: "Get gateway status (up/down, latency, loss)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Gateway management ──────────────────────────────────────
+
+    search_gateways:
+      method: POST
+      path: /routing/settings/search_gateway
+      access: read
+      description: "Search configured gateways"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_gateway:
+      method: GET
+      path: /routing/settings/get_gateway/{uuid}
+      access: read
+      description: "Get a gateway by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_gateway:
+      method: POST
+      path: /routing/settings/add_gateway
+      # OPNsense reads the posted item from PHP $_POST, which is ONLY populated for
+      # form-urlencoded / multipart bodies — NOT application/json. The item must be a
+      # SINGLE nested object param named `gateway_item` so ToolMesh form-encodes it with
+      # PHP bracket notation (gateway_item[name]=...). A JSON body, or flat dotted keys
+      # like "gateway_item.name", yield a bare {"result":"failed"} (empty validations).
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Create a new gateway. Provide the whole item as the object param `gateway_item`
+        (posted as gateway_item[<field>]=... form fields). SELECT fields must be BARE
+        option values: interface = friendly key ("wan","opt1"), ipprotocol = "inet"/"inet6".
+        Booleans are "0"/"1" strings. Required: name, interface, ipprotocol, gateway.
+        Returns {"result":"saved"} or {"result":"failed","validations":{...}} — inspect
+        "validations". Fields: name, descr, disabled, interface (bare), ipprotocol (bare),
+        gateway, defaultgw, fargw, nosync, monitor, monitor_disable, monitor_noroute,
+        monitor_killstates, monitor_killstates_priority, force_down, priority, weight,
+        latencylow, latencyhigh, losslow, losshigh, interval, time_period, loss_interval,
+        data_length.
+      params:
+        gateway_item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Full gateway item, e.g. {name:"WAN_GW", interface:"wan", ipprotocol:"inet",
+            gateway:"192.0.2.1", monitor:"8.8.8.8", priority:"255", weight:"1"}.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_gateway:
+      method: POST
+      path: /routing/settings/set_gateway/{uuid}
+      # See add_gateway: must be form-urlencoded with a nested `gateway_item` object so
+      # OPNsense's getPost('gateway_item') (PHP $_POST) sees it. JSON bodies are ignored.
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Low-level update of a gateway definition. PREFER the update_gateway composite —
+        it does a safe read-modify-write. This primitive REPLACES the whole item:
+        OPNsense's setBase('gateway_item','gateway_item',uuid) rebuilds the model from
+        exactly what you post, so any field you omit is reset to its model default
+        (monitor cleared, defaultgw/nosync/priority lost). Pass the COMPLETE item as the
+        object param `gateway_item` (form-encoded as gateway_item[<field>]=...): use
+        get_gateway, flatten the SELECT maps, change the fields you want, post it all back.
+        SELECT fields must be BARE values: interface = friendly key ("wan","opt1"),
+        ipprotocol = "inet"/"inet6". Booleans are "0"/"1" strings. Returns
+        {"result":"saved"} on success or {"result":"failed","validations":{...}} on error.
+      params:
+        uuid: { type: string, in: path, required: true }
+        gateway_item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Full gateway item. Fields: name, descr, disabled, interface (bare key),
+            ipprotocol (bare inet/inet6), gateway, defaultgw, fargw, nosync, monitor,
+            monitor_disable, monitor_noroute, monitor_killstates,
+            monitor_killstates_priority, force_down, priority, weight, latencylow,
+            latencyhigh, losslow, losshigh, interval, time_period, loss_interval,
+            data_length.
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_gateway:
+      method: POST
+      path: /routing/settings/del_gateway/{uuid}
+      access: dangerous
+      description: "Delete a gateway definition by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_gateways:
+      method: POST
+      path: /routing/settings/reconfigure
+      access: admin
+      description: "Apply gateway changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIRMWARE & SYSTEM
+    # =========================================================================
+
+    get_firmware_status:
+      method: POST
+      path: /core/firmware/status
+      access: read
+      description: "Get firmware update status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    check_firmware_updates:
+      method: POST
+      path: /core/firmware/check
+      access: read
+      description: "Check for available firmware updates"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firmware_info:
+      method: GET
+      path: /core/firmware/info
+      access: read
+      description: "Get installed firmware version and build info"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firmware_running:
+      method: GET
+      path: /core/firmware/running
+      access: read
+      description: "Check if a firmware operation is currently running"
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_firmware:
+      method: POST
+      path: /core/firmware/update
+      access: admin
+      description: "Start firmware update (non-blocking, check status with get_firmware_running)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firmware_changelog:
+      method: POST
+      path: /core/firmware/changelog/{version}
+      access: read
+      description: "Get changelog for a specific firmware version"
+      params:
+        version: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    install_firmware_plugin:
+      method: POST
+      path: /core/firmware/install/{pkg_name}
+      access: admin
+      description: "Install a plugin package"
+      params:
+        pkg_name: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    remove_firmware_plugin:
+      method: POST
+      path: /core/firmware/remove/{pkg_name}
+      access: admin
+      description: "Remove a plugin package"
+      params:
+        pkg_name: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_firmware_details:
+      method: POST
+      path: /core/firmware/details/{pkg_name}
+      access: read
+      description: "Get details about an installed package"
+      params:
+        pkg_name: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── System control ──────────────────────────────────────────
+
+    get_system_status:
+      method: GET
+      path: /core/system/status
+      access: read
+      description: "Get system status and pending notifications"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reboot_system:
+      method: POST
+      path: /core/system/reboot
+      access: dangerous
+      description: "Reboot the OPNsense appliance"
+      response:
+        result_path: "$"
+      pagination: none
+
+    halt_system:
+      method: POST
+      path: /core/system/halt
+      access: dangerous
+      description: "Shut down the OPNsense appliance"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ── Backup ──────────────────────────────────────────────────
+
+    list_backups:
+      method: GET
+      path: /core/backup/backups/{host}
+      access: read
+      description: "List configuration backups"
+      params:
+        host: { type: string, in: path, required: true, description: "Hostname or 'this' for local" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    download_backup:
+      method: GET
+      path: /core/backup/download/{host}/{backup}
+      access: read
+      description: "Download a configuration backup file as XML. Use list_backups to find available backup filenames."
+      params:
+        host: { type: string, in: path, required: true, description: "Hostname or 'this' for local backups" }
+        backup: { type: string, in: path, required: true, description: "Backup filename from list_backups — use 'this' for current running config" }
+      response:
+        result_path: "$"
+        binary: true
+        content_type: application/xml
+      pagination: none
+
+    revert_backup:
+      method: POST
+      path: /core/backup/revert_backup/{backup}
+      access: dangerous
+      description: "Revert to a previous configuration backup"
+      params:
+        backup: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    delete_backup:
+      method: POST
+      path: /core/backup/delete_backup/{backup}
+      access: dangerous
+      description: "Delete a configuration backup"
+      params:
+        backup: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    diff_backups:
+      method: GET
+      path: /core/backup/diff/{host}/{backup1}/{backup2}
+      access: read
+      description: "Show diff between two configuration backups"
+      params:
+        host: { type: string, in: path, required: true }
+        backup1: { type: string, in: path, required: true }
+        backup2: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # CORE SERVICES
+    # =========================================================================
+
+    search_services:
+      method: GET
+      path: /core/service/search
+      access: read
+      description: "List all services and their status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    start_service:
+      method: POST
+      path: /core/service/start/{name}
+      access: admin
+      description: "Start a system service by name (e.g. 'unbound', 'openvpn'). Use search_services to list available service names."
+      params:
+        name: { type: string, in: path, required: true }
+        id: { type: string, in: query, description: "Service instance ID for multi-instance services (e.g. OpenVPN)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    stop_service:
+      method: POST
+      path: /core/service/stop/{name}
+      access: admin
+      description: "Stop a system service by name. Use search_services to list running services."
+      params:
+        name: { type: string, in: path, required: true }
+        id: { type: string, in: query, description: "Service instance ID for multi-instance services" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    restart_service:
+      method: POST
+      path: /core/service/restart/{name}
+      access: admin
+      description: "Restart a system service by name. Useful after configuration changes or to recover a stalled service."
+      params:
+        name: { type: string, in: path, required: true }
+        id: { type: string, in: query, description: "Service instance ID for multi-instance services" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # IDS/IPS (INTRUSION DETECTION)
+    # =========================================================================
+
+    get_ids_status:
+      method: GET
+      path: /ids/service/status
+      access: read
+      description: "Get IDS/IPS (Suricata) service status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    query_ids_alerts:
+      method: POST
+      path: /ids/service/query_alerts
+      access: read
+      description: "Query IDS/IPS alert log"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+        fileid: { type: string, in: body, description: "Log file identifier" }
+
+    get_ids_alert_info:
+      method: GET
+      path: /ids/service/get_alert_info/{alertId}
+      access: read
+      description: "Get detailed information for a specific IDS/IPS alert by alert ID. Returns rule metadata, classification, and affected traffic details."
+      params:
+        alertId: { type: string, in: path, required: true }
+        fileid: { type: string, in: query, description: "Log file identifier — omit for current log" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ids_alert_logs:
+      method: GET
+      path: /ids/service/get_alert_logs
+      access: read
+      description: "List available IDS alert log files"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_ids:
+      method: POST
+      path: /ids/service/reconfigure
+      access: admin
+      description: "Apply IDS/IPS configuration changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    update_ids_rules:
+      method: POST
+      path: /ids/service/update_rules
+      access: admin
+      description: "Download and update IDS/IPS rulesets"
+      response:
+        result_path: "$"
+      pagination: none
+
+    drop_ids_alert_log:
+      method: POST
+      path: /ids/service/drop_alert_log
+      access: admin
+      description: "Clear the IDS alert log"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ids_settings:
+      method: GET
+      path: /ids/settings/get
+      access: read
+      description: "Get IDS/IPS settings"
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ids_settings:
+      method: POST
+      path: /ids/settings/set
+      access: write
+      description: "Update IDS/IPS settings"
+      params:
+        ids.general.enabled: { type: string, in: body }
+        ids.general.ips: { type: string, in: body, description: "1=IPS mode (inline blocking)" }
+        ids.general.interfaces: { type: string, in: body }
+        ids.general.homenet: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_ids_rules:
+      method: POST
+      path: /ids/settings/search_installed_rules
+      access: read
+      description: "Search installed IDS/IPS rules (signatures)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    toggle_ids_rule:
+      method: POST
+      path: /ids/settings/toggle_rule/{sids}
+      access: write
+      description: "Enable or disable IDS/IPS rules by Suricata SID. Accepts comma-separated SIDs for bulk toggle."
+      params:
+        sids: { type: string, in: path, required: true, description: "Comma-separated Suricata rule SIDs" }
+        enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # TRAFFIC SHAPER
+    # =========================================================================
+
+    search_shaper_pipes:
+      method: POST
+      path: /trafficshaper/settings/search_pipe
+      access: read
+      description: "Search traffic shaper pipes (bandwidth limiters)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_shaper_pipe:
+      method: POST
+      path: /trafficshaper/settings/add_pipe
+      access: write
+      description: "Create a traffic shaper pipe (bandwidth limit)"
+      params:
+        pipe.enabled: { type: string, in: body, default: "1" }
+        pipe.bandwidth: { type: integer, in: body, required: true }
+        pipe.bandwidthMetric: { type: string, in: body, default: "Kbit", description: "Kbit, Mbit, Gbit" }
+        pipe.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_shaper_pipe:
+      method: POST
+      path: /trafficshaper/settings/set_pipe/{uuid}
+      access: write
+      description: "Update a traffic shaper pipe (bandwidth limit)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        pipe.enabled: { type: string, in: body }
+        pipe.bandwidth: { type: integer, in: body }
+        pipe.bandwidthMetric: { type: string, in: body, description: "Kbit, Mbit, Gbit" }
+        pipe.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_shaper_pipe:
+      method: POST
+      path: /trafficshaper/settings/del_pipe/{uuid}
+      access: dangerous
+      description: "Delete a traffic shaper pipe"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_shaper_queues:
+      method: POST
+      path: /trafficshaper/settings/search_queue
+      access: read
+      description: "Search traffic shaper queues (within pipes)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    search_shaper_rules:
+      method: POST
+      path: /trafficshaper/settings/search_rule
+      access: read
+      description: "Search traffic shaper rules (match traffic to pipes/queues)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_shaper_rule:
+      method: POST
+      path: /trafficshaper/settings/add_rule
+      access: write
+      description: "Create a traffic shaper rule"
+      params:
+        rule.enabled: { type: string, in: body, default: "1" }
+        rule.interface: { type: string, in: body }
+        rule.protocol: { type: string, in: body }
+        rule.source: { type: string, in: body }
+        rule.destination: { type: string, in: body }
+        rule.target: { type: string, in: body, description: "Target pipe UUID" }
+        rule.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_shaper_rule:
+      method: POST
+      path: /trafficshaper/settings/set_rule/{uuid}
+      access: write
+      description: "Update a traffic shaper rule"
+      params:
+        uuid: { type: string, in: path, required: true }
+        rule.enabled: { type: string, in: body }
+        rule.interface: { type: string, in: body }
+        rule.protocol: { type: string, in: body }
+        rule.source: { type: string, in: body }
+        rule.destination: { type: string, in: body }
+        rule.target: { type: string, in: body, description: "Target pipe UUID" }
+        rule.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_shaper_rule:
+      method: POST
+      path: /trafficshaper/settings/del_rule/{uuid}
+      access: dangerous
+      description: "Delete a traffic shaper rule"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_shaper:
+      method: POST
+      path: /trafficshaper/service/reconfigure
+      access: admin
+      description: "Apply traffic shaper changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_shaper_statistics:
+      method: GET
+      path: /trafficshaper/service/statistics
+      access: read
+      description: "Get traffic shaper statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # HAPROXY (Plugin)
+    # =========================================================================
+
+    search_haproxy_servers:
+      method: POST
+      path: /haproxy/settings/search_server
+      access: read
+      description: "Search HAProxy backend servers"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_haproxy_server:
+      method: POST
+      path: /haproxy/settings/add_server
+      access: write
+      description: "Create an HAProxy backend server"
+      params:
+        server.name: { type: string, in: body, required: true }
+        server.address: { type: string, in: body, required: true }
+        server.port: { type: string, in: body }
+        server.mode: { type: string, in: body, default: "active" }
+        server.ssl: { type: string, in: body }
+        server.weight: { type: string, in: body }
+        server.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_haproxy_server:
+      method: POST
+      path: /haproxy/settings/set_server/{uuid}
+      access: write
+      description: "Update an HAProxy backend server"
+      params:
+        uuid: { type: string, in: path, required: true }
+        server.name: { type: string, in: body }
+        server.address: { type: string, in: body }
+        server.port: { type: string, in: body }
+        server.mode: { type: string, in: body }
+        server.ssl: { type: string, in: body }
+        server.weight: { type: string, in: body }
+        server.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_haproxy_server:
+      method: POST
+      path: /haproxy/settings/del_server/{uuid}
+      access: dangerous
+      description: "Delete an HAProxy backend server"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_haproxy_backends:
+      method: POST
+      path: /haproxy/settings/search_backend
+      access: read
+      description: "Search HAProxy backends"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_haproxy_backend:
+      method: POST
+      path: /haproxy/settings/add_backend
+      access: write
+      description: "Create an HAProxy backend"
+      params:
+        backend.enabled: { type: string, in: body, default: "1" }
+        backend.name: { type: string, in: body, required: true }
+        backend.mode: { type: string, in: body, default: "http", description: "http, tcp" }
+        backend.algorithm: { type: string, in: body, default: "roundrobin" }
+        backend.linkedServers: { type: string, in: body, description: "Comma-separated server UUIDs" }
+        backend.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_haproxy_backend:
+      method: POST
+      path: /haproxy/settings/set_backend/{uuid}
+      access: write
+      description: "Update an HAProxy backend"
+      params:
+        uuid: { type: string, in: path, required: true }
+        backend.enabled: { type: string, in: body }
+        backend.name: { type: string, in: body }
+        backend.mode: { type: string, in: body, description: "http, tcp" }
+        backend.algorithm: { type: string, in: body }
+        backend.linkedServers: { type: string, in: body, description: "Comma-separated server UUIDs" }
+        backend.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_haproxy_backend:
+      method: POST
+      path: /haproxy/settings/del_backend/{uuid}
+      access: dangerous
+      description: "Delete an HAProxy backend"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_haproxy_frontends:
+      method: POST
+      path: /haproxy/settings/search_frontend
+      access: read
+      description: "Search HAProxy frontends (public listeners)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_haproxy_frontend:
+      method: POST
+      path: /haproxy/settings/add_frontend
+      access: write
+      description: "Create an HAProxy frontend"
+      params:
+        frontend.enabled: { type: string, in: body, default: "1" }
+        frontend.name: { type: string, in: body, required: true }
+        frontend.bind: { type: string, in: body, required: true, description: "Bind address:port" }
+        frontend.mode: { type: string, in: body, default: "http" }
+        frontend.defaultBackend: { type: string, in: body, description: "Default backend UUID" }
+        frontend.ssl_enabled: { type: string, in: body }
+        frontend.ssl_certificates: { type: string, in: body }
+        frontend.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_haproxy_frontend:
+      method: POST
+      path: /haproxy/settings/set_frontend/{uuid}
+      access: write
+      description: "Update an HAProxy frontend"
+      params:
+        uuid: { type: string, in: path, required: true }
+        frontend.enabled: { type: string, in: body }
+        frontend.name: { type: string, in: body }
+        frontend.bind: { type: string, in: body, description: "Bind address:port" }
+        frontend.mode: { type: string, in: body }
+        frontend.defaultBackend: { type: string, in: body, description: "Default backend UUID" }
+        frontend.ssl_enabled: { type: string, in: body }
+        frontend.ssl_certificates: { type: string, in: body }
+        frontend.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_haproxy_frontend:
+      method: POST
+      path: /haproxy/settings/del_frontend/{uuid}
+      access: dangerous
+      description: "Delete an HAProxy frontend"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_haproxy_status:
+      method: GET
+      path: /haproxy/service/status
+      access: read
+      description: "Get HAProxy service status"
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_haproxy:
+      method: POST
+      path: /haproxy/service/reconfigure
+      access: admin
+      description: "Apply HAProxy configuration changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    test_haproxy_config:
+      method: GET
+      path: /haproxy/service/configtest
+      access: read
+      description: "Test HAProxy configuration for syntax errors"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_haproxy_statistics:
+      method: GET
+      path: /haproxy/statistics/counters
+      access: read
+      description: "Get HAProxy statistics counters"
+      response:
+        result_path: "$"
+      pagination: none
+
+    export_haproxy_config:
+      method: GET
+      path: /haproxy/export/config
+      access: read
+      description: "Export the generated HAProxy configuration file"
+      response:
+        result_path: "$"
+      pagination: none
+
+    diff_haproxy_config:
+      method: GET
+      path: /haproxy/export/diff
+      access: read
+      description: "Show diff between staged and active HAProxy config"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # CERTIFICATES (Trust)
+    # =========================================================================
+
+    search_certificates:
+      method: POST
+      path: /trust/cert/search
+      access: read
+      description: "Search TLS/SSL certificates"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_certificate:
+      method: GET
+      path: /trust/cert/get/{uuid}
+      access: read
+      description: "Get a certificate by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_certificate:
+      method: POST
+      path: /trust/cert/add
+      access: write
+      description: "Create/import a certificate"
+      params:
+        cert.descr: { type: string, in: body, required: true }
+        cert.action: { type: string, in: body, required: true, description: "internal (create CSR), import (import existing)" }
+        cert.key_type: { type: string, in: body, description: "RSA, ECDSA" }
+        cert.digest: { type: string, in: body }
+        cert.lifetime: { type: integer, in: body }
+        cert.caref: { type: string, in: body, description: "Signing CA reference" }
+        cert.cn: { type: string, in: body, description: "Common Name" }
+        cert.san: { type: string, in: body, description: "Subject Alternative Names" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_certificate:
+      method: POST
+      path: /trust/cert/set/{uuid}
+      access: write
+      description: "Update a certificate"
+      params:
+        uuid: { type: string, in: path, required: true }
+        cert.descr: { type: string, in: body }
+        cert.action: { type: string, in: body, description: "internal (create CSR), import (import existing)" }
+        cert.key_type: { type: string, in: body, description: "RSA, ECDSA" }
+        cert.digest: { type: string, in: body }
+        cert.lifetime: { type: integer, in: body }
+        cert.caref: { type: string, in: body, description: "Signing CA reference" }
+        cert.cn: { type: string, in: body, description: "Common Name" }
+        cert.san: { type: string, in: body, description: "Subject Alternative Names" }
+      response:
+        result_path: "$"
+      pagination: none
+    del_certificate:
+      method: POST
+      path: /trust/cert/del/{uuid}
+      access: dangerous
+      description: "Delete a certificate"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_cas:
+      method: POST
+      path: /trust/ca/search
+      access: read
+      description: "Search Certificate Authorities"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_ca:
+      method: GET
+      path: /trust/ca/get/{uuid}
+      access: read
+      description: "Get a Certificate Authority by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_ca:
+      method: POST
+      path: /trust/ca/add
+      access: write
+      description: "Create/import a Certificate Authority"
+      params:
+        ca.descr: { type: string, in: body, required: true }
+        ca.action: { type: string, in: body, required: true, description: "internal, existing, import" }
+        ca.key_type: { type: string, in: body }
+        ca.digest: { type: string, in: body }
+        ca.lifetime: { type: integer, in: body }
+        ca.cn: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ca:
+      method: POST
+      path: /trust/ca/set/{uuid}
+      access: write
+      description: "Update a Certificate Authority"
+      params:
+        uuid: { type: string, in: path, required: true }
+        ca.descr: { type: string, in: body }
+        ca.action: { type: string, in: body, description: "internal, existing, import" }
+        ca.key_type: { type: string, in: body }
+        ca.digest: { type: string, in: body }
+        ca.lifetime: { type: integer, in: body }
+        ca.cn: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_ca:
+      method: POST
+      path: /trust/ca/del/{uuid}
+      access: dangerous
+      description: "Delete a Certificate Authority"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # SYSLOG
+    # =========================================================================
+
+    get_syslog_settings:
+      method: GET
+      path: /syslog/settings/get
+      access: read
+      description: "Get syslog service settings including log retention, remote destinations, and format options"
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_syslog_destinations:
+      method: POST
+      path: /syslog/settings/search_destinations
+      access: read
+      description: "Search remote syslog destinations"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_syslog_destination:
+      method: POST
+      path: /syslog/settings/add_destination
+      access: write
+      description: "Create a remote syslog destination"
+      params:
+        destination.enabled: { type: string, in: body, default: "1" }
+        destination.transport: { type: string, in: body, default: "udp4", description: "udp4, udp6, tcp4, tcp6, tls4, tls6" }
+        destination.hostname: { type: string, in: body, required: true }
+        destination.port: { type: string, in: body, default: "514" }
+        destination.rfc5424: { type: string, in: body, description: "1=use RFC 5424 format" }
+        destination.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_syslog_destination:
+      method: POST
+      path: /syslog/settings/set_destination/{uuid}
+      access: write
+      description: "Update a remote syslog destination"
+      params:
+        uuid: { type: string, in: path, required: true }
+        destination.enabled: { type: string, in: body }
+        destination.transport: { type: string, in: body, description: "udp4, udp6, tcp4, tcp6, tls4, tls6" }
+        destination.hostname: { type: string, in: body }
+        destination.port: { type: string, in: body }
+        destination.rfc5424: { type: string, in: body, description: "1=use RFC 5424 format" }
+        destination.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_syslog_destination:
+      method: POST
+      path: /syslog/settings/del_destination/{uuid}
+      access: write
+      description: "Delete a remote syslog destination"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_syslog:
+      method: POST
+      path: /syslog/service/reconfigure
+      access: admin
+      description: "Apply syslog configuration changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_syslog_stats:
+      method: GET
+      path: /syslog/service/stats
+      access: read
+      description: "Get syslog service statistics"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # CRON
+    # =========================================================================
+
+    search_cron_jobs:
+      method: POST
+      path: /cron/settings/search_jobs
+      access: read
+      description: "Search scheduled cron jobs"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_cron_job:
+      method: GET
+      path: /cron/settings/get_job/{uuid}
+      access: read
+      description: "Get a cron job by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_cron_job:
+      method: POST
+      path: /cron/settings/add_job
+      access: write
+      description: "Create a new cron job"
+      params:
+        job.enabled: { type: string, in: body, default: "1" }
+        job.minutes: { type: string, in: body, required: true }
+        job.hours: { type: string, in: body, required: true }
+        job.days: { type: string, in: body, required: true }
+        job.months: { type: string, in: body, required: true }
+        job.weekdays: { type: string, in: body, required: true }
+        job.command: { type: string, in: body, required: true }
+        job.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_cron_job:
+      method: POST
+      path: /cron/settings/set_job/{uuid}
+      access: write
+      description: "Update a scheduled cron job"
+      params:
+        uuid: { type: string, in: path, required: true }
+        job.enabled: { type: string, in: body }
+        job.minutes: { type: string, in: body }
+        job.hours: { type: string, in: body }
+        job.days: { type: string, in: body }
+        job.months: { type: string, in: body }
+        job.weekdays: { type: string, in: body }
+        job.command: { type: string, in: body }
+        job.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_cron_job:
+      method: POST
+      path: /cron/settings/del_job/{uuid}
+      access: write
+      description: "Delete a scheduled cron job by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_cron_job:
+      method: POST
+      path: /cron/settings/toggle_job/{uuid}
+      access: write
+      description: "Toggle a scheduled cron job on or off. Omit 'enabled' to flip the current state."
+      params:
+        uuid: { type: string, in: path, required: true }
+        enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # HA SYNC (High Availability)
+    # =========================================================================
+
+    get_hasync_settings:
+      method: GET
+      path: /core/hasync/get
+      access: read
+      description: "Get HA synchronization settings"
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_hasync_settings:
+      method: POST
+      path: /core/hasync/set
+      # OPNsense reads PHP $_POST (form-urlencoded); the model node is `hasync`. Pass the fields
+      # as a single object param `hasync` so ToolMesh emits hasync[<field>]=... — a JSON body or
+      # flat dotted keys give a bare {"result":"failed"}. setNodes MERGES: scalar fields you omit
+      # keep their current value, so a partial post is safe. EXCEPTION: syncitems is a multi-select
+      # — posting it REPLACES the whole selection, so use update_hasync_settings to toggle
+      # individual sections without dropping the rest. (The old signature used the WRONG field
+      # names synchronizeusername/synchronizepassword — the model fields are username/password.)
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Low-level update of HA sync settings. PREFER the update_hasync_settings composite (safe
+        read-modify-write, and the only sane way to change syncitems). Provide the fields under
+        the object param `hasync` (posted as hasync[<field>]=...). Fields: disablepreempt,
+        disconnectppps, synchronizetoip (peer IP), username, password, verifypeer, pfsyncdefer,
+        pfsyncpeerip, pfsyncinterface (bare key, e.g. "lan"), pfsyncversion ("1301"/"1400"),
+        syncitems (comma-joined section keys, e.g. "aliases,ipsec,radvd,ndpproxy" — REPLACES the
+        whole selection). Booleans are "0"/"1" strings. Returns {"result":"saved"} or
+        {"result":"failed","validations":{...}}.
+      params:
+        hasync:
+          type: object
+          in: body
+          required: true
+          description: >
+            HA sync fields to write, e.g. {synchronizetoip:"192.0.2.3", username:"admin",
+            syncitems:"aliases,rules,ipsec,radvd,ndpproxy"}. Omitted scalar fields are preserved;
+            syncitems fully replaces the synced-section selection.
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_hasync:
+      method: POST
+      path: /core/hasync/reconfigure
+      access: admin
+      description: "Apply local HA/pfsync changes (runs 'interface pfsync configure'). NOTE: this does NOT push config to the peer — for the XMLRPC config sync use synchronize_ha_services."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # HA STATUS (config sync / remote service control on the CARP peer)
+    # =========================================================================
+    # These wrap the HA "Status" page (/api/core/hasync_status/*). The service actions
+    # first run `system ha exec exec_sync` (the XMLRPC config push to the backup) and
+    # `reload_templates`, so synchronize_ha_services doubles as the manual "synchronize" trigger.
+
+    get_ha_status_version:
+      method: GET
+      path: /core/hasync_status/version
+      access: read
+      description: "Check the HA peer link: returns the backup node's version info (empty/❌ when the peer is unreachable or credentials are wrong)."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ha_status_services:
+      method: POST
+      path: /core/hasync_status/services
+      access: read
+      description: "List HA-managed services on the peer with their sync/running state (the rows behind the HA status grid)."
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 100 }
+        searchPhrase: { type: string, in: body }
+
+    synchronize_ha_services:
+      method: POST
+      path: /core/hasync_status/restart_all
+      access: admin
+      description: >
+        HA "Synchronize and reconfigure all services": pushes the current config to the backup
+        via XMLRPC (exec_sync), reloads templates, then restarts every HA-managed service on the
+        peer. This is the manual config-sync trigger. Returns {"status":"ok","count":N}. Heavy —
+        it bounces services on the backup; for a routine change, a normal save already auto-syncs.
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # ROUTER ADVERTISEMENTS (radvd — IPv6 RA, core module //OPNsense/radvd)
+    # =========================================================================
+    # Per-interface RA config is an ArrayField `entries`. add/set are full-replace (setBase):
+    # post the COMPLETE entry under the object param `entries`; prefer the update_radvd composite.
+
+    search_radvd:
+      method: POST
+      path: /radvd/settings/search_entry
+      access: read
+      description: "Search Router Advertisement (radvd) per-interface configurations"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_radvd:
+      method: GET
+      path: /radvd/settings/get_entry/{uuid}
+      access: read
+      description: "Get a radvd interface entry by UUID. SELECT fields (interface, mode, Adv* option fields) come back as {opt:{value,selected}} maps — flatten to the bare selected key before posting back."
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_radvd:
+      method: POST
+      path: /radvd/settings/add_entry
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Create a Router Advertisement config for an interface. Provide the whole entry as the
+        object param `entries` (posted as entries[<field>]=...). SELECT fields are BARE values:
+        interface = friendly key ("lan","opt1"), mode = router|unmanaged|managed|assist|stateless,
+        AdvDefaultPreference = low|medium|high, DeprecatePrefix/RemoveAdvOnExit/RemoveRoute =
+        ""(auto)|on|off. Booleans (enabled, dns) are "0"/"1". List fields (routes, RDNSS, DNSSL)
+        are comma-separated. Returns {"result":"saved","uuid":...} or {"result":"failed","validations":{...}}.
+        Then call reconfigure_radvd.
+      params:
+        entries:
+          type: object
+          in: body
+          required: true
+          description: >
+            Full radvd entry, e.g. {enabled:"1", interface:"lan", mode:"stateless", dns:"1",
+            MinRtrAdvInterval:"200", MaxRtrAdvInterval:"600", AdvDefaultPreference:"medium",
+            AdvCurHopLimit:"64", RDNSS:"2001:db8::1", DNSSL:"example.lan"}.
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_radvd:
+      method: POST
+      path: /radvd/settings/set_entry/{uuid}
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Low-level replace of a radvd entry — PREFER the update_radvd composite (read-modify-write).
+        setBase rebuilds the entry from exactly what you post, so any omitted field resets to its
+        model default. Pass the COMPLETE entry as the object param `entries`: use get_radvd, flatten
+        the SELECT maps to bare values, change what you need, post it all back. Booleans "0"/"1";
+        interface/mode/AdvDefaultPreference bare; routes/RDNSS/DNSSL comma-separated. Returns
+        {"result":"saved"} or {"result":"failed","validations":{...}}.
+      params:
+        uuid: { type: string, in: path, required: true }
+        entries:
+          type: object
+          in: body
+          required: true
+          description: "Complete radvd entry (same fields as add_radvd). Omitted fields reset to defaults — post everything."
+      response:
+        result_path: "$"
+      pagination: none
+
+    toggle_radvd:
+      method: POST
+      path: /radvd/settings/toggle_entry/{uuid}/{enabled}
+      access: write
+      description: "Enable/disable a radvd interface entry. enabled=1 to enable, 0 to disable."
+      params:
+        uuid: { type: string, in: path, required: true }
+        enabled: { type: string, in: path, required: true, description: "1=enable, 0=disable" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_radvd:
+      method: POST
+      path: /radvd/settings/del_entry/{uuid}
+      access: dangerous
+      description: "Delete a radvd interface entry by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_radvd:
+      method: POST
+      path: /radvd/service/reconfigure
+      access: admin
+      description: "Apply radvd changes (regenerates radvd.conf and reloads the daemon)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # NDP PROXY (os-ndp-proxy-go plugin, //OPNsense/ndpproxy)
+    # =========================================================================
+    # `general` is a settings singleton (partial-merge set via ndpproxy.general.*); proxy entries
+    # live in the aliases.alias ArrayField (the `alias` field is an external-type firewall alias UUID).
+
+    get_ndpproxy_settings:
+      method: GET
+      path: /ndpproxy/general/get
+      access: read
+      description: "Get NDP Proxy settings. Returns {ndpproxy:{general:{...}, aliases:{alias:{...}}}}. `general.upstream`/`downstream` come back as interface SELECT maps."
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ndpproxy_settings:
+      method: POST
+      path: /ndpproxy/general/set
+      access: admin
+      description: >
+        Update NDP Proxy `general` settings (partial-merge — omitted fields keep their value). Fields
+        (as ndpproxy.general.*): enabled, upstream (bare interface key), downstream (bare, comma list
+        for multiple), ra ("0"/"1"), routes ("0"/"1"), carp_depend_on ("0"/"1", HA/CARP failover),
+        cache_ttl, cache_max, cache_file, route_qps, pf_qps, pcap_timeout, debug. Booleans are "0"/"1".
+        Then call reconfigure_ndpproxy. Returns {"result":"saved"} or {"result":"failed","validations":{...}}.
+      params:
+        ndpproxy.general.enabled: { type: string, in: body, description: "1=enable the NDP proxy service, 0=disable" }
+        ndpproxy.general.upstream: { type: string, in: body, description: "Upstream/WAN interface (bare key, e.g. wan)" }
+        ndpproxy.general.downstream: { type: string, in: body, description: "Downstream interface(s), bare keys, comma-separated for multiple" }
+        ndpproxy.general.ra: { type: string, in: body, description: "Proxy Router Advertisements (0/1)" }
+        ndpproxy.general.routes: { type: string, in: body, description: "Manage routes (0/1)" }
+        ndpproxy.general.carp_depend_on: { type: string, in: body, description: "Only run on the CARP master (HA failover) (0/1)" }
+        ndpproxy.general.cache_ttl: { type: integer, in: body }
+        ndpproxy.general.cache_max: { type: integer, in: body }
+        ndpproxy.general.cache_file: { type: string, in: body, description: "Persist cache to file (0/1)" }
+        ndpproxy.general.route_qps: { type: integer, in: body }
+        ndpproxy.general.pf_qps: { type: integer, in: body }
+        ndpproxy.general.pcap_timeout: { type: integer, in: body }
+        ndpproxy.general.debug: { type: string, in: body, description: "Debug logging (0/1)" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_ndpproxy_aliases:
+      method: POST
+      path: /ndpproxy/general/search_alias
+      access: read
+      description: "Search NDP Proxy alias entries (proxied external firewall aliases per interface)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_ndpproxy_alias:
+      method: GET
+      path: /ndpproxy/general/get_alias/{uuid}
+      access: read
+      description: "Get an NDP Proxy alias entry by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_ndpproxy_alias:
+      method: POST
+      path: /ndpproxy/general/add_alias
+      access: write
+      description: >
+        Add an NDP Proxy alias entry (fields as alias.*): alias.interface (bare key, blank=any),
+        alias.alias (UUID of an EXTERNAL-type firewall alias — use search_firewall_aliases to find
+        it), alias.description. Then call reconfigure_ndpproxy.
+      params:
+        alias.interface: { type: string, in: body, description: "Interface (bare key); blank = any" }
+        alias.alias: { type: string, in: body, required: true, description: "External-type firewall alias UUID to proxy" }
+        alias.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_ndpproxy_alias:
+      method: POST
+      path: /ndpproxy/general/set_alias/{uuid}
+      access: write
+      description: "Update an NDP Proxy alias entry by UUID (full-replace — post interface, alias and description). Then reconfigure_ndpproxy."
+      params:
+        uuid: { type: string, in: path, required: true }
+        alias.interface: { type: string, in: body }
+        alias.alias: { type: string, in: body }
+        alias.description: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    del_ndpproxy_alias:
+      method: POST
+      path: /ndpproxy/general/del_alias/{uuid}
+      access: dangerous
+      description: "Delete an NDP Proxy alias entry by UUID"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_ndpproxy:
+      method: POST
+      path: /ndpproxy/service/reconfigure
+      access: admin
+      description: "Apply NDP Proxy changes and reload the ndp-proxy-go service"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_ndpproxy_status:
+      method: GET
+      path: /ndpproxy/service/status
+      access: read
+      description: "Get NDP Proxy service run state (running/stopped)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # AUTH (Users & Groups)
+    # =========================================================================
+
+    search_users:
+      method: POST
+      path: /auth/user/search
+      access: admin
+      description: "Search OPNsense system users with optional filtering by name or email"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_user:
+      method: GET
+      path: /auth/user/get/{uuid}
+      access: admin
+      description: "Get a system user account by UUID including group memberships and permissions"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    add_user:
+      method: POST
+      path: /auth/user/add
+      access: admin
+      description: "Create a system user"
+      params:
+        user.name: { type: string, in: body, required: true }
+        user.password: { type: string, in: body }
+        user.email: { type: string, in: body }
+        user.groups: { type: string, in: body, description: "Comma-separated group UUIDs" }
+        user.expires: { type: string, in: body }
+        user.disabled: { type: string, in: body, default: "0" }
+        user.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_user:
+      method: POST
+      path: /auth/user/set/{uuid}
+      access: write
+      description: "Update a system user account"
+      params:
+        uuid: { type: string, in: path, required: true }
+        user.name: { type: string, in: body }
+        user.password: { type: string, in: body }
+        user.email: { type: string, in: body }
+        user.groups: { type: string, in: body, description: "Comma-separated group UUIDs" }
+        user.expires: { type: string, in: body }
+        user.disabled: { type: string, in: body }
+        user.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_user:
+      method: POST
+      path: /auth/user/del/{uuid}
+      access: admin
+      description: "Delete a system user"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_groups:
+      method: POST
+      path: /auth/group/search
+      access: admin
+      description: "Search system groups"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    # Note: API keys are managed per-user (via the user detail page), not as
+    # standalone resources. There is no separate "API Keys" list with an add button.
+
+    add_user_api_key:
+      method: POST
+      path: /auth/user/add_api_key/{username}
+      access: admin
+      description: "Generate a new API key+secret pair for a user. The key is returned as a downloadable file. IMPORTANT: the secret is not stored on the system — save it immediately."
+      params:
+        username: { type: string, in: path, required: true, description: "Username to generate the API key for" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    search_api_keys:
+      method: POST
+      path: /auth/user/search_api_key
+      access: admin
+      description: "Search API keys across all users — returns key ID, associated username, and creation date. Keys are managed per-user, not as standalone resources."
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    del_user_api_key:
+      method: POST
+      path: /auth/user/del_api_key/{id}
+      access: admin
+      description: "Delete an API key by its ID — revokes API access for this key immediately"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # SYSTEM HEALTH & MONITORING
+    # =========================================================================
+
+    get_rrd_list:
+      method: GET
+      path: /diagnostics/systemhealth/get_rrd_list
+      access: read
+      description: "List available RRD graphs (system health metrics)"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_system_health:
+      method: GET
+      path: /diagnostics/systemhealth/get_system_health/{rrd}
+      access: read
+      description: "Get system health time-series data for a specific RRD metric. Use get_rrd_list to discover available metric names (e.g. cpu-usage, traffic-wan)."
+      params:
+        rrd: { type: string, in: path, required: true, description: "RRD metric name from get_rrd_list" }
+        detail: { type: string, in: query, description: "0=summary (default), 1=detailed data points" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_health_interfaces:
+      method: GET
+      path: /diagnostics/systemhealth/get_interfaces
+      access: read
+      description: "List interfaces available for health monitoring"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # TUNABLES (sysctl)
+    # =========================================================================
+
+    search_tunables:
+      method: POST
+      path: /core/tunables/search_item
+      access: read
+      description: "Search system tunables (sysctl)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    add_tunable:
+      method: POST
+      path: /core/tunables/add_item
+      access: admin
+      description: "Create a system tunable"
+      params:
+        tunable.tunable: { type: string, in: body, required: true, description: "sysctl name" }
+        tunable.value: { type: string, in: body, required: true }
+        tunable.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+
+    set_tunable:
+      method: POST
+      path: /core/tunables/set_item/{uuid}
+      access: write
+      description: "Update a system tunable"
+      params:
+        uuid: { type: string, in: path, required: true }
+        tunable.tunable: { type: string, in: body, description: "sysctl name" }
+        tunable.value: { type: string, in: body }
+        tunable.descr: { type: string, in: body }
+      response:
+        result_path: "$"
+      pagination: none
+    del_tunable:
+      method: POST
+      path: /core/tunables/del_item/{uuid}
+      access: admin
+      description: "Delete a system tunable"
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    reconfigure_tunables:
+      method: POST
+      path: /core/tunables/reconfigure
+      access: admin
+      description: "Apply tunable changes"
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # DASHBOARD & MENU
+    # =========================================================================
+
+    get_dashboard:
+      method: GET
+      path: /core/dashboard/get_dashboard
+      access: read
+      description: "Get dashboard widget configuration"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_product_info:
+      method: GET
+      path: /core/dashboard/product_info_feed
+      access: read
+      description: "Get product info and update feed"
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_menu_tree:
+      method: GET
+      path: /core/menu/tree
+      access: read
+      description: "Get the full OPNsense menu structure"
+      response:
+        result_path: "$"
+      pagination: none
+
+  composites:
+
+    update_gateway:
+      description: >
+        Safely update a gateway by UUID using read-modify-write. Pass `uuid` and a
+        `changes` object with only the fields you want to change (e.g.
+        {monitor:"8.8.8.8", losslow:"10", losshigh:"20"}). The composite GETs the current
+        gateway_item, flattens its SELECT maps (interface, ipprotocol) to bare values,
+        merges your changes, and POSTs the COMPLETE item back under the correct
+        "gateway_item" node — so untouched fields (defaultgw, nosync, priority, weight, …)
+        are preserved instead of being reset by OPNsense's full-replace setBase.
+        Does NOT apply by default: call reconfigure_gateways yourself, or pass apply:true.
+        On failure returns {ok:false, validations, raw} with the full OPNsense response so
+        errors are visible instead of a bare {"result":"failed"}.
+        Field names for `changes`: name, descr, disabled, interface (bare key, e.g.
+        "wan"/"opt1"), ipprotocol ("inet"/"inet6"), gateway, defaultgw, fargw, nosync,
+        monitor, monitor_disable, monitor_noroute, monitor_killstates,
+        monitor_killstates_priority, force_down, priority, weight, latencylow,
+        latencyhigh, losslow, losshigh, interval, time_period, loss_interval, data_length.
+      params:
+        uuid:
+          type: string
+          required: true
+          description: "Gateway UUID (from search_gateways / get_gateway)"
+        changes:
+          type: object
+          required: true
+          description: "Partial map of fields to change; everything else is preserved"
+        apply:
+          type: boolean
+          default: false
+          description: "When true, call reconfigure_gateways after a successful save"
+      timeout: 30s
+      depends_on: [get_gateway, set_gateway, reconfigure_gateways]
+      code: |
+        // 1) READ current item
+        const got = await api.get_gateway({ uuid: params.uuid });
+        const item = got && got.gateway_item;
+        if (!item) {
+          return { ok: false, uuid: params.uuid, error: "gateway_item not found", raw: got };
+        }
+
+        // 2) Flatten OPNsense SELECT maps ({optKey:{value,selected}}) to bare values.
+        //    Single-select -> the selected key; multi-select -> comma-joined keys.
+        const flat = {};
+        for (const k of Object.keys(item)) {
+          const v = item[k];
+          if (v && typeof v === "object" && !Array.isArray(v)) {
+            const selected = Object.keys(v).filter(
+              (opt) => v[opt] && typeof v[opt] === "object" && String(v[opt].selected) === "1"
+            );
+            flat[k] = selected.join(",");
+          } else {
+            flat[k] = v;
+          }
+        }
+
+        // 3) MODIFY: merge only the requested changes onto the full item.
+        const merged = Object.assign({}, flat, params.changes || {});
+
+        // 4) WRITE the complete item back under the gateway_item node.
+        const res = await api.set_gateway({ uuid: params.uuid, gateway_item: merged });
+
+        // 5) Surface the full response on failure (validations + raw body).
+        if (!res || res.result !== "saved") {
+          return {
+            ok: false,
+            uuid: params.uuid,
+            validations: (res && res.validations) || null,
+            raw: res,
+          };
+        }
+
+        let applied = null;
+        if (params.apply) applied = await api.reconfigure_gateways();
+        return { ok: true, uuid: params.uuid, changed: params.changes, result: res, applied };
+
+    update_hasync_settings:
+      description: >
+        Safely update HA sync settings — especially the syncitems multi-select — via
+        read-modify-write. Pass `changes` (scalar fields: synchronizetoip, username, password,
+        disablepreempt, disconnectppps, verifypeer, pfsyncinterface (bare), pfsyncversion,
+        pfsyncpeerip, pfsyncdefer) and/or `enable_syncitems` / `disable_syncitems` (arrays of
+        section keys, e.g. ["radvd","ndpproxy"]). The composite GETs the current hasync model,
+        derives the new syncitems selection FROM the current one (so untouched sections are
+        preserved, never clobbered by a bare set), merges your scalar changes, and POSTs only what
+        changed (setNodes merges). Does NOT apply pfsync (call reconfigure_hasync if you changed a
+        pfsync field). Valid syncitems keys are whatever the appliance reports — commonly aliases,
+        authservers, captiveportal, categories, certs, cron, dhcpd, dhcpdv6, dhcrelay, dnsforwarder,
+        dnsresolver, hostwatch, ifgroups, ipsec, kea, lvtemplate, monit, nat, ndpproxy, ntpd,
+        opendns, openvpn, radvd, rules, schedules, shaper, ssh, staticroutes, suricata, sysctl,
+        syslog, syslog-ng, users, virtualip, webgui, wireguard. On failure returns {ok:false,
+        validations, raw}.
+      params:
+        changes:
+          type: object
+          default: {}
+          description: "Scalar hasync fields to set (merged onto current). Omit to only touch syncitems."
+        enable_syncitems:
+          type: array
+          default: []
+          description: 'Section keys to ADD to syncitems, e.g. ["radvd","ndpproxy"]'
+        disable_syncitems:
+          type: array
+          default: []
+          description: "Section keys to REMOVE from syncitems"
+      timeout: 30s
+      depends_on: [get_hasync_settings, set_hasync_settings]
+      code: |
+        // 1) READ current model
+        const got = await api.get_hasync_settings();
+        const cur = got && got.hasync;
+        if (!cur) return { ok: false, error: "hasync model not found", raw: got };
+
+        // 2) recompute syncitems only when the caller asked to (preserve the rest)
+        const wantEnable = params.enable_syncitems || [];
+        const wantDisable = params.disable_syncitems || [];
+        const payload = Object.assign({}, params.changes || {});
+        const si = cur.syncitems && typeof cur.syncitems === "object" ? cur.syncitems : {};
+        const selected = new Set(
+          Object.keys(si).filter((k) => si[k] && String(si[k].selected) === "1")
+        );
+        if (wantEnable.length || wantDisable.length) {
+          for (const k of wantEnable) selected.add(k);
+          for (const k of wantDisable) selected.delete(k);
+          payload.syncitems = Array.from(selected).join(",");
+        }
+        if (Object.keys(payload).length === 0) {
+          return { ok: false, error: "nothing to change", current_syncitems: Array.from(selected) };
+        }
+
+        // 3) WRITE (setNodes merges — omitted scalar fields are preserved)
+        const res = await api.set_hasync_settings({ hasync: payload });
+        if (!res || res.result !== "saved") {
+          return { ok: false, validations: (res && res.validations) || null, raw: res };
+        }
+        return { ok: true, changed: payload, syncitems: Array.from(selected), result: res };
+
+    update_radvd:
+      description: >
+        Safely update a radvd interface entry by UUID via read-modify-write. Pass `uuid` and a
+        `changes` object with only the fields to change (e.g. {mode:"managed", dns:"1"}). The
+        composite GETs the current entry, flattens its SELECT maps (interface, mode, Adv* option
+        fields, AdvRASrcAddress) to bare values, merges your changes, and POSTs the COMPLETE entry
+        back under the `entries` node — so untouched fields are preserved instead of being reset by
+        setBase's full-replace. Does NOT apply by default: call reconfigure_radvd, or pass apply:true.
+        Field names for `changes`: enabled, interface (bare), Base6Interface (bare), mode
+        (router|unmanaged|managed|assist|stateless), dns, DeprecatePrefix/RemoveAdvOnExit/RemoveRoute
+        (""|on|off), routes/RDNSS/DNSSL (comma lists), MinRtrAdvInterval, MaxRtrAdvInterval,
+        AdvDefaultPreference (low|medium|high), AdvCurHopLimit, AdvDefaultLifetime, AdvLinkMTU,
+        AdvPreferredLifetime, AdvValidLifetime, AdvRDNSSLifetime, AdvRouteLifetime, AdvDNSSLLifetime,
+        AdvRASrcAddress, nat64prefix. On failure returns {ok:false, validations, raw}.
+      params:
+        uuid:
+          type: string
+          required: true
+          description: "radvd entry UUID (from search_radvd)"
+        changes:
+          type: object
+          required: true
+          description: "Partial map of fields to change; everything else is preserved"
+        apply:
+          type: boolean
+          default: false
+          description: "When true, call reconfigure_radvd after a successful save"
+      timeout: 30s
+      depends_on: [get_radvd, set_radvd, reconfigure_radvd]
+      code: |
+        // 1) READ current entry
+        const got = await api.get_radvd({ uuid: params.uuid });
+        const item = got && got.entries;
+        if (!item) return { ok: false, uuid: params.uuid, error: "radvd entry not found", raw: got };
+
+        // 2) Flatten OPNsense SELECT maps ({optKey:{value,selected}}) to bare selected keys.
+        //    List/scalar string fields (routes, RDNSS, DNSSL, integers, booleans) pass through.
+        const flat = {};
+        for (const k of Object.keys(item)) {
+          const v = item[k];
+          if (v && typeof v === "object" && !Array.isArray(v)) {
+            const sel = Object.keys(v).filter(
+              (opt) => v[opt] && typeof v[opt] === "object" && String(v[opt].selected) === "1"
+            );
+            flat[k] = sel.join(",");
+          } else {
+            flat[k] = v;
+          }
+        }
+
+        // 3) MODIFY + WRITE the complete entry back under the entries node.
+        const merged = Object.assign({}, flat, params.changes || {});
+        const res = await api.set_radvd({ uuid: params.uuid, entries: merged });
+        if (!res || res.result !== "saved") {
+          return { ok: false, uuid: params.uuid, validations: (res && res.validations) || null, raw: res };
+        }
+        let applied = null;
+        if (params.apply) applied = await api.reconfigure_radvd();
+        return { ok: true, uuid: params.uuid, changed: params.changes, result: res, applied };
+
+  examples:
+    - name: "Block an IP via alias"
+      description: "Add an IP to a blocklist alias and apply changes"
+      code: |
+        // Find the blocklist alias UUID
+        const aliases = await api.search_firewall_aliases({
+          searchPhrase: 'blocklist'
+        });
+        const alias = aliases.rows[0];
+
+        // Add the IP to the alias runtime table
+        await api.add_alias_entry({
+          alias: alias.name,
+          address: '203.0.113.50'
+        });
+
+        // Apply alias changes to the running firewall
+        await api.reconfigure_firewall_aliases();
+
+    - name: "Create a port forwarding rule"
+      description: "Forward external port 8080 to internal web server"
+      code: |
+        // Create DNAT rule
+        const result = await api.add_dnat_rule({
+          'rule.enabled': '1',
+          'rule.interface': 'wan',
+          'rule.protocol': 'TCP',
+          'rule.destination_port': '8080',
+          'rule.target': '192.168.1.100',
+          'rule.target_port': '80',
+          'rule.description': 'Web server port forward'
+        });
+
+        // Apply with savepoint for auto-rollback safety
+        const sp = await api.savepoint_firewall();
+        await api.apply_firewall({ rollback_revision: sp.revision });
+        // If everything works, confirm:
+        await api.cancel_rollback_firewall({ rollback_revision: sp.revision });
+
+    - name: "Add a DNS host override"
+      description: "Create a local DNS record and apply"
+      code: |
+        await api.add_unbound_host_override({
+          'host.hostname': 'myapp',
+          'host.domain': 'local.lan',
+          'host.server': '192.168.1.50',
+          'host.description': 'My App Server'
+        });
+        await api.reconfigure_unbound();
+
+    - name: "Update gateway monitoring (read-modify-write)"
+      description: "Change a gateway's monitor IP and loss thresholds without resetting other fields, then apply"
+      code: |
+        // Find the gateway UUID
+        const found = await api.search_gateways({ searchPhrase: 'WAN_GW' });
+        const uuid = found.rows[0].uuid;
+
+        // Safe partial update — defaultgw/nosync/priority are preserved
+        const res = await api.update_gateway({
+          uuid,
+          changes: { monitor: '8.8.8.8', losslow: '10', losshigh: '20' }
+        });
+        if (!res.ok) return res; // surfaces { validations, raw } on failure
+
+        // Apply to the running system
+        await api.reconfigure_gateways();
+        return res;
+
+    - name: "System health check"
+      description: "Get system information, gateway status, and service list"
+      code: |
+        const [sysinfo, gateways, services] = await Promise.all([
+          api.get_system_information(),
+          api.get_gateway_status(),
+          api.search_services()
+        ]);
+        return { sysinfo, gateways, services };
+
+    - name: "Enable radvd + NDP Proxy in the HA config sync"
+      description: "Add the Router Advertisements and NDP Proxy sections to syncitems without dropping the others, then push to the backup"
+      code: |
+        // Read-modify-write: only radvd + ndpproxy are added; the other selected sections stay.
+        const upd = await api.update_hasync_settings({
+          enable_syncitems: ['radvd', 'ndpproxy']
+        });
+        if (!upd.ok) return upd; // surfaces { validations, raw } on failure
+        // Force the HA-status "Synchronize and reconfigure all services" (XMLRPC push to backup)
+        return await api.synchronize_ha_services();
+
+    - name: "Configure Router Advertisements on an interface"
+      description: "Create a stateless RA config on LAN, apply, then change one field via read-modify-write"
+      code: |
+        const add = await api.add_radvd({
+          entries: {
+            enabled: '1', interface: 'lan', mode: 'stateless', dns: '1',
+            AdvDefaultPreference: 'medium', AdvCurHopLimit: '64',
+            MinRtrAdvInterval: '200', MaxRtrAdvInterval: '600'
+          }
+        });
+        if (add.result !== 'saved') return add; // inspect add.validations
+        await api.reconfigure_radvd();
+        // Later: switch to managed mode without resetting the other fields
+        return await api.update_radvd({ uuid: add.uuid, changes: { mode: 'managed' }, apply: true });
