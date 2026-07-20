@@ -1,0 +1,2427 @@
+# billomat.dadl — Billomat REST API for ToolMesh
+# Billomat is a German cloud invoicing & accounting SaaS (invoices, estimates,
+# credit notes, recurring invoices, clients, articles, dunning, expenses).
+#
+# Live-verified 2026-07-20 against a real Billomat account: auth, JSON negotiation,
+# list/get (empty/single/many-item envelopes), sub-resource filters, status filters,
+# PDF retrieval, and a full create -> verify -> delete cycle for clients + contacts.
+# NOT yet exercised: document state actions (complete_*, cancel_*/uncancel_*, and
+# email_* which sends real mail) and a few filter enums (e.g. incomings status).
+#
+# Domain Notes for LLM consumers:
+# - BASE URL is account-specific: https://{billomatID}.billomat.net/api
+#   {billomatID} is the account's subdomain. base_url is NOT hard-coded in this
+#   DADL — it is supplied via backends.yaml `url:` (see the setup block).
+# - AUTH: a person-bound API key sent in the header `X-BillomatApiKey` (no prefix).
+#   Enable API access for a user under "Settings > Employees" to generate the key.
+#   (Registering an App yields an App-ID/App-Secret, sent as separate X-AppId/X-AppSecret
+#   headers, which only raise the rate limit and are independent of authentication.)
+# - FORMAT: this DADL forces JSON via `Accept: application/json` (reads) and
+#   `Content-Type: application/json` (writes), both set in defaults.headers.
+#   The API defaults to XML otherwise.
+# - VALUES ARE STRINGS. Billomat's JSON is derived from XML, so every field value
+#   comes back as a STRING — including numbers ("123.45") and booleans ("1"/"0").
+#   Parse/coerce client-side. When writing booleans, send 1 (true) or 0 (false).
+# - READ WRAPPING. A list is wrapped as {plural:{"@page","@per_page","@total",
+#   singular:[...]}} and a single resource as {singular:{...}} — e.g.
+#   {"clients":{"client":[...]}} and {"client":{...}}. Each list tool here already
+#   extracts and NORMALIZES the inner array (a 1-item list would otherwise come
+#   back as a bare object, not an array — a classic Billomat pitfall). So list_*
+#   tools always return a plain array; get_* tools return the object.
+# - WRITE WRAPPING. Request bodies must wrap the payload under the resource's
+#   singular key: {"client":{...}}, {"invoice":{...}}, {"invoice-payment":{...}}.
+#   This DADL models every writable resource as ONE object param named after that
+#   key. Call e.g. api.create_client({ client: { name: "ACME", ... } }).
+# - IDs are numeric integers (returned as strings). Foreign keys: client_id,
+#   contact_id, article_id, invoice_id, offer_id, supplier_id, unit_id, tax_id.
+# - DOCUMENT LIFECYCLE (invoices, offers/estimates, confirmations, credit-notes,
+#   delivery-notes, reminders): a document is created in DRAFT, then "completed"
+#   (complete_*) which assigns the final number, renders the PDF and moves it to
+#   OPEN. Only DRAFT documents can be edited or deleted. invoice_number/offer_number
+#   is EMPTY until the document is completed. Further states: OPEN, OVERDUE, PAID,
+#   CANCELED (invoices); DRAFT, OPEN, WON, LOST, CANCELED, CLEARED (offers).
+# - LINE ITEMS are separate resources (invoice-items, offer-items, ...) filtered by
+#   their parent id (?invoice_id=123). They can ALSO be embedded when creating a
+#   document by nesting them under the plural/singular item keys, e.g.
+#   { invoice: { client_id: 1, "invoice-items": { "invoice-item": [ {unit_price, quantity, title}, ... ] } } }.
+# - PAYMENTS (invoice-payments) can only be booked for OPEN/OVERDUE invoices; set
+#   mark_invoice_as_paid:1 to also flip the invoice to PAID.
+# - PDF: get_*_pdf returns {"pdf":{"base64file","filename","mimetype","filesize"}}.
+#   Decode base64file to obtain the PDF. (The raw ?format=pdf stream is not modeled.)
+# - PAGINATION: page + per_page (default 100, max 1000). No has_more flag —
+#   keep requesting the next page until one returns fewer than per_page rows.
+# - FILTERING/SORTING: list endpoints take resource-specific filters (e.g.
+#   ?status=OPEN, ?client_id=5, ?from=2026-01-01&to=2026-03-31). Statuses and
+#   payment types may be comma-separated (OR). Sort with order_by=field+DIR,
+#   e.g. order_by=date+DESC,invoice_number+ASC.
+# - DATES are YYYY-MM-DD; datetimes are ISO-8601 with offset. Money is decimal.
+# - SIDE EFFECTS: email_* sends a real e-mail to the client; complete_*/cancel_*
+#   change document state. delete_* is irreversible (removes items, PDFs, comments).
+# - RATE LIMITS apply per plan (HTTP 429 when exceeded); this DADL retries on 429.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+
+credits:
+  - "Dunkel Cloud GmbH — maintainer"
+
+source_name: "Billomat REST API"
+source_url: "https://www.billomat.com/en/api/"
+date: "2026-07-20"
+
+# ── Shared YAML anchors (underscore-prefixed keys are ignored by ToolMesh) ──
+_anchors:
+  # Unwrap a Billomat list response to a clean array. Every list is wrapped as
+  # {plural: {"@page","@per_page","@total"[, singular: <obj|array>]}}. List tools
+  # set result_path to the {plural} wrapper (which ALWAYS exists), and this transform
+  # pulls the single non-"@" data key. Handles all three shapes Billomat returns:
+  #   - empty list  -> only "@" attrs, no singular key      -> []
+  #   - single hit  -> singular key is a bare object         -> [obj]
+  #   - many hits   -> singular key is an array              -> as-is
+  # (result_path "$.plural.singular" would miss the empty case: the singular key is
+  # absent, so ToolMesh falls back to the raw wrapper and skips the transform.)
+  normalize_list: &normalize_list |
+    [ to_entries[] | select(.key | startswith("@") | not) | .value ] | (.[0] // []) | (if type == "array" then . else [.] end)
+
+backend:
+  name: billomat
+  type: rest
+  version: "1.0"
+  # base_url intentionally omitted — each account has its own subdomain
+  # (https://{billomatID}.billomat.net/api). Provide it via backends.yaml `url:`.
+  description: "Billomat REST API — German cloud invoicing & accounting: invoices, estimates, credit notes, recurring invoices, delivery notes, order confirmations, dunning reminders, clients, contacts, articles, payments, expenses, taxes"
+
+  coverage:
+    endpoints: 145
+    total_endpoints: 250
+    percentage: 58
+    focus: "Billomat invoicing: invoices (items, payments, comments, tags), offers (estimates, quotes), credit notes, recurring invoices, clients (contacts), articles, taxes, units, suppliers, incoming invoices."
+    missing: "article property values, client/supplier property values, inbox documents, activity feed, webhooks, templates CRUD (read-only here), settings write beyond read, letters, digital signature upload, postal mail (Pixelletter), encashment"
+    last_reviewed: "2026-07-20"
+
+  setup:
+    credential_steps:
+      - "Log in to your Billomat account at https://{billomatID}.billomat.net"
+      - "Open Settings > Employees (Einstellungen > Mitarbeiter) and select your user"
+      - "Enable API access for the user — a personal API key is generated"
+      - "Store it as CREDENTIAL_BILLOMAT_API_KEY in .env (sent as the X-BillomatApiKey header)"
+      - "Note your billomatID (the subdomain in your Billomat URL) — it forms the base URL"
+    env_var: CREDENTIAL_BILLOMAT_API_KEY
+    backends_yaml: |
+      - name: billomat
+        transport: rest
+        dadl: billomat.dadl
+        url: "https://YOUR_BILLOMAT_ID.billomat.net/api"
+    required_scopes: []
+    optional_scopes: []
+    docs_url: "https://www.billomat.com/en/api/basics/authentication/"
+    notes: >
+      One credential is needed: CREDENTIAL_BILLOMAT_API_KEY (a person-bound API key
+      from Settings > Employees). Replace YOUR_BILLOMAT_ID in the backends.yaml url
+      with your account subdomain. Billomat has no OAuth scopes — the API key grants
+      the issuing user's permissions, so restrict that user to limit API access.
+      Optional: registering an App (Settings > Administration > Apps) yields an
+      App-ID/App-Secret sent as separate X-AppId / X-AppSecret headers that only raise
+      the rate limit (300 → plan quota per 15 min); adding those two credential-backed
+      headers would need a small ToolMesh auth extension. A free developer account is
+      available from api@billomat.com.
+
+  auth:
+    type: apikey
+    credential: billomat_api_key
+    inject_into: header
+    header_name: X-BillomatApiKey
+    # Person-bound API key: Settings > Employees > enable API access for a user.
+    # Registering an App (App-ID/App-Secret, sent as separate X-AppId/X-AppSecret
+    # headers) is INDEPENDENT of auth — it only raises the rate limit from 300 to a
+    # plan-specific quota per 15 min, and is not modeled here. If you later need the
+    # higher quota, those two extra credential-backed headers require a small ToolMesh
+    # extension (the apikey auth type injects a single header today).
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    pagination:
+      strategy: page
+      request:
+        page_param: page
+        limit_param: per_page
+        limit_default: 100
+      # No has_more/next flag in Billomat — the LLM keeps paging until a page
+      # returns fewer than per_page rows. Metadata (@page/@total) lives on the
+      # plural wrapper and is dropped by each list tool's transform.
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      message_path: "$.errors.error"
+      retry_on: [429, 500, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 409]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+    response:
+      # result_path is set per-tool because each Billomat resource has its own
+      # plural/singular wrapper keys. allow_jq_override lets the LLM reshape output.
+      allow_jq_override: true
+
+  hints:
+    create_invoice:
+      wrapping: "wrap fields under the `invoice` key: { invoice: { client_id, ... } }"
+      draft_state: "new invoices are always DRAFT; invoice_number stays empty until complete_invoice"
+      embed_items: "embed line items via invoice: { 'invoice-items': { 'invoice-item': [ {unit_price, quantity, title} ] } }"
+      net_gross: "net_gross is NET or GROSS; prices follow that basis"
+    complete_invoice:
+      effect: "DRAFT -> OPEN, assigns the final invoice number and renders the PDF"
+      body: "optional { complete: { template_id } } to pick a PDF template"
+    create_invoice_payment:
+      constraint: "invoice must be OPEN or OVERDUE"
+      close_invoice: "set mark_invoice_as_paid:1 to also move the invoice to PAID"
+      types: "type is one of INVOICE_CORRECTION, CREDIT_NOTE, BANK_CARD, BANK_TRANSFER, DEBIT, CASH, CHECK, PAYPAL, CREDIT_CARD, COUPON, MISC"
+    get_invoice_pdf:
+      shape: "returns { base64file, filename, mimetype, filesize } — decode base64file for the PDF"
+    email_invoice:
+      side_effect: "sends a real e-mail; recipients requires at least one of to/cc/bcc"
+    list_contacts:
+      required_filter: "client_id is mandatory — contacts are always scoped to one client"
+    list_invoices:
+      filters: "client_id, contact_id, invoice_number, status (DRAFT/OPEN/OVERDUE/PAID/CANCELED, comma-OR), payment_type, from, to, label, intro, note, tags, article_id; group_by=client|status|day|week|month|year"
+    create_offer:
+      status_flow: "estimates use statuses DRAFT/OPEN/WON/LOST/CANCELED/CLEARED"
+    create_client:
+      strings: "all values are strings; *_type fields accept SETTINGS to inherit the account default"
+
+  tools:
+    # ══════════════════════════════════════════════════════════════════
+    # Clients (customers)
+    # ══════════════════════════════════════════════════════════════════
+    list_clients:
+      method: GET
+      path: /clients
+      access: read
+      description: >
+        List clients (customers). Filter with name, client_number, email,
+        country_code, note, tags, invoice_id, creditor_identifier. Returns an
+        array of client objects (values are strings).
+      params:
+        name: { type: string, in: query, description: "Filter by company/display name" }
+        client_number: { type: string, in: query, description: "Filter by client number" }
+        email: { type: string, in: query }
+        country_code: { type: string, in: query, description: "ISO 3166 Alpha-2, e.g. DE" }
+        note: { type: string, in: query, description: "Free-text search in note" }
+        tags: { type: string, in: query, description: "Comma-separated tag list" }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100, description: "Max 1000" }
+        order_by: { type: string, in: query, description: "e.g. name+ASC or created+DESC" }
+      response:
+        result_path: "$.clients"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_client:
+      method: GET
+      path: /clients/{id}
+      access: read
+      description: "Retrieve a single client by numeric ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.client"
+      pagination: none
+
+    create_client:
+      method: POST
+      path: /clients
+      access: write
+      description: >
+        Create a client. Wrap fields under the `client` key.
+      params:
+        client:
+          type: object
+          in: body
+          required: true
+          description: >
+            Client object. Writable fields: name (company), salutation, first_name,
+            last_name, street, zip, city, state, country_code (ISO Alpha-2), phone,
+            fax, mobile, email, www, tax_number, vat_number, bank_account_owner,
+            bank_name, bank_account_number, bank_swift, bank_iban, sepa_mandate,
+            sepa_mandate_date, tax_rule (COUNTRY/CB/NO_TAX), net_gross
+            (SETTINGS/NET/GROSS), default_payment_types, reduction, discount_rate,
+            discount_days, due_days, offer_validity_days, currency_code, price_group,
+            debitor_account_number, enable_customerportal (1/0), note, client_number,
+            number, number_pre, number_length. Most *_type fields accept SETTINGS.
+      response:
+        result_path: "$.client"
+      pagination: none
+
+    update_client:
+      method: PUT
+      path: /clients/{id}
+      access: write
+      description: "Update a client. Wrap changed fields under the `client` key (same fields as create_client)."
+      params:
+        id: { type: string, in: path, required: true }
+        client:
+          type: object
+          in: body
+          required: true
+          description: >
+            Client object with any writable fields to change — same schema as
+            create_client (name, first_name, last_name, street, zip, city,
+            country_code, email, phone, vat_number, bank_iban, net_gross,
+            default_payment_types, due_days, currency_code, note, ...).
+      response:
+        result_path: "$.client"
+      pagination: none
+
+    delete_client:
+      method: DELETE
+      path: /clients/{id}
+      access: dangerous
+      description: "Permanently delete a client. Fails if the client still has documents."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Contacts (additional addresses per client)
+    # ══════════════════════════════════════════════════════════════════
+    list_contacts:
+      method: GET
+      path: /contacts
+      access: read
+      description: >
+        List contacts for one client. client_id is REQUIRED — contacts are always
+        scoped to a single client. Returns an array of contact objects.
+      params:
+        client_id: { type: string, in: query, required: true, description: "Client ID (mandatory)" }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.contacts"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_contact:
+      method: GET
+      path: /contacts/{id}
+      access: read
+      description: "Retrieve a single contact by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.contact"
+      pagination: none
+
+    create_contact:
+      method: POST
+      path: /contacts
+      access: write
+      description: "Create a contact for a client. Empty fields inherit the client's value."
+      params:
+        contact:
+          type: object
+          in: body
+          required: true
+          description: >
+            Contact object. Fields: client_id (required), label, name (company),
+            salutation, first_name, last_name, street, zip, city, state,
+            country_code (ISO Alpha-2), phone, fax, mobile, email, www.
+      response:
+        result_path: "$.contact"
+      pagination: none
+
+    update_contact:
+      method: PUT
+      path: /contacts/{id}
+      access: write
+      description: "Update a contact (same fields as create_contact)."
+      params:
+        id: { type: string, in: path, required: true }
+        contact:
+          type: object
+          in: body
+          required: true
+          description: >
+            Contact object with fields to change: label, name, salutation,
+            first_name, last_name, street, zip, city, state, country_code,
+            phone, fax, mobile, email, www.
+      response:
+        result_path: "$.contact"
+      pagination: none
+
+    delete_contact:
+      method: DELETE
+      path: /contacts/{id}
+      access: dangerous
+      description: "Delete a contact"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Articles (products / services catalog)
+    # ══════════════════════════════════════════════════════════════════
+    list_articles:
+      method: GET
+      path: /articles
+      access: read
+      description: >
+        List catalog articles (products/services). Filter with article_number,
+        title, description, currency_code, unit_id, supplier_id. Returns an array.
+      params:
+        article_number: { type: string, in: query }
+        title: { type: string, in: query, description: "Free-text search in title" }
+        description: { type: string, in: query }
+        unit_id: { type: string, in: query }
+        supplier_id: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.articles"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_article:
+      method: GET
+      path: /articles/{id}
+      access: read
+      description: "Retrieve a single article by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.article"
+      pagination: none
+
+    create_article:
+      method: POST
+      path: /articles
+      access: write
+      description: "Create a catalog article."
+      params:
+        article:
+          type: object
+          in: body
+          required: true
+          description: >
+            Article object. Fields: title (required), description, sales_price
+            (number as string), sales_price2..sales_price5 (price groups),
+            currency_code, unit_id, tax_id, purchase_price,
+            purchase_price_net_gross (NET/GROSS), supplier_id, article_number,
+            number, number_pre, number_length.
+      response:
+        result_path: "$.article"
+      pagination: none
+
+    update_article:
+      method: PUT
+      path: /articles/{id}
+      access: write
+      description: "Update an article (same fields as create_article)."
+      params:
+        id: { type: string, in: path, required: true }
+        article:
+          type: object
+          in: body
+          required: true
+          description: >
+            Article object with fields to change: title, description, sales_price,
+            sales_price2..5, currency_code, unit_id, tax_id, purchase_price,
+            purchase_price_net_gross, supplier_id.
+      response:
+        result_path: "$.article"
+      pagination: none
+
+    delete_article:
+      method: DELETE
+      path: /articles/{id}
+      access: dangerous
+      description: "Delete an article from the catalog"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Invoices
+    # ══════════════════════════════════════════════════════════════════
+    list_invoices:
+      method: GET
+      path: /invoices
+      access: read
+      description: >
+        List invoices. Filters: client_id, contact_id, invoice_number, status
+        (DRAFT/OPEN/OVERDUE/PAID/CANCELED — comma-separated OR), payment_type,
+        from, to (YYYY-MM-DD), label, intro, note, tags, article_id. group_by
+        (client/status/day/week/month/year) returns aggregated sums instead.
+        Returns an array of invoice objects (all values are strings).
+      params:
+        client_id: { type: string, in: query }
+        contact_id: { type: string, in: query }
+        invoice_number: { type: string, in: query }
+        status: { type: string, in: query, description: "DRAFT, OPEN, OVERDUE, PAID, CANCELED (comma-OR)" }
+        payment_type: { type: string, in: query, description: "e.g. BANK_TRANSFER,PAYPAL (comma-OR)" }
+        from: { type: string, in: query, description: "Only invoices since this date (YYYY-MM-DD)" }
+        to: { type: string, in: query, description: "Only invoices up to this date (YYYY-MM-DD)" }
+        label: { type: string, in: query }
+        tags: { type: string, in: query }
+        article_id: { type: string, in: query }
+        group_by: { type: string, in: query, description: "client, status, day, week, month, year (aggregated result)" }
+        order_by: { type: string, in: query, description: "e.g. date+DESC,invoice_number+ASC" }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.invoices"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_invoice:
+      method: GET
+      path: /invoices/{id}
+      access: read
+      description: "Retrieve a single invoice by ID (includes combined taxes and totals)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.invoice"
+      pagination: none
+
+    create_invoice:
+      method: POST
+      path: /invoices
+      access: write
+      description: >
+        Create an invoice (always DRAFT). Line items may be embedded. Call
+        complete_invoice afterwards to assign a number and render the PDF.
+      params:
+        invoice:
+          type: object
+          in: body
+          required: true
+          description: >
+            Invoice object. Fields: client_id (required), contact_id, address,
+            number_pre, number, number_length, date (default today), supply_date,
+            supply_date_type (SUPPLY_DATE/DELIVERY_DATE/SUPPLY_TEXT/DELIVERY_TEXT),
+            due_date, discount_rate, discount_date, title, label, intro, note,
+            reduction (e.g. "10" or "10%"), currency_code, net_gross (NET/GROSS),
+            quote, payment_types, offer_id, confirmation_id, recurring_id,
+            free_text_id, template_id. Embed items via
+            "invoice-items": { "invoice-item": [ { unit_price, quantity, title,
+            description, unit, article_id, tax_name, tax_rate } ] }.
+      response:
+        result_path: "$.invoice"
+      pagination: none
+
+    update_invoice:
+      method: PUT
+      path: /invoices/{id}
+      access: write
+      description: "Update an invoice. Only DRAFT invoices can be edited. Items are managed via invoice-items, not here."
+      params:
+        id: { type: string, in: path, required: true }
+        invoice:
+          type: object
+          in: body
+          required: true
+          description: >
+            Invoice object with fields to change (same schema as create_invoice):
+            client_id, contact_id, address, date, supply_date, due_date, title,
+            label, intro, note, reduction, currency_code, net_gross, payment_types,
+            template_id, ...
+      response:
+        result_path: "$.invoice"
+      pagination: none
+
+    delete_invoice:
+      method: DELETE
+      path: /invoices/{id}
+      access: dangerous
+      description: "Delete an invoice with all its documents (PDFs), items and comments. Irreversible."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    complete_invoice:
+      method: PUT
+      path: /invoices/{id}/complete
+      access: write
+      description: >
+        Complete a DRAFT invoice: assigns the final invoice number, renders the
+        PDF and moves the status to OPEN (or OVERDUE/PAID). Optional template_id.
+      params:
+        id: { type: string, in: path, required: true }
+        complete:
+          type: object
+          in: body
+          description: "Optional { template_id } to select the PDF template"
+      response:
+        result_path: "$"
+      pagination: none
+
+    email_invoice:
+      method: POST
+      path: /invoices/{id}/email
+      access: write
+      description: >
+        Send the invoice to the client by e-mail. SIDE EFFECT: sends a real
+        e-mail. recipients must contain at least one of to/cc/bcc.
+      params:
+        id: { type: string, in: path, required: true }
+        email:
+          type: object
+          in: body
+          required: true
+          description: >
+            E-mail object. Fields: recipients { to, cc, bcc } (each a string or
+            array of addresses; at least one required), from (sender), subject,
+            body (may contain placeholders), filename (PDF name without .pdf),
+            email_template_id, attachments { attachment: [ { filename, mimetype,
+            base64file } ] }. Omitting subject/body uses the default e-mail template.
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_invoice:
+      method: PUT
+      path: /invoices/{id}/cancel
+      access: write
+      description: "Cancel a completed invoice (status -> CANCELED)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    uncancel_invoice:
+      method: PUT
+      path: /invoices/{id}/uncancel
+      access: write
+      description: "Undo the cancellation of an invoice"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_invoice_pdf:
+      method: GET
+      path: /invoices/{id}/pdf
+      access: read
+      description: >
+        Get the invoice PDF metadata and content. Returns { base64file, filename,
+        mimetype, filesize } — decode base64file to obtain the PDF bytes.
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.pdf"
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Invoice items (line items)
+    # ══════════════════════════════════════════════════════════════════
+    list_invoice_items:
+      method: GET
+      path: /invoice-items
+      access: read
+      description: "List line items of an invoice. invoice_id is required. Returns an array ordered by position."
+      params:
+        invoice_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.invoice-items"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_invoice_item:
+      method: GET
+      path: /invoice-items/{id}
+      access: read
+      description: "Retrieve a single invoice line item by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.invoice-item"
+      pagination: none
+
+    create_invoice_item:
+      method: POST
+      path: /invoice-items
+      access: write
+      description: "Add a line item to an existing invoice (DRAFT only)."
+      params:
+        invoice-item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Invoice item object. Fields: invoice_id (required), article_id, unit,
+            unit_price (required), quantity (required), title, description,
+            tax_name, tax_rate, reduction, position (sort order), optional (1/0).
+      response:
+        result_path: "$.invoice-item"
+      pagination: none
+
+    update_invoice_item:
+      method: PUT
+      path: /invoice-items/{id}
+      access: write
+      description: "Update an invoice line item (same fields as create_invoice_item, without invoice_id)."
+      params:
+        id: { type: string, in: path, required: true }
+        invoice-item:
+          type: object
+          in: body
+          required: true
+          description: "Item fields to change: unit, unit_price, quantity, title, description, tax_name, tax_rate, reduction, position."
+      response:
+        result_path: "$.invoice-item"
+      pagination: none
+
+    delete_invoice_item:
+      method: DELETE
+      path: /invoice-items/{id}
+      access: dangerous
+      description: "Delete an invoice line item"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Invoice payments
+    # ══════════════════════════════════════════════════════════════════
+    list_invoice_payments:
+      method: GET
+      path: /invoice-payments
+      access: read
+      description: >
+        List payments booked against invoices. Filters: invoice_id, from, to,
+        type (payment type, comma-OR), user_id. Returns an array.
+      params:
+        invoice_id: { type: string, in: query }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        type: { type: string, in: query, description: "BANK_TRANSFER, CASH, PAYPAL, ... (comma-OR)" }
+        user_id: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.invoice-payments"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_invoice_payment:
+      method: GET
+      path: /invoice-payments/{id}
+      access: read
+      description: "Retrieve a single invoice payment by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.invoice-payment"
+      pagination: none
+
+    create_invoice_payment:
+      method: POST
+      path: /invoice-payments
+      access: write
+      description: >
+        Book a payment for an invoice (invoice must be OPEN or OVERDUE). Set
+        mark_invoice_as_paid to also flip the invoice to PAID.
+      params:
+        invoice-payment:
+          type: object
+          in: body
+          required: true
+          description: >
+            Payment object. Fields: invoice_id (required), amount (required,
+            decimal), date (default today), comment, type (INVOICE_CORRECTION,
+            CREDIT_NOTE, BANK_CARD, BANK_TRANSFER, DEBIT, CASH, CHECK, PAYPAL,
+            CREDIT_CARD, COUPON, MISC), mark_invoice_as_paid (1/0).
+      response:
+        result_path: "$.invoice-payment"
+      pagination: none
+
+    delete_invoice_payment:
+      method: DELETE
+      path: /invoice-payments/{id}
+      access: dangerous
+      description: "Delete an invoice payment"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Invoice comments (activity log entries)
+    # ══════════════════════════════════════════════════════════════════
+    list_invoice_comments:
+      method: GET
+      path: /invoice-comments
+      access: read
+      description: "List comments/activity-log entries of an invoice. invoice_id required. Returns an array."
+      params:
+        invoice_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.invoice-comments"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    create_invoice_comment:
+      method: POST
+      path: /invoice-comments
+      access: write
+      description: "Add a comment to an invoice's activity log."
+      params:
+        invoice-comment:
+          type: object
+          in: body
+          required: true
+          description: "Comment object. Fields: invoice_id (required), comment (text)."
+      response:
+        result_path: "$.invoice-comment"
+      pagination: none
+
+    delete_invoice_comment:
+      method: DELETE
+      path: /invoice-comments/{id}
+      access: dangerous
+      description: "Delete an invoice comment"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Invoice tags
+    # ══════════════════════════════════════════════════════════════════
+    list_invoice_tags:
+      method: GET
+      path: /invoice-tags
+      access: read
+      description: "List tags of an invoice. invoice_id required. Returns an array."
+      params:
+        invoice_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.invoice-tags"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    create_invoice_tag:
+      method: POST
+      path: /invoice-tags
+      access: write
+      description: "Attach a tag to an invoice."
+      params:
+        invoice-tag:
+          type: object
+          in: body
+          required: true
+          description: "Tag object. Fields: invoice_id (required), name (tag text)."
+      response:
+        result_path: "$.invoice-tag"
+      pagination: none
+
+    delete_invoice_tag:
+      method: DELETE
+      path: /invoice-tags/{id}
+      access: dangerous
+      description: "Remove a tag from an invoice"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Recurring invoices (subscriptions / Abo)
+    # ══════════════════════════════════════════════════════════════════
+    list_recurrings:
+      method: GET
+      path: /recurrings
+      access: read
+      description: >
+        List recurring invoice templates. Filters: client_id, contact_id, name,
+        payment_type, cycle. Returns an array of recurring objects.
+      params:
+        client_id: { type: string, in: query }
+        contact_id: { type: string, in: query }
+        name: { type: string, in: query }
+        payment_type: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.recurrings"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_recurring:
+      method: GET
+      path: /recurrings/{id}
+      access: read
+      description: "Retrieve a single recurring invoice template by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.recurring"
+      pagination: none
+
+    create_recurring:
+      method: POST
+      path: /recurrings
+      access: write
+      description: "Create a recurring invoice template that auto-generates invoices on a cycle."
+      params:
+        recurring:
+          type: object
+          in: body
+          required: true
+          description: >
+            Recurring object. Fields: client_id (required), contact_id, title,
+            name, cycle_number, cycle (DAILY/WEEKLY/MONTHLY/QUARTERLY/BIANNUAL/
+            YEARLY), action (CREATE/COMPLETE/EMAIL/MAIL), hour (0-23), start_date,
+            end_date, iterations, due_days, discount_rate, discount_days, intro,
+            note, net_gross, reduction, currency_code, quote, ultimo (1/0), label,
+            supply_date, supply_date_type, payment_types, template_id,
+            email_template_id, email_sender, email_subject, email_message,
+            email_filename, email_bcc, letter_color, letter_duplex,
+            letter_paper_weight, offer_id, confirmation_id. Embed items via
+            "recurring-items": { "recurring-item": [ {...} ] }.
+      response:
+        result_path: "$.recurring"
+      pagination: none
+
+    update_recurring:
+      method: PUT
+      path: /recurrings/{id}
+      access: write
+      description: "Update a recurring invoice template (same fields as create_recurring)."
+      params:
+        id: { type: string, in: path, required: true }
+        recurring:
+          type: object
+          in: body
+          required: true
+          description: "Recurring fields to change: title, name, cycle, cycle_number, action, start_date, end_date, intro, note, payment_types, template_id, ..."
+      response:
+        result_path: "$.recurring"
+      pagination: none
+
+    delete_recurring:
+      method: DELETE
+      path: /recurrings/{id}
+      access: dangerous
+      description: "Delete a recurring invoice template"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Recurring items ──
+    list_recurring_items:
+      method: GET
+      path: /recurring-items
+      access: read
+      description: "List line items of a recurring template. recurring_id required. Returns an array."
+      params:
+        recurring_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.recurring-items"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_recurring_item:
+      method: GET
+      path: /recurring-items/{id}
+      access: read
+      description: "Retrieve a single recurring line item by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.recurring-item"
+      pagination: none
+
+    create_recurring_item:
+      method: POST
+      path: /recurring-items
+      access: write
+      description: "Add a line item to a recurring template."
+      params:
+        recurring-item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Recurring item object. Fields: recurring_id (required), article_id,
+            unit, unit_price (required), quantity (required), title, description,
+            tax_name, tax_rate, reduction, position.
+      response:
+        result_path: "$.recurring-item"
+      pagination: none
+
+    update_recurring_item:
+      method: PUT
+      path: /recurring-items/{id}
+      access: write
+      description: "Update a recurring line item (same fields as create_recurring_item, without recurring_id)."
+      params:
+        id: { type: string, in: path, required: true }
+        recurring-item:
+          type: object
+          in: body
+          required: true
+          description: "Item fields to change: unit, unit_price, quantity, title, description, tax_name, tax_rate, reduction, position."
+      response:
+        result_path: "$.recurring-item"
+      pagination: none
+
+    delete_recurring_item:
+      method: DELETE
+      path: /recurring-items/{id}
+      access: dangerous
+      description: "Delete a recurring line item"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Estimates / Offers (quotes)
+    # ══════════════════════════════════════════════════════════════════
+    list_offers:
+      method: GET
+      path: /offers
+      access: read
+      description: >
+        List estimates (offers/quotes). Filters: client_id, contact_id,
+        offer_number, status (DRAFT/OPEN/WON/LOST/CANCELED/CLEARED — comma-OR),
+        from, to, label, intro, note, tags, article_id. Returns an array.
+      params:
+        client_id: { type: string, in: query }
+        contact_id: { type: string, in: query }
+        offer_number: { type: string, in: query }
+        status: { type: string, in: query, description: "DRAFT, OPEN, WON, LOST, CANCELED, CLEARED (comma-OR)" }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        label: { type: string, in: query }
+        tags: { type: string, in: query }
+        article_id: { type: string, in: query }
+        order_by: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.offers"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_offer:
+      method: GET
+      path: /offers/{id}
+      access: read
+      description: "Retrieve a single estimate by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.offer"
+      pagination: none
+
+    create_offer:
+      method: POST
+      path: /offers
+      access: write
+      description: "Create an estimate/offer (always DRAFT). Complete it to assign a number and render the PDF."
+      params:
+        offer:
+          type: object
+          in: body
+          required: true
+          description: >
+            Offer object. Fields: client_id (required), contact_id, address,
+            number_pre, number, number_length, date, title, label, intro, note,
+            reduction, currency_code, net_gross (NET/GROSS), quote, validity_date,
+            free_text_id, template_id. Embed items via
+            "offer-items": { "offer-item": [ { unit_price, quantity, title } ] }.
+      response:
+        result_path: "$.offer"
+      pagination: none
+
+    update_offer:
+      method: PUT
+      path: /offers/{id}
+      access: write
+      description: "Update an estimate (DRAFT only; same fields as create_offer)."
+      params:
+        id: { type: string, in: path, required: true }
+        offer:
+          type: object
+          in: body
+          required: true
+          description: "Offer fields to change: client_id, contact_id, address, date, title, label, intro, note, reduction, currency_code, net_gross, validity_date, template_id."
+      response:
+        result_path: "$.offer"
+      pagination: none
+
+    delete_offer:
+      method: DELETE
+      path: /offers/{id}
+      access: dangerous
+      description: "Delete an estimate with all items and comments"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    complete_offer:
+      method: PUT
+      path: /offers/{id}/complete
+      access: write
+      description: "Complete a DRAFT estimate: assigns the number, renders the PDF, moves status to OPEN. Optional template_id."
+      params:
+        id: { type: string, in: path, required: true }
+        complete:
+          type: object
+          in: body
+          description: "Optional { template_id }"
+      response:
+        result_path: "$"
+      pagination: none
+
+    email_offer:
+      method: POST
+      path: /offers/{id}/email
+      access: write
+      description: "Send the estimate to the client by e-mail. SIDE EFFECT: sends a real e-mail."
+      params:
+        id: { type: string, in: path, required: true }
+        email:
+          type: object
+          in: body
+          required: true
+          description: "E-mail object: recipients { to, cc, bcc }, from, subject, body, filename, email_template_id, attachments."
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_offer:
+      method: PUT
+      path: /offers/{id}/cancel
+      access: write
+      description: "Cancel an estimate (status -> CANCELED)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    uncancel_offer:
+      method: PUT
+      path: /offers/{id}/uncancel
+      access: write
+      description: "Undo the cancellation of an estimate"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_offer_pdf:
+      method: GET
+      path: /offers/{id}/pdf
+      access: read
+      description: "Get the estimate PDF: { base64file, filename, mimetype, filesize } — decode base64file."
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.pdf"
+      pagination: none
+
+    # ── Offer items ──
+    list_offer_items:
+      method: GET
+      path: /offer-items
+      access: read
+      description: "List line items of an estimate. offer_id required. Returns an array."
+      params:
+        offer_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.offer-items"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_offer_item:
+      method: GET
+      path: /offer-items/{id}
+      access: read
+      description: "Retrieve a single estimate line item by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.offer-item"
+      pagination: none
+
+    create_offer_item:
+      method: POST
+      path: /offer-items
+      access: write
+      description: "Add a line item to an estimate."
+      params:
+        offer-item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Offer item object. Fields: offer_id (required), article_id, unit,
+            unit_price (required), quantity (required), title, description,
+            tax_name, tax_rate, reduction, position.
+      response:
+        result_path: "$.offer-item"
+      pagination: none
+
+    update_offer_item:
+      method: PUT
+      path: /offer-items/{id}
+      access: write
+      description: "Update an estimate line item (same fields as create_offer_item, without offer_id)."
+      params:
+        id: { type: string, in: path, required: true }
+        offer-item:
+          type: object
+          in: body
+          required: true
+          description: "Item fields to change: unit, unit_price, quantity, title, description, tax_name, tax_rate, reduction, position."
+      response:
+        result_path: "$.offer-item"
+      pagination: none
+
+    delete_offer_item:
+      method: DELETE
+      path: /offer-items/{id}
+      access: dangerous
+      description: "Delete an estimate line item"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Order confirmations
+    # ══════════════════════════════════════════════════════════════════
+    list_confirmations:
+      method: GET
+      path: /confirmations
+      access: read
+      description: >
+        List order confirmations. Filters: client_id, contact_id,
+        confirmation_number, status (DRAFT/OPEN/CANCELED/CLEARED), from, to,
+        label, intro, note, tags, article_id. Returns an array.
+      params:
+        client_id: { type: string, in: query }
+        contact_id: { type: string, in: query }
+        confirmation_number: { type: string, in: query }
+        status: { type: string, in: query, description: "DRAFT, OPEN, CANCELED, CLEARED (comma-OR)" }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        tags: { type: string, in: query }
+        article_id: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.confirmations"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_confirmation:
+      method: GET
+      path: /confirmations/{id}
+      access: read
+      description: "Retrieve a single order confirmation by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.confirmation"
+      pagination: none
+
+    create_confirmation:
+      method: POST
+      path: /confirmations
+      access: write
+      description: "Create an order confirmation (always DRAFT)."
+      params:
+        confirmation:
+          type: object
+          in: body
+          required: true
+          description: >
+            Confirmation object. Fields: client_id (required), contact_id, address,
+            number_pre, number, number_length, date, title, label, intro, note,
+            reduction, currency_code, net_gross, quote, free_text_id, template_id.
+            Embed items via "confirmation-items": { "confirmation-item": [ {...} ] }.
+      response:
+        result_path: "$.confirmation"
+      pagination: none
+
+    update_confirmation:
+      method: PUT
+      path: /confirmations/{id}
+      access: write
+      description: "Update an order confirmation (DRAFT only; same fields as create_confirmation)."
+      params:
+        id: { type: string, in: path, required: true }
+        confirmation:
+          type: object
+          in: body
+          required: true
+          description: "Confirmation fields to change: client_id, contact_id, address, date, title, label, intro, note, reduction, currency_code, net_gross, template_id."
+      response:
+        result_path: "$.confirmation"
+      pagination: none
+
+    delete_confirmation:
+      method: DELETE
+      path: /confirmations/{id}
+      access: dangerous
+      description: "Delete an order confirmation with all items and comments"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    complete_confirmation:
+      method: PUT
+      path: /confirmations/{id}/complete
+      access: write
+      description: "Complete a DRAFT confirmation: assigns the number, renders the PDF, moves status to OPEN."
+      params:
+        id: { type: string, in: path, required: true }
+        complete:
+          type: object
+          in: body
+          description: "Optional { template_id }"
+      response:
+        result_path: "$"
+      pagination: none
+
+    email_confirmation:
+      method: POST
+      path: /confirmations/{id}/email
+      access: write
+      description: "Send the order confirmation by e-mail. SIDE EFFECT: sends a real e-mail."
+      params:
+        id: { type: string, in: path, required: true }
+        email:
+          type: object
+          in: body
+          required: true
+          description: "E-mail object: recipients { to, cc, bcc }, from, subject, body, filename, email_template_id, attachments."
+      response:
+        result_path: "$"
+      pagination: none
+
+    cancel_confirmation:
+      method: PUT
+      path: /confirmations/{id}/cancel
+      access: write
+      description: "Cancel an order confirmation (status -> CANCELED)"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_confirmation_pdf:
+      method: GET
+      path: /confirmations/{id}/pdf
+      access: read
+      description: "Get the confirmation PDF: { base64file, filename, mimetype, filesize } — decode base64file."
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.pdf"
+      pagination: none
+
+    # ── Confirmation items ──
+    list_confirmation_items:
+      method: GET
+      path: /confirmation-items
+      access: read
+      description: "List line items of an order confirmation. confirmation_id required. Returns an array."
+      params:
+        confirmation_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.confirmation-items"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_confirmation_item:
+      method: GET
+      path: /confirmation-items/{id}
+      access: read
+      description: "Retrieve a single confirmation line item by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.confirmation-item"
+      pagination: none
+
+    create_confirmation_item:
+      method: POST
+      path: /confirmation-items
+      access: write
+      description: "Add a line item to an order confirmation."
+      params:
+        confirmation-item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Confirmation item object. Fields: confirmation_id (required),
+            article_id, unit, unit_price (required), quantity (required), title,
+            description, tax_name, tax_rate, reduction, position.
+      response:
+        result_path: "$.confirmation-item"
+      pagination: none
+
+    update_confirmation_item:
+      method: PUT
+      path: /confirmation-items/{id}
+      access: write
+      description: "Update a confirmation line item (same fields as create_confirmation_item, without confirmation_id)."
+      params:
+        id: { type: string, in: path, required: true }
+        confirmation-item:
+          type: object
+          in: body
+          required: true
+          description: "Item fields to change: unit, unit_price, quantity, title, description, tax_name, tax_rate, reduction, position."
+      response:
+        result_path: "$.confirmation-item"
+      pagination: none
+
+    delete_confirmation_item:
+      method: DELETE
+      path: /confirmation-items/{id}
+      access: dangerous
+      description: "Delete a confirmation line item"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Credit notes (Gutschriften)
+    # ══════════════════════════════════════════════════════════════════
+    list_credit_notes:
+      method: GET
+      path: /credit-notes
+      access: read
+      description: >
+        List credit notes. Filters: client_id, contact_id, credit_note_number,
+        status (DRAFT/OPEN/PAID/CANCELED), from, to, label, intro, note, tags,
+        article_id, invoice_id. Returns an array.
+      params:
+        client_id: { type: string, in: query }
+        contact_id: { type: string, in: query }
+        credit_note_number: { type: string, in: query }
+        status: { type: string, in: query, description: "DRAFT, OPEN, PAID, CANCELED (comma-OR)" }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        invoice_id: { type: string, in: query, description: "Source invoice ID" }
+        tags: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.credit-notes"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_credit_note:
+      method: GET
+      path: /credit-notes/{id}
+      access: read
+      description: "Retrieve a single credit note by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.credit-note"
+      pagination: none
+
+    create_credit_note:
+      method: POST
+      path: /credit-notes
+      access: write
+      description: "Create a credit note (always DRAFT). Optionally reference a source invoice via invoice_id."
+      params:
+        credit-note:
+          type: object
+          in: body
+          required: true
+          description: >
+            Credit note object. Fields: client_id (required), invoice_id (source
+            invoice, optional), contact_id, address, number_pre, number,
+            number_length, date, title, label, intro, note, reduction,
+            currency_code, net_gross, quote, free_text_id, template_id. Embed items
+            via "credit-note-items": { "credit-note-item": [ {...} ] }.
+      response:
+        result_path: "$.credit-note"
+      pagination: none
+
+    update_credit_note:
+      method: PUT
+      path: /credit-notes/{id}
+      access: write
+      description: "Update a credit note (DRAFT only; same fields as create_credit_note)."
+      params:
+        id: { type: string, in: path, required: true }
+        credit-note:
+          type: object
+          in: body
+          required: true
+          description: "Credit note fields to change: client_id, contact_id, address, date, title, label, intro, note, reduction, currency_code, net_gross, template_id."
+      response:
+        result_path: "$.credit-note"
+      pagination: none
+
+    delete_credit_note:
+      method: DELETE
+      path: /credit-notes/{id}
+      access: dangerous
+      description: "Delete a credit note with all items and comments"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    complete_credit_note:
+      method: PUT
+      path: /credit-notes/{id}/complete
+      access: write
+      description: "Complete a DRAFT credit note: assigns the number, renders the PDF, moves status to OPEN."
+      params:
+        id: { type: string, in: path, required: true }
+        complete:
+          type: object
+          in: body
+          description: "Optional { template_id }"
+      response:
+        result_path: "$"
+      pagination: none
+
+    email_credit_note:
+      method: POST
+      path: /credit-notes/{id}/email
+      access: write
+      description: "Send the credit note by e-mail. SIDE EFFECT: sends a real e-mail."
+      params:
+        id: { type: string, in: path, required: true }
+        email:
+          type: object
+          in: body
+          required: true
+          description: "E-mail object: recipients { to, cc, bcc }, from, subject, body, filename, email_template_id, attachments."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_credit_note_pdf:
+      method: GET
+      path: /credit-notes/{id}/pdf
+      access: read
+      description: "Get the credit note PDF: { base64file, filename, mimetype, filesize } — decode base64file."
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.pdf"
+      pagination: none
+
+    # ── Credit note items ──
+    list_credit_note_items:
+      method: GET
+      path: /credit-note-items
+      access: read
+      description: "List line items of a credit note. credit_note_id required. Returns an array."
+      params:
+        credit_note_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.credit-note-items"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_credit_note_item:
+      method: GET
+      path: /credit-note-items/{id}
+      access: read
+      description: "Retrieve a single credit note line item by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.credit-note-item"
+      pagination: none
+
+    create_credit_note_item:
+      method: POST
+      path: /credit-note-items
+      access: write
+      description: "Add a line item to a credit note."
+      params:
+        credit-note-item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Credit note item object. Fields: credit_note_id (required),
+            article_id, unit, unit_price (required), quantity (required), title,
+            description, tax_name, tax_rate, reduction, position.
+      response:
+        result_path: "$.credit-note-item"
+      pagination: none
+
+    update_credit_note_item:
+      method: PUT
+      path: /credit-note-items/{id}
+      access: write
+      description: "Update a credit note line item (same fields as create_credit_note_item, without credit_note_id)."
+      params:
+        id: { type: string, in: path, required: true }
+        credit-note-item:
+          type: object
+          in: body
+          required: true
+          description: "Item fields to change: unit, unit_price, quantity, title, description, tax_name, tax_rate, reduction, position."
+      response:
+        result_path: "$.credit-note-item"
+      pagination: none
+
+    delete_credit_note_item:
+      method: DELETE
+      path: /credit-note-items/{id}
+      access: dangerous
+      description: "Delete a credit note line item"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Delivery notes (Lieferscheine)
+    # ══════════════════════════════════════════════════════════════════
+    list_delivery_notes:
+      method: GET
+      path: /delivery-notes
+      access: read
+      description: >
+        List delivery notes. Filters: client_id, contact_id,
+        delivery_note_number, status (DRAFT/OPEN/CANCELED), from, to, label,
+        intro, note, tags, article_id, invoice_id. Returns an array.
+      params:
+        client_id: { type: string, in: query }
+        contact_id: { type: string, in: query }
+        delivery_note_number: { type: string, in: query }
+        status: { type: string, in: query, description: "DRAFT, OPEN, CANCELED (comma-OR)" }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        invoice_id: { type: string, in: query }
+        tags: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.delivery-notes"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_delivery_note:
+      method: GET
+      path: /delivery-notes/{id}
+      access: read
+      description: "Retrieve a single delivery note by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.delivery-note"
+      pagination: none
+
+    create_delivery_note:
+      method: POST
+      path: /delivery-notes
+      access: write
+      description: "Create a delivery note (always DRAFT). Often created from an invoice via invoice_id."
+      params:
+        delivery-note:
+          type: object
+          in: body
+          required: true
+          description: >
+            Delivery note object. Fields: client_id (required), invoice_id
+            (source, optional), contact_id, address, number_pre, number,
+            number_length, date, title, label, intro, note, template_id. Embed
+            items via "delivery-note-items": { "delivery-note-item": [ {...} ] }.
+      response:
+        result_path: "$.delivery-note"
+      pagination: none
+
+    update_delivery_note:
+      method: PUT
+      path: /delivery-notes/{id}
+      access: write
+      description: "Update a delivery note (DRAFT only; same fields as create_delivery_note)."
+      params:
+        id: { type: string, in: path, required: true }
+        delivery-note:
+          type: object
+          in: body
+          required: true
+          description: "Delivery note fields to change: client_id, contact_id, address, date, title, label, intro, note, template_id."
+      response:
+        result_path: "$.delivery-note"
+      pagination: none
+
+    delete_delivery_note:
+      method: DELETE
+      path: /delivery-notes/{id}
+      access: dangerous
+      description: "Delete a delivery note with all items and comments"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    complete_delivery_note:
+      method: PUT
+      path: /delivery-notes/{id}/complete
+      access: write
+      description: "Complete a DRAFT delivery note: assigns the number, renders the PDF, moves status to OPEN."
+      params:
+        id: { type: string, in: path, required: true }
+        complete:
+          type: object
+          in: body
+          description: "Optional { template_id }"
+      response:
+        result_path: "$"
+      pagination: none
+
+    email_delivery_note:
+      method: POST
+      path: /delivery-notes/{id}/email
+      access: write
+      description: "Send the delivery note by e-mail. SIDE EFFECT: sends a real e-mail."
+      params:
+        id: { type: string, in: path, required: true }
+        email:
+          type: object
+          in: body
+          required: true
+          description: "E-mail object: recipients { to, cc, bcc }, from, subject, body, filename, email_template_id, attachments."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_delivery_note_pdf:
+      method: GET
+      path: /delivery-notes/{id}/pdf
+      access: read
+      description: "Get the delivery note PDF: { base64file, filename, mimetype, filesize } — decode base64file."
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.pdf"
+      pagination: none
+
+    # ── Delivery note items ──
+    list_delivery_note_items:
+      method: GET
+      path: /delivery-note-items
+      access: read
+      description: "List line items of a delivery note. delivery_note_id required. Returns an array."
+      params:
+        delivery_note_id: { type: string, in: query, required: true }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.delivery-note-items"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_delivery_note_item:
+      method: GET
+      path: /delivery-note-items/{id}
+      access: read
+      description: "Retrieve a single delivery note line item by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.delivery-note-item"
+      pagination: none
+
+    create_delivery_note_item:
+      method: POST
+      path: /delivery-note-items
+      access: write
+      description: "Add a line item to a delivery note."
+      params:
+        delivery-note-item:
+          type: object
+          in: body
+          required: true
+          description: >
+            Delivery note item object. Fields: delivery_note_id (required),
+            article_id, unit, unit_price, quantity (required), title, description,
+            reduction, position.
+      response:
+        result_path: "$.delivery-note-item"
+      pagination: none
+
+    update_delivery_note_item:
+      method: PUT
+      path: /delivery-note-items/{id}
+      access: write
+      description: "Update a delivery note line item (same fields as create_delivery_note_item, without delivery_note_id)."
+      params:
+        id: { type: string, in: path, required: true }
+        delivery-note-item:
+          type: object
+          in: body
+          required: true
+          description: "Item fields to change: unit, unit_price, quantity, title, description, reduction, position."
+      response:
+        result_path: "$.delivery-note-item"
+      pagination: none
+
+    delete_delivery_note_item:
+      method: DELETE
+      path: /delivery-note-items/{id}
+      access: dangerous
+      description: "Delete a delivery note line item"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Dunning reminders (Mahnungen)
+    # ══════════════════════════════════════════════════════════════════
+    list_reminders:
+      method: GET
+      path: /reminders
+      access: read
+      description: >
+        List dunning reminders for overdue invoices. Filters: client_id,
+        contact_id, invoice_id, invoice_number, status (DRAFT/OPEN/CANCELED),
+        from, to, label, intro, note. Returns an array.
+      params:
+        client_id: { type: string, in: query }
+        contact_id: { type: string, in: query }
+        invoice_id: { type: string, in: query }
+        invoice_number: { type: string, in: query }
+        status: { type: string, in: query, description: "DRAFT, OPEN, CANCELED (comma-OR)" }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.reminders"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_reminder:
+      method: GET
+      path: /reminders/{id}
+      access: read
+      description: "Retrieve a single dunning reminder by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.reminder"
+      pagination: none
+
+    create_reminder:
+      method: POST
+      path: /reminders
+      access: write
+      description: >
+        Create a dunning reminder for an overdue invoice (always DRAFT). The
+        reminder level escalates automatically based on prior reminders.
+      params:
+        reminder:
+          type: object
+          in: body
+          required: true
+          description: >
+            Reminder object. Fields: invoice_id (required), contact_id, address,
+            date, due_date, subject/label, intro, note, reduction, template_id,
+            reminder_text_id. Embed extra items via
+            "reminder-items": { "reminder-item": [ {...} ] }.
+      response:
+        result_path: "$.reminder"
+      pagination: none
+
+    update_reminder:
+      method: PUT
+      path: /reminders/{id}
+      access: write
+      description: "Update a dunning reminder (DRAFT only; same fields as create_reminder)."
+      params:
+        id: { type: string, in: path, required: true }
+        reminder:
+          type: object
+          in: body
+          required: true
+          description: "Reminder fields to change: contact_id, address, date, due_date, label, intro, note, template_id."
+      response:
+        result_path: "$.reminder"
+      pagination: none
+
+    delete_reminder:
+      method: DELETE
+      path: /reminders/{id}
+      access: dangerous
+      description: "Delete a dunning reminder"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    complete_reminder:
+      method: PUT
+      path: /reminders/{id}/complete
+      access: write
+      description: "Complete a DRAFT reminder: assigns the number, renders the PDF, moves status to OPEN."
+      params:
+        id: { type: string, in: path, required: true }
+        complete:
+          type: object
+          in: body
+          description: "Optional { template_id }"
+      response:
+        result_path: "$"
+      pagination: none
+
+    email_reminder:
+      method: POST
+      path: /reminders/{id}/email
+      access: write
+      description: "Send the dunning reminder by e-mail. SIDE EFFECT: sends a real e-mail."
+      params:
+        id: { type: string, in: path, required: true }
+        email:
+          type: object
+          in: body
+          required: true
+          description: "E-mail object: recipients { to, cc, bcc }, from, subject, body, filename, email_template_id, attachments."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_reminder_pdf:
+      method: GET
+      path: /reminders/{id}/pdf
+      access: read
+      description: "Get the reminder PDF: { base64file, filename, mimetype, filesize } — decode base64file."
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.pdf"
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Suppliers (Lieferanten)
+    # ══════════════════════════════════════════════════════════════════
+    list_suppliers:
+      method: GET
+      path: /suppliers
+      access: read
+      description: "List suppliers. Filters: name, supplier_number, email, country_code, note, tags. Returns an array."
+      params:
+        name: { type: string, in: query }
+        supplier_number: { type: string, in: query }
+        email: { type: string, in: query }
+        country_code: { type: string, in: query }
+        tags: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.suppliers"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_supplier:
+      method: GET
+      path: /suppliers/{id}
+      access: read
+      description: "Retrieve a single supplier by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.supplier"
+      pagination: none
+
+    create_supplier:
+      method: POST
+      path: /suppliers
+      access: write
+      description: "Create a supplier (vendor for incoming invoices)."
+      params:
+        supplier:
+          type: object
+          in: body
+          required: true
+          description: >
+            Supplier object. Fields: name (required), salutation, first_name,
+            last_name, street, zip, city, state, country_code, phone, fax, mobile,
+            email, www, tax_number, vat_number, bank_account_owner, bank_name,
+            bank_account_number, bank_swift, bank_iban, creditor_identifier,
+            creditor_account_number, currency_code, note, supplier_number.
+      response:
+        result_path: "$.supplier"
+      pagination: none
+
+    update_supplier:
+      method: PUT
+      path: /suppliers/{id}
+      access: write
+      description: "Update a supplier (same fields as create_supplier)."
+      params:
+        id: { type: string, in: path, required: true }
+        supplier:
+          type: object
+          in: body
+          required: true
+          description: "Supplier fields to change: name, first_name, last_name, street, zip, city, country_code, email, phone, vat_number, bank_iban, currency_code, note."
+      response:
+        result_path: "$.supplier"
+      pagination: none
+
+    delete_supplier:
+      method: DELETE
+      path: /suppliers/{id}
+      access: dangerous
+      description: "Delete a supplier"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Incoming invoices / expenses (Eingangsrechnungen)
+    # ══════════════════════════════════════════════════════════════════
+    list_incomings:
+      method: GET
+      path: /incomings
+      access: read
+      description: >
+        List incoming invoices (expenses / supplier bills). Filters: supplier_id,
+        number, status (paid/unpaid/overdue), from, to, tags. Returns an array.
+      params:
+        supplier_id: { type: string, in: query }
+        number: { type: string, in: query, description: "Supplier's invoice number" }
+        status: { type: string, in: query, description: "e.g. PAID, UNPAID, OVERDUE" }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        tags: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.incomings"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_incoming:
+      method: GET
+      path: /incomings/{id}
+      access: read
+      description: "Retrieve a single incoming invoice by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.incoming"
+      pagination: none
+
+    create_incoming:
+      method: POST
+      path: /incomings
+      access: write
+      description: "Record an incoming invoice (expense) from a supplier."
+      params:
+        incoming:
+          type: object
+          in: body
+          required: true
+          description: >
+            Incoming object. Fields: supplier_id, number (supplier's invoice
+            number), date, due_date, title, note, currency_code, quote, net_gross,
+            total_net, total_gross, status, category, address.
+      response:
+        result_path: "$.incoming"
+      pagination: none
+
+    update_incoming:
+      method: PUT
+      path: /incomings/{id}
+      access: write
+      description: "Update an incoming invoice (same fields as create_incoming)."
+      params:
+        id: { type: string, in: path, required: true }
+        incoming:
+          type: object
+          in: body
+          required: true
+          description: "Incoming fields to change: supplier_id, number, date, due_date, title, note, currency_code, total_net, total_gross, status, category."
+      response:
+        result_path: "$.incoming"
+      pagination: none
+
+    delete_incoming:
+      method: DELETE
+      path: /incomings/{id}
+      access: dangerous
+      description: "Delete an incoming invoice"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ── Incoming payments ──
+    list_incoming_payments:
+      method: GET
+      path: /incoming-payments
+      access: read
+      description: "List payments made against incoming invoices. Filter with incoming_id. Returns an array."
+      params:
+        incoming_id: { type: string, in: query }
+        from: { type: string, in: query, description: "YYYY-MM-DD" }
+        to: { type: string, in: query, description: "YYYY-MM-DD" }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.incoming-payments"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    create_incoming_payment:
+      method: POST
+      path: /incoming-payments
+      access: write
+      description: "Book a payment against an incoming invoice."
+      params:
+        incoming-payment:
+          type: object
+          in: body
+          required: true
+          description: >
+            Incoming payment object. Fields: incoming_id (required), amount
+            (required), date, comment, type (BANK_TRANSFER/CASH/...),
+            mark_incoming_as_paid (1/0).
+      response:
+        result_path: "$.incoming-payment"
+      pagination: none
+
+    delete_incoming_payment:
+      method: DELETE
+      path: /incoming-payments/{id}
+      access: dangerous
+      description: "Delete an incoming payment"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Taxes
+    # ══════════════════════════════════════════════════════════════════
+    list_taxes:
+      method: GET
+      path: /taxes
+      access: read
+      description: "List configured tax rates. Returns an array of tax objects (name, rate, is_default)."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.taxes"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_tax:
+      method: GET
+      path: /taxes/{id}
+      access: read
+      description: "Retrieve a single tax rate by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.tax"
+      pagination: none
+
+    create_tax:
+      method: POST
+      path: /taxes
+      access: write
+      description: "Create a tax rate."
+      params:
+        tax:
+          type: object
+          in: body
+          required: true
+          description: "Tax object. Fields: name (required), rate (percent, required), is_default (1/0), account_number (DATEV bookkeeping account)."
+      response:
+        result_path: "$.tax"
+      pagination: none
+
+    update_tax:
+      method: PUT
+      path: /taxes/{id}
+      access: write
+      description: "Update a tax rate (same fields as create_tax)."
+      params:
+        id: { type: string, in: path, required: true }
+        tax:
+          type: object
+          in: body
+          required: true
+          description: "Tax fields to change: name, rate, is_default, account_number."
+      response:
+        result_path: "$.tax"
+      pagination: none
+
+    delete_tax:
+      method: DELETE
+      path: /taxes/{id}
+      access: dangerous
+      description: "Delete a tax rate"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Units (of measure)
+    # ══════════════════════════════════════════════════════════════════
+    list_units:
+      method: GET
+      path: /units
+      access: read
+      description: "List units of measure (e.g. hour, piece). Returns an array of unit objects."
+      params:
+        name: { type: string, in: query }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.units"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_unit:
+      method: GET
+      path: /units/{id}
+      access: read
+      description: "Retrieve a single unit by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.unit"
+      pagination: none
+
+    create_unit:
+      method: POST
+      path: /units
+      access: write
+      description: "Create a unit of measure."
+      params:
+        unit:
+          type: object
+          in: body
+          required: true
+          description: "Unit object. Fields: name (required)."
+      response:
+        result_path: "$.unit"
+      pagination: none
+
+    update_unit:
+      method: PUT
+      path: /units/{id}
+      access: write
+      description: "Rename a unit of measure."
+      params:
+        id: { type: string, in: path, required: true }
+        unit:
+          type: object
+          in: body
+          required: true
+          description: "Unit object. Fields: name."
+      response:
+        result_path: "$.unit"
+      pagination: none
+
+    delete_unit:
+      method: DELETE
+      path: /units/{id}
+      access: dangerous
+      description: "Delete a unit of measure"
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Templates, settings & lookups (read-only)
+    # ══════════════════════════════════════════════════════════════════
+    list_templates:
+      method: GET
+      path: /templates
+      access: read
+      description: "List document (PDF) templates. Filter with type (INVOICE, OFFER, ...). Returns an array."
+      params:
+        type: { type: string, in: query, description: "INVOICE, OFFER, CONFIRMATION, CREDIT_NOTE, DELIVERY_NOTE, REMINDER, LETTER" }
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.templates"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_template:
+      method: GET
+      path: /templates/{id}
+      access: read
+      description: "Retrieve a single document template by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.template"
+      pagination: none
+
+    list_email_templates:
+      method: GET
+      path: /email-templates
+      access: read
+      description: "List e-mail templates used by the email_* actions. Returns an array."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.email-templates"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_email_template:
+      method: GET
+      path: /email-templates/{id}
+      access: read
+      description: "Retrieve a single e-mail template by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.email-template"
+      pagination: none
+
+    get_settings:
+      method: GET
+      path: /settings
+      access: read
+      description: "Retrieve the account settings (default number ranges, texts, due days, currency, tax defaults, etc.)."
+      response:
+        result_path: "$.settings"
+      pagination: none
+
+    list_users:
+      method: GET
+      path: /users
+      access: read
+      description: "List employees/users of the account. Returns an array of user objects."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.users"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    get_user:
+      method: GET
+      path: /users/{id}
+      access: read
+      description: "Retrieve a single user by ID"
+      params:
+        id: { type: string, in: path, required: true }
+      response:
+        result_path: "$.user"
+      pagination: none
+
+    list_countries:
+      method: GET
+      path: /countries
+      access: read
+      description: "List countries with their tax/currency configuration. Returns an array."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.countries"
+        transform: *normalize_list
+        allow_jq_override: true
+
+    list_currencies:
+      method: GET
+      path: /currencies
+      access: read
+      description: "List configured currencies. Returns an array."
+      params:
+        page: { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 100 }
+      response:
+        result_path: "$.currencies"
+        transform: *normalize_list
+        allow_jq_override: true
+
+  examples:
+    - name: "Create, complete and email an invoice"
+      description: "Create a client, draft an invoice with two line items, finalize it, then e-mail it"
+      code: |
+        const client = await api.create_client({
+          client: { name: "ACME GmbH", email: "billing@acme.example", country_code: "DE" }
+        });
+        const invoice = await api.create_invoice({
+          invoice: {
+            client_id: client.id,
+            date: "2026-07-20",
+            net_gross: "NET",
+            "invoice-items": {
+              "invoice-item": [
+                { title: "Consulting", unit: "hour", unit_price: "90", quantity: "8", tax_name: "VAT", tax_rate: "19" },
+                { title: "License", unit: "piece", unit_price: "199", quantity: "1", tax_name: "VAT", tax_rate: "19" }
+              ]
+            }
+          }
+        });
+        await api.complete_invoice({ id: invoice.id });
+        await api.email_invoice({
+          id: invoice.id,
+          email: { recipients: { to: "billing@acme.example" }, subject: "Your invoice" }
+        });
+        return await api.get_invoice({ id: invoice.id });
+
+    - name: "Book a payment and mark the invoice paid"
+      description: "Register a bank transfer against an open invoice and close it"
+      code: |
+        const payment = await api.create_invoice_payment({
+          "invoice-payment": {
+            invoice_id: "12345",
+            amount: "1130.10",
+            date: "2026-07-20",
+            type: "BANK_TRANSFER",
+            mark_invoice_as_paid: 1
+          }
+        });
+        return payment;
+
+    - name: "List overdue invoices"
+      description: "Fetch all OVERDUE invoices and project a compact summary"
+      code: |
+        const overdue = await api.list_invoices({ status: "OVERDUE", per_page: 100 });
+        return overdue.map(inv => ({
+          id: inv.id,
+          number: inv.invoice_number,
+          client_id: inv.client_id,
+          open_amount: inv.open_amount,
+          due_date: inv.due_date
+        }));
+
+    - name: "Convert an accepted estimate into an invoice"
+      description: "Read an estimate and create an invoice that references it"
+      code: |
+        const offer = await api.get_offer({ id: "555" });
+        const invoice = await api.create_invoice({
+          invoice: { client_id: offer.client_id, offer_id: offer.id }
+        });
+        return { invoice_id: invoice.id, from_offer: offer.id };
