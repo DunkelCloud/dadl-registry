@@ -265,7 +265,7 @@ backend:
     forget_backup_repository:
       note: "Removes the repository registration from XO. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it. There is no DELETE route -- this action is the removal."
     get_backup_repository_health:
-      note: "Read-only reachability/config check. Run it before pointing a backup job at a repository, and as a routine check afterwards. Added XO 6.6."
+      note: "Read-only reachability/config check, returns {\"success\": true} on a healthy repository. Run it before pointing a backup job at a repository, and as a routine check afterwards. Added XO 6.6."
     benchmark_backup_repository:
       note: "Writes and reads back test data to measure throughput -- it does touch the repository. Long-running: omit sync and poll the returned task. Added XO 6.6."
     update_network_traffic_rule:
@@ -3271,7 +3271,7 @@ backend:
       method: GET
       path: /backup-repositories/{id}/health
       access: read
-      description: "Check a backup repository's health: whether XO can reach and mount it, plus its reported state. Use this to validate a repository before pointing a backup job at it, or as a routine health check. Added in XO 6.6."
+      description: "Check whether XO can reach and mount a backup repository. Returns {\"success\": true} when healthy; an unreachable or misconfigured repository reports the failure instead. Use this to validate a repository before pointing a backup job at it, or as a routine health check. Added in XO 6.6."
       params:
         id: { type: string, in: path, required: true }
       pagination: none
