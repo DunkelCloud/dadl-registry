@@ -38,17 +38,32 @@
 # - Actions are async by default -- add ?sync to get the result directly (blocks; risk of timeout for long ops).
 # - VM property writes: PATCH /vms/{id} (update_vm) partially updates name, CPU, memory, boot firmware, tags, etc.
 #   (added XO 6.5).
-# - VDI property writes: PATCH /vdis/{id} (update_vdi) was ADDED in XO 6.6 -- rename (name_label/name_description)
-#   and grow the disk (size). Before 6.6 VDIs could only be renamed via tags or the JSON-RPC API. Returns 404 on XO < 6.6.
+# - VDI property writes: PATCH /vdis/{id} (update_vdi) was ADDED in XO 6.7 -- rename (name_label/name_description)
+#   and grow the disk (size). Before 6.7 VDIs could only be renamed via tags or the JSON-RPC API. Returns 404 on XO < 6.7.
 # - VIF property writes: PATCH /vifs/{id} (update_vif) was ADDED in XO 6.6 -- partially updates locking mode,
 #   allowed IPv4/IPv6 addresses, rate limit, and TX checksumming offload. Returns 404 on XO < 6.6.
 # - Snapshot revert: POST /vms/{id}/actions/revert_snapshot (revert_vm_to_snapshot); set snapshotBefore to make it undoable.
 # - SDN traffic rules: /plugins/sdn-controller/{networks|vifs}/{id}/actions/{add|delete|update}_traffic_rule -- only present
 #   when the xo-server-sdn-controller plugin is loaded; calls fail with 404 otherwise. The update_* variants were added in XO 6.6.
 # - Backup repositories ("remotes") became WRITABLE in XO 6.6: POST /backup-repositories (create),
-#   PATCH /backup-repositories/{id} (update), DELETE /backup-repositories/{id} (remove). Pre-6.6 they were read-only.
+#   PATCH /backup-repositories/{id} (update). Pre-6.6 they were read-only. There is NO DELETE route --
+#   removal is POST /backup-repositories/{id}/actions/forget (forget_backup_repository).
+# - Backup repository diagnostics (XO 6.6): GET /backup-repositories/{id}/health checks reachability/config before
+#   you rely on a repository, POST /backup-repositories/{id}/actions/benchmark measures read/write throughput.
+# - Host power/lifecycle over REST (XO 6.6): start, clean_shutdown, clean_reboot, smart_reboot, restart_toolstack,
+#   emergency_shutdown, detach and forget are all POST /hosts/{id}/actions/<name>. Older builds only had
+#   disable/enable/management_reconfigure.
+# - Maintenance mode (XO 6.7): POST /hosts/{id}/actions/disable accepts autoEnable -- set it to false so the host
+#   STAYS disabled across a reboot (safe hardware intervention). Default behaviour re-enables the host on boot.
+# - Pool membership: POST /pools/{id}/actions/add_host makes a standalone host join the pool (XO 6.6). The changelog
+#   calls this "hosts/:id/actions/join_pool" but the route lives on the pool.
+# - SR creation (XO 6.7): POST /srs creates a storage repository (hostId + SR_type + device_config). Note that the
+#   pool-level management_reconfigure takes a NETWORK id, while the host-level one takes a PIF id.
 # - XO 6.6 added two built-in RBAC v2 roles: "Storage Administrator" (full control of sr/vdi/vbd/pbd/backup-repository)
 #   and "Network Administrator" (full control of networks/bonds/PIFs/VIFs). Discover via list_acl_roles.
+# - RBAC introspection (XO 6.7): GET /acl-roles/{id}/users and /acl-roles/{id}/groups list who holds a role,
+#   GET /groups/{id}/acl-roles lists what a group is granted. Before 6.7 the assignment could only be written,
+#   never read back.
 # - Auth (XO 6.6): an unauthenticated request now returns HTTP 401 with a WWW-Authenticate header so browsers
 #   surface a native Basic Auth prompt -- ToolMesh injects the token cookie, so this only matters when debugging 401s.
 # - Tags: add with PUT /<type>/{id}/tags/{tag}, remove with DELETE.
@@ -69,15 +84,15 @@ credits:
 
 source_name: "Xen Orchestra REST API"
 source_url: "https://docs.xen-orchestra.com/restapi"
-date: "2026-06-30"
+date: "2026-07-30"
 
 backend:
   name: xen-orchestra
   type: rest
-  version: "3.2"
+  version: "3.3"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
-  description: "Xen Orchestra REST API (XO 6.4+, current through 6.6) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts, pools, storage (SR, VDI incl. PATCH update, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/writable repositories/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges), proxies, servers, dashboards, auth tokens, SDN traffic rules (add/delete/update), health check"
+  description: "Xen Orchestra REST API (XO 6.4+, current through 6.7) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode), pools (incl. add_host), storage (SR create/delete, VDI incl. PATCH update, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories incl. health + benchmark/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), proxies, servers, dashboards, auth tokens, SDN traffic rules (add/delete/update), health check"
 
   auth:
     type: bearer
@@ -111,12 +126,12 @@ backend:
       max_items: 500
 
   coverage:
-    endpoints: 252
-    total_endpoints: 252
+    endpoints: 267
+    total_endpoints: 267
     percentage: 100
-    focus: "Complete REST API coverage for XO 6.4+ (current through 6.6): all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges), backups (archives, jobs, logs, restore-logs, writable repositories, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
-    missing: "Host lifecycle power actions (start/shutdown/reboot/restart_toolstack) are NOT exposed over REST -- only disable/enable/management_reconfigure are; use pool-level rolling_reboot/rolling_update or the JSON-RPC API for host power. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13"
-    last_reviewed: "2026-06-30"
+    focus: "Complete REST API coverage for XO 6.4+ (current through 6.7): all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full host power/lifecycle control (start, clean/smart reboot, clean/emergency shutdown, restart toolstack, disable/enable incl. reboot-persistent maintenance mode, detach, forget, pool join), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges, plus reading role-to-user/group assignments), backups (archives, jobs, logs, restore-logs, writable repositories incl. health check and throughput benchmark, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update incl. pinned-VM handling, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
+    missing: "Backup RESTORE is not exposed over REST -- backup archives, jobs and logs can be read, but restoring a restore-point onto a target SR must be done in the XO GUI or via the JSON-RPC API. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13. Version floor: routes marked 'XO 6.7+' in their description return 404 on 6.6.x -- create_sr, update_vdi, list_acl_role_users, list_acl_role_groups, list_group_acl_roles -- and the 6.7 body params autoEnable (disable_host), shutdownPinnedVms (rolling_reboot_pool / rolling_update_pool) and high_availability (create_vm) are ignored by older builds"
+    last_reviewed: "2026-07-30"
 
   setup:
     credential_steps:
@@ -182,13 +197,26 @@ backend:
     emergency_shutdown_pool:
       warning: "Shuts down ALL VMs and hosts in the pool. Use only in emergencies."
     rolling_reboot_pool:
-      note: "Reboots each host sequentially, migrating VMs automatically. No downtime."
+      note: "Reboots each host sequentially, migrating VMs automatically. No downtime. VMs that cannot migrate (PCI passthrough, SR-IOV, vGPU, affinity) abort the run unless shutdownPinnedVms=true (XO 6.7+)."
     rolling_update_pool:
-      note: "Applies pending updates to each host sequentially with live migration."
+      note: "Applies pending updates to each host sequentially with live migration. Same shutdownPinnedVms handling as rolling_reboot_pool (XO 6.7+). XO 6.7 also refuses to start a second concurrent run on the same pool."
     create_pool_network:
       modes: "Three flavors: create_network (basic with PIF), create_bonded_network (link aggregation across pifIds with bondMode), create_internal_network (host-internal, no physical PIF)"
+      body_fields: "All three share name/description/mtu/nbd -- NOT name_label/name_description. nbd=true enables Network Block Device for backup traffic (XO 6.6+)."
     management_reconfigure_host:
       warning: "Moves the management interface to a different PIF. May briefly disconnect XO from the host."
+    management_reconfigure_pool:
+      warning: "Takes a NETWORK id, unlike management_reconfigure_host which takes a PIF id. XO resolves the matching PIF on each host itself."
+    disable_host:
+      maintenance_mode: "This is 'maintenance mode'. autoEnable=false (XO 6.7+) keeps the host disabled across reboots -- set it before pulling hardware, otherwise the host re-enables itself on boot and XAPI starts placing VMs on it again."
+    smart_reboot_host:
+      note: "Suspends resident VMs, reboots, resumes them -- no migration target needed. Prefer this over clean_reboot_host when the pool has no spare capacity for evacuation."
+    forget_host:
+      warning: "Only for hosts that are permanently gone. Removes the pool record without contacting the host; if that host later boots again it conflicts with the pool. Use detach_host for a host that is alive."
+    add_host_to_pool:
+      note: "The host must already be registered in XO (add_server) and be homogeneous with the pool master. force skips the CPU/version checks but leaves the pool heterogeneous, which restricts live migration."
+    create_sr:
+      device_config: "Driver-specific: nfs -> {server, serverpath}; smb -> {server, username, password}; lvmoiscsi -> {target, targetIQN, SCSIid}; lvm/ext -> {device}. hostId is the pool master for shared types."
     get_host_stats:
       granularity: "seconds (last 10min) | minutes (last 2h) | hours (last week) | days (last year)"
     get_vm_stats:
@@ -202,7 +230,7 @@ backend:
       note: "Aggregated overview: pool/host/VM counts, storage usage, recent backup-jobs (7d), disconnected servers, disabled hosts. Pre-6.4 path was /dashboards (now removed); use /dashboard (singular)."
     create_user:
       permission_field: "Permission strings: 'admin', 'user', 'none'. Omit for default user-level access."
-    create_authentication_token:
+    create_auth_token:
       expires_in: "Accepts either a number (milliseconds) or a duration string (e.g. '1 hour', '7 days', '30d')"
       note: "Use user_id='me' for self. POST /users/authentication_tokens (without user id in path) is DEPRECATED -- removal 2026-10-13."
     create_acl_role:
@@ -220,7 +248,7 @@ backend:
     get_mcp_status:
       note: "Unauthenticated. Reports whether XO's built-in Model Context Protocol server is enabled (HTTP 200) or disabled (HTTP 503)."
     update_vdi:
-      added: "XO 6.6 -- PATCH /vdis/{id} returns 404 on older builds. Before 6.6, VDIs could not be renamed via REST."
+      added: "XO 6.7 -- PATCH /vdis/{id} returns 404 on older builds. Before 6.7, VDIs could not be renamed via REST."
       note: "PATCH semantics. size can only grow (>= current size); shrinking is rejected by XAPI. Use add_vdi_tag/remove_vdi_tag for tags."
     update_vif:
       added: "XO 6.6 -- PATCH /vifs/{id} returns 404 on older builds."
@@ -234,8 +262,12 @@ backend:
       note: "url encodes the backend: 'nfs://host:/path', 'smb://user:pass@host\\\\share', 's3://key:secret@endpoint/bucket', or 'file:///srv/backups' for a local mount. Returns {id}."
     update_backup_repository:
       note: "PATCH semantics. Set enabled=false to stop new backups writing here without deleting the target. options is a free-form per-backend settings map."
-    delete_backup_repository:
-      note: "Removes the repository registration from XO. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it."
+    forget_backup_repository:
+      note: "Removes the repository registration from XO. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it. There is no DELETE route -- this action is the removal."
+    get_backup_repository_health:
+      note: "Read-only reachability/config check, returns {\"success\": true} on a healthy repository. Run it before pointing a backup job at a repository, and as a routine check afterwards. Added XO 6.6."
+    benchmark_backup_repository:
+      note: "Writes and reads back test data to measure throughput -- it does touch the repository. Long-running: omit sync and poll the returned task. Added XO 6.6."
     update_network_traffic_rule:
       note: "Requires the xo-server-sdn-controller plugin (404 otherwise). Identify the existing rule by direction+ipRange+protocol+port, then send the new allow value. Added XO 6.6."
     update_vif_traffic_rule:
@@ -493,6 +525,19 @@ backend:
         ndjson: { type: boolean, in: query }
         markdown: { type: boolean, in: query }
 
+    list_group_acl_roles:
+      method: GET
+      path: /groups/{id}/acl-roles
+      access: admin
+      description: "List the RBAC roles granted to this group -- i.e. what every member of the group inherits. Requires XO 6.7+ (returns 404 on older builds). Inverse view of list_acl_role_groups."
+      params:
+        id: { type: string, in: path, required: true, description: "Group UUID" }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
     # =========================================================================
     # ACL ROLES -- RBAC v2 (XO 6.4+)
     # =========================================================================
@@ -570,6 +615,32 @@ backend:
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
+
+    list_acl_role_users:
+      method: GET
+      path: /acl-roles/{id}/users
+      access: admin
+      description: "List the users this RBAC role is directly attached to. Requires XO 6.7+ (returns 404 on older builds). Note this shows direct assignments only -- users who hold the role through a group appear in list_acl_role_groups instead."
+      params:
+        id: { type: string, in: path, required: true, description: "Role UUID" }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    list_acl_role_groups:
+      method: GET
+      path: /acl-roles/{id}/groups
+      access: admin
+      description: "List the groups this RBAC role is attached to. Every member of those groups inherits the role. Requires XO 6.7+ (returns 404 on older builds)."
+      params:
+        id: { type: string, in: path, required: true, description: "Role UUID" }
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
 
     attach_acl_role_to_group:
       method: PUT
@@ -1547,12 +1618,13 @@ backend:
       method: POST
       path: /hosts/{uuid}/actions/disable
       access: admin
-      description: "Disable a host (prepare for maintenance). Optionally evacuate VMs in the same call (body.evacuate=true, optional force/vmIdsToForceMigrate)."
+      description: "Disable a host = enter maintenance mode. Optionally evacuate VMs in the same call (body.evacuate=true, optional force/vmIdsToForceMigrate). Pass autoEnable=false (XO 6.7+) to keep the host disabled across a reboot -- use that for hardware interventions, otherwise the host re-enables itself on boot."
       params:
         uuid: { type: string, in: path, required: true }
         evacuate: { type: boolean, in: body, description: "True = evacuate VMs to other hosts" }
         force: { type: boolean, in: body, description: "Force migration even if rules disagree (with evacuate=true)" }
         vmIdsToForceMigrate: { type: array, in: body, description: "Specific VM UUIDs to force-migrate" }
+        autoEnable: { type: boolean, in: body, description: "XO 6.7+: false = stay in maintenance mode across reboots; true (default) = re-enable on boot. Ignored by older builds." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1560,7 +1632,97 @@ backend:
       method: POST
       path: /hosts/{uuid}/actions/enable
       access: admin
-      description: "Re-enable a disabled host"
+      description: "Re-enable a disabled host (leave maintenance mode)"
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    start_host:
+      method: POST
+      path: /hosts/{uuid}/actions/start
+      access: admin
+      description: "Power on a halted host via its out-of-band controller (wake-on-LAN / IPMI, as configured in XAPI). Requires XO 6.6+."
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    clean_shutdown_host:
+      method: POST
+      path: /hosts/{uuid}/actions/clean_shutdown
+      access: dangerous
+      description: "Gracefully shut down a host. Refuses while VMs are still running unless they are evacuated first -- disable_host with evacuate=true is the normal preceding step. Requires XO 6.6+."
+      params:
+        uuid: { type: string, in: path, required: true }
+        bypassBackupCheck: { type: boolean, in: body, description: "Proceed even though a backup job is currently running on this host" }
+        bypassEvacuate: { type: boolean, in: body, description: "Skip the 'VMs must be evacuated' guard -- running VMs will be shut down with the host" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    clean_reboot_host:
+      method: POST
+      path: /hosts/{uuid}/actions/clean_reboot
+      access: dangerous
+      description: "Gracefully reboot a host. Same evacuation rules as clean_shutdown_host. Requires XO 6.6+."
+      params:
+        uuid: { type: string, in: path, required: true }
+        force: { type: boolean, in: body, description: "Reboot even if guards would block it" }
+        bypassBackupCheck: { type: boolean, in: body, description: "Proceed even though a backup job is currently running on this host" }
+        bypassVersionCheck: { type: boolean, in: body, description: "Proceed even though the host runs a different version than the pool master" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    smart_reboot_host:
+      method: POST
+      path: /hosts/{uuid}/actions/smart_reboot
+      access: dangerous
+      description: "Suspend the resident VMs, reboot the host, then resume the VMs in place -- no live migration needed. Preferred over clean_reboot_host when the pool has no spare capacity. Requires XO 6.6+."
+      params:
+        uuid: { type: string, in: path, required: true }
+        bypassBackupCheck: { type: boolean, in: body, description: "Proceed even though a backup job is currently running on this host" }
+        bypassVersionCheck: { type: boolean, in: body, description: "Proceed even though the host runs a different version than the pool master" }
+        bypassBlockedSuspend: { type: boolean, in: body, description: "Proceed even if a VM has suspend blocked (e.g. PCI passthrough) -- such VMs are shut down instead" }
+        bypassCurrentVmCheck: { type: boolean, in: body, description: "Proceed even though the XO appliance itself runs on this host" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    restart_toolstack_host:
+      method: POST
+      path: /hosts/{uuid}/actions/restart_toolstack
+      access: admin
+      description: "Restart the XAPI toolstack on a host. Running VMs keep running; the host is briefly unmanageable. Standard first remedy for a wedged XAPI. Requires XO 6.6+."
+      params:
+        uuid: { type: string, in: path, required: true }
+        bypassBackupCheck: { type: boolean, in: body, description: "Proceed even though a backup job is currently running on this host" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    emergency_shutdown_host:
+      method: POST
+      path: /hosts/{uuid}/actions/emergency_shutdown
+      access: dangerous
+      description: "Suspend all resident VMs and shut the host down immediately, without evacuation. For UPS-low / thermal events. Requires XO 6.6+."
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    detach_host:
+      method: POST
+      path: /hosts/{uuid}/actions/detach
+      access: dangerous
+      description: "Eject a host from its pool and make it standalone again. The host must be running and its VMs relocated. Inverse of add_host_to_pool. Requires XO 6.6+."
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    forget_host:
+      method: POST
+      path: /hosts/{uuid}/actions/forget
+      access: dangerous
+      description: "Remove a dead host's record from the pool database without contacting it. Only for hosts that are permanently gone -- if the host later comes back it will conflict with the pool. Requires XO 6.6+."
       params:
         uuid: { type: string, in: path, required: true }
         sync: { type: boolean, in: query }
@@ -1699,6 +1861,7 @@ backend:
         cloud_config: { type: string, in: body }
         network_config: { type: string, in: body }
         vdis: { type: array, in: body }
+        high_availability: { type: string, in: body, description: "XO 6.7+: HA restart priority -- 'restart' (guaranteed restart), 'best-effort', or '' (empty string = HA disabled, the default). Ignored by older builds." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1716,9 +1879,10 @@ backend:
       method: POST
       path: /pools/{pool_id}/actions/rolling_reboot
       access: admin
-      description: "Sequentially reboot hosts with automatic VM migration. Zero downtime."
+      description: "Sequentially reboot hosts with automatic VM migration. Zero downtime for migratable VMs."
       params:
         pool_id: { type: string, in: path, required: true }
+        shutdownPinnedVms: { type: boolean, in: body, description: "XO 6.7+: shut down VMs that cannot be migrated (PCI passthrough, SR-IOV, vGPU, affinity-pinned) instead of aborting the run. They are restarted afterwards. Ignored by older builds." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1729,6 +1893,19 @@ backend:
       description: "Apply updates to hosts sequentially with live migration"
       params:
         pool_id: { type: string, in: path, required: true }
+        shutdownPinnedVms: { type: boolean, in: body, description: "XO 6.7+: shut down VMs that cannot be migrated (PCI passthrough, SR-IOV, vGPU, affinity-pinned) instead of aborting the run. They are restarted afterwards. Ignored by older builds." }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    add_host_to_pool:
+      method: POST
+      path: /pools/{pool_id}/actions/add_host
+      access: admin
+      description: "Make a standalone host join this pool. The host must already be registered as a server in XO and be homogeneous with the pool master (CPU features, XCP-ng version) unless force is set. Requires XO 6.6+. Inverse of detach_host."
+      params:
+        pool_id: { type: string, in: path, required: true }
+        host: { type: string, in: body, required: true, description: "UUID of the standalone host to join" }
+        force: { type: boolean, in: body, description: "Skip the homogeneity checks (CPU masking / version). Use with care -- a heterogeneous pool restricts live migration." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1744,6 +1921,7 @@ backend:
         pif: { type: string, in: body, required: true, description: "PIF UUID to bind the network to" }
         mtu: { type: integer, in: body, description: "MTU (optional, default from PIF)" }
         vlan: { type: integer, in: body, description: "VLAN ID (optional)" }
+        nbd: { type: boolean, in: body, description: "XO 6.6+: enable NBD (Network Block Device) on this network, so backups can stream disk data over it. Strongly recommended for a dedicated backup network." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1758,6 +1936,8 @@ backend:
         description: { type: string, in: body }
         pifIds: { type: array, in: body, required: true, description: "Array of PIF UUIDs to bond" }
         bondMode: { type: string, in: body, description: "'balance-slb' | 'active-backup' | 'lacp'" }
+        mtu: { type: integer, in: body, description: "MTU (optional)" }
+        nbd: { type: boolean, in: body, description: "XO 6.6+: enable NBD (Network Block Device) on this network, so backups can stream disk data over it." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1765,11 +1945,13 @@ backend:
       method: POST
       path: /pools/{pool_id}/actions/create_internal_network
       access: write
-      description: "Create an internal-only network (host-local, no physical PIF, useful for VM-to-VM private traffic)"
+      description: "Create an internal-only network (host-local, no physical PIF, useful for VM-to-VM private traffic). Body field names are name/description -- NOT name_label/name_description."
       params:
         pool_id: { type: string, in: path, required: true }
-        name_label: { type: string, in: body, required: true }
-        name_description: { type: string, in: body }
+        name: { type: string, in: body, required: true, description: "Network display name" }
+        description: { type: string, in: body, description: "Network description" }
+        mtu: { type: integer, in: body, description: "MTU (optional)" }
+        nbd: { type: boolean, in: body, description: "XO 6.6+: enable NBD (Network Block Device) on this network." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1777,10 +1959,10 @@ backend:
       method: POST
       path: /pools/{pool_id}/actions/management_reconfigure
       access: admin
-      description: "Reconfigure the management interface across all hosts in the pool. Coordinated equivalent of management_reconfigure_host."
+      description: "Reconfigure the management interface across all hosts in the pool. Coordinated equivalent of management_reconfigure_host -- but note this one takes a NETWORK id, while the host-level route takes a PIF id."
       params:
         pool_id: { type: string, in: path, required: true }
-        pif: { type: string, in: body, required: true, description: "Target PIF UUID (must exist on the pool master)" }
+        network: { type: string, in: body, required: true, description: "Target network UUID -- XO resolves the matching PIF on each host" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1807,6 +1989,22 @@ backend:
       description: "Get details of an SR"
       params:
         uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    create_sr:
+      method: POST
+      path: /srs
+      access: write
+      description: "Create a storage repository on a host. Requires XO 6.7+ (returns 404 on older builds). SR_type selects the driver -- shared/network types: nfs, smb, lvmoiscsi, lvmohba, lvmofcoe, hba, cephfs, glusterfs, moosefs, iso; local types: lvm, ext, file. device_config holds the driver-specific keys, e.g. nfs -> {server, serverpath}, smb -> {server, username, password}, lvmoiscsi -> {target, targetIQN, SCSIid}, lvm/ext -> {device}. Returns {id}."
+      params:
+        hostId: { type: string, in: body, required: true, description: "UUID of the host that performs the creation (for shared SRs, the pool master)" }
+        name_label: { type: string, in: body, required: true, description: "Display name, e.g. 'NFS store'" }
+        SR_type: { type: string, in: body, required: true, description: "Driver type, e.g. 'nfs', 'smb', 'lvmoiscsi', 'lvm', 'ext', 'iso'" }
+        device_config: { type: object, in: body, required: true, description: "Driver-specific connection settings, e.g. {\"server\":\"10.0.0.1\",\"serverpath\":\"/data\"} for nfs" }
+        name_description: { type: string, in: body, description: "Optional description" }
+        size: { type: integer, in: body, description: "Physical size in bytes -- only meaningful for drivers that carve out a fixed area" }
+        content_type: { type: string, in: body, description: "Optional XAPI content type (default 'user'; use 'iso' for ISO libraries)" }
+        sm_config: { type: object, in: body, description: "Optional storage-manager settings map (driver-specific, rarely needed)" }
       pagination: none
 
     delete_sr:
@@ -1949,7 +2147,7 @@ backend:
       method: PATCH
       path: /vdis/{uuid}
       access: write
-      description: "Partially update a VDI: rename (name_label / name_description) or grow the disk (size). Only the fields you pass are changed. Added in XO 6.6 -- returns 404 on older builds. Size can only be increased, never shrunk."
+      description: "Partially update a VDI: rename (name_label / name_description) or grow the disk (size). Only the fields you pass are changed. Added in XO 6.7 -- returns 404 on older builds. Size can only be increased, never shrunk."
       params:
         uuid: { type: string, in: path, required: true }
         name_label: { type: string, in: body, description: "New display name" }
@@ -3059,13 +3257,33 @@ backend:
         enabled: { type: boolean, in: body, description: "Enable/disable the repository" }
       pagination: none
 
-    delete_backup_repository:
-      method: DELETE
-      path: /backup-repositories/{id}
+    forget_backup_repository:
+      method: POST
+      path: /backup-repositories/{id}/actions/forget
       access: dangerous
-      description: "Remove a backup repository registration from XO. Added in XO 6.6. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it."
+      description: "Remove a backup repository registration from XO. Added in XO 6.6. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it. Note: there is no DELETE /backup-repositories/{id} route -- this action IS the removal."
       params:
         id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    get_backup_repository_health:
+      method: GET
+      path: /backup-repositories/{id}/health
+      access: read
+      description: "Check whether XO can reach and mount a backup repository. Returns {\"success\": true} when healthy; an unreachable or misconfigured repository reports the failure instead. Use this to validate a repository before pointing a backup job at it, or as a routine health check. Added in XO 6.6."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    benchmark_backup_repository:
+      method: POST
+      path: /backup-repositories/{id}/actions/benchmark
+      access: read
+      description: "Measure read/write throughput of a backup repository by writing and reading back test data. Use it to investigate slow backups or to compare candidate targets. Runs for a while and writes to the repository -- prefer async (omit sync) and poll the returned task. Added in XO 6.6."
+      params:
+        id: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query, description: "Block until the benchmark finishes -- likely to hit a request timeout; prefer the async task." }
       pagination: none
 
     # =========================================================================
@@ -3254,11 +3472,50 @@ backend:
         // ... do maintenance work ...
         await api.enable_host({ uuid: "host-uuid", sync: true });
 
+    - name: "Hardware intervention: maintenance mode that survives a reboot (XO 6.7+)"
+      description: "Evacuate, keep the host disabled across the power cycle, shut it down, re-enable afterwards"
+      code: |
+        // autoEnable: false -- without it the host re-enables itself on boot
+        // and XAPI starts placing VMs on it while you are still working on it.
+        await api.disable_host({
+          uuid: "host-uuid",
+          evacuate: true,
+          autoEnable: false,
+          sync: true
+        });
+        await api.clean_shutdown_host({ uuid: "host-uuid", sync: true });
+        // ... swap the disk / RAM, power the host back on ...
+        await api.enable_host({ uuid: "host-uuid", sync: true });
+
+    - name: "Reboot a host that has non-migratable VMs"
+      description: "smart_reboot suspends and resumes the VMs in place -- no migration target needed"
+      code: |
+        const task = await api.smart_reboot_host({
+          uuid: "host-uuid",
+          bypassBlockedSuspend: false
+        });
+        return await api.get_task({ id: task.id, wait: "result" });
+
+    - name: "Validate a backup repository before trusting it (XO 6.6+)"
+      description: "Reachability check, then a throughput benchmark"
+      code: |
+        const repos = await api.list_backup_repositories({ fields: "id,name" });
+        const health = await api.get_backup_repository_health({ id: repos[0].id });
+        if (!health) return "unreachable";
+        // benchmark writes test data and runs a while -- poll the task
+        const task = await api.benchmark_backup_repository({ id: repos[0].id });
+        return await api.get_task({ id: task.id, wait: "result" });
+
     - name: "Rolling pool update"
       description: "Zero-downtime update of all hosts"
       code: |
         const pools = await api.list_pools({ fields: "uuid" });
-        const task = await api.rolling_update_pool({ pool_id: pools[0].uuid });
+        // shutdownPinnedVms (XO 6.7+): VMs that cannot live-migrate (PCI passthrough,
+        // SR-IOV, vGPU, affinity-pinned) would otherwise abort the whole run.
+        const task = await api.rolling_update_pool({
+          pool_id: pools[0].uuid,
+          shutdownPinnedVms: true
+        });
         return await api.get_task({ id: task.id, wait: "result" });
 
     - name: "Provision RBAC v2 read-only operator role (XO 6.4+)"
