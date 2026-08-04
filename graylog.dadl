@@ -40,6 +40,11 @@
 #     silently, so it would return UNSCOPED results with no error. Not surfaced here.
 #   - /views/search/sync: no top-level `streams` (HTTP 400) -- use query.filter.
 #   - /views/search/messages: a top-level `streams` array IS honored.
+# - There is NO /sources endpoint in Graylog 6.x -- the class backing it does not exist
+#   in the server codebase, and /api/sources falls through to the web UI, which answers
+#   with the SPA shell (HTML, HTTP 200). It is therefore not surfaced as a tool; an
+#   earlier revision blamed a base_url without /api, which was a misdiagnosis. For
+#   "which sources are sending, and how much", use aggregate_by_field(field: "source").
 # - Search results are limited to 10,000 by default (Elasticsearch result window).
 # - Pagination uses offset/limit pattern. Response includes "total" for total count.
 # - Stream filtering in search: use filter param "streams:STREAM_ID" to scope queries.
@@ -99,10 +104,10 @@ backend:
       allow_jq_override: true
 
   coverage:
-    endpoints: 235
+    endpoints: 234
     total_endpoints: 320
     percentage: 73
-    focus: "Views/Search API (sync, messages, pivot/histogram/stats via composites), legacy relative + keyword search, CSV export, streams, stream rules, pipelines, pipeline rules, inputs, extractors, events, notifications, dashboards, users, roles, tokens, index sets, indices, grok patterns, lookup tables, sidecars, sidecar configurations, collectors, content packs, outputs, metrics, system info, cluster, processing control, loggers, sources, forensic incident_window composite"
+    focus: "Views/Search API (sync, messages, pivot/histogram/stats via composites), legacy relative + keyword search, CSV export, streams, stream rules, pipelines, pipeline rules, inputs, extractors, events, notifications, dashboards, users, roles, tokens, index sets, indices, grok patterns, lookup tables, sidecars, sidecar configurations, collectors, content packs, outputs, metrics, system info, cluster, processing control, loggers, forensic incident_window composite"
     missing: "enterprise-only plugins (archives, audit log, reports, license, data lake), Views CRUD (saved views, dashboard widgets), alert callbacks (legacy), message decorators, debug events, codec types, retention/rotation strategy config, LDAP config, async Views/Search (poll-based), absolute-range legacy search (covered by views_search_sync)"
     last_reviewed: "2026-08-04"
 
@@ -2965,26 +2970,6 @@ backend:
         nodeId: { type: string, in: path, required: true }
 
     # ──────────────────────────────────────────────
-    # Sources
-    # ──────────────────────────────────────────────
-
-    list_sources:
-      method: GET
-      path: /sources
-      access: read
-      description: >
-        List active message sources with their message counts within the given
-        relative time window. NOTE: requires base_url that ends with /api -- if
-        backends.yaml has url: 'https://host' (no /api), this endpoint returns
-        the web UI HTML instead of JSON. Verify with get_system first when in doubt.
-      params:
-        range: { type: integer, in: query, required: true, description: "REQUIRED. Relative seconds, e.g. 3600 = last hour. 0 = all time." }
-        size:  { type: integer, in: query, default: 100, description: "Max number of sources to return" }
-      response:
-        result_path: "$.sources"
-      pagination: none
-
-    # ──────────────────────────────────────────────
     # Stream Alerts (Legacy)
     # ──────────────────────────────────────────────
 
@@ -3403,8 +3388,6 @@ backend:
     histogram_grouped:
       interval_format: "Graylog timeunit {quantity}{unit}, unit in [s m h d w M y] -- 30s, 1m, 5m, 1h, 1d. NOT ISO-8601: PT1M returns HTTP 400 'Time unit must be {quantity}{unit}'. The composite converts ISO-8601 input, but the pivot row_group wants the Graylog form."
       interval_property: "the row_group interval object is { type: 'timeunit', timeunit: '1m' } -- the value key is `timeunit`, not `value` (HTTP 400 'Known properties include: timeunit, type')"
-    list_sources:
-      base_url_caveat: "if you receive HTML instead of JSON, the configured base_url in backends.yaml does not end with /api -- fix the backends.yaml entry"
     create_stream:
       default_stream_id: "000000000000000000000001 -- cannot be deleted"
       starts_paused: "newly created streams are paused -- call resume_stream to activate"
