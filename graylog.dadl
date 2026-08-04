@@ -1819,7 +1819,12 @@ backend:
       method: GET
       path: /system/indexer/failures/count
       access: read
-      description: "Get the total count of indexer failures."
+      description: >
+        Total count of indexer failures since a given date. "since" is REQUIRED --
+        an ISO8601 timestamp; omitting it fails with HTTP 400
+        "FailuresResource.count.arg0 must not be empty".
+      params:
+        since: { type: string, in: query, required: true, description: "ISO8601 date, e.g. '2026-08-01T00:00:00.000Z'. Counts failures at or after this point." }
       response:
         result_path: "$"
       pagination: none
@@ -3125,22 +3130,35 @@ backend:
 
     histogram_grouped:
       description: >
-        Time-series histogram, optionally grouped by a field. interval is an
-        ISO-8601 timeunit string (PT30S, PT1M, PT1H, P1D). Returns
-        [{bucket_start, group_key|null, count}].
+        Time-series histogram, optionally grouped by a field. interval is a
+        Graylog timeunit: {quantity}{unit} with unit one of s m h d w M y --
+        e.g. 30s, 1m, 5m, 1h, 1d. NOT ISO-8601: "PT1M" is rejected with
+        HTTP 400. ISO-8601 forms are converted here for convenience, but pass
+        the Graylog form. Returns [{bucket_start, group_key|null, count}].
       params:
         query:      { type: string,  default: "*" }
         time_range: { type: object,  required: true }
-        interval:   { type: string,  default: "PT1M" }
+        interval:   { type: string,  default: "1m" }
         group_by:   { type: string,  default: "" }
         size:       { type: integer, default: 10 }
         streams:    { type: array,   default: [] }
       timeout: 60s
       depends_on: [views_search_sync]
       code: |
+        // Graylog wants {quantity}{unit} with unit in [smhdwMy]; accept ISO-8601 too.
+        const toTimeunit = (v) => {
+          const s = String(v || "1m").trim();
+          const iso = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(s);
+          if (!iso) return s;
+          if (iso[1]) return iso[1] + "d";
+          if (iso[2]) return iso[2] + "h";
+          if (iso[3]) return iso[3] + "m";
+          if (iso[4]) return iso[4] + "s";
+          return "1m";
+        };
         const rowGroups = [{
           type: "time", field: "timestamp",
-          interval: { type: "timeunit", value: params.interval || "PT1M" },
+          interval: { type: "timeunit", timeunit: toTimeunit(params.interval) },
         }];
         if (params.group_by) {
           rowGroups.push({ type: "values", field: params.group_by, limit: params.size || 10 });
@@ -3373,7 +3391,8 @@ backend:
       replaces: "deprecated _terms / _histogram / _stats endpoints removed in Graylog 6.0"
       row_col_keys: "row.key is an array -- first row_fields entries are row dimensions, the rest are column dimensions when rollup=true"
     histogram_grouped:
-      interval_format: "ISO-8601 timeunit, e.g. PT30S (30s), PT1M (1min), PT1H, P1D"
+      interval_format: "Graylog timeunit {quantity}{unit}, unit in [s m h d w M y] -- 30s, 1m, 5m, 1h, 1d. NOT ISO-8601: PT1M returns HTTP 400 'Time unit must be {quantity}{unit}'. The composite converts ISO-8601 input, but the pivot row_group wants the Graylog form."
+      interval_property: "the row_group interval object is { type: 'timeunit', timeunit: '1m' } -- the value key is `timeunit`, not `value` (HTTP 400 'Known properties include: timeunit, type')"
     list_sources:
       base_url_caveat: "if you receive HTML instead of JSON, the configured base_url in backends.yaml does not end with /api -- fix the backends.yaml entry"
     create_stream:
@@ -3448,7 +3467,7 @@ backend:
         return await api.histogram_grouped({
           query: "*",
           time_range: { type: "relative", range: 3600 },
-          interval: "PT30S",
+          interval: "30s",
           group_by: "level",
           size: 8,
         });
