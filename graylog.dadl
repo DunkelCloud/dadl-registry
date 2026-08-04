@@ -20,9 +20,26 @@
 # - Plain message retrieval is still available via search_relative (legacy, working in 6.x)
 #   and search_keyword (open-ended Natty phrases). For absolute windows or projected fields
 #   use views_search_sync / search_messages_compact.
-# - CSV export endpoints (/search/universal/relative/export, /views/search/messages) are
-#   not surfaced -- they require an Accept: text/csv override that the registry schema
-#   does not currently allow. Pull JSON via views_search_sync and convert client-side.
+# - search_keyword / export_search_keyword REQUIRE a "timezone" query parameter. It is
+#   undocumented in Graylog's own API browser (no @Parameter annotation) but carries
+#   @NotEmpty, so omitting it fails with HTTP 400 "KeywordSearchResource.searchKeyword.arg2
+#   must not be empty". Both tools default it to UTC so it is always sent.
+# - CSV export is available via export_search_relative, export_search_keyword and
+#   views_search_messages. These endpoints only produce text/csv, so each declares an
+#   `Accept` header parameter (default text/csv) that overrides the backend-wide
+#   Accept: application/json -- without it Graylog answers HTTP 406. Their responses are
+#   streamed to the ToolMesh file broker, so the tool result is a time-limited DOWNLOAD
+#   URL rather than inline rows: treat exported log data accordingly and prefer the
+#   inline JSON tools when the result set is small. An empty result set yields no file
+#   at all (size_bytes 0, url null), and views_search_messages can return a backend
+#   error as text INSIDE the CSV with HTTP 200 -- verify the first line is the header row.
+# - Stream scoping differs per endpoint and is easy to get wrong:
+#   - legacy /search/universal/* (search_relative, search_keyword, both exports):
+#     ONLY filter="streams:STREAM_ID" works. Graylog 6.1 has no `streams` query param
+#     there; newer server code adds one, but on 6.1 an unknown query param is dropped
+#     silently, so it would return UNSCOPED results with no error. Not surfaced here.
+#   - /views/search/sync: no top-level `streams` (HTTP 400) -- use query.filter.
+#   - /views/search/messages: a top-level `streams` array IS honored.
 # - Search results are limited to 10,000 by default (Elasticsearch result window).
 # - Pagination uses offset/limit pattern. Response includes "total" for total count.
 # - Stream filtering in search: use filter param "streams:STREAM_ID" to scope queries.
@@ -40,12 +57,12 @@ credits:
 
 source_name: "Graylog REST API"
 source_url: "https://go2docs.graylog.org/current/setting_up_graylog/rest_api.html"
-date: "2026-04-26"
+date: "2026-08-04"
 
 backend:
   name: graylog
   type: rest
-  version: "1.0"
+  version: "1.1"
   # base_url intentionally omitted -- self-hosted, provided via backends.yaml
   description: "Graylog REST API -- log search (Views/Search + legacy universal), streams, pipelines, inputs, alerts, events, dashboards, users, roles, sidecars, index management, and cluster administration. Targets Graylog 6.x."
 
@@ -82,12 +99,12 @@ backend:
       allow_jq_override: true
 
   coverage:
-    endpoints: 232
+    endpoints: 235
     total_endpoints: 320
-    percentage: 72
-    focus: "Views/Search API (sync, messages, pivot/histogram/stats via composites), legacy relative + keyword search, streams, stream rules, pipelines, pipeline rules, inputs, extractors, events, notifications, dashboards, users, roles, tokens, index sets, indices, grok patterns, lookup tables, sidecars, sidecar configurations, collectors, content packs, outputs, metrics, system info, cluster, processing control, loggers, sources, forensic incident_window composite"
-    missing: "enterprise-only plugins (archives, audit log, reports, license, data lake), Views CRUD (saved views, dashboard widgets), alert callbacks (legacy), message decorators, debug events, codec types, retention/rotation strategy config, LDAP config, async Views/Search (poll-based)"
-    last_reviewed: "2026-04-26"
+    percentage: 73
+    focus: "Views/Search API (sync, messages, pivot/histogram/stats via composites), legacy relative + keyword search, CSV export, streams, stream rules, pipelines, pipeline rules, inputs, extractors, events, notifications, dashboards, users, roles, tokens, index sets, indices, grok patterns, lookup tables, sidecars, sidecar configurations, collectors, content packs, outputs, metrics, system info, cluster, processing control, loggers, sources, forensic incident_window composite"
+    missing: "enterprise-only plugins (archives, audit log, reports, license, data lake), Views CRUD (saved views, dashboard widgets), alert callbacks (legacy), message decorators, debug events, codec types, retention/rotation strategy config, LDAP config, async Views/Search (poll-based), absolute-range legacy search (covered by views_search_sync)"
+    last_reviewed: "2026-08-04"
 
   setup:
     credential_steps:
@@ -127,7 +144,8 @@ backend:
       description: >
         Search messages with a relative time range (seconds from now).
         Query uses Lucene syntax. Returns messages with id, timestamp, source, and all fields.
-        Default limit 150, max 10000. Use filter "streams:STREAM_ID" to scope to a stream.
+        Default limit 150, max 10000. Scope to a stream with filter "streams:STREAM_ID"
+        -- that is the only stream scoping this endpoint honors on Graylog 6.1.
       params:
         query: { type: string, in: query, required: true, description: "Lucene query string, e.g. 'source:myserver AND level:3'" }
         range: { type: integer, in: query, required: true, description: "Relative timeframe in seconds from now (e.g. 3600 = last hour)" }
@@ -138,6 +156,32 @@ backend:
         sort: { type: string, in: query, description: "Sort field and order, e.g. 'timestamp:desc'" }
         decorate: { type: boolean, in: query, default: true, description: "Run decorators on results" }
       response:
+        result_path: "$"
+      pagination: none
+
+    export_search_relative:
+      method: GET
+      path: /search/universal/relative/export
+      access: read
+      description: >
+        CSV export of a relative-time-range search. Same query semantics as
+        search_relative, but returns text/csv streamed to the file broker --
+        the tool result is a download URL, not inline rows. "fields" is REQUIRED
+        here (unlike search_relative) and defines the column order. Use for bulk
+        pulls; for inline results use search_relative or search_messages_compact.
+        Leave the Accept parameter at its default -- it is what selects CSV.
+      params:
+        query:      { type: string,  in: query, required: true, description: "Lucene query string" }
+        range:      { type: integer, in: query, required: true, description: "Relative timeframe in seconds from now (0 = all time)" }
+        fields:     { type: string,  in: query, required: true, description: "REQUIRED. Comma-separated list of fields, in output column order" }
+        limit:      { type: integer, in: query, description: "Max messages to export (omit for no limit)" }
+        offset:     { type: integer, in: query, default: 0, description: "Offset" }
+        batch_size: { type: integer, in: query, default: 500, description: "Backend scroll batch size (Graylog default 500)" }
+        filter:     { type: string,  in: query, description: "Stream filter, e.g. 'streams:000000000000000000000001'" }
+        Accept:     { type: string,  in: header, default: "text/csv", description: "Response media type -- the endpoint only produces text/csv; overriding this yields HTTP 406" }
+      response:
+        binary: true
+        content_type: text/csv
         result_path: "$"
       pagination: none
 
@@ -152,12 +196,15 @@ backend:
       description: >
         Search messages with a Natty-parsed open-ended time range like
         "last 5 minutes", "last 7 hours", "yesterday", "last week".
+        The keyword is parsed in the "timezone" time zone (default UTC) -- override
+        it to make phrases like "yesterday" mean yesterday in local time.
         WARNING: closed/relative phrases like "7 hours ago" are rejected with HTTP 400.
         For closed absolute windows or aggregation use the views_search_sync /
         aggregate_pivot composites instead.
       params:
         query: { type: string, in: query, required: true }
         keyword: { type: string, in: query, required: true, description: "Open-ended Natty phrase, e.g. 'last 5 minutes', 'yesterday'" }
+        timezone: { type: string, in: query, default: "UTC", description: "IANA time zone the keyword is parsed in, e.g. 'Europe/Berlin'. Sent on every call -- Graylog rejects an empty value with HTTP 400 (arg2 must not be empty)." }
         limit: { type: integer, in: query, default: 150 }
         offset: { type: integer, in: query, default: 0 }
         filter: { type: string, in: query }
@@ -165,6 +212,32 @@ backend:
         sort: { type: string, in: query }
         decorate: { type: boolean, in: query, default: true }
       response:
+        result_path: "$"
+      pagination: none
+
+    export_search_keyword:
+      method: GET
+      path: /search/universal/keyword/export
+      access: read
+      description: >
+        CSV export of a keyword-time-range search. Same keyword grammar and
+        timezone handling as search_keyword, but returns text/csv streamed to the
+        file broker -- the tool result is a download URL, not inline rows.
+        "fields" is REQUIRED here and defines the column order.
+        Leave the Accept parameter at its default -- it is what selects CSV.
+      params:
+        query:      { type: string,  in: query, required: true, description: "Lucene query string" }
+        keyword:    { type: string,  in: query, required: true, description: "Open-ended Natty phrase, e.g. 'last 5 minutes', 'yesterday'" }
+        timezone:   { type: string,  in: query, default: "UTC", description: "IANA time zone the keyword is parsed in. Required by Graylog -- an empty value returns HTTP 400." }
+        fields:     { type: string,  in: query, required: true, description: "REQUIRED. Comma-separated list of fields, in output column order" }
+        limit:      { type: integer, in: query, description: "Max messages to export (omit for no limit)" }
+        offset:     { type: integer, in: query, default: 0, description: "Offset" }
+        batch_size: { type: integer, in: query, default: 500, description: "Backend scroll batch size (Graylog default 500)" }
+        filter:     { type: string,  in: query, description: "Stream filter, e.g. 'streams:000000000000000000000001'" }
+        Accept:     { type: string,  in: header, default: "text/csv", description: "Response media type -- the endpoint only produces text/csv; overriding this yields HTTP 406" }
+      response:
+        binary: true
+        content_type: text/csv
         result_path: "$"
       pagination: none
 
@@ -194,6 +267,42 @@ backend:
         skip_no_streams_check:   { type: boolean, in: body, description: "Skip the safety check that requires at least one stream filter (admin-only)" }
         timeout:                 { type: integer, in: query, default: 60,    description: "Server-side timeout in seconds" }
       response:
+        result_path: "$"
+      pagination: none
+
+    views_search_messages:
+      method: POST
+      path: /views/search/messages
+      access: read
+      description: >
+        Standalone CSV message export with free-form parameters -- no saved Search
+        needed. This is NOT the views_search_sync body shape. Body fields:
+        timerange (required, the usual absolute / relative / keyword object),
+        query_string (required, { "type": "elasticsearch", "query_string": "level:3" }),
+        streams (array of stream IDs -- allowed here, unlike views_search_sync,
+        and actually honored), fields_in_order (array, MUST be non-empty, defines
+        CSV column order), chunk_size, time_zone, limit.
+        IMPORTANT: limit is only enforced at CHUNK boundaries -- with the default
+        chunk_size of 1000, limit 3 still returns 1000 rows. To cap the output set
+        chunk_size to the row count you want. time_zone defaults to the API user's
+        configured time zone (NOT UTC) -- pass it explicitly for stable timestamps.
+        Returns text/csv streamed to the file broker -- the tool result is a
+        download URL, not inline rows. Preferred over export_search_relative /
+        export_search_keyword when you need an absolute window, exact field
+        projection or real stream scoping. Leave the Accept parameter at its
+        default -- it selects CSV.
+      params:
+        timerange:       { type: object,  in: body, required: true, description: "Time range object, e.g. { type: 'relative', range: 3600 }" }
+        query_string:    { type: object,  in: body, required: true, description: "{ type: 'elasticsearch', query_string: 'level:3' } -- use query_string '' or '*' to match everything" }
+        streams:         { type: array,   in: body, description: "Stream IDs to scope the export to. An unknown ID yields an error string inside the CSV body with HTTP 200." }
+        fields_in_order: { type: array,   in: body, default: ["timestamp", "source", "message"], description: "Non-empty list of fields in CSV column order" }
+        chunk_size:      { type: integer, in: body, default: 1000, description: "Backend export chunk size -- also the effective granularity of `limit`" }
+        time_zone:       { type: string,  in: body, description: "IANA time zone for rendering timestamps, e.g. 'Europe/Berlin'. Defaults to the API user's time zone, not UTC." }
+        limit:           { type: integer, in: body, description: "Max messages to export (positive; rounded up to whole chunks -- see chunk_size). Omit for no limit." }
+        Accept:          { type: string,  in: header, default: "text/csv", description: "Response media type -- the endpoint only produces text/csv; overriding this yields HTTP 406" }
+      response:
+        binary: true
+        content_type: text/csv
         result_path: "$"
       pagination: none
 
@@ -3235,6 +3344,24 @@ backend:
       absolute_window: "for absolute timestamp windows on 6.x use timestamp:[\"FROM\" TO \"TO\"] in the query plus a generous range, OR use views_search_sync / aggregate_pivot with timerange.type=absolute"
     search_keyword:
       keyword_grammar: "open-ended Natty phrases ONLY: 'last 5 minutes', 'last 7 hours', 'yesterday', 'last week'. '7 hours ago' returns HTTP 400 -- use 'last 7 hours' instead, or views_search_sync for closed ranges."
+      timezone_required: "the 'timezone' query param is mandatory server-side (@NotEmpty, undocumented in the API browser). Omitting it returns HTTP 400 'KeywordSearchResource.searchKeyword.arg2 must not be empty'. Defaults to UTC here; set e.g. 'Europe/Berlin' so 'yesterday' means the local day."
+    export_search_relative:
+      csv_only: "endpoint produces text/csv only -- the Accept header param must stay text/csv, anything else is HTTP 406"
+      fields_required: "'fields' is mandatory (unlike search_relative) and sets the CSV column order"
+      result_is_a_url: "response is streamed to the file broker; the tool returns a temporary download URL, not rows"
+      stream_scoping: "use filter 'streams:STREAM_ID'. Graylog 6.1 has no 'streams' query param on the legacy export -- passing one is silently ignored and you get UNSCOPED results."
+      empty_result: "a search matching nothing returns an empty body and no file -- the tool result then carries size_bytes 0 and url null instead of a download link"
+    export_search_keyword:
+      csv_only: "endpoint produces text/csv only -- the Accept header param must stay text/csv, anything else is HTTP 406"
+      timezone_required: "same undocumented @NotEmpty 'timezone' param as search_keyword -- defaults to UTC here"
+      stream_scoping: "use filter 'streams:STREAM_ID' -- see export_search_relative"
+    views_search_messages:
+      body_shape: "NOT the views_search_sync shape. Body is a MessagesRequest: { timerange, query_string: {type:'elasticsearch', query_string:'...'}, streams: [...], fields_in_order: [...], chunk_size, time_zone, limit }"
+      streams_allowed: "unlike views_search_sync, a top-level 'streams' array IS valid here -- and unlike the legacy export endpoints it is actually honored. This is the only CSV export with working stream scoping."
+      fields_in_order: "must be non-empty (@NotEmpty) and defines the CSV column order"
+      limit_is_chunked: "limit is enforced at chunk boundaries only: chunk_size 1000 (default) + limit 3 returns 1000 rows. Set chunk_size to the number of rows you actually want."
+      time_zone_default: "defaults to the API user's configured time zone, NOT UTC -- legacy exports render Z, this one renders e.g. +02:00 unless time_zone is passed"
+      errors_in_body: "backend errors (e.g. an unknown stream ID) come back as an ElasticsearchException string INSIDE the CSV with HTTP 200 -- check that the first line is the expected header row"
     views_search_sync:
       time_range_shapes: |
         absolute: { type: "absolute", from: "2026-04-25T00:11:00.000Z", to: "2026-04-25T00:17:00.000Z" }
