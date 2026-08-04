@@ -40,6 +40,15 @@
 #     silently, so it would return UNSCOPED results with no error. Not surfaced here.
 #   - /views/search/sync: no top-level `streams` (HTTP 400) -- use query.filter.
 #   - /views/search/messages: a top-level `streams` array IS honored.
+# - Endpoints that do NOT exist in Graylog 6.x and are therefore not surfaced, all of
+#   them verified against a live 6.1.16 and the server sources: /count/total,
+#   /filters/blacklist/*, the legacy alerts API (/streams/alerts, /streams/{id}/alerts
+#   -- superseded by events), GET on /system/inputs/{id}/staticfields (POST/DELETE only),
+#   and the single-item paths /search/saved/{id} and /dashboards/{id}. The last two are
+#   the common trap: the LIST endpoints /search/saved and /dashboards do exist, but a
+#   single dashboard or saved search is fetched as a View via get_view (/views/{id}).
+# - An unknown /api path does NOT 404 -- Graylog serves the web UI, so the tool gets
+#   HTTP 200 with the SPA HTML. Treat an HTML body as "this endpoint does not exist".
 # - There is NO /sources endpoint in Graylog 6.x -- the class backing it does not exist
 #   in the server codebase, and /api/sources falls through to the web UI, which answers
 #   with the SPA shell (HTML, HTTP 200). It is therefore not surfaced as a tool; an
@@ -104,11 +113,11 @@ backend:
       allow_jq_override: true
 
   coverage:
-    endpoints: 234
+    endpoints: 216
     total_endpoints: 320
-    percentage: 73
-    focus: "Views/Search API (sync, messages, pivot/histogram/stats via composites), legacy relative + keyword search, CSV export, streams, stream rules, pipelines, pipeline rules, inputs, extractors, events, notifications, dashboards, users, roles, tokens, index sets, indices, grok patterns, lookup tables, sidecars, sidecar configurations, collectors, content packs, outputs, metrics, system info, cluster, processing control, loggers, forensic incident_window composite"
-    missing: "enterprise-only plugins (archives, audit log, reports, license, data lake), Views CRUD (saved views, dashboard widgets), alert callbacks (legacy), message decorators, debug events, codec types, retention/rotation strategy config, LDAP config, async Views/Search (poll-based), absolute-range legacy search (covered by views_search_sync)"
+    percentage: 68
+    focus: "Views/Search API (sync, messages, pivot/histogram/stats via composites), legacy relative + keyword search, CSV export, views, streams, stream rules, pipelines, pipeline rules, inputs, extractors, events, notifications, dashboards, users, roles, tokens, index sets, indices, grok patterns, lookup tables, sidecars, sidecar configurations, collectors, content packs, outputs, metrics, system info, cluster, processing control, loggers, forensic incident_window composite"
+    missing: "enterprise-only plugins (archives, audit log, reports, license, data lake), Views CRUD (saved views, dashboard widgets), Views write CRUD (create/update/delete -- POST/PUT/DELETE /views), legacy alerts API (removed in 6.x, superseded by events), message decorators, debug events, codec types, retention/rotation strategy config, LDAP config, async Views/Search (poll-based), absolute-range legacy search (covered by views_search_sync)"
     last_reviewed: "2026-08-04"
 
   setup:
@@ -365,37 +374,8 @@ backend:
       response:
         result_path: "$.searches"
 
-    get_saved_search:
-      method: GET
-      path: /search/saved/{searchId}
-      access: read
-      description: "Get a saved search by ID."
-      params:
-        searchId: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
-      pagination: none
 
-    create_saved_search:
-      method: POST
-      path: /search/saved
-      access: write
-      description: "Create a saved search."
-      params:
-        title: { type: string, in: body, required: true }
-        query: { type: object, in: body, required: true, description: "Search query object with query string and timerange" }
-      response:
-        result_path: "$"
-      pagination: none
 
-    delete_saved_search:
-      method: DELETE
-      path: /search/saved/{searchId}
-      access: dangerous
-      description: "Delete a saved search."
-      params:
-        searchId: { type: string, in: path, required: true }
-      pagination: none
 
     # ──────────────────────────────────────────────
     # Streams
@@ -1035,15 +1015,6 @@ backend:
     # Input Static Fields
     # ──────────────────────────────────────────────
 
-    list_static_fields:
-      method: GET
-      path: /system/inputs/{inputId}/staticfields
-      access: read
-      description: "List static fields added to all messages from this input."
-      params:
-        inputId: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
 
     create_static_field:
       method: POST
@@ -1266,50 +1237,42 @@ backend:
       response:
         result_path: "$.dashboards"
 
-    get_dashboard:
+    list_views:
       method: GET
-      path: /dashboards/{dashboardId}
+      path: /views
       access: read
-      description: "Get a single dashboard with all its widgets."
+      description: >
+        List saved Views. In Graylog 6 a "dashboard" and a "saved search" are both
+        Views, distinguished by their type field (DASHBOARD / SEARCH). list_dashboards
+        and list_saved_searches are the type-filtered convenience listings; this one
+        returns both. Results are paginated under $.elements.
       params:
-        dashboardId: { type: string, in: path, required: true }
+        page:     { type: integer, in: query, default: 1 }
+        per_page: { type: integer, in: query, default: 50 }
+        query:    { type: string,  in: query, description: "Search string over title/summary" }
+        sort:     { type: string,  in: query, description: "Sort field, e.g. title" }
+        order:    { type: string,  in: query, description: "asc or desc" }
+      response:
+        result_path: "$.elements"
+
+    get_view:
+      method: GET
+      path: /views/{viewId}
+      access: read
+      description: >
+        Get a single View by ID -- this is how you fetch ONE dashboard or ONE saved
+        search. There is no /dashboards/{id} or /search/saved/{id} in Graylog 6: those
+        paths fall through to the web UI and return HTML. Take the id from
+        list_dashboards / list_saved_searches / list_views.
+      params:
+        viewId: { type: string, in: path, required: true, description: "View ID (the `id` field, not `search_id`)" }
       response:
         result_path: "$"
       pagination: none
 
-    create_dashboard:
-      method: POST
-      path: /dashboards
-      access: write
-      description: "Create a new dashboard."
-      params:
-        title: { type: string, in: body, required: true }
-        description: { type: string, in: body }
-      response:
-        result_path: "$"
-      pagination: none
 
-    update_dashboard:
-      method: PUT
-      path: /dashboards/{dashboardId}
-      access: write
-      description: "Update a dashboard's title or description."
-      params:
-        dashboardId: { type: string, in: path, required: true }
-        title: { type: string, in: body, required: true }
-        description: { type: string, in: body }
-      response:
-        result_path: "$"
-      pagination: none
 
-    delete_dashboard:
-      method: DELETE
-      path: /dashboards/{dashboardId}
-      access: dangerous
-      description: "Delete a dashboard and all its widgets."
-      params:
-        dashboardId: { type: string, in: path, required: true }
-      pagination: none
+
 
     # ──────────────────────────────────────────────
     # Users
@@ -1415,23 +1378,23 @@ backend:
 
     list_user_tokens:
       method: GET
-      path: /users/{username}/tokens
+      path: /users/{userId}/tokens
       access: admin
       description: "List all access tokens for a user. Token values are NOT returned -- only name, id, and last_access."
       params:
-        username: { type: string, in: path, required: true }
+        userId: { type: string, in: path, required: true, description: "User ID (24-char hex from list_users[].id) -- NOT the username. Passing a username returns HTTP 500 'hexString has 24 characters'; the config-defined admin (id local:admin) has no token store." }
       response:
         result_path: "$.tokens"
 
     create_user_token:
       method: POST
-      path: /users/{username}/tokens/{tokenName}
+      path: /users/{userId}/tokens/{tokenName}
       access: admin
       description: >
         Create a new access token for a user. The token value is returned ONLY in this response.
         Store it immediately. Used for API auth: username=token_value, password="token".
       params:
-        username: { type: string, in: path, required: true }
+        userId: { type: string, in: path, required: true, description: "User ID (24-char hex from list_users[].id) -- NOT the username. Passing a username returns HTTP 500 'hexString has 24 characters'; the config-defined admin (id local:admin) has no token store." }
         tokenName: { type: string, in: path, required: true }
       response:
         result_path: "$"
@@ -1439,11 +1402,11 @@ backend:
 
     delete_user_token:
       method: DELETE
-      path: /users/{username}/tokens/{tokenId}
+      path: /users/{userId}/tokens/{tokenId}
       access: admin
       description: "Delete/revoke an access token."
       params:
-        username: { type: string, in: path, required: true }
+        userId: { type: string, in: path, required: true, description: "User ID (24-char hex from list_users[].id) -- NOT the username. Passing a username returns HTTP 500 'hexString has 24 characters'; the config-defined admin (id local:admin) has no token store." }
         tokenId: { type: string, in: path, required: true }
       pagination: none
 
@@ -2317,7 +2280,7 @@ backend:
       pagination: none
 
     sidecar_administration:
-      method: GET
+      method: POST
       path: /sidecar/administration
       access: read
       description: "Get sidecar administration overview with collector statuses."
@@ -2472,62 +2435,10 @@ backend:
     # Blacklist Filters
     # ──────────────────────────────────────────────
 
-    list_blacklist_filters:
-      method: GET
-      path: /filters/blacklist
-      access: read
-      description: "List all message blacklist filters."
-      response:
-        result_path: "$.filters"
 
-    get_blacklist_filter:
-      method: GET
-      path: /filters/blacklist/{filterId}
-      access: read
-      description: "Get a single blacklist filter."
-      params:
-        filterId: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
-      pagination: none
 
-    create_blacklist_filter:
-      method: POST
-      path: /filters/blacklist
-      access: write
-      description: "Create a blacklist filter to drop matching messages."
-      params:
-        title: { type: string, in: body, required: true }
-        description: { type: string, in: body }
-        pattern: { type: string, in: body, required: true }
-        field_name: { type: string, in: body, required: true }
-      response:
-        result_path: "$"
-      pagination: none
 
-    update_blacklist_filter:
-      method: PUT
-      path: /filters/blacklist/{filterId}
-      access: write
-      description: "Update a blacklist filter."
-      params:
-        filterId: { type: string, in: path, required: true }
-        title: { type: string, in: body, required: true }
-        description: { type: string, in: body }
-        pattern: { type: string, in: body, required: true }
-        field_name: { type: string, in: body, required: true }
-      response:
-        result_path: "$"
-      pagination: none
 
-    delete_blacklist_filter:
-      method: DELETE
-      path: /filters/blacklist/{filterId}
-      access: dangerous
-      description: "Delete a blacklist filter."
-      params:
-        filterId: { type: string, in: path, required: true }
-      pagination: none
 
     # ──────────────────────────────────────────────
     # System -- General Info
@@ -2560,14 +2471,6 @@ backend:
         result_path: "$"
       pagination: none
 
-    get_total_message_count:
-      method: GET
-      path: /count/total
-      access: read
-      description: "Get the total number of messages stored."
-      response:
-        result_path: "$"
-      pagination: none
 
     list_message_fields:
       method: GET
@@ -2645,7 +2548,13 @@ backend:
       method: GET
       path: /system/lbstatus
       access: read
-      description: "Get the load balancer status (ALIVE or DEAD). Used by LB health checks."
+      description: >
+        Load-balancer status of this node as PLAIN TEXT, not JSON: "ALIVE"
+        (HTTP 200), "DEAD" (HTTP 503) or "THROTTLED" (HTTP 429). The endpoint
+        produces text/plain only -- leave the Accept parameter at its default;
+        application/json returns HTTP 406.
+      params:
+        Accept: { type: string, in: header, default: "text/plain", description: "Response media type -- the endpoint only produces text/plain" }
       response:
         result_path: "$"
       pagination: none
@@ -2973,52 +2882,9 @@ backend:
     # Stream Alerts (Legacy)
     # ──────────────────────────────────────────────
 
-    list_all_alerts:
-      method: GET
-      path: /streams/alerts
-      access: read
-      description: "List recent alerts across all streams."
-      params:
-        since: { type: integer, in: query, default: 0, description: "Unix timestamp" }
-        limit: { type: integer, in: query, default: 300 }
-      response:
-        result_path: "$.alerts"
 
-    list_all_alerts_paginated:
-      method: GET
-      path: /streams/alerts/paginated
-      access: read
-      description: "List alerts across all streams with pagination."
-      params:
-        skip: { type: integer, in: query, default: 0 }
-        limit: { type: integer, in: query, default: 300 }
-        state: { type: string, in: query, description: "any, resolved, unresolved" }
-      response:
-        result_path: "$"
 
-    list_stream_alerts:
-      method: GET
-      path: /streams/{streamId}/alerts
-      access: read
-      description: "List alerts for a specific stream."
-      params:
-        streamId: { type: string, in: path, required: true }
-        since: { type: integer, in: query, default: 0 }
-        limit: { type: integer, in: query, default: 300 }
-      response:
-        result_path: "$.alerts"
 
-    get_alert:
-      method: GET
-      path: /streams/{streamId}/alerts/{alertId}
-      access: read
-      description: "Get a specific alert."
-      params:
-        streamId: { type: string, in: path, required: true }
-        alertId: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
-      pagination: none
 
   composites:
 
