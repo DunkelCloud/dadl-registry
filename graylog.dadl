@@ -3119,14 +3119,24 @@ backend:
         };
         const r = await api.views_search_sync(body);
         const rows = r.results?.q?.search_types?.st?.rows || [];
-        const rN = (params.row_fields || []).length;
-        return rows
-          .filter(row => row.source === "leaf")
-          .map(row => ({
-            row_keys: row.key.slice(0, rN),
-            col_keys: row.key.slice(rN),
-            count:    row.values?.[0]?.value || 0,
-          }));
+        // Column dimensions do NOT live in row.key -- they are one entry per
+        // row.values[] with source "col-leaf" and key [...colValues, seriesId].
+        // The single "row-leaf" entry is the rollup total across all columns.
+        const hasCols = (params.column_fields || []).length > 0;
+        const out = [];
+        for (const row of rows) {
+          if (row.source !== "leaf") continue;
+          for (const v of (row.values || [])) {
+            const isCol = v.source === "col-leaf";
+            if (hasCols !== isCol) continue;
+            out.push({
+              row_keys: row.key || [],
+              col_keys: (v.key || []).slice(0, -1),
+              count:    v.value || 0,
+            });
+          }
+        }
+        return out;
 
     histogram_grouped:
       description: >
@@ -3389,7 +3399,7 @@ backend:
       stream_filter: "no top-level 'streams' field -- Graylog returns HTTP 400. Scope per query via query.filter: { type: 'or', filters: [{ type: 'stream', id: STREAM_ID }, ...] }"
     aggregate_pivot:
       replaces: "deprecated _terms / _histogram / _stats endpoints removed in Graylog 6.0"
-      row_col_keys: "row.key is an array -- first row_fields entries are row dimensions, the rest are column dimensions when rollup=true"
+      row_col_keys: "row.key holds ONLY the row dimensions. Column dimensions are NOT in row.key -- each column cell is a separate row.values[] entry with source 'col-leaf' and key [...colValues, seriesId]; the one entry with source 'row-leaf' is the rollup total across all columns."
     histogram_grouped:
       interval_format: "Graylog timeunit {quantity}{unit}, unit in [s m h d w M y] -- 30s, 1m, 5m, 1h, 1d. NOT ISO-8601: PT1M returns HTTP 400 'Time unit must be {quantity}{unit}'. The composite converts ISO-8601 input, but the pivot row_group wants the Graylog form."
       interval_property: "the row_group interval object is { type: 'timeunit', timeunit: '1m' } -- the value key is `timeunit`, not `value` (HTTP 400 'Known properties include: timeunit, type')"
