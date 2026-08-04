@@ -1253,7 +1253,7 @@ backend:
         sort:     { type: string,  in: query, description: "Sort field, e.g. title" }
         order:    { type: string,  in: query, description: "asc or desc" }
       response:
-        result_path: "$.elements"
+        result_path: "$.views"
 
     get_view:
       method: GET
@@ -2283,24 +2283,34 @@ backend:
       method: POST
       path: /sidecar/administration
       access: read
-      description: "Get sidecar administration overview with collector statuses."
+      description: >
+        Paginated sidecar listing including collector compatibility -- the data
+        behind the Sidecar Administration page. This is a POST despite being a
+        read: the filter is sent as a body. A body is REQUIRED; an empty request
+        fails with HTTP 400 "administration.arg0 must not be null". Body fields:
+        page, per_page, query (search over node_name, e.g. "status:running"),
+        filters (map, e.g. { "status": "1" }).
       params:
-        page: { type: integer, in: query, default: 1 }
-        per_page: { type: integer, in: query, default: 50 }
-        query: { type: string, in: query }
+        page:     { type: integer, in: body, default: 1, description: "1-based page number" }
+        per_page: { type: integer, in: body, default: 50, description: "Page size" }
+        query:    { type: string,  in: body, default: "", description: "Search query over node_name; status:running|failing|unknown is mapped server-side" }
+        filters:  { type: object,  in: body, default: {}, description: "Field filters as a flat string map" }
       response:
         result_path: "$"
+      pagination: none
 
     bulk_sidecar_action:
-      method: POST
-      path: /sidecar/administration
+      method: PUT
+      path: /sidecar/administration/action
       access: admin
-      description: "Perform bulk actions on sidecars (assign configurations, restart collectors)."
+      description: >
+        Set collector actions (start / restart / stop) on sidecars in bulk.
+        Returns HTTP 202 on success. Body: { action, collectors: [ { sidecar_id,
+        collector_ids: [...] } ] } -- note the nested per-sidecar list; there is
+        no flat sidecar_ids field.
       params:
-        action: { type: string, in: body, required: true }
-        collector_id: { type: string, in: body }
-        sidecar_ids: { type: array, in: body }
-        configuration_id: { type: string, in: body }
+        action:     { type: string, in: body, required: true, description: "Action to apply, e.g. start, restart, stop" }
+        collectors: { type: array,  in: body, required: true, description: "[{ sidecar_id: string, collector_ids: [string] }]" }
       pagination: none
 
     # ──────────────────────────────────────────────
