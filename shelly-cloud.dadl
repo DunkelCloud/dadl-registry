@@ -63,10 +63,8 @@ backend:
         max_retries: 3
         backoff: exponential
         initial_delay: 1s
-      rate_limit:
-        # Shelly enforces 1 request per second globally.
-        # No rate limit headers — enforce client-side delay.
-        requests_per_second: 1
+      # Shelly enforces 1 request per second globally (no rate-limit
+      # headers) — pace calls client-side; 429 is retried per retry_on.
     response:
       allow_jq_override: true
 
