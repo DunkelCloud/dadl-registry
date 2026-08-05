@@ -13,10 +13,10 @@ backend:
   description: "GitLab REST API v4 — projects, issues, merge requests, pipelines, CI/CD, and code search"
 
   coverage:
-    endpoints: 52
+    endpoints: 75
     total_endpoints: 400
-    percentage: 13
-    focus: "projects, issues, merge requests, branches, commits, pipelines, jobs, releases, groups, users, repository files, labels, milestones, search"
+    percentage: 19
+    focus: "GitLab REST API v4: projects, issues, merge requests, pipelines, jobs, branches, commits, releases, groups, users, repository files, labels, milestones, code search"
     missing: "deploy tokens, container registry, packages, wikis, snippets, epics, environments, cluster agents, protected branches, webhooks, project hooks"
     last_reviewed: "2026-03-26"
 
@@ -30,7 +30,7 @@ backend:
     backends_yaml: |
       - name: gitlab
         transport: rest
-        dadl: /app/dadl/gitlab.dadl
+        dadl: gitlab.dadl
         url: "https://your-gitlab.example.com/api/v4"
     required_scopes:
       - api
@@ -49,8 +49,9 @@ backend:
 
   defaults:
     headers:
-      Content-Type: application/json
       Accept: application/json
+    # No Content-Type here: the runtime defaults request bodies to
+    # application/json and only sets the header when a body is actually sent.
     pagination: &default-pagination
       strategy: page
       request:
@@ -60,6 +61,8 @@ backend:
       response:
         total_pages_header: x-total-pages
         total_count_header: x-total
+      # expose: the LLM passes page/per_page itself. GitLab list endpoints are
+      # broad, so transparent all-page fetching (auto) would flood the context.
       behavior: expose
       max_pages: 10
     errors: &standard-errors
@@ -71,14 +74,22 @@ backend:
         max_retries: 3
         backoff: exponential
         initial_delay: 1s
+      # Rate-limit headers (RateLimit-Limit/-Remaining/-Reset/-Observed,
+      # Retry-After on 429) are documented in the domain notes below; the
+      # runtime does not act on them, so no errors.rate_limit block here.
 
   # ──────────────────────────────────────────────────────────────
   # Domain notes (for LLM consumers of these tools)
   #
   # ID parameter:
   #   Most endpoints accept either a numeric project/group ID or a
-  #   URL-encoded namespace path (e.g., "my-group%2Fmy-project").
-  #   Forward slashes in paths must be URL-encoded as %2F.
+  #   namespace path (e.g., "my-group/my-project").
+  #   Pass the path with PLAIN forward slashes — do NOT pre-encode them
+  #   as %2F. ToolMesh URL-escapes path parameters itself; a pre-encoded
+  #   "%2F" is escaped again to "%252F" and the call 404s. Verified live
+  #   against gitlab.dunkel.io 2026-08-05: id "infra/monitoring-config"
+  #   resolves, "infra%2Fmonitoring-config" returns 404. The same applies
+  #   to file_path ("config/rules/hosts.yml", not "config%2Frules%2F...").
   #
   # IID vs ID:
   #   GitLab uses "iid" (internal ID) for project-scoped numbering
@@ -105,10 +116,18 @@ backend:
   #   Validation errors nest by field name with arrays of messages.
   #
   # Dates:
-  #   ISO 8601 format. Encode '+' in timezone offsets as %2B.
+  #   ISO 8601 format. Pass timezone offsets literally
+  #   ("2026-01-01T00:00:00+02:00"); query values are escaped for you.
   #
   # Arrays in params:
-  #   Use param[]=value1&param[]=value2 syntax.
+  #   Array-typed BODY params (assignee_ids, reviewer_ids) work — they are
+  #   marshalled as a real JSON array.
+  #   Array-typed QUERY params do NOT work through ToolMesh: the value is
+  #   stringified to "[66 65]" instead of iids[]=66&iids[]=65, so the filter
+  #   matches nothing and you get an empty list back rather than an error.
+  #   GitLab's iids[] filters are therefore not exposed. To fetch specific
+  #   items, call the per-item tool (get_merge_request / get_project_issue)
+  #   or filter client-side after a list call.
   # ──────────────────────────────────────────────────────────────
 
   tools:
@@ -139,7 +158,7 @@ backend:
       method: GET
       path: /projects/{id}
       access: read
-      description: "Get a single project by ID or URL-encoded path (e.g., 'my-group%2Fmy-project')."
+      description: "Get a single project by numeric ID or namespace path with plain slashes (e.g., 'my-group/my-project'). Do not pre-encode slashes as %2F — that 404s."
       params:
         id: { type: string, in: path, required: true }
         license: { type: boolean, in: query }
@@ -248,7 +267,9 @@ backend:
         search: { type: string, in: query }
         order_by: { type: string, in: query, default: "created_at" }
         sort: { type: string, in: query, default: "desc" }
-        iids: { type: array, in: query }
+        # GitLab's iids[] filter is intentionally not exposed: array query
+        # params serialize to the literal "[66 65]" (see domain notes), which
+        # matches nothing and returns an empty list instead of an error.
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 20 }
 
@@ -369,7 +390,7 @@ backend:
         search: { type: string, in: query }
         order_by: { type: string, in: query, default: "created_at" }
         sort: { type: string, in: query, default: "desc" }
-        iids: { type: array, in: query }
+        # iids[] omitted — see list_project_issues above and the domain notes.
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 20 }
 
@@ -854,7 +875,7 @@ backend:
       method: GET
       path: /groups/{id}
       access: read
-      description: "Get details of a group by ID or URL-encoded path."
+      description: "Get details of a group by numeric ID or full path with plain slashes (e.g. 'parent-group/subgroup')."
       params:
         id: { type: string, in: path, required: true }
         with_projects: { type: boolean, in: query }
@@ -918,11 +939,11 @@ backend:
 
     get_user:
       method: GET
-      path: /users/{user_id}
+      path: /users/{id}
       access: read
-      description: "Get a single user by ID. Admins see extended fields including sign-in history."
+      description: "Get a single user by numeric user ID. Admins see extended fields including sign-in history."
       params:
-        user_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
       pagination: none
 
     # ── Repository Files ─────────────────────────────────────────
@@ -931,7 +952,7 @@ backend:
       method: GET
       path: /projects/{id}/repository/files/{file_path}
       access: read
-      description: "Get file metadata and base64-encoded content. The file_path must be URL-encoded (slashes as %2F)."
+      description: "Get file metadata and base64-encoded content. Pass file_path with plain slashes (e.g. 'config/rules/hosts.yml'); do not pre-encode them as %2F."
       params:
         id: { type: string, in: path, required: true }
         file_path: { type: string, in: path, required: true }
