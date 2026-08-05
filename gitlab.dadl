@@ -57,15 +57,10 @@ backend:
         page_param: page
         limit_param: per_page
         limit_default: 20
-        limit_max: 100
       response:
-        next_link_header: Link
-        total_header: x-total
         total_pages_header: x-total-pages
-        current_page_header: x-page
-        next_page_header: x-next-page
-        per_page_header: x-per-page
-      behavior: manual
+        total_count_header: x-total
+      behavior: expose
       max_pages: 10
     errors: &standard-errors
       format: json
@@ -76,12 +71,6 @@ backend:
         max_retries: 3
         backoff: exponential
         initial_delay: 1s
-      rate_limit_headers:
-        limit: RateLimit-Limit
-        remaining: RateLimit-Remaining
-        reset: RateLimit-Reset
-        observed: RateLimit-Observed
-        retry_after: Retry-After
 
   # ──────────────────────────────────────────────────────────────
   # Domain notes (for LLM consumers of these tools)

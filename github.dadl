@@ -64,10 +64,7 @@ backend:
         page_param: page
         limit_param: per_page
         limit_default: 30
-      response:
-        # GitHub uses Link header for pagination
-        next_link_header: Link
-      behavior: manual
+      behavior: expose
       max_pages: 10
     errors: &standard-errors
       format: json
