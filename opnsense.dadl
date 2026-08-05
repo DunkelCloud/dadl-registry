@@ -13,8 +13,28 @@
 #   Workflow: 1) add/set/del → modify stored config  2) reconfigure → apply.
 #   Without reconfigure, changes are saved but NOT active.
 # - Search endpoints (pagination): all search_* endpoints accept POST with
-#   JSON body: { "current": 1, "rowCount": 50, "searchPhrase": "", "sort": "field" }
-#   Response: { "rows": [...], "rowCount": 50, "total": 123, "current": 1 }
+#   { "current": 1, "rowCount": 50, "searchPhrase": "", "sort": "field" }.
+# - UNIFORM LIST ENVELOPE: every list-shaped response — the OPNsense grid
+#   {rows,total,rowCount,current} as well as the {items,status} shape used by
+#   get_gateway_status — is normalised to ONE shape by the backend-wide response
+#   transform: { total, returned, truncated, rows: [...] } (any other sibling keys, e.g.
+#   the `carp` block on get_vip_status, are preserved alongside). Note that OPNsense's own
+#   `total` counts only the MVC records on grids that append automatic/internal rows
+#   (search_dnat_rules reported total 2 for 5 rows), so `total` is clamped to at least
+#   `returned` and is a lower bound, not gospel. ALWAYS CHECK `truncated`
+#   before stating that a list is complete: rowCount silently caps the result and the
+#   appliance gives no hint (a 53-rule ruleset came back as 50 rows). Where completeness
+#   matters most — firewall/NAT rules, aliases, gateways, gateway groups, certificates —
+#   the rowCount default is raised to 500.
+# - SECRETS ARE WRITE-ONLY (enforced in the response transform, see defaults.response):
+#   private keys (cert/CA prv, prv_payload), the HA sync password, user password hashes,
+#   PSKs and similar fields can be SET through the add_/set_ tools but are never returned;
+#   on read they are replaced with "(redacted: write-only, settable but never returned)".
+#   Empty stays empty, so "is it configured?" is still answerable. Consequence for
+#   read-modify-write: never post back a value read from such a field — every set_*
+#   endpoint merges (BaseField::setNodes only writes the keys you send), so omitting the
+#   field preserves it. The one place all of this is still in the clear is the config XML
+#   from download_backup / diff_backups — treat those outputs accordingly.
 # - UUID pattern: resources are identified by UUID (e.g. "a1b2c3d4-...").
 #   Use search endpoints to find UUIDs, then get/set/del by UUID.
 # - Toggle pattern: toggle endpoints accept UUID and optional enabled state
@@ -56,17 +76,76 @@
 #   ArrayField (aliases.alias); the `alias` field is the UUID of an EXTERNAL-type firewall
 #   alias. Apply with reconfigure_ndpproxy; get_ndpproxy_status for service state.
 # - Interface IP configuration is only PARTLY API-addressable: the modern MVC exposes interface
-#   ASSIGNMENT (device↔name), VLANs, VIPs and static neighbors, but the per-interface IPv6
-#   Configuration Type (SLAAC/DHCPv6/Static/Track) and dhcp6 options remain LEGACY config.xml
-#   (interfaces.php) — read-only here via get_interfaces_overview / get_interface_detail /
-#   export_interfaces. There is no set_interface tool because OPNsense ships no such endpoint.
+#   ASSIGNMENT (device↔name), VLANs, VIPs, static neighbors and the GLOBAL interface settings
+#   singleton (get/set_interface_settings: hardware offloading, global disableipv6, dhcp6_duid/
+#   dhcp6_norelease/dhcp6_debug/dhcp6_ratimeout — partial-merge setNodes), but the PER-INTERFACE
+#   IPv4/IPv6 Configuration Type (SLAAC/DHCPv6/Static/Track), addresses and MTU/MSS remain
+#   LEGACY config.xml (interfaces.php, verified on 26.7) — read-only here via
+#   get_interfaces_overview / get_interface_detail / export_interfaces. There is no per-interface
+#   set tool because OPNsense ships no such endpoint. reload_interface (configd "interface
+#   reconfigure") re-applies the stored config to one live interface (re-runs address assignment,
+#   restarts dhclient/dhcp6c) — the API-side "bounce/flush" lever.
+# - Diagnostics JOBS (ping, packet capture) are 2-phase, UUID-addressed and in-memory (:memory:
+#   model + /tmp job files — they do NOT survive a reboot and never touch config.xml):
+#   1) set_*_job posts the settings under the MODEL node (single object param `ping` /
+#   `packetcapture` with a nested `settings` object) and returns {result:"ok", uuid};
+#   2) start_*_job/{uuid} launches it. Poll search_*_jobs for status+stats (ping: send/received/
+#   loss/min/avg/max), then stop_*_job and remove_*_job to clean up. Capture extras:
+#   view_capture_job (decoded packets, detail normal|medium|high), download_capture (pcap archive
+#   as file download), get_capture_macinfo (MAC vendor lookup).
+# - NPTv6 (/firewall/npt, npt.rule node): IPv6 prefix translation rules — source_net /
+#   destination_net MUST be IPv6; set trackif INSTEAD of destination_net for dynamically
+#   assigned (tracked) external prefixes. CRUD mirrors DNAT (dotted rule.* body params;
+#   set_npt_rule is setBase FULL-REPLACE — post the complete rule). Rules only become active
+#   after apply_firewall (same pf reload as filter/DNAT/SNAT — there is no separate NPT
+#   reconfigure endpoint).
+# - Service instances (dpinger gateway monitors, OpenVPN, …): /core/service/{start,stop,restart}
+#   take the instance id as a SECOND PATH SEGMENT (/core/service/restart/{name}/{id}) — use the
+#   *_service_instance tools for multi-instance services. search_services lists instances with
+#   id "name/instance" (e.g. "dpinger/WAN_GW" — the part after the slash is the id). A ?id=
+#   query param is IGNORED by the API router and silently acts on nothing.
+# - There is NO generic configctl/exec endpoint in the OPNsense API (by design — every configd
+#   action needs a dedicated controller). Available operational levers: *_service_instance
+#   (dpinger restarts etc.), reload_interface (address re-apply/flush), per-module reconfigure_*
+#   endpoints, and the diagnostics job endpoints above.
+# - Firewall rules: search_firewall_rules mixes USER rules (MVC model) with OPNsense's own
+#   AUTOMATIC rules (anti-lockout, default deny, pfsync …) and the two families are typed
+#   differently in the raw API — booleans on automatic rules, "1"/"0" STRINGS on user rules, and
+#   is_automatic simply absent instead of false. `if (rule.log)` was therefore true for log "0".
+#   The tool normalises all of it to real booleans and always emits is_automatic. Filter with the
+#   `interface` (comma list; "" = floating only) and `category` params, or on is_automatic.
+#   NEGATION: read %source_net / %destination_net / %interface, which render the *_not flags
+#   inline as "NOT <alias>". The bare source_net/destination_net fields say nothing about
+#   negation — reading them alone turns a policy-routing rule into its apparent opposite.
+# - Firewall apply: there is NO savepoint/rollback/revert API on 26.7 (FilterBaseController has
+#   applyAction() and nothing else); apply_firewall takes no arguments. The rollback net for a
+#   risky change is the config backup history (list_backups → revert_backup).
+# - NAT families use INVERTED, differently-spelled fields vs. filter rules: `disabled` instead of
+#   `enabled`, `descr` instead of `description`, dotted source.network / destination.not instead
+#   of source_net / destination_not. search_dnat_rules / search_snat_rules therefore add
+#   filter-compatible `enabled`, `description` and negation-aware %source_net/%destination_net.
+#   For outbound NAT ALWAYS read get_outbound_nat_mode first — an empty snat rule list means
+#   "generated automatically" in mode automatic/hybrid but "no NAT at all" in mode advanced.
+# - Gateways: `defaultgw` from search_gateways is COMPUTED (is this the currently active default
+#   route?), not the stored config flag — two gateways with defaultgw=1 in config.xml both report
+#   false while a higher-priority gateway holds the route. Renaming a gateway is impossible
+#   (validateNameChange blocks it); create → repoint references → delete.
+# - Gateway GROUPS (/routing/group_settings/*, model GatewayGroups.xml): TIER 1 IS THE FIELD
+#   `item`, not `item1`; tiers 2..5 are item2..item5, and all of them are multi-selects of
+#   gateway NAMES. Code that iterates item1..item5 silently skips the highest-priority tier.
+#   Use the update_gateway_group composite (tier-number API) and verify the tiers it reports back.
+# - kill_firewall_states only works for BARE IPv4 addresses: OPNsense sanitises the filter with
+#   SanitizeFilter::filter_query, which strips ":" and "/", so IPv6 addresses and CIDR prefixes
+#   are mangled into non-matching substrings and the call returns {"result":"ok",
+#   "dropped_states":0}. For IPv6/CIDR: query_firewall_states → del_firewall_state per state, or
+#   flush_firewall_states.
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
 
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "OPNsense REST API"
 source_url: "https://docs.opnsense.org/development/api.html"
-date: "2026-07-20"
+date: "2026-08-02"
 
 backend:
   name: opnsense
@@ -102,14 +181,19 @@ backend:
     # params (gateway_item) contain no dots and are unaffected.
     nest_body_keys: true
 
+    # behavior: expose — the caller drives paging with current/rowCount; ToolMesh does not
+    # fetch further pages by itself. There is deliberately no `response:` block here: the only
+    # body-path field that would fit OPNsense's grids is a total path, which the DADL spec does
+    # not define (pagination.response covers next_cursor / has_more / the two *_header fields)
+    # and which the ToolMesh runtime does not read either — the former `total_path: "$.total"`
+    # was a no-op rejected by the registry schema. The row total is surfaced by the response
+    # transform instead, as `total` / `truncated` in the list envelope.
     pagination: &default-pagination
       strategy: page
       request:
         page_param: current
         limit_param: rowCount
         limit_default: 50
-      response:
-        total_path: "$.total"
       behavior: expose
       max_pages: 20
 
@@ -124,17 +208,78 @@ backend:
         backoff: exponential
         initial_delay: 2s
 
+    # Backend-wide response normalisation. Applies to EVERY tool that does not
+    # declare its own `response:` block — deliberately almost all of them. A per-tool
+    # block REPLACES this one, so a tool with its own transform must repeat the parts
+    # it still needs.
+    #
+    # Three jobs, in order:
+    #  1) redact — OPNsense hands out secrets on plain read endpoints: /trust/cert/*
+    #     and /trust/ca/* return `prv`/`prv_payload` (complete PEM private keys),
+    #     /core/hasync/get returns the XMLRPC sync `password` in CLEAR TEXT, /auth/user/*
+    #     returns the bcrypt `password` hash. Those fields stay WRITABLE — the set_/add_
+    #     tools send whatever you pass — but they are never handed back: on the way out
+    #     the value is replaced by a marker. Empty values stay empty, so "is it set at
+    #     all?" is still answerable. Enforced here in the ToolMesh response path; the
+    #     appliance itself offers no opt-out parameter.
+    #     READ-MODIFY-WRITE WARNING: never post a value back that you read from one of
+    #     these fields — you would write the marker string. Every set_* endpoint merges
+    #     (BaseField::setNodes only touches keys present in the POST), so omitting the
+    #     field preserves it.
+    #  2) isodates — epoch-second fields (valid_from/valid_to on certificates) get a
+    #     readable "%valid_from"/"%valid_to" sibling; the raw field is kept.
+    #  3) envelope — OPNsense grids answer {rows,total,rowCount,current}, a few
+    #     endpoints answer {items,status}. Both collapse to ONE shape:
+    #     {total, returned, truncated, rows:[…]}. `truncated: true` means the grid holds
+    #     more rows than were returned — raise rowCount and repeat. The previous default
+    #     (result_path $.rows) handed back a bare array and dropped `total`, so a short
+    #     answer was indistinguishable from a complete one. Non-grid responses
+    #     ({result:"saved"}, model getters like {gateway_item:{…}}) pass through.
     response: &default-response
-      result_path: "$.rows"
+      result_path: "$"
       allow_jq_override: true
+      transform: |
+        def redact:
+          walk(
+            if type == "object" then
+              with_entries(
+                if (.key | ascii_downcase | ltrimstr("%")
+                    | IN("prv", "prv_payload", "csr", "csr_payload", "password", "privkey",
+                         "private_key", "privatekey", "psk", "pre_shared_key", "sharedkey",
+                         "secret", "client_secret", "passphrase", "tls_key", "scrambled_password"))
+                   and (.value | type) == "string" and (.value | length) > 0
+                then .value = "(redacted: write-only, settable but never returned)"
+                else . end
+              )
+            else . end
+          );
+        def isodates:
+          walk(
+            if type == "object" then
+              (if (.valid_from | tostring | test("^[0-9]+$")) then . + {"%valid_from": (.valid_from | tonumber | todate)} else . end)
+              | (if (.valid_to | tostring | test("^[0-9]+$")) then . + {"%valid_to": (.valid_to | tonumber | todate)} else . end)
+            else . end
+          );
+        def envelope:
+          if type == "object" and (.rows | type) == "array" then
+            (.rows | length) as $n
+            | (((.total | tostring | tonumber?) // $n) | if . < $n then $n else . end) as $t
+            | del(.rows, .total, .rowCount, .current) as $extra
+            | {total: $t, returned: $n, truncated: ($t > $n), rows: .rows} + $extra
+          elif type == "object" and (.items | type) == "array" then
+            (.items | length) as $n
+            | del(.items) as $extra
+            | {total: $n, returned: $n, truncated: false, rows: .items} + $extra
+          else . end;
+        redact | isodates | envelope
 
   coverage:
-    endpoints: 311
+    endpoints: 343
     total_endpoints: 1500
-    percentage: 21
-    focus: "firewall (aliases, filter rules, NAT), diagnostics (ARP, states, system), interfaces, Unbound DNS, WireGuard, OpenVPN, IPsec, Kea DHCP, routes/gateways, firmware, system/backup, HAProxy, IDS/IPS, traffic shaper, certificates, syslog, cron, HA (hasync syncitems, config sync), IPv6 RA (radvd), NDP proxy"
-    missing: "per-interface IPv4/IPv6 address config (IPv6 configuration type, dhcp6 options — legacy config.xml, no API), captive portal vouchers, BIND DNS, Caddy, Nginx, FRR routing, ACME client, Monit, collectd, CrowdSec, FreeRADIUS, most third-party plugins"
-    last_reviewed: "2026-07-20"
+    percentage: 23
+    focus: "firewall (aliases, filter rules, NAT, outbound NAT mode, NPTv6), diagnostics (ARP, states, system, ping jobs, packet capture), interfaces (overview, VLANs, VIPs, global settings, reload), Unbound DNS, WireGuard, OpenVPN, IPsec, Kea DHCP, routes/gateways/gateway groups, firmware, system/backup, HAProxy, IDS/IPS, traffic shaper, certificates, syslog, cron, HA (hasync syncitems, config sync), IPv6 RA (radvd), NDP proxy, services (per-instance start/stop/restart)"
+    missing: "per-interface IPv4/IPv6 address config (configuration type, addresses, MTU/MSS — legacy config.xml, no API as of 26.7), firewall normalization/scrub rules (firewall_scrub.php legacy, no API as of 26.7), firewall savepoint/rollback (no such endpoints on 26.7), captive portal vouchers, BIND DNS, Caddy, Nginx, FRR routing, ACME client, Monit, collectd, CrowdSec, FreeRADIUS, most third-party plugins"
+    last_reviewed: "2026-08-02"
 
   setup:
     credential_steps:
@@ -164,10 +309,24 @@ backend:
       alias_types: "host, network, port, url, urltable, geoip, networkgroup, mac, asn, dynipv6host, authgroup, internal, external"
       content_format: "newline-separated values in 'content' field"
     search_firewall_rules:
-      search_body: "POST body: {current: 1, rowCount: 50, searchPhrase: ''}"
+      search_body: "POST body: {current: 1, rowCount: 500, searchPhrase: ''}; returns {total, returned, truncated, rows}"
       rule_ordering: "rules are evaluated top-to-bottom; use move_firewall_rule_before to reorder"
+      completeness: "check `truncated` — the appliance default of rowCount 50 cuts a 53-rule ruleset short without any hint"
+      mixed_families: "user rules and automatic rules are mixed; is_automatic is normalised to a real boolean and always present"
+      negation: "read %source_net / %destination_net / %interface — they render the *_not flags as 'NOT <alias>'"
+    add_firewall_rule:
+      complete_model: "the declared params ARE the full Filter.xml field set; a field not declared here is dropped silently and yields a MORE permissive rule than requested (icmptype empty = all ICMP types)"
+      wan_replyto: "disablereplyto=1 is regularly required on WAN/tunnel interfaces where the implicit reply-to would send answers out the wrong link"
     apply_firewall:
-      savepoint_note: "call savepoint_firewall first to get a rollback revision, then apply with that revision — auto-rollback if you don't confirm within 60s"
+      no_savepoint: "26.7 has no savepoint/rollback/revert endpoints — apply_firewall takes no parameters; use list_backups/revert_backup as the rollback net"
+      usually_redundant: "model writes already save+reload the filter on most installations, so apply is typically a confirmation rather than the activating step"
+    update_gateway_group:
+      tier1_is_item: "tier 1 is stored in `item`, NOT `item1` (tiers 2..5 are item2..item5) — iterating item1..item5 silently skips the top tier"
+      verify: "the composite returns the resulting tiers; count them against what you asked for"
+    get_outbound_nat_mode:
+      read_first: "an empty search_snat_rules means 'automatic generation' in mode automatic/hybrid but 'no outbound NAT at all' in mode advanced"
+    kill_firewall_states:
+      ipv4_only: "OPNsense strips ':' and '/' from the filter, so IPv6 and CIDR silently drop 0 states; use query_firewall_states + del_firewall_state instead"
     add_kea_dhcp4_reservation:
       mac_format: "MAC address in aa:bb:cc:dd:ee:ff format"
     search_unbound_host_overrides:
@@ -181,10 +340,20 @@ backend:
     set_gateway:
       body_encoding: "must be form-urlencoded with a nested gateway_item object (gateway_item[field]=...); OPNsense reads PHP $_POST which ignores JSON bodies — a JSON post or flat dotted keys give a bare {\"result\":\"failed\"} (empty validations)"
       full_replace: "setBase rebuilds the item from the POST — omitted fields reset to model defaults; always post the complete item (use update_gateway)"
+      no_rename: "validateNameChange() rejects any name change — create the new gateway, repoint references, delete the old one"
+    search_gateways:
+      defaultgw_is_computed: "defaultgw reports whether the gateway currently HOLDS the default route, not the stored config flag; use get_gateway for the stored value"
+    search_certificates:
+      no_private_keys: "prv/prv_payload/csr/csr_payload are redacted — write-only. Keys are settable via add_/set_certificate but never returned; empty still shows as empty"
+      expiry: "%valid_from/%valid_to are added; the raw fields are epoch-second strings and easy to overlook"
+    get_hasync_settings:
+      password_write_only: "the sync password is redacted on read — set it with update_hasync_settings({changes:{password:'…'}}); omitting it preserves the stored one"
+      no_pfsyncenabled: "the 26.7 model has no pfsyncenabled field (it reads as null); use %pfsync_configured plus get_pfsync_nodes for the live state"
     update_hasync_settings:
       use_this: "preferred way to change HA sync — read-modify-write; enable_syncitems/disable_syncitems flip individual synced sections without dropping the other ~35"
       syncitems: "syncitems is a multi-select; a bare set_hasync_settings REPLACES the whole selection. Section keys include radvd (Router Advertisements) and ndpproxy (NDP Proxy)"
       field_names: "the hasync model fields are username/password — NOT synchronizeusername/synchronizepassword"
+      password: "password is write-only: pass changes.password to set it, omit it to keep it. The composite refuses to write the redaction marker back"
     synchronize_ha_services:
       what: "the HA-status 'Synchronize and reconfigure all services' action — runs XMLRPC exec_sync to push config to the backup, then reloads templates and restarts HA services on the peer"
       lighter_option: "a normal save with hasync targets set already auto-syncs; use this only to force a full resync/reconfigure"
@@ -196,6 +365,19 @@ backend:
       apply: "call reconfigure_ndpproxy after set to (re)load the ndp-proxy-go service"
     add_ndpproxy_alias:
       alias_ref: "alias.alias is the UUID of an EXTERNAL-type firewall alias (search_firewall_aliases), not a name or IP"
+    set_ping_job:
+      nested_node: "single object param `ping` — {settings:{hostname:'2001:db8::1', fam:'ip6', source_address:'…'}}; the returned uuid feeds start_ping_job"
+      stats: "poll search_ping_jobs for send/received/loss/min/avg/max; job pings until stop_ping_job"
+    set_capture_job:
+      nested_node: "single object param `packetcapture` — {settings:{interface:'em0', fam:'any', count:'100'}}; interface = comma list of PHYSICAL devices (em0, vlan01, …) — map friendly names via get_interfaces_overview"
+      workflow: "set → start → (traffic) → stop → view_capture_job / download_capture → remove"
+    add_npt_rule:
+      ipv6_only: "source_net/destination_net must be IPv6 prefixes; use trackif instead of destination_net for dynamic (tracked) external prefixes"
+      apply: "rules only become active after apply_firewall (which takes no parameters)"
+    reload_interface:
+      identifier: "friendly interface key (lan, wan, opt1 — see get_interface_names); re-runs address assignment, brief connectivity loss expected"
+    restart_service_instance:
+      dpinger: "gateway monitors are per-gateway dpinger instances: name='dpinger', id='<gateway name>' (search_services shows 'dpinger/<gateway>')"
     reconfigure_pattern:
       rule: "after any add/set/del change, call the module's reconfigure endpoint to apply"
 
@@ -223,8 +405,6 @@ backend:
       description: "Get a single firewall alias by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_firewall_alias:
@@ -240,8 +420,6 @@ backend:
         alias.description: { type: string, in: body }
         alias.proto: { type: string, in: body, description: "IPv4, IPv6 or empty for both" }
         alias.updatefreq: { type: string, in: body, description: "Update frequency in days (for urltable type)" }
-      response:
-        result_path: "$"
       pagination: none
 
     set_firewall_alias:
@@ -258,8 +436,6 @@ backend:
         alias.description: { type: string, in: body }
         alias.proto: { type: string, in: body }
         alias.updatefreq: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_firewall_alias:
@@ -269,8 +445,6 @@ backend:
       description: "Delete a firewall alias by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_firewall_alias:
@@ -281,8 +455,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_firewall_aliases:
@@ -290,8 +462,6 @@ backend:
       path: /firewall/alias/reconfigure
       access: admin
       description: "Apply alias changes to the running firewall"
-      response:
-        result_path: "$"
       pagination: none
 
     get_alias_uuid_by_name:
@@ -301,8 +471,6 @@ backend:
       description: "Look up alias UUID by name"
       params:
         name: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     list_alias_content:
@@ -312,8 +480,6 @@ backend:
       description: "List the resolved content (IPs/networks) of an alias"
       params:
         alias: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_alias_entry:
@@ -324,8 +490,6 @@ backend:
       params:
         alias: { type: string, in: path, required: true }
         address: { type: string, in: body, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     delete_alias_entry:
@@ -336,8 +500,6 @@ backend:
       params:
         alias: { type: string, in: path, required: true }
         address: { type: string, in: body, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     flush_alias:
@@ -347,8 +509,6 @@ backend:
       description: "Flush (clear) all entries from an alias at runtime"
       params:
         alias: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     list_network_aliases:
@@ -356,8 +516,6 @@ backend:
       path: /firewall/alias/listNetworkAliases
       access: read
       description: "List all aliases usable as network references"
-      response:
-        result_path: "$"
       pagination: none
 
     list_alias_categories:
@@ -365,8 +523,6 @@ backend:
       path: /firewall/alias/listCategories
       access: read
       description: "List all alias categories"
-      response:
-        result_path: "$"
       pagination: none
 
     list_geoip:
@@ -374,8 +530,6 @@ backend:
       path: /firewall/alias/getGeoIP
       access: read
       description: "Get GeoIP configuration and available countries"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -386,12 +540,63 @@ backend:
       method: POST
       path: /firewall/filter/searchRule
       access: read
-      description: "Search firewall filter rules"
+      description: >
+        Search firewall filter rules. Returns {total, returned, truncated, rows} — check
+        `truncated` before claiming a complete picture (rowCount defaults to 500 here, the
+        appliance's own default of 50 silently cut a 53-rule ruleset short).
+        The result MIXES user rules (MVC model) with OPNsense's automatic/internal rules
+        (anti-lockout, default deny, pfsync, …): `is_automatic: true` marks the latter and is
+        now always present as a real boolean — the raw API omits the key entirely on user rules.
+        All boolean-ish fields are normalised to real booleans (raw API returns `true` on
+        automatic rules but the string "1"/"0" on user rules, so `if (rule.log)` was true for
+        log "0"): enabled, log, quick, source_not, destination_not, interfacenot, disablereplyto,
+        nosync, nopfsync, allowopts, tcpflags_any.
+        NEGATION: the added comfort fields %source_net / %destination_net / %interface render
+        the negation flags inline ("NOT <alias>"), so a policy-routing rule can no longer
+        be misread as its own opposite. Always read those, or read the *_not flags — the bare
+        source_net/destination_net/interface fields say nothing about negation.
+        Filters: `interface` (comma list of friendly keys; pass "" for floating rules only,
+        omit for ALL rules), `category` (comma list of category UUIDs — automatic rules carry
+        their own category), `show_all: 1` additionally merges live pf hit counters
+        (evaluations/states/packets/bytes) into each row.
       params:
         current: { type: integer, in: body, default: 1 }
-        rowCount: { type: integer, in: body, default: 50 }
+        rowCount: { type: integer, in: body, default: 500 }
         searchPhrase: { type: string, in: body }
         sort: { type: string, in: body }
+        interface: { type: string, in: body, description: "Comma-separated interface keys (lan,opt3). Empty string = floating rules only; omit the param entirely for all rules." }
+        category: { type: string, in: body, description: "Comma-separated category UUIDs to filter on" }
+        show_all: { type: string, in: body, description: "1 = merge live pf rule statistics into each row" }
+      response:
+        result_path: "$"
+        transform: |
+          def truthy: if . == null then false
+                      elif type == "boolean" then .
+                      elif type == "number" then . != 0
+                      else (. == "1" or . == "true") end;
+          def neg($not): (. // "") as $v | if ($not | truthy) then "NOT " + $v else $v end;
+          def norm:
+            . as $r
+            | .is_automatic    = ($r.is_automatic | truthy)
+            | .enabled         = ($r.enabled | truthy)
+            | .log             = ($r.log | truthy)
+            | .quick           = ($r.quick | truthy)
+            | .source_not      = ($r.source_not | truthy)
+            | .destination_not = ($r.destination_not | truthy)
+            | .interfacenot    = ($r.interfacenot | truthy)
+            | .disablereplyto  = ($r.disablereplyto | truthy)
+            | .nosync          = ($r.nosync | truthy)
+            | .nopfsync        = ($r.nopfsync | truthy)
+            | .allowopts       = ($r.allowopts | truthy)
+            | .tcpflags_any    = ($r.tcpflags_any | truthy)
+            | .["%source_net"]      = ($r.source_net      | neg($r.source_not))
+            | .["%destination_net"] = ($r.destination_net | neg($r.destination_not))
+            | .["%interface"]       = ($r.interface       | neg($r.interfacenot))
+            | del(.category_colors);
+          (.rows | length) as $n
+          | (((.total | tostring | tonumber?) // $n) | if . < $n then $n else . end) as $t
+          | del(.rows, .total, .rowCount, .current) as $extra
+          | {total: $t, returned: $n, truncated: ($t > $n), rows: (.rows | map(norm))} + $extra
 
     get_firewall_rule:
       method: GET
@@ -400,52 +605,107 @@ backend:
       description: "Get a single firewall filter rule by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
+    # ── Filter rule writes ──────────────────────────────────────
+    # The params below are the COMPLETE writable field set of OPNsense/Firewall/Filter.xml
+    # (rules.rule) as shipped in 26.7. This matters: ToolMesh only transmits parameters that
+    # are declared here, so a field missing from this list cannot be set at all — and it fails
+    # SILENTLY (no validation error, the rule is simply created without it). Most of these
+    # fields are RESTRICTIVE, so a dropped field yields a rule that is more permissive than
+    # requested: asking for icmptype=echoreq without the field declared gave a rule that let
+    # every ICMP type through.
+    # setRule/addRule MERGE (BaseField::setNodes only writes keys present in the POST), so a
+    # partial set_firewall_rule leaves the untouched fields alone.
+    # Multi-value fields (icmptype, icmp6type, tcpflags1/2, categories, source_net,
+    # destination_net, interface) take a COMMA-SEPARATED list of bare option keys.
     add_firewall_rule:
       method: POST
       path: /firewall/filter/addRule
       access: write
-      description: "Create a new firewall filter rule"
+      description: >
+        Create a new firewall filter rule. Covers the full Filter.xml model — fields not listed
+        here cannot be sent. Apply with apply_firewall afterwards. Key gotchas: icmptype/icmp6type
+        are ignored unless protocol is ICMP/IPv6-ICMP, and leaving them empty means ALL ICMP types;
+        disablereplyto is regularly required on WAN-side rules; statetype defaults to "keep".
       params:
         rule.enabled: { type: string, in: body, default: "1" }
         rule.action: { type: string, in: body, required: true, description: "pass, block, reject" }
         rule.quick: { type: string, in: body, default: "1", description: "1=first match wins" }
-        rule.interface: { type: string, in: body, required: true, description: "Interface name (e.g. lan, wan, opt1)" }
+        rule.interface: { type: string, in: body, required: true, description: "Interface key(s), comma list (lan, wan, opt1). Empty = floating rule." }
+        rule.interfacenot: { type: string, in: body, description: "1 = invert the interface selection (rule matches on every interface EXCEPT those listed)" }
         rule.direction: { type: string, in: body, required: true, description: "in, out" }
         rule.ipprotocol: { type: string, in: body, default: "inet", description: "inet (IPv4), inet6 (IPv6), inet46 (both)" }
-        rule.protocol: { type: string, in: body, description: "TCP, UDP, ICMP, any, etc." }
-        rule.source_net: { type: string, in: body, description: "Source address/alias" }
+        rule.protocol: { type: string, in: body, description: "TCP, UDP, ICMP, IPV6-ICMP, any, etc." }
+        rule.icmptype: { type: string, in: body, description: "IPv4 ICMP types, comma list of bare keys (echoreq, echorep, unreach, redir, timex, paramprob, …). EMPTY = all types allowed. Only evaluated for protocol ICMP." }
+        rule.icmp6type: { type: string, in: body, description: "IPv6 ICMP types, comma list (echoreq, echorep, unreach, toobig, timex, paramprob, neighbrsol, neighbradv, routersol, routeradv, …). EMPTY = all types. Only for protocol IPV6-ICMP." }
+        rule.source_net: { type: string, in: body, description: "Source address/network/alias, comma list; 'any'" }
         rule.source_not: { type: string, in: body, description: "1=negate source" }
         rule.source_port: { type: string, in: body }
-        rule.destination_net: { type: string, in: body, description: "Destination address/alias" }
-        rule.destination_not: { type: string, in: body }
+        rule.destination_net: { type: string, in: body, description: "Destination address/network/alias, comma list; 'any'" }
+        rule.destination_not: { type: string, in: body, description: "1=negate destination" }
         rule.destination_port: { type: string, in: body }
-        rule.gateway: { type: string, in: body }
+        rule.gateway: { type: string, in: body, description: "Gateway or gateway-group NAME for policy routing" }
+        rule.replyto: { type: string, in: body, description: "Explicit reply-to gateway (overrides the automatic WAN reply-to)" }
+        rule.disablereplyto: { type: string, in: body, description: "1 = disable the automatic reply-to on WAN-type interfaces. Regularly needed on tunnel/multi-WAN setups where the implicit reply-to sends answers out the wrong link." }
+        rule.statetype: { type: string, in: body, description: "keep (default), sloppy, modulate, synproxy, none" }
+        rule.state-policy: { type: string, in: body, description: "Empty = system default, if-bound (bind states to interface), floating" }
+        rule.statetimeout: { type: string, in: body, description: "State timeout in seconds" }
         rule.log: { type: string, in: body, description: "1=log matching packets" }
+        rule.allowopts: { type: string, in: body, description: "1 = allow IP options (needed for e.g. IGMP/multicast)" }
+        rule.nosync: { type: string, in: body, description: "1 = do not sync this RULE to the HA peer" }
+        rule.nopfsync: { type: string, in: body, description: "1 = do not sync STATES created by this rule via pfsync" }
+        rule.tcpflags1: { type: string, in: body, description: "TCP flags that must be SET, comma list (syn, ack, fin, rst, psh, urg, ece, cwr)" }
+        rule.tcpflags2: { type: string, in: body, description: "TCP flags to examine (out of), comma list. Empty with tcpflags1 set means 'out of the default set'." }
+        rule.tcpflags_any: { type: string, in: body, description: "1 = any flag combination (disables tcpflags1/2)" }
+        rule.max: { type: string, in: body, description: "Max simultaneous states this rule may create" }
+        rule.max-src-nodes: { type: string, in: body, description: "Max source hosts" }
+        rule.max-src-states: { type: string, in: body, description: "Max states per source host" }
+        rule.max-src-conn: { type: string, in: body, description: "Max simultaneous TCP connections per source host" }
+        rule.max-src-conn-rate: { type: string, in: body, description: "New connections per source host allowed within max-src-conn-rates seconds" }
+        rule.max-src-conn-rates: { type: string, in: body, description: "Time window (seconds) for max-src-conn-rate" }
+        rule.overload: { type: string, in: body, description: "Alias NAME to add rate-limit offenders to (default virusprot)" }
+        rule.adaptivestart: { type: string, in: body, description: "State count at which adaptive timeouts start scaling" }
+        rule.adaptiveend: { type: string, in: body, description: "State count at which adaptive timeouts reach zero" }
+        rule.udp-first: { type: string, in: body, description: "UDP first-packet state timeout (s)" }
+        rule.udp-single: { type: string, in: body, description: "UDP single-packet state timeout (s)" }
+        rule.udp-multiple: { type: string, in: body, description: "UDP multiple-packet state timeout (s)" }
+        rule.prio: { type: string, in: body, description: "Match only packets with this VLAN PCP / queue priority (0-7)" }
+        rule.set-prio: { type: string, in: body, description: "Set VLAN PCP on matching packets (0-7)" }
+        rule.set-prio-low: { type: string, in: body, description: "Priority for TCP ACK / low-latency packets (0-7)" }
+        rule.tag: { type: string, in: body, description: "Tag to attach to matching packets" }
+        rule.tagged: { type: string, in: body, description: "Match only packets already carrying this tag" }
+        rule.sched: { type: string, in: body, description: "Schedule UUID (time-based rule)" }
+        rule.tos: { type: string, in: body, description: "Match TOS/DSCP value" }
+        rule.divert-to: { type: string, in: body, description: "Divert socket / port (transparent proxying)" }
+        rule.shaper1: { type: string, in: body, description: "Traffic-shaper pipe/queue UUID (direction 1)" }
+        rule.shaper2: { type: string, in: body, description: "Traffic-shaper pipe/queue UUID (direction 2)" }
         rule.description: { type: string, in: body }
         rule.categories: { type: string, in: body, description: "Comma-separated category UUIDs" }
-        rule.sequence: { type: integer, in: body, description: "Sort order" }
-      response:
-        result_path: "$"
+        rule.sequence: { type: integer, in: body, description: "Sort order (1-999999)" }
       pagination: none
 
     set_firewall_rule:
       method: POST
       path: /firewall/filter/setRule/{uuid}
       access: write
-      description: "Update an existing firewall filter rule"
+      description: >
+        Update an existing firewall filter rule. Same full field set as add_firewall_rule; the
+        endpoint MERGES, so omitted fields keep their stored value. A field that is not in this
+        list cannot be written and is dropped without any error — check the list before assuming
+        a restriction was applied. Apply with apply_firewall afterwards.
       params:
         uuid: { type: string, in: path, required: true }
         rule.enabled: { type: string, in: body }
-        rule.action: { type: string, in: body }
+        rule.action: { type: string, in: body, description: "pass, block, reject" }
         rule.quick: { type: string, in: body }
-        rule.interface: { type: string, in: body }
+        rule.interface: { type: string, in: body, description: "Interface key(s), comma list. Empty = floating rule." }
+        rule.interfacenot: { type: string, in: body, description: "1 = invert the interface selection" }
         rule.direction: { type: string, in: body }
         rule.ipprotocol: { type: string, in: body }
         rule.protocol: { type: string, in: body }
+        rule.icmptype: { type: string, in: body, description: "IPv4 ICMP types, comma list of bare keys. EMPTY = all types." }
+        rule.icmp6type: { type: string, in: body, description: "IPv6 ICMP types, comma list of bare keys. EMPTY = all types." }
         rule.source_net: { type: string, in: body }
         rule.source_not: { type: string, in: body }
         rule.source_port: { type: string, in: body }
@@ -453,12 +713,43 @@ backend:
         rule.destination_not: { type: string, in: body }
         rule.destination_port: { type: string, in: body }
         rule.gateway: { type: string, in: body }
+        rule.replyto: { type: string, in: body }
+        rule.disablereplyto: { type: string, in: body, description: "1 = disable the automatic WAN reply-to" }
+        rule.statetype: { type: string, in: body, description: "keep, sloppy, modulate, synproxy, none" }
+        rule.state-policy: { type: string, in: body, description: "empty, if-bound, floating" }
+        rule.statetimeout: { type: string, in: body }
         rule.log: { type: string, in: body }
+        rule.allowopts: { type: string, in: body }
+        rule.nosync: { type: string, in: body, description: "1 = do not sync this rule to the HA peer" }
+        rule.nopfsync: { type: string, in: body, description: "1 = do not pfsync states from this rule" }
+        rule.tcpflags1: { type: string, in: body }
+        rule.tcpflags2: { type: string, in: body }
+        rule.tcpflags_any: { type: string, in: body }
+        rule.max: { type: string, in: body }
+        rule.max-src-nodes: { type: string, in: body }
+        rule.max-src-states: { type: string, in: body }
+        rule.max-src-conn: { type: string, in: body }
+        rule.max-src-conn-rate: { type: string, in: body }
+        rule.max-src-conn-rates: { type: string, in: body }
+        rule.overload: { type: string, in: body }
+        rule.adaptivestart: { type: string, in: body }
+        rule.adaptiveend: { type: string, in: body }
+        rule.udp-first: { type: string, in: body }
+        rule.udp-single: { type: string, in: body }
+        rule.udp-multiple: { type: string, in: body }
+        rule.prio: { type: string, in: body }
+        rule.set-prio: { type: string, in: body }
+        rule.set-prio-low: { type: string, in: body }
+        rule.tag: { type: string, in: body }
+        rule.tagged: { type: string, in: body }
+        rule.sched: { type: string, in: body }
+        rule.tos: { type: string, in: body }
+        rule.divert-to: { type: string, in: body }
+        rule.shaper1: { type: string, in: body }
+        rule.shaper2: { type: string, in: body }
         rule.description: { type: string, in: body }
         rule.categories: { type: string, in: body }
         rule.sequence: { type: integer, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_firewall_rule:
@@ -468,8 +759,6 @@ backend:
       description: "Delete a firewall filter rule"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_firewall_rule:
@@ -480,8 +769,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
-      response:
-        result_path: "$"
       pagination: none
 
     move_firewall_rule_before:
@@ -492,8 +779,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true, description: "UUID of rule to move" }
         target_uuid: { type: string, in: path, required: true, description: "UUID of target rule (moved rule will be placed before this)" }
-      response:
-        result_path: "$"
       pagination: none
 
     get_firewall_interface_list:
@@ -501,8 +786,6 @@ backend:
       path: /firewall/filter/getInterfaceList
       access: read
       description: "List interfaces available for firewall rules"
-      response:
-        result_path: "$"
       pagination: none
 
     get_firewall_rule_stats:
@@ -510,52 +793,28 @@ backend:
       path: /firewall/filter_util/ruleStats
       access: read
       description: "Get firewall rule hit statistics"
-      response:
-        result_path: "$"
       pagination: none
 
-    # ── Firewall apply/rollback ─────────────────────────────────
-
-    savepoint_firewall:
-      method: POST
-      path: /firewall/filter_base/savepoint
-      access: admin
-      description: "Create a savepoint before applying firewall changes (returns revision ID for rollback)"
-      response:
-        result_path: "$"
-      pagination: none
+    # ── Firewall apply ──────────────────────────────────────────
+    # There is NO savepoint / rollback / revert API in 26.7: FilterBaseController exposes
+    # exactly one write-side action, applyAction(), and it takes no arguments. The former
+    # savepoint_firewall / cancel_rollback_firewall / revert_firewall tools pointed at
+    # endpoints that answer {"errorMessage":"Endpoint not found"} and have been removed —
+    # the safety net for a risky ruleset change is a config backup (list_backups /
+    # revert_backup), not a filter savepoint.
 
     apply_firewall:
       method: POST
-      path: /firewall/filter_base/apply/{rollback_revision}
+      path: /firewall/filter_base/apply
       access: admin
-      description: "Apply firewall filter changes. Pass a rollback_revision from savepoint_firewall for auto-rollback safety (reverts after 60s unless confirmed via cancel_rollback_firewall)."
-      params:
-        rollback_revision: { type: string, in: path, required: true, description: "Revision from savepoint_firewall — auto-rollback if not confirmed within 60s" }
-      response:
-        result_path: "$"
-      pagination: none
-
-    cancel_rollback_firewall:
-      method: POST
-      path: /firewall/filter_base/cancelRollback/{rollback_revision}
-      access: admin
-      description: "Confirm applied firewall changes (cancel auto-rollback)"
-      params:
-        rollback_revision: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
-      pagination: none
-
-    revert_firewall:
-      method: POST
-      path: /firewall/filter_base/revert/{revision}
-      access: admin
-      description: "Revert firewall to a previous revision"
-      params:
-        revision: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
+      description: >
+        Apply the stored firewall ruleset to the running pf (runs configd "filter reload
+        skip_alias"). Takes NO parameters — the old {rollback_revision} path segment does not
+        exist on 26.7 and made this tool uncallable. Returns {"status":"OK"} plus the reload
+        output. NOTE: model writes via add_/set_/del_/toggle_ endpoints already trigger a
+        config save that reloads the filter on most installations, so an explicit apply is
+        usually a no-op confirmation rather than the step that activates the change. NPT/DNAT/
+        SNAT rules share this same pf reload; there is no separate per-family apply.
       pagination: none
 
     # =========================================================================
@@ -581,8 +840,6 @@ backend:
         category.name: { type: string, in: body, required: true }
         category.auto: { type: string, in: body, default: "0" }
         category.color: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_firewall_category:
@@ -595,8 +852,6 @@ backend:
         category.name: { type: string, in: body }
         category.auto: { type: string, in: body }
         category.color: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_firewall_category:
       method: POST
@@ -605,8 +860,6 @@ backend:
       description: "Delete a firewall rule category"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -617,11 +870,42 @@ backend:
       method: POST
       path: /firewall/dNat/searchRule
       access: read
-      description: "Search destination NAT (port forwarding) rules"
+      description: >
+        Search destination NAT (port forwarding) rules. The NAT families use different field
+        conventions than the filter rules — inverted polarity and dot instead of underscore
+        notation — which reads as "everything is disabled" if taken at face value: raw rows
+        carry `disabled: "0"` (NOT `enabled`), `descr` (not `description`) and
+        `source.network` / `destination.network` / `destination.not` (not source_net /
+        destination_net / destination_not). This tool therefore ADDS filter-rule-compatible
+        fields: `enabled` (real boolean, inverse of disabled), `description`, and the negation-
+        aware %source_net / %destination_net ("NOT <alias>" when the .not flag is set).
+        disabled/log/is_automatic/nordr are normalised to real booleans.
       params:
         current: { type: integer, in: body, default: 1 }
-        rowCount: { type: integer, in: body, default: 50 }
+        rowCount: { type: integer, in: body, default: 500 }
         searchPhrase: { type: string, in: body }
+      response:
+        result_path: "$"
+        transform: |
+          def truthy: if . == null then false
+                      elif type == "boolean" then .
+                      elif type == "number" then . != 0
+                      else (. == "1" or . == "true") end;
+          def neg($not): (. // "") as $v | if ($not | truthy) then "NOT " + $v else $v end;
+          def norm:
+            . as $r
+            | .disabled     = ($r.disabled | truthy)
+            | .enabled      = (($r.disabled | truthy) | not)
+            | .is_automatic = ($r.is_automatic | truthy)
+            | .log          = ($r.log | truthy)
+            | .nordr        = ($r.nordr | truthy)
+            | .description  = ($r.description // $r.descr // "")
+            | .["%source_net"]      = ($r["source.network"]      | neg($r["source.not"]))
+            | .["%destination_net"] = ($r["destination.network"] | neg($r["destination.not"]));
+          (.rows | length) as $n
+          | (((.total | tostring | tonumber?) // $n) | if . < $n then $n else . end) as $t
+          | del(.rows, .total, .rowCount, .current) as $extra
+          | {total: $t, returned: $n, truncated: ($t > $n), rows: (.rows | map(norm))} + $extra
 
     get_dnat_rule:
       method: GET
@@ -630,8 +914,6 @@ backend:
       description: "Get a single DNAT rule by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_dnat_rule:
@@ -652,8 +934,6 @@ backend:
         rule.target_port: { type: string, in: body, description: "Internal target port" }
         rule.log: { type: string, in: body }
         rule.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_dnat_rule:
@@ -675,8 +955,6 @@ backend:
         rule.target_port: { type: string, in: body }
         rule.log: { type: string, in: body }
         rule.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_dnat_rule:
@@ -686,8 +964,6 @@ backend:
       description: "Delete a destination NAT (port forwarding) rule by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_dnat_rule:
@@ -698,23 +974,87 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         disabled: { type: string, in: query, description: "1=disable, 0=enable — omit to toggle" }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
     # FIREWALL — SOURCE NAT (Outbound NAT)
     # =========================================================================
+    # Read the MODE first (get_outbound_nat_mode). An empty search_snat_rules result means
+    # something completely different per mode: in "automatic" there are no manual rules by
+    # design and NAT still happens; in "advanced" an empty list means NO outbound NAT at all.
+
+    get_outbound_nat_mode:
+      method: GET
+      path: /firewall/source_nat/get
+      access: read
+      description: >
+        Get the outbound (source) NAT generation mode — the Firewall→NAT→Outbound radio button.
+        Returns {filter:{general:{snat_mode:{<key>:{value,selected}}}}} as an OPNsense SELECT map;
+        the selected key is one of automatic (rules generated from the interface config),
+        hybrid (automatic PLUS the manual rules), advanced (manual rules ONLY) or disabled
+        (no source NAT at all). Without this, an empty search_snat_rules cannot be interpreted.
+      pagination: none
+
+    set_outbound_nat_mode:
+      method: POST
+      path: /firewall/source_nat/set
+      # Model node is `filter`, the mode lives at filter[general][snat_mode]; OPNsense reads
+      # PHP $_POST so this must be form-urlencoded with a single nested object param.
+      content_type: application/x-www-form-urlencoded
+      access: admin
+      description: >
+        Set the outbound (source) NAT generation mode. Pass the object param `filter` as
+        {general: {snat_mode: "advanced"}} — a BARE option key, not the {value,selected} map
+        from get_outbound_nat_mode. Valid: automatic, hybrid, advanced, disabled. Switching from
+        automatic/hybrid to advanced with no manual rules present DROPS ALL OUTBOUND NAT and
+        will cut every masqueraded client off the internet — read search_snat_rules first.
+        Apply with apply_firewall.
+      params:
+        filter:
+          type: object
+          in: body
+          required: true
+          description: 'Outbound NAT general settings, e.g. {general: {snat_mode: "advanced"}}'
+      pagination: none
 
     search_snat_rules:
       method: POST
       path: /firewall/sourceNat/searchRule
       access: read
-      description: "Search source NAT (outbound NAT) rules"
+      description: >
+        Search source NAT (outbound NAT) rules. An EMPTY rows list is ambiguous on its own —
+        call get_outbound_nat_mode: in mode "automatic" no manual rules exist by design while
+        NAT is still active; in mode "advanced" an empty list means no outbound NAT is applied.
+        Same field-convention normalisation as search_dnat_rules: raw rows use `disabled`,
+        `descr` and dotted source.network/destination.network, so `enabled` (boolean),
+        `description` and negation-aware %source_net / %destination_net are added.
       params:
         current: { type: integer, in: body, default: 1 }
-        rowCount: { type: integer, in: body, default: 50 }
+        rowCount: { type: integer, in: body, default: 500 }
         searchPhrase: { type: string, in: body }
+      response:
+        result_path: "$"
+        transform: |
+          def truthy: if . == null then false
+                      elif type == "boolean" then .
+                      elif type == "number" then . != 0
+                      else (. == "1" or . == "true") end;
+          def neg($not): (. // "") as $v | if ($not | truthy) then "NOT " + $v else $v end;
+          def norm:
+            . as $r
+            | .disabled     = ($r.disabled | truthy)
+            | .enabled      = (if ($r.enabled | type) == "string" or ($r.enabled | type) == "boolean"
+                               then ($r.enabled | truthy) else (($r.disabled | truthy) | not) end)
+            | .is_automatic = ($r.is_automatic | truthy)
+            | .log          = ($r.log | truthy)
+            | .nonat        = ($r.nonat | truthy)
+            | .description  = ($r.description // $r.descr // "")
+            | .["%source_net"]      = (($r["source.network"] // $r.source_net) | neg($r["source.not"] // $r.source_not))
+            | .["%destination_net"] = (($r["destination.network"] // $r.destination_net) | neg($r["destination.not"] // $r.destination_not));
+          (.rows | length) as $n
+          | (((.total | tostring | tonumber?) // $n) | if . < $n then $n else . end) as $t
+          | del(.rows, .total, .rowCount, .current) as $extra
+          | {total: $t, returned: $n, truncated: ($t > $n), rows: (.rows | map(norm))} + $extra
 
     add_snat_rule:
       method: POST
@@ -733,8 +1073,6 @@ backend:
         rule.target: { type: string, in: body, description: "NAT target IP/alias" }
         rule.log: { type: string, in: body }
         rule.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_snat_rule:
@@ -755,8 +1093,6 @@ backend:
         rule.target: { type: string, in: body, description: "NAT target IP/alias" }
         rule.log: { type: string, in: body }
         rule.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_snat_rule:
       method: POST
@@ -765,8 +1101,95 @@ backend:
       description: "Delete a source NAT rule"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL — NPTv6 (IPv6 NETWORK PREFIX TRANSLATION)
+    # =========================================================================
+    # npt.rule model node. Changes require apply_firewall (same pf reload as
+    # filter/DNAT/SNAT rules) — there is no separate NPT reconfigure endpoint.
+
+    search_npt_rules:
+      method: POST
+      path: /firewall/npt/search_rule
+      access: read
+      description: "Search NPTv6 (IPv6 network prefix translation) rules. Rows include uuid, sequence, interface, source_net (internal prefix), destination_net (external prefix), trackif, enabled."
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_npt_rule:
+      method: GET
+      path: /firewall/npt/get_rule/{uuid}
+      access: read
+      description: "Get a single NPTv6 rule by UUID. SELECT fields (interface, trackif, categories) come back as {opt:{value,selected}} maps — flatten to the bare selected key before posting back via set_npt_rule."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    add_npt_rule:
+      method: POST
+      path: /firewall/npt/add_rule
+      access: write
+      description: >
+        Create an NPTv6 rule translating an internal IPv6 prefix (source_net) to an
+        external one (destination_net). For dynamically assigned (tracked) external
+        prefixes set trackif to the upstream interface INSTEAD of destination_net.
+        Booleans are "0"/"1" strings; interface is the bare friendly key. The rule is
+        stored only — call apply_firewall to activate it in pf. Returns
+        {"result":"saved","uuid":...} or {"result":"failed","validations":{...}}.
+      params:
+        rule.enabled: { type: string, in: body, default: "1" }
+        rule.sequence: { type: string, in: body, description: "Evaluation order 1-999999 (default 1)" }
+        rule.interface: { type: string, in: body, required: true, description: "Bare friendly key, e.g. wan" }
+        rule.source_net: { type: string, in: body, required: true, description: "Internal IPv6 prefix, e.g. fc00:1::/64" }
+        rule.destination_net: { type: string, in: body, description: "External IPv6 prefix — required unless trackif is set" }
+        rule.trackif: { type: string, in: body, description: "Track interface (bare key) for dynamic external prefixes — used instead of destination_net" }
+        rule.log: { type: string, in: body, default: "0" }
+        rule.categories: { type: string, in: body, description: "Comma-separated category UUIDs" }
+        rule.description: { type: string, in: body }
+      pagination: none
+
+    set_npt_rule:
+      method: POST
+      path: /firewall/npt/set_rule/{uuid}
+      access: write
+      description: >
+        Update an NPTv6 rule. FULL-REPLACE (setBase): any field you omit is reset to
+        its model default — read with get_npt_rule, flatten SELECT maps to bare
+        values, change what you need, then post the COMPLETE rule. Call
+        apply_firewall afterwards to activate.
+      params:
+        uuid: { type: string, in: path, required: true }
+        rule.enabled: { type: string, in: body }
+        rule.sequence: { type: string, in: body }
+        rule.interface: { type: string, in: body }
+        rule.source_net: { type: string, in: body }
+        rule.destination_net: { type: string, in: body }
+        rule.trackif: { type: string, in: body }
+        rule.log: { type: string, in: body }
+        rule.categories: { type: string, in: body }
+        rule.description: { type: string, in: body }
+      pagination: none
+
+    del_npt_rule:
+      method: POST
+      path: /firewall/npt/del_rule/{uuid}
+      access: dangerous
+      description: "Delete an NPTv6 rule by UUID. Call apply_firewall afterwards to deactivate it in pf."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    toggle_npt_rule:
+      method: POST
+      path: /firewall/npt/toggle_rule/{uuid}/{enabled}
+      access: write
+      description: "Enable/disable an NPTv6 rule. enabled=1 to enable, 0 to disable. Call apply_firewall afterwards."
+      params:
+        uuid: { type: string, in: path, required: true }
+        enabled: { type: string, in: path, required: true, description: "1=enable, 0=disable" }
       pagination: none
 
     # =========================================================================
@@ -791,8 +1214,6 @@ backend:
       description: "Get pf firewall statistics. Available sections: info, memory, timeouts, interfaces, rules. Pass a section name or 'all' for everything."
       params:
         section: { type: string, in: path, required: true, description: "Section name: info, memory, timeouts, interfaces, rules, or 'all'" }
-      response:
-        result_path: "$"
       pagination: none
 
     get_firewall_stats:
@@ -800,8 +1221,6 @@ backend:
       path: /diagnostics/firewall/stats
       access: read
       description: "Get firewall statistics summary"
-      response:
-        result_path: "$"
       pagination: none
 
     get_firewall_log:
@@ -823,19 +1242,31 @@ backend:
       path: /diagnostics/firewall/log_filters
       access: read
       description: "Get available firewall log filter options"
-      response:
-        result_path: "$"
       pagination: none
 
     kill_firewall_states:
       method: POST
       path: /diagnostics/firewall/kill_states
       access: dangerous
-      description: "Kill firewall states matching criteria"
+      description: >
+        Kill pf states selected by address filter and/or rule label. WORKS ONLY FOR BARE IPv4
+        ADDRESSES — this is an appliance-side limitation, not a tool bug, and it fails SILENTLY
+        with {"result":"ok","dropped_states":0}. OPNsense runs `filter` through
+        SanitizeFilter::filter_query, which keeps only [0-9 a-z A-Z , space * - _ . #] and
+        therefore STRIPS ":" and "/": an IPv6 address "2001:db8::1" arrives as "2001db81", and
+        a CIDR "198.51.100.0/24" arrives as "198.51.100.024" — neither parses as a network, so both
+        degrade to a plain substring match that matches nothing. Verified against 26.7.1_1
+        (kill_states.py + lib/states.py + SanitizeFilter.php).
+        WHAT WORKS: one or more space-separated bare IPv4 addresses (e.g. "192.0.2.10
+        192.0.2.11"); each is matched against a state's src/dst/nat address and gateway, and ALL
+        address clauses must match. Tokens that are not parseable as an address become substring
+        filters over the state record. `ruleid` is matched as a lowercase substring of the pf
+        rule label and is sanitised to alphanumerics only.
+        FOR IPv6 OR CIDR use query_firewall_states to get stateid/creatorid and then
+        del_firewall_state per state, or flush_firewall_states to drop everything.
       params:
-        filter: { type: string, in: body, description: "Filter expression for states to kill" }
-      response:
-        result_path: "$"
+        filter: { type: string, in: body, description: "Space-separated bare IPv4 addresses (and/or plain substrings). Colons and slashes are stripped by the appliance — no IPv6, no CIDR." }
+        ruleid: { type: string, in: body, description: "pf rule label substring (from list_firewall_rule_ids); sanitised to [A-Za-z0-9]" }
       pagination: none
 
     flush_firewall_states:
@@ -843,8 +1274,6 @@ backend:
       path: /diagnostics/firewall/flush_states
       access: dangerous
       description: "Flush ALL firewall states"
-      response:
-        result_path: "$"
       pagination: none
 
     del_firewall_state:
@@ -855,8 +1284,6 @@ backend:
       params:
         stateid: { type: string, in: path, required: true }
         creatorid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     list_firewall_rule_ids:
@@ -864,8 +1291,6 @@ backend:
       path: /diagnostics/firewall/list_rule_ids
       access: read
       description: "List all active pf rule IDs with descriptions"
-      response:
-        result_path: "$"
       pagination: none
 
     query_pf_top:
@@ -876,8 +1301,6 @@ backend:
       params:
         current: { type: integer, in: body, default: 1 }
         rowCount: { type: integer, in: body, default: 50 }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -911,8 +1334,6 @@ backend:
       path: /diagnostics/interface/flush_arp
       access: dangerous
       description: "Flush the entire ARP table"
-      response:
-        result_path: "$"
       pagination: none
 
     get_routes:
@@ -920,8 +1341,6 @@ backend:
       path: /diagnostics/interface/get_routes
       access: read
       description: "Get the system routing table"
-      response:
-        result_path: "$"
       pagination: none
 
     get_interface_config:
@@ -929,8 +1348,6 @@ backend:
       path: /diagnostics/interface/get_interface_config
       access: read
       description: "Get configuration of all network interfaces"
-      response:
-        result_path: "$"
       pagination: none
 
     get_interface_names:
@@ -938,8 +1355,6 @@ backend:
       path: /diagnostics/interface/get_interface_names
       access: read
       description: "Get interface name mappings (physical ↔ friendly)"
-      response:
-        result_path: "$"
       pagination: none
 
     get_interface_statistics:
@@ -947,8 +1362,6 @@ backend:
       path: /diagnostics/interface/get_interface_statistics
       access: read
       description: "Get traffic statistics for all interfaces"
-      response:
-        result_path: "$"
       pagination: none
 
     get_vip_status:
@@ -956,8 +1369,6 @@ backend:
       path: /diagnostics/interface/get_vip_status
       access: read
       description: "Get CARP/VIP status for high availability"
-      response:
-        result_path: "$"
       pagination: none
 
     get_pfsync_nodes:
@@ -965,8 +1376,6 @@ backend:
       path: /diagnostics/interface/get_pfsync_nodes
       access: read
       description: "Get pfsync HA cluster node status"
-      response:
-        result_path: "$"
       pagination: none
 
     del_route:
@@ -977,8 +1386,6 @@ backend:
       params:
         destination: { type: string, in: body, required: true }
         gateway: { type: string, in: body, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     get_protocol_statistics:
@@ -986,8 +1393,6 @@ backend:
       path: /diagnostics/interface/get_protocol_statistics
       access: read
       description: "Get protocol-level traffic statistics (TCP, UDP, ICMP, etc.)"
-      response:
-        result_path: "$"
       pagination: none
 
     get_socket_statistics:
@@ -995,8 +1400,6 @@ backend:
       path: /diagnostics/interface/get_socket_statistics
       access: read
       description: "Get active socket/connection statistics"
-      response:
-        result_path: "$"
       pagination: none
 
     get_memory_statistics:
@@ -1004,8 +1407,6 @@ backend:
       path: /diagnostics/interface/get_memory_statistics
       access: read
       description: "Get network memory (mbuf) allocation statistics"
-      response:
-        result_path: "$"
       pagination: none
 
     get_bpf_statistics:
@@ -1013,8 +1414,6 @@ backend:
       path: /diagnostics/interface/get_bpf_statistics
       access: read
       description: "Get BPF (Berkeley Packet Filter) statistics"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -1025,9 +1424,16 @@ backend:
       method: GET
       path: /diagnostics/system/system_information
       access: read
-      description: "Get comprehensive system information (hostname, version, uptime, CPU, memory, etc.)"
+      description: >
+        Hostname and OPNsense/kernel version strings. Much thinner than the name suggests —
+        no uptime, CPU or memory here (use get_system_resources / get_system_status).
+        The raw response also carries an `updates` field whose value is the UI label
+        "Click to check for updates." rather than any update state; it is stripped here.
+        Real update state: check_firmware_updates or get_firmware_status.
       response:
         result_path: "$"
+        transform: |
+          del(.updates)
       pagination: none
 
     get_system_resources:
@@ -1035,17 +1441,17 @@ backend:
       path: /diagnostics/system/system_resources
       access: read
       description: "Get system resource usage (CPU, memory, processes)"
-      response:
-        result_path: "$"
       pagination: none
 
     get_system_memory:
       method: GET
       path: /diagnostics/system/memory
       access: read
-      description: "Get detailed memory usage"
-      response:
-        result_path: "$"
+      description: >
+        RAW kernel allocator dump: the complete vmstat malloc-statistics and memory-zone
+        statistics (~45 KB of per-bucket counters). This is NOT a memory usage summary and is
+        almost never what you want — for total/used/ARC in a few hundred bytes use
+        get_system_resources. Reach for this only when you need per-zone allocator detail.
       pagination: none
 
     get_system_disk:
@@ -1053,8 +1459,6 @@ backend:
       path: /diagnostics/system/system_disk
       access: read
       description: "Get disk usage for all filesystems"
-      response:
-        result_path: "$"
       pagination: none
 
     get_system_temperature:
@@ -1062,8 +1466,6 @@ backend:
       path: /diagnostics/system/system_temperature
       access: read
       description: "Get system temperature sensors"
-      response:
-        result_path: "$"
       pagination: none
 
     get_system_time:
@@ -1071,8 +1473,6 @@ backend:
       path: /diagnostics/system/system_time
       access: read
       description: "Get current system time and uptime"
-      response:
-        result_path: "$"
       pagination: none
 
     get_system_swap:
@@ -1080,8 +1480,6 @@ backend:
       path: /diagnostics/system/system_swap
       access: read
       description: "Get swap space usage statistics (total, used, free)"
-      response:
-        result_path: "$"
       pagination: none
 
     get_system_mbuf:
@@ -1089,8 +1487,6 @@ backend:
       path: /diagnostics/system/system_mbuf
       access: read
       description: "Get mbuf (network memory buffer) statistics"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Diagnostics: Activity & DNS ─────────────────────────────
@@ -1100,8 +1496,6 @@ backend:
       path: /diagnostics/activity/get_activity
       access: read
       description: "Get running processes and system activity"
-      response:
-        result_path: "$"
       pagination: none
 
     reverse_dns_lookup:
@@ -1111,8 +1505,6 @@ backend:
       description: "Perform a reverse DNS lookup"
       params:
         address: { type: string, in: query, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -1124,8 +1516,6 @@ backend:
       path: /diagnostics/traffic/_interface
       access: read
       description: "Get current traffic rates per interface"
-      response:
-        result_path: "$"
       pagination: none
 
     get_traffic_top:
@@ -1135,8 +1525,171 @@ backend:
       description: "Get top traffic connections for specified interfaces"
       params:
         interfaces: { type: string, in: path, required: true, description: "Comma-separated interface names" }
+      pagination: none
+
+    # =========================================================================
+    # DIAGNOSTICS — PING JOBS
+    # =========================================================================
+    # 2-phase in-memory jobs: set_ping_job (returns uuid) → start_ping_job →
+    # poll search_ping_jobs (status + stats) → stop_ping_job → remove_ping_job.
+    # Jobs live under /tmp and do not survive a reboot.
+
+    set_ping_job:
+      method: POST
+      path: /diagnostics/ping/set
+      access: write
+      description: >
+        Create a ping diagnostics job (does NOT start it). Pass the single object
+        param `ping` with a nested settings object; returns {"result":"ok","uuid":"…"}
+        — feed the uuid to start_ping_job. Settings fields: hostname (required —
+        target host/IP), fam (address family: "ip"=IPv4, "ip6"=IPv6; default ip),
+        source_address (source IP to ping from — controls source-address selection,
+        e.g. to test a specific GUA/ULA), packetsize (bytes 1-65535), disable_frag
+        ("0"/"1"), interval (seconds between packets 1-120), description.
+      params:
+        ping:
+          type: object
+          in: body
+          required: true
+          description: >
+            Nested job settings, e.g. {settings:{hostname:"2001:db8::53", fam:"ip6",
+            source_address:"2001:db8:1::1"}}
+      pagination: none
+
+    start_ping_job:
+      method: POST
+      path: /diagnostics/ping/start/{jobid}
+      access: write
+      description: "Start a ping job created with set_ping_job. It pings continuously until stop_ping_job."
+      params:
+        jobid: { type: string, in: path, required: true, description: "uuid from set_ping_job" }
+      pagination: none
+
+    stop_ping_job:
+      method: POST
+      path: /diagnostics/ping/stop/{jobid}
+      access: write
+      description: "Stop a running ping job. Final statistics stay readable via search_ping_jobs until the job is removed."
+      params:
+        jobid: { type: string, in: path, required: true }
+      pagination: none
+
+    remove_ping_job:
+      method: POST
+      path: /diagnostics/ping/remove/{jobid}
+      access: write
+      description: "Remove a stopped ping job and its result files"
+      params:
+        jobid: { type: string, in: path, required: true }
+      pagination: none
+
+    search_ping_jobs:
+      method: POST
+      path: /diagnostics/ping/search_jobs
+      access: read
+      description: "List ping jobs with live status and statistics per job: id (uuid), status, hostname, send, received, loss, min, avg, max (ms)"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    # =========================================================================
+    # DIAGNOSTICS — PACKET CAPTURE JOBS
+    # =========================================================================
+    # Same 2-phase job pattern as ping: set (uuid) → start → stop →
+    # view/download → remove. Capture auto-stops once `count` packets are seen.
+
+    set_capture_job:
+      method: POST
+      path: /diagnostics/packet_capture/set
+      access: write
+      description: >
+        Create a packet capture job (does NOT start it). Pass the single object param
+        `packetcapture` with a nested settings object; returns {"result":"ok","uuid":"…"}.
+        Settings fields: interface (required — comma-separated PHYSICAL device names as
+        listed in get_interfaces_overview `device`, e.g. "em0" or "em0,vlan01" — NOT
+        friendly keys like lan/wan, those fail with "Option not in list"), fam
+        (required address-family filter: any|ip|ip6|arp), promiscuous
+        ("0"/"1", default 0), protocol (tcpdump protocol filter, default any — e.g. icmp,
+        tcp, udp, esp), protocol_not ("1" inverts the protocol match), host (host/network
+        filter), port (1-65535), port_not ("1" inverts the port match), snaplen (bytes
+        per packet 1-262144), count (packet limit, default 100 — capture auto-stops when
+        reached), description.
+      params:
+        packetcapture:
+          type: object
+          in: body
+          required: true
+          description: >
+            Nested job settings, e.g. {settings:{interface:"lan", fam:"ip6",
+            protocol:"icmp", count:"200"}}
+      pagination: none
+
+    start_capture_job:
+      method: POST
+      path: /diagnostics/packet_capture/start/{jobid}
+      access: write
+      description: "Start a packet capture job created with set_capture_job"
+      params:
+        jobid: { type: string, in: path, required: true, description: "uuid from set_capture_job" }
+      pagination: none
+
+    stop_capture_job:
+      method: POST
+      path: /diagnostics/packet_capture/stop/{jobid}
+      access: write
+      description: "Stop a running packet capture job (it also auto-stops after `count` packets)"
+      params:
+        jobid: { type: string, in: path, required: true }
+      pagination: none
+
+    view_capture_job:
+      method: GET
+      path: /diagnostics/packet_capture/view/{jobid}/{detail}
+      access: read
+      description: "View decoded packets of a capture job (tcpdump text rows per interface, with interface name map). detail: normal, medium (-v) or high (-vv)."
+      params:
+        jobid: { type: string, in: path, required: true }
+        detail: { type: string, in: path, required: true, default: "normal", description: "normal | medium | high" }
+      pagination: none
+
+    download_capture:
+      method: GET
+      path: /diagnostics/packet_capture/download/{jobid}
+      access: read
+      description: "Download the raw pcap archive of a capture job as a file (open in Wireshark/tcpdump)"
+      params:
+        jobid: { type: string, in: path, required: true }
       response:
-        result_path: "$"
+        type: file_url
+      pagination: none
+
+    remove_capture_job:
+      method: POST
+      path: /diagnostics/packet_capture/remove/{jobid}
+      access: write
+      description: "Remove a stopped capture job and its pcap files"
+      params:
+        jobid: { type: string, in: path, required: true }
+      pagination: none
+
+    search_capture_jobs:
+      method: POST
+      path: /diagnostics/packet_capture/search_jobs
+      access: read
+      description: "List packet capture jobs with status per job: id (uuid), status (stopped/running), interface, description"
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 50 }
+        searchPhrase: { type: string, in: body }
+
+    get_capture_macinfo:
+      method: GET
+      path: /diagnostics/packet_capture/mac_info/{macaddr}
+      access: read
+      description: "Look up the vendor (OUI) of a MAC address seen in a capture"
+      params:
+        macaddr: { type: string, in: path, required: true, description: "MAC address, e.g. aa:bb:cc:dd:ee:ff" }
       pagination: none
 
     # =========================================================================
@@ -1147,9 +1700,22 @@ backend:
       method: GET
       path: /interfaces/overview/interfaces_info
       access: read
-      description: "Get detailed information about all configured interfaces"
+      description: >
+        Detailed live state of all configured interfaces. The prefix length is only embedded in
+        the address strings (addr4 "198.51.100.2/24", addr6 "2001:db8:0:a::2/64") — this tool adds
+        `subnetbits4` / `subnetbits6` as separate fields so no string splitting is needed
+        (the stored config values are also in config.subnet / config.subnetv6).
+        Per row: device, identifier (friendly key), description, addr4/addr6 plus full ipv4/ipv6
+        lists incl. CARP VIPs, carp (vhid → MASTER/BACKUP), macaddr, mtu, media, flags, routes.
       response:
         result_path: "$"
+        transform: |
+          (.rows | length) as $n
+          | {total: $n, returned: $n, truncated: false,
+             rows: (.rows | map(. + {
+               subnetbits4: (if (.addr4 // "") | test("/") then ((.addr4 | split("/"))[1]) else null end),
+               subnetbits6: (if (.addr6 // "") | test("/") then ((.addr6 | split("/"))[1]) else null end)
+             }))}
       pagination: none
 
     get_interface_detail:
@@ -1159,8 +1725,6 @@ backend:
       description: "Get details for a specific interface"
       params:
         if: { type: string, in: path, required: true, description: "Interface identifier (e.g. lan, wan, opt1)" }
-      response:
-        result_path: "$"
       pagination: none
 
     export_interfaces:
@@ -1168,8 +1732,66 @@ backend:
       path: /interfaces/overview/export
       access: read
       description: "Export interface configuration"
-      response:
-        result_path: "$"
+      pagination: none
+
+    reload_interface:
+      method: POST
+      path: /interfaces/overview/reload_interface/{identifier}
+      access: admin
+      description: >
+        Re-apply the stored configuration of ONE interface (configd "interface
+        reconfigure"): re-runs address assignment and restarts dhclient/dhcp6c on it —
+        the API-side way to bounce/flush an interface after upstream or config changes
+        (e.g. to re-trigger SLAAC/DHCPv6). Expect a brief connectivity loss on that
+        interface.
+      params:
+        identifier: { type: string, in: path, required: true, description: "Friendly interface key (e.g. lan, wan, opt1) — see get_interface_names" }
+      pagination: none
+
+    # ── Global interface settings (//OPNsense/Interfaces/settings) ──────────
+    # MVC settings singleton — GLOBAL interface behavior only; per-interface
+    # addressing stays legacy (see domain notes).
+
+    get_interface_settings:
+      method: GET
+      path: /interfaces/settings/get
+      access: read
+      description: >
+        Get global interface settings: hardware offloading flags
+        (disablechecksumoffloading, disablesegmentationoffloading,
+        disablelargereceiveoffloading, disablevlanhwfilter 0|1|2), the global IPv6
+        kill switch (disableipv6), and DHCPv6 client behavior (dhcp6_norelease,
+        dhcp6_debug, dhcp6_duid, dhcp6_ratimeout). Also returns suggested DUID
+        values under `duids`.
+      pagination: none
+
+    set_interface_settings:
+      method: POST
+      path: /interfaces/settings/set
+      access: admin
+      description: >
+        Update GLOBAL interface settings — PARTIAL MERGE (setNodes): only posted
+        fields change, everything else is preserved. Pass the single object param
+        `settings`. Fields: disablechecksumoffloading, disablesegmentationoffloading,
+        disablelargereceiveoffloading ("0"/"1"), disablevlanhwfilter (bare "0"=enable
+        HW filtering, "1"=disable, "2"=leave default), disableipv6 ("1" disables IPv6
+        on ALL interfaces — dangerous), dhcp6_norelease ("1" = do not send DHCPv6
+        release on exit), dhcp6_debug, dhcp6_duid (DUID string, see get response
+        `duids` for suggestions), dhcp6_ratimeout (seconds). Call
+        reconfigure_interface_settings to apply.
+      params:
+        settings:
+          type: object
+          in: body
+          required: true
+          description: 'Partial settings map, e.g. {dhcp6_norelease:"1"}'
+      pagination: none
+
+    reconfigure_interface_settings:
+      method: POST
+      path: /interfaces/settings/reconfigure
+      access: admin
+      description: "Apply global interface settings changes to the running system"
       pagination: none
 
     # ── VLANs ───────────────────────────────────────────────────
@@ -1191,8 +1813,6 @@ backend:
       description: "Get a VLAN interface by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_vlan:
@@ -1205,8 +1825,6 @@ backend:
         vlan.tag: { type: integer, in: body, required: true, description: "VLAN tag (1-4094)" }
         vlan.pcp: { type: integer, in: body }
         vlan.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_vlan:
@@ -1220,8 +1838,6 @@ backend:
         vlan.tag: { type: integer, in: body }
         vlan.pcp: { type: integer, in: body }
         vlan.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_vlan:
@@ -1231,8 +1847,6 @@ backend:
       description: "Delete a VLAN interface"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_vlans:
@@ -1240,8 +1854,6 @@ backend:
       path: /interfaces/vlan_settings/reconfigure
       access: admin
       description: "Apply VLAN interface changes to the running system configuration"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── VIPs (Virtual IPs / CARP) ───────────────────────────────
@@ -1269,8 +1881,6 @@ backend:
         vip.vhid: { type: string, in: body, description: "CARP VHID group" }
         vip.advskew: { type: string, in: body, description: "CARP advertisement skew" }
         vip.password: { type: string, in: body, description: "CARP password" }
-      response:
-        result_path: "$"
       pagination: none
 
     set_vip:
@@ -1287,8 +1897,6 @@ backend:
         vip.vhid: { type: string, in: body, description: "CARP VHID group" }
         vip.advskew: { type: string, in: body, description: "CARP advertisement skew" }
         vip.password: { type: string, in: body, description: "CARP password" }
-      response:
-        result_path: "$"
       pagination: none
     del_vip:
       method: POST
@@ -1297,8 +1905,6 @@ backend:
       description: "Delete a virtual IP address"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_vips:
@@ -1306,8 +1912,6 @@ backend:
       path: /interfaces/vip_settings/reconfigure
       access: admin
       description: "Apply virtual IP changes"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -1319,8 +1923,6 @@ backend:
       path: /unbound/settings/get
       access: read
       description: "Get Unbound DNS resolver settings"
-      response:
-        result_path: "$"
       pagination: none
 
     set_unbound_settings:
@@ -1334,8 +1936,6 @@ backend:
         unbound.general.dnssec: { type: string, in: body }
         unbound.general.active_interface: { type: string, in: body }
         unbound.general.outgoing_interface: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Unbound: Host Overrides ─────────────────────────────────
@@ -1357,8 +1957,6 @@ backend:
       description: "Get a DNS host override by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_unbound_host_override:
@@ -1373,8 +1971,6 @@ backend:
         host.rr: { type: string, in: body, default: "A", description: "Record type: A, AAAA, MX" }
         host.server: { type: string, in: body, required: true, description: "Target IP address" }
         host.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_unbound_host_override:
@@ -1390,8 +1986,6 @@ backend:
         host.rr: { type: string, in: body }
         host.server: { type: string, in: body }
         host.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_unbound_host_override:
@@ -1401,8 +1995,6 @@ backend:
       description: "Delete a DNS host override"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Unbound: Forwards ───────────────────────────────────────
@@ -1427,8 +2019,6 @@ backend:
         forward.domain: { type: string, in: body, required: true }
         forward.server: { type: string, in: body, required: true, description: "Comma-separated DNS server IPs" }
         forward.port: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_unbound_forward:
@@ -1442,8 +2032,6 @@ backend:
         forward.domain: { type: string, in: body }
         forward.server: { type: string, in: body, description: "Comma-separated DNS server IPs" }
         forward.port: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_unbound_forward:
       method: POST
@@ -1452,8 +2040,6 @@ backend:
       description: "Delete a DNS forwarding entry"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Unbound: DNSBL (blocklists) ─────────────────────────────
@@ -1473,8 +2059,6 @@ backend:
       path: /unbound/settings/update_blocklist
       access: admin
       description: "Trigger DNS blocklist update"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Unbound: Service ────────────────────────────────────────
@@ -1484,8 +2068,6 @@ backend:
       path: /unbound/service/status
       access: read
       description: "Get Unbound DNS resolver service status"
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_unbound:
@@ -1493,8 +2075,6 @@ backend:
       path: /unbound/service/reconfigure
       access: admin
       description: "Apply Unbound DNS changes and restart"
-      response:
-        result_path: "$"
       pagination: none
 
     restart_unbound:
@@ -1502,8 +2082,6 @@ backend:
       path: /unbound/service/restart
       access: admin
       description: "Restart the Unbound DNS resolver"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Unbound: Diagnostics ────────────────────────────────────
@@ -1513,8 +2091,6 @@ backend:
       path: /unbound/diagnostics/dumpcache
       access: read
       description: "Dump the Unbound DNS cache"
-      response:
-        result_path: "$"
       pagination: none
 
     get_unbound_stats:
@@ -1522,8 +2098,6 @@ backend:
       path: /unbound/diagnostics/stats
       access: read
       description: "Get Unbound DNS resolver statistics"
-      response:
-        result_path: "$"
       pagination: none
 
     get_unbound_local_data:
@@ -1531,8 +2105,6 @@ backend:
       path: /unbound/diagnostics/listlocaldata
       access: read
       description: "List Unbound local data entries"
-      response:
-        result_path: "$"
       pagination: none
 
     get_unbound_local_zones:
@@ -1540,8 +2112,6 @@ backend:
       path: /unbound/diagnostics/listlocalzones
       access: read
       description: "List Unbound local zones"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -1565,8 +2135,6 @@ backend:
       description: "Get a WireGuard server instance by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_wireguard_server:
@@ -1584,8 +2152,6 @@ backend:
         server.peers: { type: string, in: body, description: "Comma-separated peer UUIDs" }
         server.dns: { type: string, in: body }
         server.mtu: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_wireguard_server:
@@ -1602,8 +2168,6 @@ backend:
         server.peers: { type: string, in: body }
         server.dns: { type: string, in: body }
         server.mtu: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_wireguard_server:
@@ -1613,8 +2177,6 @@ backend:
       description: "Delete a WireGuard server instance"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_wireguard_server:
@@ -1624,8 +2186,6 @@ backend:
       description: "Toggle a WireGuard server instance on/off"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     wireguard_key_pair:
@@ -1633,8 +2193,6 @@ backend:
       path: /wireguard/server/key_pair
       access: read
       description: "Generate a new WireGuard key pair (public + private)"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── WireGuard: Clients (Peers) ──────────────────────────────
@@ -1656,8 +2214,6 @@ backend:
       description: "Get a WireGuard client (peer) by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_wireguard_client:
@@ -1665,8 +2221,6 @@ backend:
       path: /wireguard/client/add_client
       access: write
       description: "Create a new WireGuard client (peer) — returns a new peer with generated keys"
-      response:
-        result_path: "$"
       pagination: none
 
     set_wireguard_client:
@@ -1684,8 +2238,6 @@ backend:
         client.serveraddress: { type: string, in: body }
         client.serverport: { type: string, in: body }
         client.keepalive: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_wireguard_client:
@@ -1695,8 +2247,6 @@ backend:
       description: "Delete a WireGuard client (peer)"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_wireguard_client:
@@ -1706,8 +2256,6 @@ backend:
       description: "Toggle a WireGuard client (peer) on/off"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     wireguard_psk:
@@ -1715,8 +2263,6 @@ backend:
       path: /wireguard/client/psk
       access: read
       description: "Generate a new WireGuard pre-shared key"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── WireGuard: Service ──────────────────────────────────────
@@ -1726,8 +2272,6 @@ backend:
       path: /wireguard/service/status
       access: read
       description: "Get WireGuard service status"
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_wireguard:
@@ -1735,8 +2279,6 @@ backend:
       path: /wireguard/service/reconfigure
       access: admin
       description: "Apply WireGuard configuration changes"
-      response:
-        result_path: "$"
       pagination: none
 
     wireguard_show:
@@ -1744,8 +2286,6 @@ backend:
       path: /wireguard/service/show
       access: read
       description: "Show WireGuard tunnel status (equivalent to 'wg show')"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -1769,8 +2309,6 @@ backend:
       description: "Get an OpenVPN instance by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_openvpn_instance:
@@ -1790,8 +2328,6 @@ backend:
         instance.cert: { type: string, in: body, description: "Certificate UUID" }
         instance.ca: { type: string, in: body, description: "CA UUID" }
         instance.authmode: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_openvpn_instance:
@@ -1806,8 +2342,6 @@ backend:
         instance.proto: { type: string, in: body }
         instance.port: { type: string, in: body }
         instance.server: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_openvpn_instance:
@@ -1817,8 +2351,6 @@ backend:
       description: "Delete an OpenVPN instance"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_openvpn_instance:
@@ -1829,8 +2361,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_openvpn:
@@ -1838,8 +2368,6 @@ backend:
       path: /openvpn/service/reconfigure
       access: admin
       description: "Apply OpenVPN configuration changes"
-      response:
-        result_path: "$"
       pagination: none
 
     search_openvpn_sessions:
@@ -1847,8 +2375,6 @@ backend:
       path: /openvpn/service/search_sessions
       access: read
       description: "List active OpenVPN sessions/connections"
-      response:
-        result_path: "$"
       pagination: none
 
     search_openvpn_routes:
@@ -1856,8 +2382,6 @@ backend:
       path: /openvpn/service/search_routes
       access: read
       description: "List OpenVPN routing table entries"
-      response:
-        result_path: "$"
       pagination: none
 
     kill_openvpn_session:
@@ -1867,8 +2391,6 @@ backend:
       description: "Kill an active OpenVPN session"
       params:
         session_id: { type: string, in: body, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -1892,8 +2414,6 @@ backend:
       description: "Get an IPsec connection by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_ipsec_connection:
@@ -1908,8 +2428,6 @@ backend:
         connection.proposals: { type: string, in: body, description: "IKE proposals (e.g. aes256-sha256-modp2048)" }
         connection.rekey_time: { type: string, in: body }
         connection.dpd_delay: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_ipsec_connection:
@@ -1925,8 +2443,6 @@ backend:
         connection.proposals: { type: string, in: body, description: "IKE proposals (e.g. aes256-sha256-modp2048)" }
         connection.rekey_time: { type: string, in: body }
         connection.dpd_delay: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_ipsec_connection:
       method: POST
@@ -1935,8 +2451,6 @@ backend:
       description: "Delete an IPsec connection"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_ipsec_connection:
@@ -1947,8 +2461,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── IPsec: Children (Phase 2 / SAs) ─────────────────────────
@@ -1977,8 +2489,6 @@ backend:
         child.local_ts: { type: string, in: body, description: "Local traffic selector (e.g. 10.0.0.0/24)" }
         child.remote_ts: { type: string, in: body, description: "Remote traffic selector" }
         child.rekey_time: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_ipsec_child:
@@ -1996,8 +2506,6 @@ backend:
         child.local_ts: { type: string, in: body, description: "Local traffic selector (e.g. 10.0.0.0/24)" }
         child.remote_ts: { type: string, in: body, description: "Remote traffic selector" }
         child.rekey_time: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_ipsec_child:
       method: POST
@@ -2006,8 +2514,6 @@ backend:
       description: "Delete an IPsec child SA"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── IPsec: Sessions & Service ───────────────────────────────
@@ -2017,8 +2523,6 @@ backend:
       path: /ipsec/sessions/search_phase1
       access: read
       description: "List active IPsec phase 1 (IKE) sessions"
-      response:
-        result_path: "$"
       pagination: none
 
     search_ipsec_phase2:
@@ -2026,8 +2530,6 @@ backend:
       path: /ipsec/sessions/search_phase2
       access: read
       description: "List active IPsec phase 2 (child SA) sessions"
-      response:
-        result_path: "$"
       pagination: none
 
     connect_ipsec:
@@ -2037,8 +2539,6 @@ backend:
       description: "Initiate an IPsec connection"
       params:
         id: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     disconnect_ipsec:
@@ -2048,8 +2548,6 @@ backend:
       description: "Disconnect an IPsec connection"
       params:
         id: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     get_ipsec_status:
@@ -2057,8 +2555,6 @@ backend:
       path: /ipsec/service/status
       access: read
       description: "Get IPsec service status"
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_ipsec:
@@ -2066,8 +2562,6 @@ backend:
       path: /ipsec/service/reconfigure
       access: admin
       description: "Apply IPsec configuration changes"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── IPsec: Pre-Shared Keys ──────────────────────────────────
@@ -2091,8 +2585,6 @@ backend:
         psk.identity: { type: string, in: body, required: true }
         psk.type: { type: string, in: body, default: "PSK" }
         psk.secret: { type: string, in: body, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     set_ipsec_psk:
@@ -2105,8 +2597,6 @@ backend:
         psk.identity: { type: string, in: body }
         psk.type: { type: string, in: body }
         psk.secret: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_ipsec_psk:
       method: POST
@@ -2115,8 +2605,6 @@ backend:
       description: "Delete an IPsec pre-shared key"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -2140,8 +2628,6 @@ backend:
       description: "Get a Kea DHCPv4 subnet by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_kea_dhcp4_subnet:
@@ -2156,8 +2642,6 @@ backend:
         subnet.option_data_domain_name_servers: { type: string, in: body }
         subnet.option_data_domain_name: { type: string, in: body }
         subnet.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_kea_dhcp4_subnet:
@@ -2173,8 +2657,6 @@ backend:
         subnet.option_data_domain_name_servers: { type: string, in: body }
         subnet.option_data_domain_name: { type: string, in: body }
         subnet.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_kea_dhcp4_subnet:
@@ -2184,8 +2666,6 @@ backend:
       description: "Delete a Kea DHCPv4 subnet"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Kea: Reservations ───────────────────────────────────────
@@ -2211,8 +2691,6 @@ backend:
         reservation.ip_address: { type: string, in: body, required: true }
         reservation.hostname: { type: string, in: body }
         reservation.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_kea_dhcp4_reservation:
@@ -2227,8 +2705,6 @@ backend:
         reservation.ip_address: { type: string, in: body }
         reservation.hostname: { type: string, in: body }
         reservation.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_kea_dhcp4_reservation:
@@ -2238,8 +2714,6 @@ backend:
       description: "Delete a Kea DHCPv4 static reservation"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Kea: Leases & Service ───────────────────────────────────
@@ -2249,8 +2723,6 @@ backend:
       path: /kea/leases/search
       access: read
       description: "Search active DHCP leases"
-      response:
-        result_path: "$"
       pagination: none
 
     get_kea_status:
@@ -2258,8 +2730,6 @@ backend:
       path: /kea/service/status
       access: read
       description: "Get Kea DHCP service status"
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_kea:
@@ -2267,8 +2737,6 @@ backend:
       path: /kea/service/reconfigure
       access: admin
       description: "Apply Kea DHCP configuration changes"
-      response:
-        result_path: "$"
       pagination: none
 
     restart_kea:
@@ -2276,8 +2744,6 @@ backend:
       path: /kea/service/restart
       access: admin
       description: "Restart Kea DHCP service"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -2301,8 +2767,6 @@ backend:
       description: "Get a static route by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_static_route:
@@ -2315,8 +2779,6 @@ backend:
         route.network: { type: string, in: body, required: true, description: "Destination network (CIDR)" }
         route.gateway: { type: string, in: body, required: true, description: "Gateway name" }
         route.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_static_route:
@@ -2330,8 +2792,6 @@ backend:
         route.network: { type: string, in: body }
         route.gateway: { type: string, in: body }
         route.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_static_route:
@@ -2341,8 +2801,6 @@ backend:
       description: "Delete a static route"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_routes:
@@ -2350,8 +2808,6 @@ backend:
       path: /routes/routes/reconfigure
       access: admin
       description: "Apply static route changes"
-      response:
-        result_path: "$"
       pagination: none
 
     get_gateway_status:
@@ -2359,8 +2815,6 @@ backend:
       path: /routes/gateway/status
       access: read
       description: "Get gateway status (up/down, latency, loss)"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Gateway management ──────────────────────────────────────
@@ -2369,10 +2823,16 @@ backend:
       method: POST
       path: /routing/settings/search_gateway
       access: read
-      description: "Search configured gateways"
+      description: >
+        Search configured gateways. WATCH OUT for `defaultgw`: the API reports it COMPUTED, not
+        from the config — it says whether this gateway is the CURRENTLY ACTIVE default route,
+        not whether the "Upstream Gateway" checkbox is ticked. A gateway with defaultgw=1 in
+        config.xml is reported as false whenever a higher-priority gateway holds the default
+        route (lower priority number wins). That looks like data loss but is not; to read the
+        stored flag, use get_gateway (or the config backup).
       params:
         current: { type: integer, in: body, default: 1 }
-        rowCount: { type: integer, in: body, default: 50 }
+        rowCount: { type: integer, in: body, default: 500 }
         searchPhrase: { type: string, in: body }
 
     get_gateway:
@@ -2382,8 +2842,6 @@ backend:
       description: "Get a gateway by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_gateway:
@@ -2415,8 +2873,6 @@ backend:
           description: >
             Full gateway item, e.g. {name:"WAN_GW", interface:"wan", ipprotocol:"inet",
             gateway:"192.0.2.1", monitor:"8.8.8.8", priority:"255", weight:"1"}.
-      response:
-        result_path: "$"
       pagination: none
 
     set_gateway:
@@ -2437,6 +2893,10 @@ backend:
         SELECT fields must be BARE values: interface = friendly key ("wan","opt1"),
         ipprotocol = "inet"/"inet6". Booleans are "0"/"1" strings. Returns
         {"result":"saved"} on success or {"result":"failed","validations":{...}} on error.
+        RENAMING IS IMPOSSIBLE: Gateways::validateNameChange() rejects any `name` that differs
+        from the stored one with "Changing name on a gateway is not allowed" — no API call can
+        rename a gateway. Create the new gateway, repoint every reference (rules, gateway
+        groups, static routes), then delete the old one.
       params:
         uuid: { type: string, in: path, required: true }
         gateway_item:
@@ -2450,8 +2910,6 @@ backend:
             monitor_killstates_priority, force_down, priority, weight, latencylow,
             latencyhigh, losslow, losshigh, interval, time_period, loss_interval,
             data_length.
-      response:
-        result_path: "$"
       pagination: none
 
     del_gateway:
@@ -2461,8 +2919,6 @@ backend:
       description: "Delete a gateway definition by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_gateways:
@@ -2470,8 +2926,114 @@ backend:
       path: /routing/settings/reconfigure
       access: admin
       description: "Apply gateway changes"
-      response:
-        result_path: "$"
+      pagination: none
+
+    # ── Gateway groups (failover / load balancing) ──────────────
+    # Model OPNsense/Routing/GatewayGroups.xml, controller Routing/Api/GroupSettingsController
+    # (URL segment `group_settings`). The model mounts at /gateways/gateway_group+ in the legacy
+    # config, which is where the odd field naming comes from:
+    #
+    #   TIER 1 is the field called `item` — NOT `item1`. Tiers 2..5 are item2..item5.
+    #   Every one of them is a MULTI-select of gateway NAMES (Multiple=Y), so a tier can hold
+    #   several gateways (load balancing within the tier); over the API they are comma-joined
+    #   bare names on write and {name:{value,selected}} option maps on read.
+    #   The asymmetric naming is a real trap: code that iterates item2..item5, or that treats
+    #   `item` as a scalar while the others are lists (or vice versa), silently skips Tier 1 —
+    #   the highest-priority tier. In a LEGACY (not yet migrated) config.xml `item` additionally
+    #   appears as REPEATED <item>GWNAME|TIER</item> elements; GatewayGroupItemField migrates
+    #   those into the comma-joined form on first write. Anything reading a raw config backup
+    #   must handle both spellings.
+    #
+    # Lower tier number = higher priority. `trigger` decides what counts as "member down".
+
+    search_gateway_groups:
+      method: POST
+      path: /routing/group_settings/search
+      access: read
+      description: >
+        Search gateway groups (failover / load-balancing groups). Each row carries the raw
+        item/item2..item5 tier fields PLUS a `gateways` array indexed by tier that the API
+        enriches with the live dpinger status of every member. Remember: `item` is TIER 1.
+      params:
+        current: { type: integer, in: body, default: 1 }
+        rowCount: { type: integer, in: body, default: 500 }
+        searchPhrase: { type: string, in: body }
+        sort: { type: string, in: body }
+
+    get_gateway_group:
+      method: GET
+      path: /routing/group_settings/get/{uuid}
+      access: read
+      description: >
+        Get one gateway group by UUID. Returns {gateway_group:{…}} with the tier fields as
+        OPNsense SELECT maps ({gatewayname:{value,selected}}) — `item` is TIER 1, item2..item5
+        are tiers 2..5. Post them back as comma-joined BARE gateway names (see set_gateway_group),
+        or use the update_gateway_group composite which does that flattening for you.
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
+    add_gateway_group:
+      method: POST
+      path: /routing/group_settings/add
+      # Same PHP $_POST rule as the gateway endpoints: form-urlencoded, single nested object.
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Create a gateway group. Pass the whole item as the object param `gateway_group`
+        (form-encoded as gateway_group[<field>]=…). Fields: name (required, [a-zA-Z0-9_-]{1,32}),
+        item (TIER 1 — comma-separated gateway NAMES), item2/item3/item4/item5 (tiers 2..5, same
+        format), trigger (required: down | downloss | downlatency | downlosslatency, default
+        down), poolopts ("" = default, "round-robin", "round-robin sticky-address"), descr.
+        Gateway names must exist (search_gateways). Apply with reconfigure_gateway_groups.
+      params:
+        gateway_group:
+          type: object
+          in: body
+          required: true
+          description: >
+            Full group, e.g. {name:"EGRESS_V6", item:"PRIMARY_GWv6", item2:"BACKUP_GWv6",
+            trigger:"downlosslatency", descr:"v6 egress with failback"}. `item` is TIER 1.
+      pagination: none
+
+    set_gateway_group:
+      method: POST
+      path: /routing/group_settings/set/{uuid}
+      content_type: application/x-www-form-urlencoded
+      access: write
+      description: >
+        Low-level update of a gateway group. PREFER the update_gateway_group composite. Pass the
+        object param `gateway_group` with BARE, comma-joined gateway names in item (TIER 1) and
+        item2..item5 — never the {value,selected} maps returned by get_gateway_group. The
+        endpoint merges (omitted fields keep their value), but the tier fields are all-or-nothing
+        per field: posting item="A" replaces the entire tier-1 membership. Apply with
+        reconfigure_gateway_groups.
+      params:
+        uuid: { type: string, in: path, required: true }
+        gateway_group:
+          type: object
+          in: body
+          required: true
+          description: "Fields to write: name, item (TIER 1), item2..item5, trigger, poolopts, descr"
+      pagination: none
+
+    del_gateway_group:
+      method: POST
+      path: /routing/group_settings/del/{uuid}
+      access: dangerous
+      description: >
+        Delete a gateway group by UUID. Refuses with a UserException when the group is still
+        referenced by a firewall rule or another gateway consumer — the message names the
+        referring object and its UUID.
+      params:
+        uuid: { type: string, in: path, required: true, description: "Group UUID; a comma-separated list deletes several at once" }
+      pagination: none
+
+    reconfigure_gateway_groups:
+      method: POST
+      path: /routing/group_settings/reconfigure
+      access: admin
+      description: "Apply gateway-group changes (runs configd 'interface routes configure')"
       pagination: none
 
     # =========================================================================
@@ -2483,8 +3045,6 @@ backend:
       path: /core/firmware/status
       access: read
       description: "Get firmware update status"
-      response:
-        result_path: "$"
       pagination: none
 
     check_firmware_updates:
@@ -2492,17 +3052,40 @@ backend:
       path: /core/firmware/check
       access: read
       description: "Check for available firmware updates"
-      response:
-        result_path: "$"
       pagination: none
 
     get_firmware_info:
       method: GET
       path: /core/firmware/info
       access: read
-      description: "Get installed firmware version and build info"
+      description: >
+        Firmware/product identity plus the list of INSTALLED plugins. The raw endpoint answers
+        ~330 KB (900+ base packages, all 100+ known plugins and the full changelog) with no
+        section parameter, which does not fit in a model context — so this tool projects it down
+        to: product identity, os_version, last_check, needs_reboot, pending upgrade count,
+        packages_installed (count only), plugins_available (count) and plugins_installed (the
+        actual list with name/version/tier/locked/automatic/repository/comment).
+        For one specific package use get_firmware_details; for update state use
+        check_firmware_updates / get_firmware_status; for the changelog get_firmware_changelog.
       response:
         result_path: "$"
+        transform: |
+          { product_id:         .product_id,
+            product_version:    .product_version,
+            product_name:       (.product.product_name // null),
+            product_series:     (.product.product_series // null),
+            product_abi:        (.product.product_abi // null),
+            product_latest:     (.product.product_latest // null),
+            product_build_time: (.product.product_time // null),
+            os_version:         (.product.product_check.os_version // null),
+            last_check:         (.product.product_check.last_check // null),
+            needs_reboot:       (.product.product_check.needs_reboot // null),
+            upgrade_packages:   ((.product.product_check.upgrade_packages // []) | length),
+            packages_installed: ((.package // []) | length),
+            plugins_available:  ((.plugin // []) | length),
+            plugins_installed:  ((.plugin // [])
+                                  | map(select((.installed // "0") == "1"))
+                                  | map({name, version, tier, locked, automatic, repository, comment})) }
       pagination: none
 
     get_firmware_running:
@@ -2510,8 +3093,6 @@ backend:
       path: /core/firmware/running
       access: read
       description: "Check if a firmware operation is currently running"
-      response:
-        result_path: "$"
       pagination: none
 
     update_firmware:
@@ -2519,8 +3100,6 @@ backend:
       path: /core/firmware/update
       access: admin
       description: "Start firmware update (non-blocking, check status with get_firmware_running)"
-      response:
-        result_path: "$"
       pagination: none
 
     get_firmware_changelog:
@@ -2530,8 +3109,6 @@ backend:
       description: "Get changelog for a specific firmware version"
       params:
         version: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     install_firmware_plugin:
@@ -2541,8 +3118,6 @@ backend:
       description: "Install a plugin package"
       params:
         pkg_name: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     remove_firmware_plugin:
@@ -2552,8 +3127,6 @@ backend:
       description: "Remove a plugin package"
       params:
         pkg_name: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     get_firmware_details:
@@ -2563,8 +3136,6 @@ backend:
       description: "Get details about an installed package"
       params:
         pkg_name: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # ── System control ──────────────────────────────────────────
@@ -2574,8 +3145,6 @@ backend:
       path: /core/system/status
       access: read
       description: "Get system status and pending notifications"
-      response:
-        result_path: "$"
       pagination: none
 
     reboot_system:
@@ -2583,8 +3152,6 @@ backend:
       path: /core/system/reboot
       access: dangerous
       description: "Reboot the OPNsense appliance"
-      response:
-        result_path: "$"
       pagination: none
 
     halt_system:
@@ -2592,30 +3159,45 @@ backend:
       path: /core/system/halt
       access: dangerous
       description: "Shut down the OPNsense appliance"
-      response:
-        result_path: "$"
       pagination: none
 
     # ── Backup ──────────────────────────────────────────────────
 
     list_backups:
       method: GET
+      path: /core/backup/backups/this
+      access: read
+      description: >
+        List the LOCAL configuration backup history — one entry per saved config revision with
+        timestamp, the user who caused it and the change description. Takes no arguments: the
+        host is pinned to "this" in the path because ToolMesh does not apply parameter defaults
+        to path segments, so the previous {host} form failed with "missing required path
+        parameter" whenever it was called without an explicit host. For a CARP peer's history
+        use list_peer_backups.
+      pagination: none
+
+    list_peer_backups:
+      method: GET
       path: /core/backup/backups/{host}
       access: read
-      description: "List configuration backups"
+      description: "List the configuration backup history of a CARP peer (hostname as configured in HA sync). For the local appliance use list_backups."
       params:
-        host: { type: string, in: path, required: true, description: "Hostname or 'this' for local" }
-      response:
-        result_path: "$"
+        host: { type: string, in: path, required: true, description: "Peer hostname" }
       pagination: none
 
     download_backup:
       method: GET
       path: /core/backup/download/{host}/{backup}
-      access: read
-      description: "Download a configuration backup file as XML. Use list_backups to find available backup filenames."
+      access: dangerous
+      description: >
+        Download a configuration backup as XML (returned as a broker file URL, not inline).
+        HANDLE WITH CARE: the config XML is the one place where EVERY secret this backend
+        otherwise redacts is present in full — certificate and CA private keys, the HA sync
+        password, user password hashes, PSKs, RADIUS secrets. The broker URL is unauthenticated
+        for its lifetime, so do not pass it on. Use it for restores/diffs, not to work around
+        the redaction on the read tools.
       params:
-        host: { type: string, in: path, required: true, description: "Hostname or 'this' for local backups" }
+        host: { type: string, in: path, required: true, description: "'this' for the local appliance, or a peer hostname — must be passed explicitly (path params take no defaults)" }
         backup: { type: string, in: path, required: true, description: "Backup filename from list_backups — use 'this' for current running config" }
       response:
         result_path: "$"
@@ -2630,8 +3212,6 @@ backend:
       description: "Revert to a previous configuration backup"
       params:
         backup: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     delete_backup:
@@ -2641,21 +3221,20 @@ backend:
       description: "Delete a configuration backup"
       params:
         backup: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     diff_backups:
       method: GET
       path: /core/backup/diff/{host}/{backup1}/{backup2}
       access: read
-      description: "Show diff between two configuration backups"
+      description: >
+        Show the diff between two configuration backups (filenames from list_backups). Useful for
+        "what changed at 12:13?" — but note the diff is over the raw config XML and can therefore
+        expose secrets when a key or password changed between the two revisions.
       params:
-        host: { type: string, in: path, required: true }
+        host: { type: string, in: path, required: true, description: "'this' for the local appliance, or a peer hostname — must be passed explicitly (path params take no defaults)" }
         backup1: { type: string, in: path, required: true }
         backup2: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -2667,44 +3246,71 @@ backend:
       path: /core/service/search
       access: read
       description: "List all services and their status"
-      response:
-        result_path: "$"
       pagination: none
 
     start_service:
       method: POST
       path: /core/service/start/{name}
       access: admin
-      description: "Start a system service by name (e.g. 'unbound', 'openvpn'). Use search_services to list available service names."
+      description: "Start a system service by name (e.g. 'unbound', 'openvpn'). Use search_services to list available service names. For one instance of a multi-instance service use start_service_instance."
       params:
         name: { type: string, in: path, required: true }
-        id: { type: string, in: query, description: "Service instance ID for multi-instance services (e.g. OpenVPN)" }
-      response:
-        result_path: "$"
       pagination: none
 
     stop_service:
       method: POST
       path: /core/service/stop/{name}
       access: admin
-      description: "Stop a system service by name. Use search_services to list running services."
+      description: "Stop a system service by name. Use search_services to list running services. For one instance of a multi-instance service use stop_service_instance."
       params:
         name: { type: string, in: path, required: true }
-        id: { type: string, in: query, description: "Service instance ID for multi-instance services" }
-      response:
-        result_path: "$"
       pagination: none
 
     restart_service:
       method: POST
       path: /core/service/restart/{name}
       access: admin
-      description: "Restart a system service by name. Useful after configuration changes or to recover a stalled service."
+      description: "Restart a system service by name. Useful after configuration changes or to recover a stalled service. For one instance of a multi-instance service use restart_service_instance."
       params:
         name: { type: string, in: path, required: true }
-        id: { type: string, in: query, description: "Service instance ID for multi-instance services" }
-      response:
-        result_path: "$"
+      pagination: none
+
+    start_service_instance:
+      method: POST
+      path: /core/service/start/{name}/{id}
+      access: admin
+      description: >
+        Start ONE instance of a multi-instance service. The instance id is the part
+        after the slash in search_services ids — e.g. a per-gateway dpinger monitor
+        is name "dpinger", id "<gateway name>". The id MUST travel as a path
+        segment; a ?id= query param is ignored by the API router.
+      params:
+        name: { type: string, in: path, required: true, description: "Service name, e.g. dpinger, openvpn" }
+        id: { type: string, in: path, required: true, description: "Instance id, e.g. the gateway name for dpinger" }
+      pagination: none
+
+    stop_service_instance:
+      method: POST
+      path: /core/service/stop/{name}/{id}
+      access: admin
+      description: "Stop ONE instance of a multi-instance service (see start_service_instance for the name/id convention)."
+      params:
+        name: { type: string, in: path, required: true }
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    restart_service_instance:
+      method: POST
+      path: /core/service/restart/{name}/{id}
+      access: admin
+      description: >
+        Restart ONE instance of a multi-instance service — e.g. restart a single
+        gateway's dpinger monitor after source-address or IPv6 changes without
+        touching the other gateway monitors (name "dpinger", id = gateway name from
+        search_services "dpinger/<gateway>").
+      params:
+        name: { type: string, in: path, required: true }
+        id: { type: string, in: path, required: true }
       pagination: none
 
     # =========================================================================
@@ -2716,8 +3322,6 @@ backend:
       path: /ids/service/status
       access: read
       description: "Get IDS/IPS (Suricata) service status"
-      response:
-        result_path: "$"
       pagination: none
 
     query_ids_alerts:
@@ -2739,8 +3343,6 @@ backend:
       params:
         alertId: { type: string, in: path, required: true }
         fileid: { type: string, in: query, description: "Log file identifier — omit for current log" }
-      response:
-        result_path: "$"
       pagination: none
 
     get_ids_alert_logs:
@@ -2748,8 +3350,6 @@ backend:
       path: /ids/service/get_alert_logs
       access: read
       description: "List available IDS alert log files"
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_ids:
@@ -2757,8 +3357,6 @@ backend:
       path: /ids/service/reconfigure
       access: admin
       description: "Apply IDS/IPS configuration changes"
-      response:
-        result_path: "$"
       pagination: none
 
     update_ids_rules:
@@ -2766,8 +3364,6 @@ backend:
       path: /ids/service/update_rules
       access: admin
       description: "Download and update IDS/IPS rulesets"
-      response:
-        result_path: "$"
       pagination: none
 
     drop_ids_alert_log:
@@ -2775,8 +3371,6 @@ backend:
       path: /ids/service/drop_alert_log
       access: admin
       description: "Clear the IDS alert log"
-      response:
-        result_path: "$"
       pagination: none
 
     get_ids_settings:
@@ -2784,8 +3378,6 @@ backend:
       path: /ids/settings/get
       access: read
       description: "Get IDS/IPS settings"
-      response:
-        result_path: "$"
       pagination: none
 
     set_ids_settings:
@@ -2798,8 +3390,6 @@ backend:
         ids.general.ips: { type: string, in: body, description: "1=IPS mode (inline blocking)" }
         ids.general.interfaces: { type: string, in: body }
         ids.general.homenet: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     search_ids_rules:
@@ -2820,8 +3410,6 @@ backend:
       params:
         sids: { type: string, in: path, required: true, description: "Comma-separated Suricata rule SIDs" }
         enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -2848,8 +3436,6 @@ backend:
         pipe.bandwidth: { type: integer, in: body, required: true }
         pipe.bandwidthMetric: { type: string, in: body, default: "Kbit", description: "Kbit, Mbit, Gbit" }
         pipe.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_shaper_pipe:
@@ -2863,8 +3449,6 @@ backend:
         pipe.bandwidth: { type: integer, in: body }
         pipe.bandwidthMetric: { type: string, in: body, description: "Kbit, Mbit, Gbit" }
         pipe.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_shaper_pipe:
       method: POST
@@ -2873,8 +3457,6 @@ backend:
       description: "Delete a traffic shaper pipe"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     search_shaper_queues:
@@ -2910,8 +3492,6 @@ backend:
         rule.destination: { type: string, in: body }
         rule.target: { type: string, in: body, description: "Target pipe UUID" }
         rule.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_shaper_rule:
@@ -2928,8 +3508,6 @@ backend:
         rule.destination: { type: string, in: body }
         rule.target: { type: string, in: body, description: "Target pipe UUID" }
         rule.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_shaper_rule:
@@ -2939,8 +3517,6 @@ backend:
       description: "Delete a traffic shaper rule"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_shaper:
@@ -2948,8 +3524,6 @@ backend:
       path: /trafficshaper/service/reconfigure
       access: admin
       description: "Apply traffic shaper changes"
-      response:
-        result_path: "$"
       pagination: none
 
     get_shaper_statistics:
@@ -2957,8 +3531,6 @@ backend:
       path: /trafficshaper/service/statistics
       access: read
       description: "Get traffic shaper statistics"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -2988,8 +3560,6 @@ backend:
         server.ssl: { type: string, in: body }
         server.weight: { type: string, in: body }
         server.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_haproxy_server:
@@ -3006,8 +3576,6 @@ backend:
         server.ssl: { type: string, in: body }
         server.weight: { type: string, in: body }
         server.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_haproxy_server:
       method: POST
@@ -3016,8 +3584,6 @@ backend:
       description: "Delete an HAProxy backend server"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     search_haproxy_backends:
@@ -3042,8 +3608,6 @@ backend:
         backend.algorithm: { type: string, in: body, default: "roundrobin" }
         backend.linkedServers: { type: string, in: body, description: "Comma-separated server UUIDs" }
         backend.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_haproxy_backend:
@@ -3059,8 +3623,6 @@ backend:
         backend.algorithm: { type: string, in: body }
         backend.linkedServers: { type: string, in: body, description: "Comma-separated server UUIDs" }
         backend.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_haproxy_backend:
       method: POST
@@ -3069,8 +3631,6 @@ backend:
       description: "Delete an HAProxy backend"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     search_haproxy_frontends:
@@ -3097,8 +3657,6 @@ backend:
         frontend.ssl_enabled: { type: string, in: body }
         frontend.ssl_certificates: { type: string, in: body }
         frontend.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_haproxy_frontend:
@@ -3116,8 +3674,6 @@ backend:
         frontend.ssl_enabled: { type: string, in: body }
         frontend.ssl_certificates: { type: string, in: body }
         frontend.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_haproxy_frontend:
       method: POST
@@ -3126,8 +3682,6 @@ backend:
       description: "Delete an HAProxy frontend"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     get_haproxy_status:
@@ -3135,8 +3689,6 @@ backend:
       path: /haproxy/service/status
       access: read
       description: "Get HAProxy service status"
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_haproxy:
@@ -3144,8 +3696,6 @@ backend:
       path: /haproxy/service/reconfigure
       access: admin
       description: "Apply HAProxy configuration changes"
-      response:
-        result_path: "$"
       pagination: none
 
     test_haproxy_config:
@@ -3153,8 +3703,6 @@ backend:
       path: /haproxy/service/configtest
       access: read
       description: "Test HAProxy configuration for syntax errors"
-      response:
-        result_path: "$"
       pagination: none
 
     get_haproxy_statistics:
@@ -3162,8 +3710,6 @@ backend:
       path: /haproxy/statistics/counters
       access: read
       description: "Get HAProxy statistics counters"
-      response:
-        result_path: "$"
       pagination: none
 
     export_haproxy_config:
@@ -3171,8 +3717,6 @@ backend:
       path: /haproxy/export/config
       access: read
       description: "Export the generated HAProxy configuration file"
-      response:
-        result_path: "$"
       pagination: none
 
     diff_haproxy_config:
@@ -3180,8 +3724,6 @@ backend:
       path: /haproxy/export/diff
       access: read
       description: "Show diff between staged and active HAProxy config"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3192,21 +3734,31 @@ backend:
       method: POST
       path: /trust/cert/search
       access: read
-      description: "Search TLS/SSL certificates"
+      description: >
+        Search TLS/SSL certificates (inventory). PRIVATE KEY MATERIAL IS NOT RETURNED: the raw
+        endpoint ships `prv` (base64) and `prv_payload` (the full "-----BEGIN PRIVATE KEY-----"
+        PEM) with every row and has no opt-out parameter — a two-certificate inventory was 23 KB
+        of mostly RSA key. Those fields, plus csr/csr_payload, arrive redacted; an empty value
+        still shows as empty so "does this cert have a stored key?" remains answerable, and
+        private_key_location tells you where it lives. Keys stay SETTABLE via add_certificate /
+        set_certificate. The certificate itself (crt/crt_payload) is public and passes through.
+        Expiry: valid_from/valid_to are raw epoch-second strings; readable %valid_from /
+        %valid_to are added — an expired GUI certificate is easy to miss otherwise.
       params:
         current: { type: integer, in: body, default: 1 }
-        rowCount: { type: integer, in: body, default: 50 }
+        rowCount: { type: integer, in: body, default: 500 }
         searchPhrase: { type: string, in: body }
 
     get_certificate:
       method: GET
       path: /trust/cert/get/{uuid}
       access: read
-      description: "Get a certificate by UUID"
+      description: >
+        Get a certificate by UUID. Private key material (prv / prv_payload) and CSR fields are
+        redacted on the way out — settable via set_certificate, never returned. crt/crt_payload
+        (the public certificate) pass through; %valid_from / %valid_to are added.
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_certificate:
@@ -3223,8 +3775,6 @@ backend:
         cert.caref: { type: string, in: body, description: "Signing CA reference" }
         cert.cn: { type: string, in: body, description: "Common Name" }
         cert.san: { type: string, in: body, description: "Subject Alternative Names" }
-      response:
-        result_path: "$"
       pagination: none
 
     set_certificate:
@@ -3242,8 +3792,6 @@ backend:
         cert.caref: { type: string, in: body, description: "Signing CA reference" }
         cert.cn: { type: string, in: body, description: "Common Name" }
         cert.san: { type: string, in: body, description: "Subject Alternative Names" }
-      response:
-        result_path: "$"
       pagination: none
     del_certificate:
       method: POST
@@ -3252,18 +3800,20 @@ backend:
       description: "Delete a certificate"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     search_cas:
       method: POST
       path: /trust/ca/search
       access: read
-      description: "Search Certificate Authorities"
+      description: >
+        Search Certificate Authorities. Like the certificate search, the raw endpoint returns the
+        CA's PRIVATE KEY (prv / prv_payload) on a plain listing call — arguably worse, since a CA
+        key can mint new certificates. Those fields are redacted here; the CA certificate itself
+        is public and passes through, and %valid_from / %valid_to are added.
       params:
         current: { type: integer, in: body, default: 1 }
-        rowCount: { type: integer, in: body, default: 50 }
+        rowCount: { type: integer, in: body, default: 500 }
         searchPhrase: { type: string, in: body }
 
     get_ca:
@@ -3273,8 +3823,6 @@ backend:
       description: "Get a Certificate Authority by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_ca:
@@ -3289,8 +3837,6 @@ backend:
         ca.digest: { type: string, in: body }
         ca.lifetime: { type: integer, in: body }
         ca.cn: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_ca:
@@ -3306,8 +3852,6 @@ backend:
         ca.digest: { type: string, in: body }
         ca.lifetime: { type: integer, in: body }
         ca.cn: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_ca:
       method: POST
@@ -3316,8 +3860,6 @@ backend:
       description: "Delete a Certificate Authority"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3329,8 +3871,6 @@ backend:
       path: /syslog/settings/get
       access: read
       description: "Get syslog service settings including log retention, remote destinations, and format options"
-      response:
-        result_path: "$"
       pagination: none
 
     search_syslog_destinations:
@@ -3355,8 +3895,6 @@ backend:
         destination.port: { type: string, in: body, default: "514" }
         destination.rfc5424: { type: string, in: body, description: "1=use RFC 5424 format" }
         destination.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_syslog_destination:
@@ -3372,8 +3910,6 @@ backend:
         destination.port: { type: string, in: body }
         destination.rfc5424: { type: string, in: body, description: "1=use RFC 5424 format" }
         destination.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_syslog_destination:
       method: POST
@@ -3382,8 +3918,6 @@ backend:
       description: "Delete a remote syslog destination"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_syslog:
@@ -3391,8 +3925,6 @@ backend:
       path: /syslog/service/reconfigure
       access: admin
       description: "Apply syslog configuration changes"
-      response:
-        result_path: "$"
       pagination: none
 
     get_syslog_stats:
@@ -3400,8 +3932,6 @@ backend:
       path: /syslog/service/stats
       access: read
       description: "Get syslog service statistics"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3425,8 +3955,6 @@ backend:
       description: "Get a cron job by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_cron_job:
@@ -3443,8 +3971,6 @@ backend:
         job.weekdays: { type: string, in: body, required: true }
         job.command: { type: string, in: body, required: true }
         job.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_cron_job:
@@ -3462,8 +3988,6 @@ backend:
         job.weekdays: { type: string, in: body }
         job.command: { type: string, in: body }
         job.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_cron_job:
       method: POST
@@ -3472,8 +3996,6 @@ backend:
       description: "Delete a scheduled cron job by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_cron_job:
@@ -3484,8 +4006,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         enabled: { type: string, in: query, description: "1=enable, 0=disable — omit to toggle" }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3496,9 +4016,32 @@ backend:
       method: GET
       path: /core/hasync/get
       access: read
-      description: "Get HA synchronization settings"
+      description: >
+        Get HA synchronization settings. THE SYNC PASSWORD IS NOT RETURNED: /core/hasync/get
+        hands out `password` in CLEAR TEXT (it is the XMLRPC credential of the peer's admin
+        account); it is redacted here and is write-only — settable through
+        set_hasync_settings / update_hasync_settings, never readable. An unset password still
+        shows as empty.
+        The multi-select fields are flattened from OPNsense's full option maps (36 entries for
+        syncitems alone) to the comma-joined BARE selection you would post back:
+        `syncitems` = the config sections XMLRPC-synced to the peer, `pfsyncinterface`,
+        `pfsyncversion`. Added: "%pfsync_configured" — the model has NO `pfsyncenabled` field on
+        26.7 (asking for it yields null and reading that as "pfsync is off" is wrong), so this
+        flag reports whether a pfsync interface is configured. For the live picture use
+        get_pfsync_nodes (both creator IDs present = pfsync is actually exchanging states).
       response:
         result_path: "$"
+        transform: |
+          def sel: if type == "object"
+                   then ([to_entries[] | select((.value.selected // 0) | tostring | (. == "1" or . == "true")) | .key] | join(","))
+                   else (. // "") end;
+          {hasync: (.hasync
+            | .password        = (if ((.password // "") | length) > 0 then "(redacted: write-only, settable but never returned)" else "" end)
+            | .syncitems       = (.syncitems       | sel)
+            | .pfsyncinterface = (.pfsyncinterface | sel)
+            | .pfsyncversion   = (.pfsyncversion   | sel)
+            | .["%pfsync_configured"] = ((.pfsyncinterface | length) > 0)
+          )}
       pagination: none
 
     set_hasync_settings:
@@ -3531,8 +4074,6 @@ backend:
             HA sync fields to write, e.g. {synchronizetoip:"192.0.2.3", username:"admin",
             syncitems:"aliases,rules,ipsec,radvd,ndpproxy"}. Omitted scalar fields are preserved;
             syncitems fully replaces the synced-section selection.
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_hasync:
@@ -3540,8 +4081,6 @@ backend:
       path: /core/hasync/reconfigure
       access: admin
       description: "Apply local HA/pfsync changes (runs 'interface pfsync configure'). NOTE: this does NOT push config to the peer — for the XMLRPC config sync use synchronize_ha_services."
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3556,8 +4095,6 @@ backend:
       path: /core/hasync_status/version
       access: read
       description: "Check the HA peer link: returns the backup node's version info (empty/❌ when the peer is unreachable or credentials are wrong)."
-      response:
-        result_path: "$"
       pagination: none
 
     get_ha_status_services:
@@ -3579,8 +4116,6 @@ backend:
         via XMLRPC (exec_sync), reloads templates, then restarts every HA-managed service on the
         peer. This is the manual config-sync trigger. Returns {"status":"ok","count":N}. Heavy —
         it bounces services on the backup; for a routine change, a normal save already auto-syncs.
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3606,8 +4141,6 @@ backend:
       description: "Get a radvd interface entry by UUID. SELECT fields (interface, mode, Adv* option fields) come back as {opt:{value,selected}} maps — flatten to the bare selected key before posting back."
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_radvd:
@@ -3632,8 +4165,6 @@ backend:
             Full radvd entry, e.g. {enabled:"1", interface:"lan", mode:"stateless", dns:"1",
             MinRtrAdvInterval:"200", MaxRtrAdvInterval:"600", AdvDefaultPreference:"medium",
             AdvCurHopLimit:"64", RDNSS:"2001:db8::1", DNSSL:"example.lan"}.
-      response:
-        result_path: "$"
       pagination: none
 
     set_radvd:
@@ -3655,8 +4186,6 @@ backend:
           in: body
           required: true
           description: "Complete radvd entry (same fields as add_radvd). Omitted fields reset to defaults — post everything."
-      response:
-        result_path: "$"
       pagination: none
 
     toggle_radvd:
@@ -3667,8 +4196,6 @@ backend:
       params:
         uuid: { type: string, in: path, required: true }
         enabled: { type: string, in: path, required: true, description: "1=enable, 0=disable" }
-      response:
-        result_path: "$"
       pagination: none
 
     del_radvd:
@@ -3678,8 +4205,6 @@ backend:
       description: "Delete a radvd interface entry by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_radvd:
@@ -3687,8 +4212,6 @@ backend:
       path: /radvd/service/reconfigure
       access: admin
       description: "Apply radvd changes (regenerates radvd.conf and reloads the daemon)"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3702,8 +4225,6 @@ backend:
       path: /ndpproxy/general/get
       access: read
       description: "Get NDP Proxy settings. Returns {ndpproxy:{general:{...}, aliases:{alias:{...}}}}. `general.upstream`/`downstream` come back as interface SELECT maps."
-      response:
-        result_path: "$"
       pagination: none
 
     set_ndpproxy_settings:
@@ -3730,8 +4251,6 @@ backend:
         ndpproxy.general.pf_qps: { type: integer, in: body }
         ndpproxy.general.pcap_timeout: { type: integer, in: body }
         ndpproxy.general.debug: { type: string, in: body, description: "Debug logging (0/1)" }
-      response:
-        result_path: "$"
       pagination: none
 
     search_ndpproxy_aliases:
@@ -3751,8 +4270,6 @@ backend:
       description: "Get an NDP Proxy alias entry by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_ndpproxy_alias:
@@ -3767,8 +4284,6 @@ backend:
         alias.interface: { type: string, in: body, description: "Interface (bare key); blank = any" }
         alias.alias: { type: string, in: body, required: true, description: "External-type firewall alias UUID to proxy" }
         alias.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_ndpproxy_alias:
@@ -3781,8 +4296,6 @@ backend:
         alias.interface: { type: string, in: body }
         alias.alias: { type: string, in: body }
         alias.description: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     del_ndpproxy_alias:
@@ -3792,8 +4305,6 @@ backend:
       description: "Delete an NDP Proxy alias entry by UUID"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_ndpproxy:
@@ -3801,8 +4312,6 @@ backend:
       path: /ndpproxy/service/reconfigure
       access: admin
       description: "Apply NDP Proxy changes and reload the ndp-proxy-go service"
-      response:
-        result_path: "$"
       pagination: none
 
     get_ndpproxy_status:
@@ -3810,8 +4319,6 @@ backend:
       path: /ndpproxy/service/status
       access: read
       description: "Get NDP Proxy service run state (running/stopped)"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3835,8 +4342,6 @@ backend:
       description: "Get a system user account by UUID including group memberships and permissions"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     add_user:
@@ -3852,8 +4357,6 @@ backend:
         user.expires: { type: string, in: body }
         user.disabled: { type: string, in: body, default: "0" }
         user.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_user:
@@ -3870,8 +4373,6 @@ backend:
         user.expires: { type: string, in: body }
         user.disabled: { type: string, in: body }
         user.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_user:
       method: POST
@@ -3880,8 +4381,6 @@ backend:
       description: "Delete a system user"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     search_groups:
@@ -3904,8 +4403,6 @@ backend:
       description: "Generate a new API key+secret pair for a user. The key is returned as a downloadable file. IMPORTANT: the secret is not stored on the system — save it immediately."
       params:
         username: { type: string, in: path, required: true, description: "Username to generate the API key for" }
-      response:
-        result_path: "$"
       pagination: none
 
     search_api_keys:
@@ -3925,8 +4422,6 @@ backend:
       description: "Delete an API key by its ID — revokes API access for this key immediately"
       params:
         id: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3938,8 +4433,6 @@ backend:
       path: /diagnostics/systemhealth/get_rrd_list
       access: read
       description: "List available RRD graphs (system health metrics)"
-      response:
-        result_path: "$"
       pagination: none
 
     get_system_health:
@@ -3950,8 +4443,6 @@ backend:
       params:
         rrd: { type: string, in: path, required: true, description: "RRD metric name from get_rrd_list" }
         detail: { type: string, in: query, description: "0=summary (default), 1=detailed data points" }
-      response:
-        result_path: "$"
       pagination: none
 
     get_health_interfaces:
@@ -3959,8 +4450,6 @@ backend:
       path: /diagnostics/systemhealth/get_interfaces
       access: read
       description: "List interfaces available for health monitoring"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -3986,8 +4475,6 @@ backend:
         tunable.tunable: { type: string, in: body, required: true, description: "sysctl name" }
         tunable.value: { type: string, in: body, required: true }
         tunable.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
 
     set_tunable:
@@ -4000,8 +4487,6 @@ backend:
         tunable.tunable: { type: string, in: body, description: "sysctl name" }
         tunable.value: { type: string, in: body }
         tunable.descr: { type: string, in: body }
-      response:
-        result_path: "$"
       pagination: none
     del_tunable:
       method: POST
@@ -4010,8 +4495,6 @@ backend:
       description: "Delete a system tunable"
       params:
         uuid: { type: string, in: path, required: true }
-      response:
-        result_path: "$"
       pagination: none
 
     reconfigure_tunables:
@@ -4019,8 +4502,6 @@ backend:
       path: /core/tunables/reconfigure
       access: admin
       description: "Apply tunable changes"
-      response:
-        result_path: "$"
       pagination: none
 
     # =========================================================================
@@ -4032,8 +4513,6 @@ backend:
       path: /core/dashboard/get_dashboard
       access: read
       description: "Get dashboard widget configuration"
-      response:
-        result_path: "$"
       pagination: none
 
     get_product_info:
@@ -4041,8 +4520,6 @@ backend:
       path: /core/dashboard/product_info_feed
       access: read
       description: "Get product info and update feed"
-      response:
-        result_path: "$"
       pagination: none
 
     get_menu_tree:
@@ -4050,8 +4527,6 @@ backend:
       path: /core/menu/tree
       access: read
       description: "Get the full OPNsense menu structure"
-      response:
-        result_path: "$"
       pagination: none
 
   composites:
@@ -4131,6 +4606,98 @@ backend:
         if (params.apply) applied = await api.reconfigure_gateways();
         return { ok: true, uuid: params.uuid, changed: params.changes, result: res, applied };
 
+    update_gateway_group:
+      description: >
+        Safely edit a gateway group (failover/load-balancing tiers) by UUID via read-modify-write.
+        Pass `uuid` plus either `changes` (raw field map) or the friendlier `tiers` map
+        {"1": ["PRIMARY_GWv6"], "2": ["BACKUP_GWv6"]} — tier numbers 1..5, values are arrays of
+        gateway NAMES; only the tiers you name are touched.
+        WHY THIS EXISTS: tier 1 is stored in the field `item`, NOT `item1` (tiers 2..5 are
+        item2..item5), and every tier is a multi-select. Hand-written code that loops
+        item1..item5, or that assumes `item` is a scalar, skips tier 1 silently — which is how a
+        gateway rename once left a group pointing at a gateway that no longer existed. This
+        composite reads the group, flattens the SELECT maps to bare comma-joined names, applies
+        your changes and posts the complete item back, then reports the resulting tiers so the
+        result can be counted against what you asked for.
+        Does NOT apply by default — pass apply:true or call reconfigure_gateway_groups.
+        Other writable fields for `changes`: name, trigger (down | downloss | downlatency |
+        downlosslatency), poolopts ("" | "round-robin" | "round-robin sticky-address"), descr.
+      params:
+        uuid:
+          type: string
+          required: true
+          description: "Gateway group UUID (from search_gateway_groups)"
+        tiers:
+          type: object
+          default: {}
+          description: 'Tier number -> array of gateway names, e.g. {"1":["PRIMARY_GWv4"],"2":["BACKUP_GWv4"]}. Tier 1 maps to the `item` field. Untouched tiers are preserved; pass an empty array to clear a tier.'
+        changes:
+          type: object
+          default: {}
+          description: "Raw field map (name, trigger, poolopts, descr, or item/item2..item5 directly). Applied after `tiers`."
+        apply:
+          type: boolean
+          default: false
+          description: "When true, call reconfigure_gateway_groups after a successful save"
+      timeout: 30s
+      depends_on: [get_gateway_group, set_gateway_group, reconfigure_gateway_groups]
+      code: |
+        // 1) READ current group
+        const got = await api.get_gateway_group({ uuid: params.uuid });
+        const item = got && got.gateway_group;
+        if (!item) {
+          return { ok: false, uuid: params.uuid, error: "gateway_group not found", raw: got };
+        }
+
+        // 2) Flatten OPNsense SELECT maps ({optKey:{value,selected}}) to bare comma lists.
+        const flat = {};
+        for (const k of Object.keys(item)) {
+          const v = item[k];
+          if (v && typeof v === "object" && !Array.isArray(v)) {
+            const selected = Object.keys(v).filter(
+              (opt) => v[opt] && typeof v[opt] === "object" && String(v[opt].selected) === "1"
+            );
+            flat[k] = selected.join(",");
+          } else {
+            flat[k] = v;
+          }
+        }
+
+        // 3) MODIFY. Tier 1 lives in `item`, tiers 2..5 in item2..item5 — the whole point.
+        const tierField = (n) => (String(n) === "1" ? "item" : "item" + n);
+        const merged = Object.assign({}, flat);
+        const tiers = params.tiers || {};
+        for (const n of Object.keys(tiers)) {
+          if (!/^[1-5]$/.test(String(n))) {
+            return { ok: false, uuid: params.uuid, error: "tier must be 1..5, got " + n };
+          }
+          const gws = tiers[n] || [];
+          merged[tierField(n)] = Array.isArray(gws) ? gws.join(",") : String(gws);
+        }
+        Object.assign(merged, params.changes || {});
+
+        // 4) WRITE the complete item back.
+        const res = await api.set_gateway_group({ uuid: params.uuid, gateway_group: merged });
+        if (!res || res.result !== "saved") {
+          return {
+            ok: false,
+            uuid: params.uuid,
+            validations: (res && res.validations) || null,
+            raw: res,
+          };
+        }
+
+        // 5) Report the resulting tiers explicitly so tier 1 can be verified, not assumed.
+        const resulting = {};
+        for (let n = 1; n <= 5; n++) {
+          const v = merged[tierField(n)];
+          resulting[n] = v ? String(v).split(",").filter(Boolean) : [];
+        }
+
+        let applied = null;
+        if (params.apply) applied = await api.reconfigure_gateway_groups();
+        return { ok: true, uuid: params.uuid, tiers: resulting, trigger: merged.trigger, result: res, applied };
+
     update_hasync_settings:
       description: >
         Safely update HA sync settings — especially the syncitems multi-select — via
@@ -4147,6 +4714,12 @@ backend:
         opendns, openvpn, radvd, rules, schedules, shaper, ssh, staticroutes, suricata, sysctl,
         syslog, syslog-ng, users, virtualip, webgui, wireguard. On failure returns {ok:false,
         validations, raw}.
+        PASSWORD: `changes.password` is accepted and written normally — the sync password is
+        write-only, not unwritable. It is never read back (get_hasync_settings redacts it), and
+        this composite never copies it from the current model, so a plain
+        update_hasync_settings({changes:{synchronizetoip:"…"}}) leaves the stored password
+        untouched. A `changes` value that is itself the redaction marker is rejected rather than
+        written.
       params:
         changes:
           type: object
@@ -4168,14 +4741,31 @@ backend:
         const cur = got && got.hasync;
         if (!cur) return { ok: false, error: "hasync model not found", raw: got };
 
-        // 2) recompute syncitems only when the caller asked to (preserve the rest)
+        // 2) recompute syncitems only when the caller asked to (preserve the rest).
+        //    get_hasync_settings already flattens the multi-select maps to a comma-joined
+        //    string of bare keys; older/raw shapes ({key:{selected}}) are still handled.
         const wantEnable = params.enable_syncitems || [];
         const wantDisable = params.disable_syncitems || [];
         const payload = Object.assign({}, params.changes || {});
-        const si = cur.syncitems && typeof cur.syncitems === "object" ? cur.syncitems : {};
-        const selected = new Set(
-          Object.keys(si).filter((k) => si[k] && String(si[k].selected) === "1")
-        );
+
+        // Never write a redacted read-back value into a write-only field.
+        const REDACTED = "(redacted: write-only, settable but never returned)";
+        for (const k of Object.keys(payload)) {
+          if (payload[k] === REDACTED) {
+            return { ok: false, error: "refusing to write the redaction marker into '" + k +
+                     "' — pass the real value or omit the field to keep the stored one" };
+          }
+        }
+
+        const si = cur.syncitems;
+        let selected;
+        if (typeof si === "string") {
+          selected = new Set(si.split(",").filter(Boolean));
+        } else if (si && typeof si === "object") {
+          selected = new Set(Object.keys(si).filter((k) => si[k] && String(si[k].selected) === "1"));
+        } else {
+          selected = new Set();
+        }
         if (wantEnable.length || wantDisable.length) {
           for (const k of wantEnable) selected.add(k);
           for (const k of wantDisable) selected.delete(k);
@@ -4285,11 +4875,10 @@ backend:
           'rule.description': 'Web server port forward'
         });
 
-        // Apply with savepoint for auto-rollback safety
-        const sp = await api.savepoint_firewall();
-        await api.apply_firewall({ rollback_revision: sp.revision });
-        // If everything works, confirm:
-        await api.cancel_rollback_firewall({ rollback_revision: sp.revision });
+        // Apply the ruleset to the running pf. No savepoint/rollback API exists on 26.7 —
+        // apply_firewall takes no arguments. For a safety net take a config backup first
+        // (list_backups shows the history; revert_backup rolls the whole config back).
+        await api.apply_firewall();
 
     - name: "Add a DNS host override"
       description: "Create a local DNS record and apply"
@@ -4355,3 +4944,36 @@ backend:
         await api.reconfigure_radvd();
         // Later: switch to managed mode without resetting the other fields
         return await api.update_radvd({ uuid: add.uuid, changes: { mode: 'managed' }, apply: true });
+
+    - name: "IPv6 ping with explicit source address"
+      description: "Verify IPv6 reachability from a specific source address — create, run, read stats, clean up"
+      code: |
+        const job = await api.set_ping_job({
+          ping: { settings: { hostname: '2001:db8::53', fam: 'ip6', source_address: '2001:db8:1::1' } }
+        });
+        if (job.result !== 'ok') return job; // inspect validations
+        await api.start_ping_job({ jobid: job.uuid });
+        // The job pings continuously — poll stats from a LATER call so packets accumulate.
+        const jobs = await api.search_ping_jobs({});
+        const mine = jobs.rows.find(r => r.id === job.uuid);
+        await api.stop_ping_job({ jobid: job.uuid });
+        await api.remove_ping_job({ jobid: job.uuid });
+        return mine; // send/received/loss/min/avg/max
+
+    - name: "Capture ICMPv6 on an interface and download the pcap"
+      description: "Packet capture roundtrip: set → start → stop → view → download → remove"
+      code: |
+        // interface takes PHYSICAL device names — map the friendly name first
+        const ifs = await api.get_interfaces_overview();
+        const dev = ifs.find(i => i.description === 'LAN').device; // e.g. em0
+        const job = await api.set_capture_job({
+          packetcapture: { settings: { interface: dev, fam: 'ip6', protocol: 'icmp', count: '50' } }
+        });
+        if (job.result !== 'ok') return job;
+        await api.start_capture_job({ jobid: job.uuid });
+        // ...capture runs until `count` packets or an explicit stop...
+        await api.stop_capture_job({ jobid: job.uuid });
+        const packets = await api.view_capture_job({ jobid: job.uuid, detail: 'normal' });
+        const pcap = await api.download_capture({ jobid: job.uuid }); // file download URL
+        await api.remove_capture_job({ jobid: job.uuid });
+        return { packets, pcap };
