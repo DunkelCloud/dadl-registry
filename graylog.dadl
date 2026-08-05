@@ -3003,9 +3003,9 @@ backend:
       description: >
         Time-series histogram, optionally grouped by a field. interval is a
         Graylog timeunit: {quantity}{unit} with unit one of s m h d w M y --
-        e.g. 30s, 1m, 5m, 1h, 1d. NOT ISO-8601: "PT1M" is rejected with
-        HTTP 400. ISO-8601 forms are converted here for convenience, but pass
-        the Graylog form. Returns [{bucket_start, group_key|null, count}].
+        e.g. 30s, 1m, 5m, 1h, 1d. That is the form to pass. ISO-8601 ("PT1M",
+        "P1D") is also accepted and converted, because the underlying pivot
+        rejects it with HTTP 400. Returns [{bucket_start, group_key|null, count}].
       params:
         query:      { type: string,  default: "*" }
         time_range: { type: object,  required: true }
@@ -3262,7 +3262,7 @@ backend:
       replaces: "deprecated _terms / _histogram / _stats endpoints removed in Graylog 6.0"
       row_col_keys: "row.key holds ONLY the row dimensions. Column dimensions are NOT in row.key -- each column cell is a separate row.values[] entry with source 'col-leaf' and key [...colValues, seriesId]; the one entry with source 'row-leaf' is the rollup total across all columns."
     histogram_grouped:
-      interval_format: "Graylog timeunit {quantity}{unit}, unit in [s m h d w M y] -- 30s, 1m, 5m, 1h, 1d. NOT ISO-8601: PT1M returns HTTP 400 'Time unit must be {quantity}{unit}'. The composite converts ISO-8601 input, but the pivot row_group wants the Graylog form."
+      interval_format: "pass the Graylog timeunit {quantity}{unit}, unit in [s m h d w M y] -- 30s, 1m, 5m, 1h, 1d. ISO-8601 is accepted at the composite and converted; it is the raw pivot row_group that rejects PT1M with HTTP 400 'Time unit must be {quantity}{unit}'. So the 400 only appears when calling views_search_sync directly."
       interval_property: "the row_group interval object is { type: 'timeunit', timeunit: '1m' } -- the value key is `timeunit`, not `value` (HTTP 400 'Known properties include: timeunit, type')"
     create_stream:
       default_stream_id: "000000000000000000000001 -- cannot be deleted"
