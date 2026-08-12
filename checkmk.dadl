@@ -118,6 +118,15 @@
 #   GET collections) are deliberately not surfaced -- use the POST status tools or
 #   the single-value variants instead.
 #
+# - GLOBAL SETTINGS HAVE NO REST API. Setup > General > Global settings is not
+#   reachable through this API in ANY Checkmk 2.x version -- there is no
+#   /domain-types/global_settings/... endpoint, and the `global_settings` key inside
+#   a site_config is only a proxy flag, not the settings tree. If asked to change a
+#   global setting (notification handling, log levels, UI defaults), say so plainly:
+#   it must be done in the GUI, or on the server via `omd config` and the
+#   configuration files. Do not try to fake it through a rule -- rules and global
+#   settings are different layers.
+#
 # - EDITIONS: `bake_agent`, agent baking, DCD, licensing and the event console are
 #   Enterprise/Managed features. On Raw Edition (CRE) they answer 404/403.
 #   `customer` fields only exist on the Managed Edition (CME).
@@ -210,7 +219,7 @@ backend:
     total_endpoints: 230
     percentage: 54
     focus: "Checkmk 2.4 REST API v1: host status and service status via Livestatus queries, downtimes for hosts and host groups, downtimes for services and service groups, downtime modification and deletion, acknowledgements, comments, host configuration, host clusters, host bulk operations, folders with attribute inheritance, folder moves, service discovery, service phase updates, rules, rulesets, rule ordering, activation of pending changes, host groups, service groups, contact groups, roles and user accounts, passwords, time periods, host tags, aux tags, notification rules, site connections, agent download, metrics, audit log, background jobs, parent scan."
-    missing: "BI (business intelligence) aggregations and packs, event console, LDAP/SAML connections, broker connections, quick setup wizards, configuration entities (notification parameters), global settings, DCD (dynamic host configuration), licensing, certificate management, custom host attributes, autocomplete helpers, master control, graph timerange and icon endpoints, agent baking and signature keys (CEE), bulk update/delete for the three group types, deprecated GET variants of the status collections"
+    missing: "HW/SW inventory trees, agent registration, BI (business intelligence) aggregations and packs, event console (current and historical events), LDAP connections, broker connections, quick setup wizards, configuration entities (notification parameters), DCD (dynamic host configuration), licensing, certificate management, custom host attributes, autocomplete helpers, graph timerange and icon endpoints, agent baking and signature keys (CEE), bulk update/delete for the three group types, deprecated GET variants of the status collections. NOT a gap: Checkmk's global settings have no REST endpoint in any 2.x version (see domain notes)."
     last_reviewed: "2026-08-13"
 
   setup:
