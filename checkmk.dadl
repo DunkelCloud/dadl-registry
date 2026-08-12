@@ -1,0 +1,2381 @@
+# checkmk.dadl -- Checkmk REST API for ToolMesh
+# Monitoring status, host/folder configuration, downtimes, acknowledgements,
+# service discovery, rules and change activation for a Checkmk site.
+#
+# Domain Notes for LLM consumers:
+#
+# - VERSION TARGET: Checkmk 2.4/2.5, REST API version "1.0" (the URL segment is literally `1.0`).
+#   Written against the Checkmk 2.4.0 endpoint sources and LIVE-VERIFIED against a
+#   2.5.0p11 community-edition site on 2026-08-13 -- 45 tools and all three composites,
+#   including a full write cycle (folder + host + discovery + downtime + comment, then
+#   deletion and activation). Most tools also work on 2.2/2.3; the exceptions are
+#   called out per tool below.
+#
+# - BASE URL contains the SITE NAME and is deployment specific:
+#     {PROTO}://{HOST}/{SITE}/check_mk/api/1.0
+#   e.g. https://monitoring.example.com/prod/check_mk/api/1.0
+#   `base_url` is intentionally omitted here -- it comes from backends.yaml.
+#
+# - AUTHENTICATION is a Bearer header with TWO space-separated values:
+#     Authorization: Bearer <username> <automation secret>
+#   The ToolMesh credential must therefore hold the string "<username> <secret>",
+#   e.g. "automation Xy3k...". This is NOT a normal single-token bearer.
+#
+# - TWO WORLDS, do not mix them up:
+#   * MONITORING (live state, read-only, served from Livestatus): domain types
+#     `host`, `service`, `downtime`, `comment`, `acknowledge`, `metric`.
+#     Effective immediately, no activation needed.
+#   * SETUP / CONFIGURATION (the "Setup" a.k.a. WATO tree): domain types
+#     `host_config`, `folder_config`, `*_group_config`, `rule`, `user_config`,
+#     `time_period`, `host_tag_group`, `password`, ...
+#     Changes are staged as "pending changes" and are INACTIVE until
+#     activate_changes runs. Always finish a config change session with
+#     activate_changes (or the apply_pending_changes composite).
+#
+# - LIVESTATUS QUERY DSL: `query` takes a nested filter expression, e.g.
+#     {"op": "!=", "left": "state", "right": "0"}                 -- all non-OK
+#     {"op": "and", "expr": [{"op": "=", "left": "state", "right": "2"},
+#                            {"op": "=", "left": "acknowledged", "right": "0"}]}
+#     {"op": "~", "left": "name", "right": "web.*"}               -- regex match
+#   Operators: =, !=, ~ (regex), ~~ (regex, case-insensitive), <, >, <=, >=,
+#   and the boolean combinators "and", "or", "not" (with `expr`).
+#   IMPORTANT: on POST tools `query` is a real JSON OBJECT (body).
+#   On GET tools (list_downtimes, list_comments) `query` is a JSON STRING.
+#
+# - STATE CODES: hosts 0=UP, 1=DOWN, 2=UNREACHABLE. Services 0=OK, 1=WARN,
+#   2=CRIT, 3=UNKNOWN. `state_type` 0=SOFT, 1=HARD. `acknowledged` 0/1,
+#   `scheduled_downtime_depth` > 0 means "currently in a downtime".
+#
+# - "POST for read": the non-deprecated status list endpoints use POST because the
+#   query/columns payload does not fit a URL. They are still read-only
+#   (access: read). The GET variants of the same URLs exist in 2.4 but are
+#   deprecated and are removed in 2.5, so they are not surfaced here -- the POST
+#   forms are confirmed working on a live 2.5.0p11 site. On Checkmk <= 2.3 the POST
+#   variants do not exist yet and return HTTP 404 -- that 404 means "server too old",
+#   not "no data".
+#
+# - COLUMNS: the status tools return only the columns you ask for. Always pass
+#   `columns` explicitly, e.g. ["host_name","description","state","acknowledged",
+#   "scheduled_downtime_depth","last_check","plugin_output"]. Column names are the
+#   Livestatus hosts/services table columns.
+#
+# - NO PAGINATION ANYWHERE. Every collection endpoint returns the complete result
+#   set in a single response. Bound the volume with `query` + `columns`
+#   (status tools) or with the jq override (`allow_jq_override` is on globally).
+#   A bare list_services_status on a large site can be many megabytes.
+#
+# - RESPONSE SHAPE: Checkmk answers in the "Restful Objects" envelope. A collection is
+#   {"value": [<domain object>, ...]}, a domain object is
+#   {"id", "title", "links": [...], "extensions": {...}, "members": {...}}.
+#   The backend-wide transform flattens this: collections become a plain array of
+#   {id, title, ...extensions} and single objects become {id, title, ...extensions};
+#   the noisy `links` array is dropped. The real payload therefore sits at the TOP
+#   LEVEL of each item, not under `.extensions`. Anything that is not a Restful
+#   Objects envelope (get_version, get_metric) is passed through untouched.
+#
+# - ETAG / If-Match: Checkmk does optimistic locking. Most PUT endpoints and some
+#   POST actions (move, rename, activate_changes) reject the request with
+#   HTTP 428 when no `If-Match` header is present, and with 412 when the ETag is
+#   stale ("ETag didn't match. Probable cause: Object changed by another user").
+#   This backend sends `If-Match: *` on every request by default, which Checkmk
+#   accepts as "match whatever is there". Tools where genuine optimistic locking
+#   makes sense expose an overridable `If-Match` parameter -- pass the concrete
+#   ETag from the preceding GET to be safe against concurrent writers.
+#
+# - FOLDER PATHS use `~` as the delimiter, NEVER `/` (and %2f does not work either):
+#   root folder = "~", nested = "~datacenter~racks". A folder may alternatively be
+#   addressed by its 32-character hex id. The `parent`/`folder` body fields of
+#   create_host and create_folder accept both "~" and "/" notation.
+#
+# - TIMESTAMPS ARE ASYMMETRIC, and this bites in both directions:
+#   * What you SEND (downtime start_time/end_time, metric time_range) is ISO 8601 with
+#     timezone, e.g. "2026-08-12T17:32:28Z".
+#   * What Livestatus RETURNS is Unix epoch SECONDS: last_check, last_state_change,
+#     next_check come back as integers like 1786571159, and so does the audit log's
+#     `time`. Downtimes, comments and pending changes, by contrast, return ISO strings.
+#     Never feed a status column straight back into a downtime field.
+#   Downtime `duration` is in SECONDS (0 = fixed downtime spanning start_time..end_time).
+#
+# - THERE IS NO "remove acknowledgement" ENDPOINT in the 2.4 REST API. An
+#   acknowledgement disappears when the problem recovers, or must be removed in the
+#   GUI. Do not look for a delete_acknowledgement tool -- it does not exist.
+#
+# - EMPTY RESPONSES: delete/update-style endpoints answer HTTP 204 with no body.
+#   An empty result is success, not failure.
+#
+# - ERRORS come back as {"title", "status", "detail", "fields"}. `detail` is surfaced
+#   as the error message. On HTTP 400 the `fields` object carries the per-field
+#   validation messages -- if the message alone is not conclusive, re-run with a
+#   jq override to inspect the raw body.
+#
+# - BACKGROUND JOBS: service discovery, bulk discovery, host renaming, parent scan and
+#   activation all start background jobs. The pattern is always
+#   start -> poll the matching wait_*_completion tool (HTTP 204 = done, 302 = still
+#   running) -> read the result. Never assume the job finished when start returns.
+#
+# - ARRAY PARAMETERS are only expressed in request BODIES here. ToolMesh cannot emit
+#   repeated query parameters, so query-string arrays (`columns`, `hostnames` on the
+#   GET collections) are deliberately not surfaced -- use the POST status tools or
+#   the single-value variants instead.
+#
+# - EDITIONS: `bake_agent`, agent baking, DCD, licensing and the event console are
+#   Enterprise/Managed features. On Raw Edition (CRE) they answer 404/403.
+#   `customer` fields only exist on the Managed Edition (CME).
+#   download_agent only ships the vanilla agents (linux_rpm, linux_deb, windows_msi).
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Checkmk REST API"
+source_url: "https://docs.checkmk.com/latest/en/rest_api.html"
+date: "2026-08-12"
+
+backend:
+  name: checkmk
+  type: rest
+  version: "1.0"
+  # base_url intentionally omitted -- self-hosted and site-specific,
+  # provided via backends.yaml as https://<host>/<site>/check_mk/api/1.0
+  description: >
+    Checkmk REST API (version 1.0, Checkmk 2.4) -- live host and service status via Livestatus
+    queries, downtimes, acknowledgements and comments, plus the full Setup side: hosts, clusters,
+    folders, service discovery, rules and rulesets, host/service/contact groups, users, roles,
+    passwords, time periods, host tags, notification rules, site connections and change activation.
+
+  auth:
+    type: bearer
+    credential: checkmk_automation_secret   # value MUST be "<username> <automation secret>"
+    inject_into: header
+    header_name: Authorization
+    prefix: "Bearer "
+
+  defaults:
+    headers:
+      Accept: application/json
+      # Checkmk rejects mutating requests without If-Match (HTTP 428). "*" matches any
+      # ETag; tools that expose an If-Match parameter can override this per call.
+      If-Match: "*"
+    content_type: application/json
+    # pagination: intentionally absent -- the Checkmk REST API has no paging at all.
+    # Collections are returned complete; bound them via query/columns or jq override.
+    errors:
+      format: json
+      message_path: "$.detail"
+      code_path: "$.title"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 405, 406, 409, 412, 415, 422, 423, 428]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      map:
+        400: invalid_input
+        401: unauthorized
+        403: forbidden
+        404: not_found
+        405: invalid_input
+        406: invalid_input
+        409: conflict
+        412: conflict
+        415: invalid_input
+        422: invalid_input
+        423: conflict
+        428: invalid_input
+        429: rate_limited
+        500: internal
+        502: unavailable
+        503: unavailable
+        504: timeout
+    response:
+      result_path: "$"
+      # Flatten the Restful Objects envelope: drop the `links`/`domainType`/`members` noise and
+      # lift `extensions` to the top level. Collections become a plain array, single objects one
+      # object. Deliberately SUBTRACTIVE rather than projecting to a field whitelist: some
+      # collections (pending_changes, audit_log) return flat entries with no `extensions` at all,
+      # and a whitelist silently discarded their payload.
+      transform: |
+        if type == "object" then
+          if (.value | type) == "array" then
+            [ .value[] | (del(.links, .domainType, .members) + (.extensions // {})) | del(.extensions) ]
+          else
+            (del(.links, .domainType, .members) + (.extensions // {})) | del(.extensions)
+          end
+        else . end
+      allow_jq_override: true
+
+  coverage:
+    endpoints: 125
+    total_endpoints: 230
+    percentage: 54
+    focus: "Checkmk 2.4 REST API v1: host status and service status via Livestatus queries, downtimes for hosts and host groups, downtimes for services and service groups, downtime modification and deletion, acknowledgements, comments, host configuration, host clusters, host bulk operations, folders with attribute inheritance, folder moves, service discovery, service phase updates, rules, rulesets, rule ordering, activation of pending changes, host groups, service groups, contact groups, roles and user accounts, passwords, time periods, host tags, aux tags, notification rules, site connections, agent download, metrics, audit log, background jobs, parent scan."
+    missing: "BI (business intelligence) aggregations and packs, event console, LDAP/SAML connections, broker connections, quick setup wizards, configuration entities (notification parameters), global settings, DCD (dynamic host configuration), licensing, certificate management, custom host attributes, autocomplete helpers, master control, graph timerange and icon endpoints, agent baking and signature keys (CEE), bulk update/delete for the three group types, deprecated GET variants of the status collections"
+    last_reviewed: "2026-08-13"
+
+  setup:
+    credential_steps:
+      - "1. Log into the Checkmk GUI of the site you want to automate"
+      - "2. Go to Setup > Users > Add user"
+      - "3. Set 'Username' to e.g. 'automation' and enable 'Automation secret for machine accounts'"
+      - "4. Click the dice icon to generate a secret, or paste your own, and copy it"
+      - "5. Assign roles: 'Monitoring user' for read-only, 'Administrator' for Setup writes"
+      - "6. Save the user, then click 'Activate on selected sites' -- a new user is a pending change"
+      - "7. Set CREDENTIAL_CHECKMK_AUTOMATION_SECRET to the string '<username> <secret>' -- the"
+      - "   username, ONE space, then the secret (e.g. 'automation ABCdef123...'). The Checkmk"
+      - "   bearer token consists of both values; a bare secret results in HTTP 401."
+      - "8. Point the backends.yaml url at the SITE, not the server: https://<host>/<site>/check_mk/api/1.0"
+      - "9. Verify with the get_version tool -- it needs no parameters and no permissions."
+    env_var: CREDENTIAL_CHECKMK_AUTOMATION_SECRET
+    backends_yaml: |
+      - name: checkmk
+        transport: rest
+        dadl: checkmk.dadl
+        url: "https://monitoring.example.com/prod/check_mk/api/1.0"
+    required_scopes:
+      - "Monitoring user (role 'user') -- status, downtimes, acknowledgements, comments"
+    optional_scopes:
+      - "Administrator (role 'admin') -- Setup writes: hosts, folders, rules, users, activation"
+      - "wato.edit / wato.manage_hosts / wato.all_folders -- fine-grained Setup permissions"
+      - "general.see_all + wato.see_all_folders -- see objects outside own contact groups"
+    docs_url: "https://docs.checkmk.com/latest/en/rest_api.html"
+    notes: >
+      The interactive, always-up-to-date API reference lives inside every Checkmk site under
+      Help > REST API documentation (and the raw spec under
+      /<site>/check_mk/api/1.0/openapi-swagger-ui/). Self-hosted: the url MUST contain the site
+      name -- the shape is <proto>://<host>/<SITE>/check_mk/api/1.0. Getting this wrong is the
+      most common setup failure and it looks confusing: EVERY tool then returns the same HTTP 404
+      carrying an Apache HTML error page instead of Checkmk JSON. Diagnose it by requesting
+      <url>/version by hand -- the correct site answers with JSON ({"title": "Unauthorized"} when
+      unauthenticated), a wrong path answers with Apache's HTML. If you do not know the site name,
+      `omd sites` on the server lists it. An automation user must be activated once (step 6)
+      before the API accepts it. For a read-only integration, give the user the 'Monitoring user'
+      role only: every Setup tool in this backend then fails with HTTP 403 instead of silently
+      changing configuration.
+
+  tools:
+
+    # ──────────────────────────────────────────────
+    # Monitoring status (Livestatus, read-only, no activation needed)
+    # ──────────────────────────────────────────────
+
+    list_hosts_status:
+      method: POST
+      path: /domain-types/host/collections/all
+      access: read
+      description: >
+        Live status of monitored hosts, filtered with a Livestatus query. POST is used only to
+        carry the query payload -- this is a read-only call. Returns one entry per host with
+        exactly the columns requested. Example query for all non-UP hosts:
+        {"op": "!=", "left": "state", "right": "0"}. Useful columns: name, address, alias, state
+        (0=UP, 1=DOWN, 2=UNREACHABLE), state_type, acknowledged, scheduled_downtime_depth,
+        last_check, last_state_change, plugin_output, num_services_crit, num_services_warn,
+        tag_names, groups. Without a query this returns EVERY host -- always filter on large sites.
+        Requires Checkmk 2.4+ (on 2.3 and older this URL only exists as GET).
+      params:
+        query: { type: object, in: body, description: "Livestatus filter expression, e.g. {\"op\": \"!=\", \"left\": \"state\", \"right\": \"0\"}. Omit to match all hosts." }
+        columns: { type: array, in: body, description: "Hosts table columns to return. Defaults to [\"name\"] only -- pass what you actually need." }
+        sites: { type: array, in: body, description: "Restrict the query to these site ids. Empty = all sites of the distributed setup." }
+
+    get_host_status:
+      method: GET
+      path: /objects/host/{host_name}
+      access: read
+      description: >
+        Live status of ONE monitored host. Returns name, alias and address by default. Because
+        ToolMesh cannot send repeated query parameters, only a single extra column can be selected
+        here -- for a full column set call list_hosts_status with
+        {"op": "=", "left": "name", "right": "<host>"} instead. Answers HTTP 404 when the host is
+        not monitored (a host that exists in Setup but was never activated is NOT monitored).
+      params:
+        host_name: { type: string, in: path, required: true, description: "The monitored host name." }
+        columns: { type: string, in: query, description: "ONE additional Livestatus column, e.g. 'state'. For several columns use list_hosts_status." }
+
+    list_services_status:
+      method: POST
+      path: /domain-types/service/collections/all
+      access: read
+      description: >
+        Live status of monitored services across all hosts, filtered with a Livestatus query.
+        Read-only despite POST. The single most useful monitoring call: unacknowledged problems are
+        {"op": "and", "expr": [{"op": "!=", "left": "state", "right": "0"},
+        {"op": "=", "left": "acknowledged", "right": "0"},
+        {"op": "=", "left": "scheduled_downtime_depth", "right": "0"}]}.
+        Useful columns: host_name, description, state (0=OK, 1=WARN, 2=CRIT, 3=UNKNOWN), state_type,
+        acknowledged, scheduled_downtime_depth, plugin_output, last_check, last_state_change,
+        current_attempt, max_check_attempts, perf_data, host_state. Unfiltered this returns every
+        service of every host -- easily tens of thousands of rows. Requires Checkmk 2.4+.
+      params:
+        query: { type: object, in: body, description: "Livestatus filter expression on the services table. Omit to match all services." }
+        columns: { type: array, in: body, description: "Services table columns to return. Defaults to [\"host_name\", \"description\"]." }
+        host_name: { type: string, in: body, description: "Shortcut filter for a single host, combined with query via AND." }
+        sites: { type: array, in: body, description: "Restrict the query to these site ids." }
+
+    list_host_services:
+      method: POST
+      path: /objects/host/{host_name}/collections/services
+      access: read
+      description: >
+        Live status of all monitored services of ONE host. Read-only despite POST. Same column and
+        query semantics as list_services_status, but scoped to the host in the path -- the cheapest
+        way to answer "what is wrong on host X". Requires Checkmk 2.4+.
+      params:
+        host_name: { type: string, in: path, required: true, description: "The monitored host name." }
+        query: { type: object, in: body, description: "Additional Livestatus filter on the services table." }
+        columns: { type: array, in: body, description: "Services table columns to return. Defaults to [\"host_name\", \"description\"]." }
+        sites: { type: array, in: body, description: "Restrict the query to these site ids." }
+
+    get_service_status:
+      method: GET
+      path: /objects/host/{host_name}/actions/show_service/invoke
+      access: read
+      description: >
+        Live status of ONE service on ONE host. Returns host_name, description, state, state_type and
+        last_check by default -- a sensible set without further parameters. The service is addressed
+        by its display name ("Filesystem /", "CPU utilization", "Check_MK"), which is what the
+        `description` column contains. HTTP 404 when host or service is not monitored.
+      params:
+        host_name: { type: string, in: path, required: true, description: "The monitored host name." }
+        service_description: { type: string, in: query, required: true, description: "Service display name, e.g. 'Filesystem /boot'." }
+        columns: { type: string, in: query, description: "ONE Livestatus column to return instead of the defaults. For several use list_host_services." }
+
+    # ──────────────────────────────────────────────
+    # Downtimes (monitoring side, effective immediately)
+    # ──────────────────────────────────────────────
+
+    list_downtimes:
+      method: GET
+      path: /domain-types/downtime/collections/all
+      access: read
+      description: >
+        All scheduled downtimes, host and service. Each entry carries the downtime id (as `id`),
+        host_name, author, comment, start_time, end_time, is_service and recurring. The id is what
+        delete_downtime(delete_type "by_id") and modify_downtime need. Note the `query` parameter is
+        a JSON STRING here (GET), not an object.
+      params:
+        host_name: { type: string, in: query, description: "Only downtimes of this host (including its services)." }
+        service_description: { type: string, in: query, description: "Only downtimes of this service." }
+        downtime_type: { type: string, in: query, description: "Filter by type: host | service | both (default both)." }
+        site_id: { type: string, in: query, description: "Restrict to one site of a distributed setup." }
+        query: { type: string, in: query, description: "Livestatus filter on the downtimes table as a JSON STRING, e.g. '{\"op\": \"=\", \"left\": \"host_name\", \"right\": \"example.com\"}'." }
+
+    get_downtime:
+      method: GET
+      path: /objects/downtime/{downtime_id}
+      access: read
+      description: "Show a single downtime by its numeric id. site_id is required in distributed setups to locate the downtime."
+      params:
+        downtime_id: { type: string, in: path, required: true, description: "Numeric downtime id as returned by list_downtimes." }
+        site_id: { type: string, in: query, description: "Site holding the downtime." }
+
+    create_downtime_host:
+      method: POST
+      path: /domain-types/downtime/collections/host
+      access: write
+      description: >
+        Schedule a downtime for hosts. `downtime_type` selects how the targets are addressed:
+        "host" (single host_name), "hostgroup" (all hosts of hostgroup_name) or "host_by_query"
+        (all hosts matching query). start_time/end_time are ISO 8601 with timezone. A FIXED downtime
+        (duration 0, the default) simply spans start..end. With duration > 0 the downtime is
+        FLEXIBLE: it lasts `duration` SECONDS starting at the first problem inside the window.
+        `recur` makes it repeat: fixed (default, no repeat), hour, day, week, second_week,
+        fourth_week, weekday_start, weekday_end, day_of_month. Takes effect immediately, no
+        activation needed. Returns 204 with no body on success.
+      params:
+        downtime_type: { type: string, in: body, required: true, description: "host | hostgroup | host_by_query" }
+        start_time: { type: string, in: body, required: true, description: "ISO 8601 start, e.g. '2026-08-12T20:00:00Z'." }
+        end_time: { type: string, in: body, required: true, description: "ISO 8601 end." }
+        host_name: { type: string, in: body, description: "Required for downtime_type 'host'. Must be a MONITORED host." }
+        hostgroup_name: { type: string, in: body, description: "Required for downtime_type 'hostgroup'." }
+        query: { type: object, in: body, description: "Required for downtime_type 'host_by_query': Livestatus filter on the hosts table." }
+        comment: { type: string, in: body, description: "Free-text reason, shown in the GUI. Strongly recommended." }
+        duration: { type: integer, in: body, description: "Seconds. 0 (default) = fixed downtime over the whole window; > 0 = flexible." }
+        recur: { type: string, in: body, description: "Recurrence: fixed (default) | hour | day | week | second_week | fourth_week | weekday_start | weekday_end | day_of_month." }
+
+    create_downtime_service:
+      method: POST
+      path: /domain-types/downtime/collections/service
+      access: write
+      description: >
+        Schedule a downtime for services. `downtime_type` selects the addressing: "service"
+        (host_name plus service_descriptions), "servicegroup" (all services of servicegroup_name) or
+        "service_by_query" (all services matching query). Same time, duration and recur semantics as
+        create_downtime_host. To silence a whole host INCLUDING its services, schedule a host
+        downtime and additionally a service downtime by query on that host -- a host downtime alone
+        does not suppress service notifications.
+      params:
+        downtime_type: { type: string, in: body, required: true, description: "service | servicegroup | service_by_query" }
+        start_time: { type: string, in: body, required: true, description: "ISO 8601 start." }
+        end_time: { type: string, in: body, required: true, description: "ISO 8601 end." }
+        host_name: { type: string, in: body, description: "Required for downtime_type 'service'." }
+        service_descriptions: { type: array, in: body, description: "Required for downtime_type 'service': list of service display names, e.g. [\"CPU utilization\", \"Memory\"]." }
+        servicegroup_name: { type: string, in: body, description: "Required for downtime_type 'servicegroup'." }
+        query: { type: object, in: body, description: "Required for downtime_type 'service_by_query': Livestatus filter on the services table." }
+        comment: { type: string, in: body, description: "Free-text reason." }
+        duration: { type: integer, in: body, description: "Seconds. 0 (default) = fixed downtime." }
+        recur: { type: string, in: body, description: "Recurrence, see create_downtime_host." }
+
+    modify_downtime:
+      method: PUT
+      path: /domain-types/downtime/actions/modify/invoke
+      access: write
+      description: >
+        Change end time and/or comment of existing downtimes. Select the downtimes exactly like
+        delete_downtime does, via `modify_type`: by_id, params (host_name plus optional
+        service_descriptions), query, hostgroup or servicegroup. `end_time` is an object:
+        {"modify_type": "absolute", "value": "2026-08-12T22:00:00Z"} or
+        {"modify_type": "relative", "value": 30} where value is a non-zero number of MINUTES added
+        to (or, if negative, subtracted from) the current end time.
+      params:
+        modify_type: { type: string, in: body, required: true, description: "by_id | params | query | hostgroup | servicegroup" }
+        downtime_id: { type: string, in: body, description: "Required for modify_type 'by_id'." }
+        site_id: { type: string, in: body, description: "Site of the downtime, required with 'by_id'." }
+        host_name: { type: string, in: body, description: "Required for modify_type 'params'." }
+        service_descriptions: { type: array, in: body, description: "Narrow 'params' to these services of the host." }
+        hostgroup_name: { type: string, in: body, description: "Required for modify_type 'hostgroup'." }
+        servicegroup_name: { type: string, in: body, description: "Required for modify_type 'servicegroup'." }
+        query: { type: object, in: body, description: "Required for modify_type 'query': Livestatus filter on the downtimes table." }
+        end_time: { type: object, in: body, description: "{\"modify_type\": \"absolute\"|\"relative\", \"value\": <ISO 8601 datetime | non-zero minutes>}." }
+        comment: { type: string, in: body, description: "Replacement comment." }
+
+    delete_downtime:
+      method: POST
+      path: /domain-types/downtime/actions/delete/invoke
+      access: write
+      description: >
+        Remove scheduled downtimes -- POST, not DELETE. `delete_type` selects the targets:
+        "by_id" (downtime_id plus site_id), "params" (host_name, optionally narrowed by
+        service_descriptions -- without them ALL downtimes of that host go away), "query"
+        (Livestatus filter on the downtimes table), "hostgroup" or "servicegroup". Returns 204 with
+        no body. Deleting a non-existent downtime is not an error.
+      params:
+        delete_type: { type: string, in: body, required: true, description: "by_id | params | query | hostgroup | servicegroup" }
+        downtime_id: { type: string, in: body, description: "Required for delete_type 'by_id'." }
+        site_id: { type: string, in: body, description: "Site of the downtime, required with 'by_id'." }
+        host_name: { type: string, in: body, description: "Required for delete_type 'params'." }
+        service_descriptions: { type: array, in: body, description: "Narrow 'params' to these services; omit to delete all downtimes of the host." }
+        hostgroup_name: { type: string, in: body, description: "Required for delete_type 'hostgroup'." }
+        servicegroup_name: { type: string, in: body, description: "Required for delete_type 'servicegroup'." }
+        query: { type: object, in: body, description: "Required for delete_type 'query': Livestatus filter on the downtimes table." }
+
+    # ──────────────────────────────────────────────
+    # Acknowledgements (monitoring side; note: there is NO removal endpoint)
+    # ──────────────────────────────────────────────
+
+    create_acknowledgement_host:
+      method: POST
+      path: /domain-types/acknowledge/collections/host
+      access: write
+      description: >
+        Acknowledge host problems, which stops notifications until the host recovers.
+        `acknowledge_type`: "host" (host_name), "hostgroup" (hostgroup_name) or "host_by_query"
+        (query on the hosts table). `sticky` keeps the acknowledgement until the host is UP again
+        (not just until it improves), `notify` informs the contacts, `persistent` keeps the comment
+        after recovery. Effective immediately. Returns 204. There is NO endpoint to remove an
+        acknowledgement in this API version.
+      params:
+        acknowledge_type: { type: string, in: body, required: true, description: "host | hostgroup | host_by_query" }
+        comment: { type: string, in: body, required: true, description: "Reason for the acknowledgement, shown in the GUI." }
+        host_name: { type: string, in: body, description: "Required for acknowledge_type 'host'." }
+        hostgroup_name: { type: string, in: body, description: "Required for acknowledge_type 'hostgroup'." }
+        query: { type: object, in: body, description: "Required for acknowledge_type 'host_by_query'." }
+        sticky: { type: boolean, in: body, description: "Keep the acknowledgement until the host is UP again (default true)." }
+        notify: { type: boolean, in: body, description: "Send a notification about the acknowledgement (default true)." }
+        persistent: { type: boolean, in: body, description: "Keep the comment after the problem is resolved (default false)." }
+
+    create_acknowledgement_service:
+      method: POST
+      path: /domain-types/acknowledge/collections/service
+      access: write
+      description: >
+        Acknowledge service problems. `acknowledge_type`: "service" (host_name plus
+        service_description -- exactly one service), "servicegroup" (servicegroup_name) or
+        "service_by_query" (query on the services table; the way to acknowledge many services at
+        once). Same sticky/notify/persistent semantics as create_acknowledgement_host. Effective
+        immediately, returns 204, and cannot be undone via the API.
+      params:
+        acknowledge_type: { type: string, in: body, required: true, description: "service | servicegroup | service_by_query" }
+        comment: { type: string, in: body, required: true, description: "Reason for the acknowledgement." }
+        host_name: { type: string, in: body, description: "Required for acknowledge_type 'service'." }
+        service_description: { type: string, in: body, description: "Required for acknowledge_type 'service': the service display name." }
+        servicegroup_name: { type: string, in: body, description: "Required for acknowledge_type 'servicegroup'." }
+        query: { type: object, in: body, description: "Required for acknowledge_type 'service_by_query'." }
+        sticky: { type: boolean, in: body, description: "Keep until the service is OK again (default true)." }
+        notify: { type: boolean, in: body, description: "Send a notification (default true)." }
+        persistent: { type: boolean, in: body, description: "Keep the comment after recovery (default false)." }
+
+    # ──────────────────────────────────────────────
+    # Comments (monitoring side)
+    # ──────────────────────────────────────────────
+
+    list_comments:
+      method: GET
+      path: /domain-types/comment/collections/{collection_name}
+      access: read
+      description: >
+        List monitoring comments. The collection in the path selects the scope: "host" for host
+        comments, "service" for service comments, "all" for both. Acknowledgements and downtimes
+        also show up here, because Checkmk stores their text as comments. `query` is a JSON STRING
+        (GET), filtering the Livestatus comments table.
+      params:
+        collection_name: { type: string, in: path, required: true, description: "host | service | all" }
+        host_name: { type: string, in: query, description: "Only comments of this host." }
+        service_description: { type: string, in: query, description: "Only comments of this service." }
+        site_id: { type: string, in: query, description: "Restrict to one site." }
+        query: { type: string, in: query, description: "Livestatus filter on the comments table as a JSON STRING." }
+
+    get_comment:
+      method: GET
+      path: /objects/comment/{comment_id}
+      access: read
+      description: "Show a single monitoring comment by its numeric id. site_id is required to locate the comment."
+      params:
+        comment_id: { type: string, in: path, required: true, description: "Numeric comment id." }
+        site_id: { type: string, in: query, required: true, description: "Site holding the comment." }
+
+    create_comment_host:
+      method: POST
+      path: /domain-types/comment/collections/host
+      access: write
+      description: >
+        Add a comment to hosts. `comment_type` is "host" (single host_name) or "host_by_query"
+        (all hosts matching query). Non-persistent comments vanish when the monitoring core
+        restarts; set persistent true to keep them. Comments do not suppress notifications --
+        use create_acknowledgement_host or a downtime for that.
+      params:
+        comment_type: { type: string, in: body, required: true, description: "host | host_by_query" }
+        comment: { type: string, in: body, required: true, description: "The comment text." }
+        host_name: { type: string, in: body, description: "Required for comment_type 'host'." }
+        query: { type: object, in: body, description: "Required for comment_type 'host_by_query': Livestatus filter on the hosts table." }
+        persistent: { type: boolean, in: body, description: "Survive a core restart (default false)." }
+
+    create_comment_service:
+      method: POST
+      path: /domain-types/comment/collections/service
+      access: write
+      description: >
+        Add a comment to services. `comment_type` is "service" (host_name plus service_description)
+        or "service_by_query" (all services matching query). Same persistence semantics as
+        create_comment_host.
+      params:
+        comment_type: { type: string, in: body, required: true, description: "service | service_by_query" }
+        comment: { type: string, in: body, required: true, description: "The comment text." }
+        host_name: { type: string, in: body, description: "Required for comment_type 'service'." }
+        service_description: { type: string, in: body, description: "Required for comment_type 'service'." }
+        query: { type: object, in: body, description: "Required for comment_type 'service_by_query'." }
+        persistent: { type: boolean, in: body, description: "Survive a core restart (default false)." }
+
+    delete_comments:
+      method: POST
+      path: /domain-types/comment/actions/delete/invoke
+      access: write
+      description: >
+        Delete monitoring comments -- POST, not DELETE. `delete_type`: "by_id" (comment_id plus
+        site_id), "query" (Livestatus filter) or "params" (host_name, optionally narrowed by
+        service_descriptions). Deleting the comment of an acknowledgement removes the
+        acknowledgement -- this is the only indirect way to un-acknowledge a problem via the API.
+      params:
+        delete_type: { type: string, in: body, required: true, description: "by_id | query | params" }
+        comment_id: { type: integer, in: body, description: "Required for delete_type 'by_id'." }
+        site_id: { type: string, in: body, description: "Site of the comment, required with 'by_id'." }
+        host_name: { type: string, in: body, description: "Required for delete_type 'params'." }
+        service_descriptions: { type: array, in: body, description: "Narrow 'params' to these services of the host." }
+        query: { type: object, in: body, description: "Required for delete_type 'query': Livestatus filter on the comments table." }
+
+    # ──────────────────────────────────────────────
+    # Host configuration (Setup -- needs activate_changes)
+    # ──────────────────────────────────────────────
+
+    list_hosts:
+      method: GET
+      path: /domain-types/host_config/collections/all
+      access: read
+      description: >
+        All hosts configured in Setup, with their folder and attributes. This is the CONFIGURATION
+        view -- a host listed here is not necessarily monitored yet (it becomes monitored after
+        activate_changes). For live state use list_hosts_status. Set effective_attributes to see the
+        attributes inherited from the folder tree as well. Returns every host of the site; there is
+        no paging.
+      params:
+        effective_attributes: { type: boolean, in: query, description: "Include attributes inherited from parent folders (default false)." }
+        include_links: { type: boolean, in: query, description: "Populate the per-host links array (default false; the backend transform drops it anyway)." }
+        site: { type: string, in: query, description: "Only hosts of this site (distributed setups)." }
+
+    get_host:
+      method: GET
+      path: /objects/host_config/{host_name}
+      access: read
+      description: >
+        Setup configuration of a single host: its folder, its explicitly set attributes and, on
+        request, the effective attributes inherited from the folder tree. Cluster hosts additionally
+        carry cluster_nodes. HTTP 404 if the host does not exist in Setup.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host name as configured in Setup." }
+        effective_attributes: { type: boolean, in: query, description: "Include inherited folder attributes (default false)." }
+
+    create_host:
+      method: POST
+      path: /domain-types/host_config/collections/all
+      access: write
+      description: >
+        Create a host in Setup. `folder` uses tilde notation ("~" for the root folder,
+        "~datacenter~racks" for a nested one). `attributes` holds the host attributes, most commonly
+        {"ipaddress": "10.0.0.5", "site": "prod", "tag_agent": "cmk-agent",
+        "tag_address_family": "ip-v4-only", "alias": "...", "labels": {"env": "prod"},
+        "parents": ["gateway"]}. The host is created but NOT monitored until you run service
+        discovery and activate_changes -- see the add_host_monitored composite for the full flow.
+      params:
+        host_name: { type: string, in: body, required: true, description: "Name of the new host. Must be unique across the site." }
+        folder: { type: string, in: body, required: true, description: "Target folder in tilde notation, e.g. '~' or '~linux~web'." }
+        attributes: { type: object, in: body, description: "Host attributes, e.g. {\"ipaddress\": \"10.0.0.5\", \"site\": \"prod\"}." }
+        bake_agent: { type: boolean, in: query, description: "Bake the agent for this host in the background (Enterprise editions only; 404 on Raw)." }
+
+    create_host_cluster:
+      method: POST
+      path: /domain-types/host_config/collections/clusters
+      access: write
+      description: >
+        Create a CLUSTER host -- a virtual host whose services are provided jointly by its nodes
+        (e.g. a failover pair). Identical to create_host plus the mandatory `nodes` list, which must
+        contain host names that already exist in Setup.
+      params:
+        host_name: { type: string, in: body, required: true, description: "Name of the new cluster host." }
+        folder: { type: string, in: body, required: true, description: "Target folder in tilde notation." }
+        nodes: { type: array, in: body, required: true, description: "Host names of the cluster nodes, e.g. [\"node1\", \"node2\"]. They must already exist." }
+        attributes: { type: object, in: body, description: "Host attributes for the cluster host." }
+        bake_agent: { type: boolean, in: query, description: "Bake agents in the background (Enterprise editions only)." }
+
+    update_host:
+      method: PUT
+      path: /objects/host_config/{host_name}
+      access: write
+      description: >
+        Change the attributes of a host in Setup. Pick exactly ONE strategy: `attributes` REPLACES
+        the whole attribute set (everything not listed is lost), `update_attributes` merges the given
+        keys into the existing ones (the usual choice), `remove_attributes` deletes the listed
+        attribute names. Requires If-Match; "*" is sent by default -- pass the ETag from get_host
+        for real optimistic locking.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host to modify." }
+        update_attributes: { type: object, in: body, description: "Attributes to merge into the existing ones -- the safe default." }
+        attributes: { type: object, in: body, description: "Full replacement of the attribute set. Destructive: unlisted attributes are removed." }
+        remove_attributes: { type: array, in: body, description: "Attribute names to delete, e.g. [\"ipaddress\"]." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag of the host from get_host, or '*' to overwrite unconditionally." }
+
+    update_host_nodes:
+      method: PUT
+      path: /objects/host_config/{host_name}/properties/nodes
+      access: write
+      description: >
+        Replace the node list of a CLUSTER host. The given list is authoritative -- nodes not
+        included are detached from the cluster. Fails with HTTP 400 on a non-cluster host.
+      params:
+        host_name: { type: string, in: path, required: true, description: "The cluster host." }
+        nodes: { type: array, in: body, required: true, description: "Complete new list of node host names." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag of the host, or '*'." }
+
+    rename_host:
+      method: PUT
+      path: /objects/host_config/{host_name}/actions/rename/invoke
+      access: admin
+      description: >
+        Rename a host, carrying over its historic data, downtimes and comments. This starts a
+        BACKGROUND JOB and requires that there are NO pending changes (activate first, otherwise
+        HTTP 409) and that the monitoring core is stopped for the rename window. Poll
+        wait_host_rename_completion afterwards.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Current host name." }
+        new_name: { type: string, in: body, required: true, description: "New host name." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag of the host, or '*'." }
+
+    wait_host_rename_completion:
+      method: GET
+      path: /domain-types/host_config/actions/wait-for-completion/invoke
+      access: read
+      description: >
+        Poll the currently running host-rename background job. HTTP 204 = finished, HTTP 302 =
+        still running (call again), HTTP 404 = no rename job exists. Empty body in all cases.
+      depends_on: [rename_host]
+
+    move_host:
+      method: POST
+      path: /objects/host_config/{host_name}/actions/move/invoke
+      access: write
+      description: >
+        Move a host to another folder. The host then inherits the attributes of the new folder,
+        which can change how it is monitored (site, agent type, check intervals). Explicitly set
+        host attributes are kept.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host to move." }
+        target_folder: { type: string, in: body, required: true, description: "Destination folder in tilde notation, e.g. '~linux~web'." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag of the host, or '*'." }
+
+    delete_host:
+      method: DELETE
+      path: /objects/host_config/{host_name}
+      access: dangerous
+      description: >
+        Delete a host from Setup, including its services and its historic data reference. Returns
+        204. The host keeps being monitored until the next activate_changes.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host to delete." }
+
+    create_hosts_bulk:
+      method: POST
+      path: /domain-types/host_config/actions/bulk-create/invoke
+      access: write
+      description: >
+        Create many hosts in one request. `entries` is a list of create_host bodies:
+        [{"host_name": "h1", "folder": "~linux", "attributes": {"ipaddress": "10.0.0.1"}}, ...].
+        Far cheaper than a loop for onboarding whole racks. The response contains the created hosts;
+        entries that fail validation abort the request.
+      params:
+        entries: { type: array, in: body, required: true, description: "List of {host_name, folder, attributes} objects." }
+        bake_agent: { type: boolean, in: query, description: "Bake agents in the background (Enterprise editions only)." }
+
+    update_hosts_bulk:
+      method: PUT
+      path: /domain-types/host_config/actions/bulk-update/invoke
+      access: write
+      description: >
+        Update many hosts in one request. `entries` is a list of
+        {"host_name": "h1", "update_attributes": {...}} objects; `attributes` and
+        `remove_attributes` work per entry exactly as in update_host. No If-Match is required for
+        the bulk variant.
+      params:
+        entries: { type: array, in: body, required: true, description: "List of {host_name, update_attributes|attributes|remove_attributes} objects." }
+
+    delete_hosts_bulk:
+      method: POST
+      path: /domain-types/host_config/actions/bulk-delete/invoke
+      access: dangerous
+      description: >
+        Delete many hosts in one request -- POST, not DELETE. `entries` is a plain list of host
+        names. Returns 204. Irreversible once activated.
+      params:
+        entries: { type: array, in: body, required: true, description: "List of host names to delete, e.g. [\"h1\", \"h2\"]." }
+
+    # ──────────────────────────────────────────────
+    # Folders (Setup tree -- attribute inheritance)
+    # ──────────────────────────────────────────────
+
+    list_folders:
+      method: GET
+      path: /domain-types/folder_config/collections/all
+      access: read
+      description: >
+        List folders of the Setup tree. By default only the direct children of the root folder are
+        returned -- set recursive true for the whole tree, or point `parent` at a sub-folder. Each
+        entry carries its path, title and attributes. Folder attributes are inherited by every host
+        below, which makes folders the primary place to configure sites, agent types and
+        check intervals.
+      params:
+        parent: { type: string, in: query, description: "Show sub-folders of this folder in tilde notation, e.g. '~linux'. Default: root ('~')." }
+        recursive: { type: boolean, in: query, description: "Include all descendants, not just direct children (default false)." }
+        show_hosts: { type: boolean, in: query, description: "Also list the hosts of each folder. Costly on large setups (default false)." }
+      response:
+        result_path: "$"
+        transform: |
+          [ .value[] | (del(.links, .domainType, .members) + (.extensions // {})
+              + (if (.members.hosts.value | type) == "array"
+                 then {hosts: [.members.hosts.value[].title]} else {} end))
+            | del(.extensions) ]
+        allow_jq_override: true
+
+    get_folder:
+      method: GET
+      path: /objects/folder_config/{folder}
+      access: read
+      description: >
+        Show one folder with its title, path and attributes. `folder` uses tilde notation ("~" is the
+        root folder, "~linux~web" a nested one) or the folder's 32-character hex id. Slashes do not
+        work in the URL, not even percent-encoded.
+      params:
+        folder: { type: string, in: path, required: true, description: "Folder path in tilde notation ('~', '~linux~web') or its 32-char hex id." }
+        show_hosts: { type: boolean, in: query, description: "Also list the hosts stored in this folder (default false)." }
+      response:
+        result_path: "$"
+        transform: |
+          (del(.links, .domainType, .members) + (.extensions // {})
+            + (if (.members.hosts.value | type) == "array"
+               then {hosts: [.members.hosts.value[].title]} else {} end))
+          | del(.extensions)
+        allow_jq_override: true
+
+    create_folder:
+      method: POST
+      path: /domain-types/folder_config/collections/all
+      access: write
+      description: >
+        Create a folder. `name` is the directory name used in the path, `title` the label shown in
+        the GUI, `parent` the containing folder in tilde notation ("~" for top level). `attributes`
+        are inherited by all hosts and sub-folders below, e.g.
+        {"site": "prod", "tag_agent": "cmk-agent", "snmp_community": "public"}.
+      params:
+        name: { type: string, in: body, required: true, description: "Folder directory name, e.g. 'web'." }
+        title: { type: string, in: body, required: true, description: "Display title, e.g. 'Web servers'." }
+        parent: { type: string, in: body, required: true, description: "Parent folder in tilde notation, '~' for the root." }
+        attributes: { type: object, in: body, description: "Folder attributes inherited by everything below." }
+
+    update_folder:
+      method: PUT
+      path: /objects/folder_config/{folder}
+      access: write
+      description: >
+        Change title and/or attributes of a folder. Same three mutually exclusive strategies as
+        update_host: `attributes` replaces everything, `update_attributes` merges, `remove_attributes`
+        deletes named keys. Changing folder attributes silently reconfigures every host below.
+      params:
+        folder: { type: string, in: path, required: true, description: "Folder in tilde notation or by hex id." }
+        title: { type: string, in: body, description: "New display title." }
+        update_attributes: { type: object, in: body, description: "Attributes to merge -- the safe default." }
+        attributes: { type: object, in: body, description: "Full replacement of the attribute set." }
+        remove_attributes: { type: array, in: body, description: "Attribute names to delete." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag from get_folder, or '*'." }
+
+    delete_folder:
+      method: DELETE
+      path: /objects/folder_config/{folder}
+      access: dangerous
+      description: >
+        Delete a folder. delete_mode "recursive" (the DEFAULT) removes the folder with all
+        sub-folders and all hosts inside it -- pass "abort_on_nonempty" to refuse unless the folder
+        is empty. Returns 204.
+      params:
+        folder: { type: string, in: path, required: true, description: "Folder in tilde notation or by hex id." }
+        delete_mode: { type: string, in: query, default: "abort_on_nonempty", description: "recursive = delete folder plus all contents; abort_on_nonempty = only if empty. Checkmk's own default is 'recursive'; this tool defaults to the safe variant." }
+
+    move_folder:
+      method: POST
+      path: /objects/folder_config/{folder}/actions/move/invoke
+      access: write
+      description: >
+        Move a folder (with everything inside it) under a different parent. All hosts below inherit
+        the attributes of the new parent chain.
+      params:
+        folder: { type: string, in: path, required: true, description: "Folder to move." }
+        destination: { type: string, in: body, required: true, description: "New parent folder in tilde notation." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag from get_folder, or '*'." }
+
+    update_folders_bulk:
+      method: PUT
+      path: /domain-types/folder_config/actions/bulk-update/invoke
+      access: write
+      description: >
+        Update several folders in one request. `entries` is a list of
+        {"folder": "~linux~web", "title": ..., "update_attributes": {...}} objects, with the same
+        attribute strategies as update_folder. No If-Match needed.
+      params:
+        entries: { type: array, in: body, required: true, description: "List of {folder, title, attributes|update_attributes|remove_attributes} objects." }
+
+    list_folder_hosts:
+      method: GET
+      path: /objects/folder_config/{folder}/collections/hosts
+      access: read
+      description: >
+        List the hosts stored directly in one folder (not recursive). Cheaper and clearer than
+        get_folder with show_hosts, and it returns full host_config objects including attributes.
+      params:
+        folder: { type: string, in: path, required: true, description: "Folder in tilde notation or by hex id." }
+        effective_attributes: { type: boolean, in: query, description: "Include attributes inherited from the folder tree (default false)." }
+
+    # ──────────────────────────────────────────────
+    # Activate changes (every Setup change needs this)
+    # ──────────────────────────────────────────────
+
+    list_pending_changes:
+      method: GET
+      path: /domain-types/activation_run/collections/pending_changes
+      access: read
+      description: >
+        All configuration changes that are staged but not yet activated. Each entry is a FLAT object
+        {id, user_id, action_name, text, time} -- no extensions wrapper; `time` is an ISO 8601
+        string here (unlike the audit log, which returns epoch integers). An empty result means the
+        running configuration matches Setup. Call this before activate_changes to see what you are
+        about to publish, and above all to spot FOREIGN changes: any entry whose user_id is not your
+        API user makes activate_changes fail unless force_foreign_changes is set. Note the `text`
+        field is HTML-escaped by Checkmk (&#x27; for apostrophes).
+
+    activate_changes:
+      method: POST
+      path: /domain-types/activation_run/actions/activate-changes/invoke
+      access: admin
+      description: >
+        Publish all pending Setup changes to the monitoring core -- nothing configured via the
+        host_config/folder_config/rule/... tools takes effect before this runs. `sites` restricts the
+        activation to certain sites (default: all sites with pending changes).
+        `force_foreign_changes` is required when another user has staged changes as well. Without it
+        Checkmk answers **HTTP 401** "There are changes from other users and foreign changes are not
+        allowed in this API call" -- that reads like an auth failure and is mapped to `unauthorized`,
+        but the credential is fine; check list_pending_changes for entries with a foreign user_id.
+        Other status codes: 200 = accepted, 303 = started and still running, 422 = nothing to
+        activate, 423 = another activation is already running, 409 = a site failed.
+        The response carries {id, is_running, changes, sites, time_started} -- `id` feeds
+        wait_activation_completion.
+        Requires If-Match; "*" is sent by default -- pass the ETag from list_pending_changes to be
+        sure that nothing changed in between.
+      params:
+        sites: { type: array, in: body, description: "Site ids to activate, e.g. [\"prod\", \"remote1\"]. Empty/omitted = all sites with changes." }
+        force_foreign_changes: { type: boolean, in: body, description: "Also activate changes made by OTHER users (default false). Required when foreign changes are pending." }
+        redirect: { type: boolean, in: body, description: "When true the API answers 303 and points at the wait-for-completion endpoint instead of returning right away (default false)." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag of the pending changes from list_pending_changes, or '*'." }
+
+    wait_activation_completion:
+      method: GET
+      path: /objects/activation_run/{activation_id}/actions/wait-for-completion/invoke
+      access: read
+      description: >
+        Block until an activation run finishes. HTTP 204 = completed, HTTP 302 = still running
+        (call again), HTTP 404 = unknown activation id. Empty body. Use get_activation_run
+        afterwards to see whether every site succeeded.
+      params:
+        activation_id: { type: string, in: path, required: true, description: "Activation id returned by activate_changes." }
+      depends_on: [activate_changes]
+
+    get_activation_run:
+      method: GET
+      path: /objects/activation_run/{activation_id}
+      access: read
+      description: >
+        Status of one activation run: {id, is_running, changes, sites, status_per_site,
+        time_started, title}. Completion is `is_running: false` -- there is NO top-level "status"
+        field. The outcome sits in `status_per_site`, an ARRAY of
+        {site, state, phase, status_text, status_details, start_time, end_time} where
+        state is "success"/"error" and phase reaches "done". ALWAYS check state per site: a
+        finished run does not mean every site succeeded, and in a distributed setup one remote
+        site can fail while the local one reports done.
+      params:
+        activation_id: { type: string, in: path, required: true, description: "Activation id." }
+
+    list_activation_runs:
+      method: GET
+      path: /domain-types/activation_run/collections/running
+      access: read
+      description: >
+        All activation runs currently in progress. Non-empty means a subsequent activate_changes
+        would fail with HTTP 423 (locked) -- check this first when automating.
+
+    # ──────────────────────────────────────────────
+    # Service discovery (find the services of a host)
+    # ──────────────────────────────────────────────
+
+    start_service_discovery:
+      method: POST
+      path: /domain-types/service_discovery_run/actions/start/invoke
+      access: write
+      description: >
+        Run a service discovery on one host as a background job. `mode` decides what happens to the
+        result: "fix_all" (default -- add all undecided services and remove all vanished ones, the
+        usual choice after creating a host), "new" (only add newly found services), "remove" (only
+        drop vanished ones), "refresh" (re-scan and refresh labels/parameters), "only_host_labels",
+        "only_service_labels", "tabula_rasa" (throw everything away and rediscover from scratch).
+        The result is a pending Setup change -- run activate_changes afterwards.
+        On 2.5 this returns the discovery RESULT directly ({id, title, check_table, host_labels,
+        vanished_labels, changed_labels}) rather than a job handle, and a fast scan can finish
+        before a job record exists -- wait_service_discovery_completion then answers HTTP 404,
+        which means "already done", not "failed". Treat that 404 as success and read
+        get_service_discovery.
+      params:
+        host_name: { type: string, in: body, required: true, description: "Host to scan. Must exist in Setup." }
+        mode: { type: string, in: body, description: "fix_all (default) | new | remove | refresh | only_host_labels | only_service_labels | tabula_rasa" }
+
+    wait_service_discovery_completion:
+      method: GET
+      path: /objects/service_discovery_run/{host_name}/actions/wait-for-completion/invoke
+      access: read
+      description: >
+        Block until the discovery job of a host finishes. HTTP 204 = done, HTTP 302 = still running
+        (call again), HTTP 404 = no discovery job for that host. Empty body.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host whose discovery job to wait for." }
+      depends_on: [start_service_discovery]
+
+    get_service_discovery_run:
+      method: GET
+      path: /objects/service_discovery_run/{host_name}
+      access: read
+      description: >
+        Status and log output of the last service discovery job of a host -- use it to find out WHY
+        a discovery produced nothing (unreachable agent, SNMP timeout, wrong credentials).
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host name." }
+
+    get_service_discovery:
+      method: GET
+      path: /objects/service_discovery/{host_name}
+      access: read
+      description: >
+        The discovery result of a host: every service the agent offers, grouped by phase --
+        "monitored" (active), "undecided" (found but not added), "vanished" (configured but no longer
+        reported), "ignored" (disabled by rule). This is the read side that tells you what
+        update_service_phase can act on. Shape: `check_table` is an OBJECT keyed by
+        "<plugin>-<item>", each value being {value: "<phase>", extensions: {check_plugin_name,
+        service_item, service_name, host_name, ...}} -- the phase sits in `value`, the display name
+        in extensions.service_name. An empty check_table means the agent returned nothing (ping-only
+        host, unreachable agent, wrong credentials) -- check get_service_discovery_run for the log.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host name." }
+
+    update_service_phase:
+      method: PUT
+      path: /objects/host/{host_name}/actions/update_discovery_phase/invoke
+      access: write
+      description: >
+        Move a single discovered service into another phase -- the API equivalent of clicking one
+        service in the discovery view. `target_phase` is usually "monitored" (accept an undecided
+        service), "undecided" or "ignored" (disable it). `check_type` is the check plugin name
+        (e.g. "df", "cpu_utilization") and `service_item` the item within that plugin (e.g. "/boot"),
+        both as shown by get_service_discovery. Creates a pending change.
+      params:
+        host_name: { type: string, in: path, required: true, description: "Host owning the service." }
+        check_type: { type: string, in: body, required: true, description: "Check plugin name, e.g. 'df'." }
+        service_item: { type: string, in: body, required: true, description: "Item within the plugin, e.g. '/boot'. Use null/empty for item-less checks." }
+        target_phase: { type: string, in: body, required: true, description: "monitored | undecided | ignored | removed (further internal phases exist: active, changed, custom, legacy, manual, vanished, clustered_*)." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    start_discovery_bulk:
+      method: POST
+      path: /domain-types/discovery_run/actions/bulk-discovery-start/invoke
+      access: write
+      description: >
+        Run service discovery on MANY hosts as one background job -- the right tool after a bulk
+        host import. `options` selects what to apply, e.g.
+        {"monitor_undecided_services": true, "remove_vanished_services": true,
+        "update_service_labels": false, "update_service_parameters": false,
+        "update_host_labels": true} (all default to false). `do_full_scan` forces a fresh agent
+        contact instead of using cached data, `bulk_size` is the number of hosts per worker batch,
+        and `ignore_errors` keeps going when single hosts fail. Track it with get_background_job.
+      params:
+        hostnames: { type: array, in: body, required: true, description: "Host names to scan, e.g. [\"h1\", \"h2\"]." }
+        options: { type: object, in: body, description: "{monitor_undecided_services, remove_vanished_services, update_service_labels, update_service_parameters, update_host_labels} -- all boolean, all false by default." }
+        do_full_scan: { type: boolean, in: body, description: "Contact the agent again instead of using cached data (default true)." }
+        bulk_size: { type: integer, in: body, description: "Hosts per batch (default 10)." }
+        ignore_errors: { type: boolean, in: body, description: "Continue when single hosts fail (default true)." }
+
+    # ──────────────────────────────────────────────
+    # Rules and rulesets (how Checkmk is configured)
+    # ──────────────────────────────────────────────
+
+    list_rulesets:
+      method: GET
+      path: /domain-types/ruleset/collections/all
+      access: read
+      description: >
+        Search the available rulesets -- the ~1700 configuration knobs of Checkmk (thresholds,
+        check parameters, notification settings, agent options). The ruleset name
+        (e.g. "checkgroup_parameters:filesystem", "host_groups", "active_checks:http") is what
+        list_rules and create_rule expect.
+        TRAP: `used` defaults to TRUE on the server, so without it you only see rulesets that
+        ALREADY have rules -- on a fresh site that is a handful, and `fulltext`/`name` searches come
+        back empty even for rulesets that plainly exist (verified on 2.5.0p11: no filter = 15 hits,
+        used=false = 1674). To search the CATALOGUE, always pass used=false. That response is large
+        (~400 KB), so combine it with `fulltext` or `group`.
+      params:
+        fulltext: { type: string, in: query, description: "Search term matched against name, title and help text. Combine with used=false, otherwise it only searches rulesets that already have rules." }
+        name: { type: string, in: query, description: "Exact ruleset name. Also subject to the used=true default -- pass used=false to find an unused ruleset, or call get_ruleset directly." }
+        group: { type: string, in: query, description: "Ruleset group, e.g. 'monconf' or 'agent'." }
+        folder: { type: string, in: query, description: "Only rulesets with rules in this folder (tilde notation)." }
+        used: { type: boolean, in: query, description: "Server default TRUE = only rulesets that already have rules. Pass false to search the whole catalogue." }
+        deprecated: { type: boolean, in: query, description: "Include/exclude deprecated rulesets." }
+
+    get_ruleset:
+      method: GET
+      path: /objects/ruleset/{ruleset_name}
+      access: read
+      description: >
+        Show one ruleset with its title, help text, item form and the number of rules it holds.
+        Read this before writing rules into it -- it tells you what the value structure has to
+        look like.
+      params:
+        ruleset_name: { type: string, in: path, required: true, description: "Ruleset name, e.g. 'checkgroup_parameters:filesystem'." }
+
+    list_rules:
+      method: GET
+      path: /domain-types/rule/collections/all
+      access: read
+      description: >
+        All rules of ONE ruleset, in evaluation order (the first matching rule wins). Each rule
+        carries its id, folder, properties (description, comment, disabled), value_raw and
+        conditions. `ruleset_name` is mandatory -- there is no "all rules of the site" call.
+      params:
+        ruleset_name: { type: string, in: query, required: true, description: "Ruleset whose rules to list, e.g. 'host_groups'." }
+
+    get_rule:
+      method: GET
+      path: /objects/rule/{rule_id}
+      access: read
+      description: "Show one rule by its id, including value_raw and its conditions."
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Rule id as returned by list_rules." }
+
+    create_rule:
+      method: POST
+      path: /domain-types/rule/collections/all
+      access: write
+      description: >
+        Create a rule in a ruleset. `value_raw` is the rule value as a PYTHON REPRESENTATION STRING,
+        not JSON -- e.g. "{'levels': (80.0, 90.0)}" for filesystem levels. Copy the exact shape from
+        an existing rule via list_rules. `conditions` limits where the rule applies, e.g.
+        {"host_name": {"match_on": ["web01"], "operator": "one_of"},
+        "host_tags": [{"key": "agent", "operator": "is", "value": "cmk-agent"}]}.
+        `properties` holds {"description": "...", "comment": "...", "disabled": false}. New rules are
+        inserted at the TOP of the folder's rule list; use move_rule to reposition.
+      params:
+        ruleset: { type: string, in: body, required: true, description: "Ruleset name, e.g. 'checkgroup_parameters:filesystem'." }
+        folder: { type: string, in: body, required: true, description: "Folder the rule belongs to, tilde notation ('~' = root, applies everywhere)." }
+        value_raw: { type: string, in: body, required: true, description: "Rule value as a Python literal string, e.g. \"{'levels': (80.0, 90.0)}\"." }
+        properties: { type: object, in: body, description: "{description, comment, documentation_url, disabled}." }
+        conditions: { type: object, in: body, description: "{host_name, host_tags, host_labels, service_description, service_labels} -- omit for 'applies to everything in the folder'." }
+
+    update_rule:
+      method: PUT
+      path: /objects/rule/{rule_id}
+      access: write
+      description: >
+        Replace value, properties and conditions of an existing rule. The ruleset and folder of a
+        rule cannot be changed here -- use move_rule for the folder, or delete and recreate.
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Rule to modify." }
+        value_raw: { type: string, in: body, required: true, description: "New rule value as a Python literal string." }
+        properties: { type: object, in: body, description: "{description, comment, documentation_url, disabled}." }
+        conditions: { type: object, in: body, description: "New condition set. Omitting it clears the conditions." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag from get_rule, or '*'." }
+
+    move_rule:
+      method: POST
+      path: /objects/rule/{rule_id}/actions/move/invoke
+      access: write
+      description: >
+        Change the evaluation position of a rule, which decides precedence. `position`:
+        "top_of_folder" / "bottom_of_folder" (needs `folder`), "before_specific_rule" /
+        "after_specific_rule" (needs the other rule's id in `rule_id`).
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Rule to move." }
+        position: { type: string, in: body, required: true, description: "top_of_folder | bottom_of_folder | before_specific_rule | after_specific_rule" }
+        folder: { type: string, in: body, description: "Target folder for the *_of_folder positions, tilde notation." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag from get_rule, or '*'." }
+
+    delete_rule:
+      method: DELETE
+      path: /objects/rule/{rule_id}
+      access: dangerous
+      description: "Delete a rule. Returns 204. Takes effect after activate_changes."
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Rule to delete." }
+
+    # ──────────────────────────────────────────────
+    # Host groups
+    # ──────────────────────────────────────────────
+
+    list_host_groups:
+      method: GET
+      path: /domain-types/host_group_config/collections/all
+      access: read
+      description: "All host groups with name and alias. Host groups are used as downtime/acknowledgement targets and as notification conditions."
+
+    get_host_group:
+      method: GET
+      path: /objects/host_group_config/{name}
+      access: read
+      description: >
+        Show one host group -- returns its name and alias. HTTP 404 if it does not exist, which is
+        the cheapest existence check before referencing the group in a downtime or a rule.
+      params:
+        name: { type: string, in: path, required: true, description: "Host group name (the internal id, not the alias)." }
+
+    create_host_group:
+      method: POST
+      path: /domain-types/host_group_config/collections/all
+      access: write
+      description: >
+        Create a host group. `name` is the internal id used everywhere in the API, `alias` the
+        label shown in the GUI. Assigning hosts to the group is done with a rule in the
+        "host_groups" ruleset, not here.
+      params:
+        name: { type: string, in: body, required: true, description: "Internal group name." }
+        alias: { type: string, in: body, required: true, description: "Display name." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only: owning customer, or 'global'." }
+
+    update_host_group:
+      method: PUT
+      path: /objects/host_group_config/{name}
+      access: write
+      description: "Change the alias of a host group. The name itself cannot be changed -- delete and recreate instead."
+      params:
+        name: { type: string, in: path, required: true, description: "Host group to modify." }
+        alias: { type: string, in: body, required: true, description: "New display name." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_host_group:
+      method: DELETE
+      path: /objects/host_group_config/{name}
+      access: dangerous
+      description: "Delete a host group. Fails while rules still reference it. Returns 204."
+      params:
+        name: { type: string, in: path, required: true, description: "Host group to delete." }
+
+    create_host_groups_bulk:
+      method: POST
+      path: /domain-types/host_group_config/actions/bulk-create/invoke
+      access: write
+      description: "Create several host groups in one request. `entries` is a list of {name, alias} objects."
+      params:
+        entries: { type: array, in: body, required: true, description: "List of {name, alias} objects." }
+
+    # ──────────────────────────────────────────────
+    # Service groups
+    # ──────────────────────────────────────────────
+
+    list_service_groups:
+      method: GET
+      path: /domain-types/service_group_config/collections/all
+      access: read
+      description: "All service groups with name and alias. Used as downtime/acknowledgement targets and in notification rules."
+
+    get_service_group:
+      method: GET
+      path: /objects/service_group_config/{name}
+      access: read
+      description: >
+        Show one service group -- returns its name and alias. HTTP 404 if it does not exist, which is
+        the cheapest existence check before using it as a downtime or acknowledgement target.
+      params:
+        name: { type: string, in: path, required: true, description: "Service group name." }
+
+    create_service_group:
+      method: POST
+      path: /domain-types/service_group_config/collections/all
+      access: write
+      description: "Create a service group. Membership is assigned via a rule in the 'service_groups' ruleset, not here."
+      params:
+        name: { type: string, in: body, required: true, description: "Internal group name." }
+        alias: { type: string, in: body, required: true, description: "Display name." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+
+    update_service_group:
+      method: PUT
+      path: /objects/service_group_config/{name}
+      access: write
+      description: "Change the alias of a service group. The name itself is immutable -- delete and recreate to rename it."
+      params:
+        name: { type: string, in: path, required: true, description: "Service group to modify." }
+        alias: { type: string, in: body, required: true, description: "New display name." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_service_group:
+      method: DELETE
+      path: /objects/service_group_config/{name}
+      access: dangerous
+      description: >
+        Delete a service group. Fails while rules in the 'service_groups' ruleset still assign
+        services to it. Returns 204 and takes effect after activate_changes.
+      params:
+        name: { type: string, in: path, required: true, description: "Service group to delete." }
+
+    create_service_groups_bulk:
+      method: POST
+      path: /domain-types/service_group_config/actions/bulk-create/invoke
+      access: write
+      description: "Create several service groups in one request. `entries` is a list of {name, alias} objects."
+      params:
+        entries: { type: array, in: body, required: true, description: "List of {name, alias} objects." }
+
+    # ──────────────────────────────────────────────
+    # Contact groups (who gets notified, and who may see what)
+    # ──────────────────────────────────────────────
+
+    list_contact_groups:
+      method: GET
+      path: /domain-types/contact_group_config/collections/all
+      access: read
+      description: >
+        All contact groups. Contact groups are Checkmk's authorization unit: a user sees exactly the
+        hosts and services whose contact groups they belong to, and notifications are routed by them.
+
+    get_contact_group:
+      method: GET
+      path: /objects/contact_group_config/{name}
+      access: read
+      description: >
+        Show one contact group -- returns its name, alias and inventory path restrictions. It does
+        NOT list the members: users carry their contact groups, hosts get them from an attribute or
+        a rule.
+      params:
+        name: { type: string, in: path, required: true, description: "Contact group name." }
+
+    create_contact_group:
+      method: POST
+      path: /domain-types/contact_group_config/collections/all
+      access: write
+      description: >
+        Create a contact group. Users are added to it via create_user/update_user (contactgroups),
+        hosts via the 'host_contactgroups' ruleset or the host attribute 'contactgroups'.
+      params:
+        name: { type: string, in: body, required: true, description: "Internal group name." }
+        alias: { type: string, in: body, required: true, description: "Display name." }
+        inventory_paths: { type: object, in: body, description: "Restrict which HW/SW inventory paths members may see." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+
+    update_contact_group:
+      method: PUT
+      path: /objects/contact_group_config/{name}
+      access: write
+      description: "Change alias and inventory path restrictions of a contact group."
+      params:
+        name: { type: string, in: path, required: true, description: "Contact group to modify." }
+        alias: { type: string, in: body, required: true, description: "New display name." }
+        inventory_paths: { type: object, in: body, description: "Inventory path restrictions." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_contact_group:
+      method: DELETE
+      path: /objects/contact_group_config/{name}
+      access: dangerous
+      description: "Delete a contact group. Fails while users or rules still reference it. Returns 204."
+      params:
+        name: { type: string, in: path, required: true, description: "Contact group to delete." }
+
+    create_contact_groups_bulk:
+      method: POST
+      path: /domain-types/contact_group_config/actions/bulk-create/invoke
+      access: write
+      description: "Create several contact groups in one request. `entries` is a list of {name, alias} objects."
+      params:
+        entries: { type: array, in: body, required: true, description: "List of {name, alias} objects." }
+
+    # ──────────────────────────────────────────────
+    # Users and roles
+    # ──────────────────────────────────────────────
+
+    list_users:
+      method: GET
+      path: /domain-types/user_config/collections/all
+      access: admin
+      description: "All configured users with their roles, contact groups and contact options. Passwords and secrets are never returned."
+
+    get_user:
+      method: GET
+      path: /objects/user_config/{username}
+      access: admin
+      description: >
+        Show one user: full name, roles, contact groups, contact options and interface settings.
+        Passwords and automation secrets are never returned -- there is no way to read a secret back
+        out of Checkmk, only to set a new one via update_user.
+      params:
+        username: { type: string, in: path, required: true, description: "Login name." }
+
+    create_user:
+      method: POST
+      path: /domain-types/user_config/collections/all
+      access: admin
+      description: >
+        Create a user. `auth_option` decides the login type:
+        {"auth_type": "password", "password": "..."} for humans (they are forced to change it), or
+        {"auth_type": "automation", "secret": "..."} for machine accounts used with this very API.
+        `roles` is a list of role ids (["user"], ["admin"], ["guest"] or custom ones), `contactgroups`
+        decides which hosts/services the user sees and is notified about, and `contact_options` holds
+        {"email": "...", "fallback_contact": false}. A new user only works after activate_changes.
+      params:
+        username: { type: string, in: body, required: true, description: "Login name." }
+        fullname: { type: string, in: body, required: true, description: "Display name of the user." }
+        auth_option: { type: object, in: body, description: "{\"auth_type\": \"password\"|\"automation\", \"password\"|\"secret\": \"...\"}." }
+        roles: { type: array, in: body, description: "Role ids, e.g. [\"user\"] or [\"admin\"]." }
+        contactgroups: { type: array, in: body, description: "Contact groups the user belongs to." }
+        contact_options: { type: object, in: body, description: "{\"email\": \"a@b.c\", \"fallback_contact\": false}." }
+        disable_notifications: { type: object, in: body, description: "{\"disable\": true} or {\"timerange\": {\"start_time\": ..., \"end_time\": ...}}." }
+        idle_timeout: { type: object, in: body, description: "{\"option\": \"global\"|\"disable\"|\"individual\", \"duration\": 3600}." }
+        interface_options: { type: object, in: body, description: "GUI preferences: interface_theme, sidebar_position, show_mode, contextual_help_icon." }
+        authorized_sites: { type: array, in: body, description: "Restrict the user to these sites (distributed setups)." }
+        language: { type: string, in: body, description: "GUI language, e.g. 'en' or 'de'." }
+        pager_address: { type: string, in: body, description: "Pager/SMS address for notifications." }
+        disable_login: { type: boolean, in: body, description: "Lock the account without deleting it (default false)." }
+        temperature_unit: { type: string, in: body, description: "GUI temperature unit: 'default' | 'celsius' | 'fahrenheit'." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+
+    update_user:
+      method: PUT
+      path: /objects/user_config/{username}
+      access: admin
+      description: >
+        Change a user. All fields are optional -- only what you pass is modified. Sending
+        `auth_option` with a new password or secret rotates the credential (this is how you rotate
+        the automation secret this backend itself uses). Roles and contactgroups are REPLACED, not
+        merged.
+      params:
+        username: { type: string, in: path, required: true, description: "User to modify." }
+        fullname: { type: string, in: body, description: "New display name." }
+        auth_option: { type: object, in: body, description: "New credential, see create_user. Also {\"auth_type\": \"remove\"} to strip authentication." }
+        roles: { type: array, in: body, description: "Complete new role list." }
+        contactgroups: { type: array, in: body, description: "Complete new contact group list." }
+        contact_options: { type: object, in: body, description: "{email, fallback_contact}." }
+        disable_notifications: { type: object, in: body, description: "Notification suppression settings." }
+        idle_timeout: { type: object, in: body, description: "Session idle timeout settings." }
+        interface_options: { type: object, in: body, description: "GUI preferences." }
+        authorized_sites: { type: array, in: body, description: "Site restriction." }
+        language: { type: string, in: body, description: "GUI language." }
+        pager_address: { type: string, in: body, description: "Pager/SMS address." }
+        disable_login: { type: boolean, in: body, description: "Lock or unlock the account without deleting it." }
+        temperature_unit: { type: string, in: body, description: "GUI temperature unit: 'default' | 'celsius' | 'fahrenheit'." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag from get_user, or '*'." }
+
+    delete_user:
+      method: DELETE
+      path: /objects/user_config/{username}
+      access: dangerous
+      description: "Delete a user. Returns 204. Takes effect after activate_changes."
+      params:
+        username: { type: string, in: path, required: true, description: "User to delete." }
+
+    list_user_roles:
+      method: GET
+      path: /domain-types/user_role/collections/all
+      access: admin
+      description: "All user roles, built-in (admin, user, guest, agent_registration) and custom clones, with their permission sets."
+
+    get_user_role:
+      method: GET
+      path: /objects/user_role/{role_id}
+      access: admin
+      description: "Show one role with its alias, base role and permission overrides."
+      params:
+        role_id: { type: string, in: path, required: true, description: "Role id, e.g. 'admin' or a custom id." }
+
+    create_user_role:
+      method: POST
+      path: /domain-types/user_role/collections/all
+      access: admin
+      description: >
+        Clone an existing role -- roles are always derived, never created from nothing. `role_id` is
+        the role to copy (admin, user, guest, agent_registration), `new_role_id` and `new_alias`
+        name the clone. Adjust its permissions afterwards with update_user_role.
+      params:
+        role_id: { type: string, in: body, required: true, description: "Role to clone from." }
+        new_role_id: { type: string, in: body, description: "Id of the new role. Auto-generated when omitted." }
+        new_alias: { type: string, in: body, description: "Display name of the new role." }
+
+    update_user_role:
+      method: PUT
+      path: /objects/user_role/{role_id}
+      access: admin
+      description: >
+        Change a role: rename it (new_role_id/new_alias), re-base it (new_basedon, only for custom
+        roles) or override single permissions. `new_permissions` is a map of permission name to
+        "yes"/"no"/"default", e.g. {"general.server_side_requests": "no"}.
+      params:
+        role_id: { type: string, in: path, required: true, description: "Role to modify." }
+        new_role_id: { type: string, in: body, description: "New role id." }
+        new_alias: { type: string, in: body, description: "New display name." }
+        new_basedon: { type: string, in: body, description: "New base role (custom roles only)." }
+        new_permissions: { type: object, in: body, description: "{\"<permission>\": \"yes\"|\"no\"|\"default\"}." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_user_role:
+      method: DELETE
+      path: /objects/user_role/{role_id}
+      access: dangerous
+      description: "Delete a custom user role. Built-in roles cannot be deleted. Returns 204."
+      params:
+        role_id: { type: string, in: path, required: true, description: "Custom role to delete." }
+
+    # ──────────────────────────────────────────────
+    # Passwords, time periods, tags
+    # ──────────────────────────────────────────────
+
+    list_passwords:
+      method: GET
+      path: /domain-types/password/collections/all
+      access: admin
+      description: >
+        All entries of the password store -- the shared secrets that rules reference by id instead of
+        embedding them (SNMP communities, API tokens for active checks, agent credentials).
+        The password VALUES are never returned, only the metadata.
+
+    get_password:
+      method: GET
+      path: /objects/password/{name}
+      access: admin
+      description: "Show one password store entry (metadata only, no secret)."
+      params:
+        name: { type: string, in: path, required: true, description: "Password ident." }
+
+    create_password:
+      method: POST
+      path: /domain-types/password/collections/all
+      access: admin
+      description: >
+        Store a shared secret. `ident` is the id that rules reference. `owned_by` is the contact
+        group owning the entry ("admin" or a contact group name), `editable_by` the group allowed to
+        change it. Storing a secret here is much better than putting it into a rule value.
+      params:
+        ident: { type: string, in: body, description: "Unique id of the entry -- this is what rules reference. Always set it explicitly." }
+        title: { type: string, in: body, required: true, description: "Display title." }
+        password: { type: string, in: body, required: true, description: "The secret itself. Never returned by any read tool." }
+        owner: { type: string, in: body, description: "Contact group owning the entry, or 'admin'. Sent as the `owned_by` attribute internally." }
+        editable_by: { type: string, in: body, description: "Contact group allowed to edit the entry." }
+        shared: { type: array, in: body, description: "Contact groups the secret is shared with." }
+        comment: { type: string, in: body, description: "Free-text comment." }
+        documentation_url: { type: string, in: body, description: "Documentation URL for this secret." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only -- and REQUIRED there ('global' or a customer id); ignored on other editions." }
+
+    update_password:
+      method: PUT
+      path: /objects/password/{name}
+      access: admin
+      description: "Change a password store entry, including rotating the secret itself via `password`."
+      params:
+        name: { type: string, in: path, required: true, description: "Password ident to modify." }
+        title: { type: string, in: body, description: "New display title." }
+        password: { type: string, in: body, description: "New secret value." }
+        owner: { type: string, in: body, description: "Owning contact group, or 'admin'." }
+        editable_by: { type: string, in: body, description: "Editing contact group." }
+        shared: { type: array, in: body, description: "Contact groups the secret is shared with." }
+        comment: { type: string, in: body, description: "Free-text comment." }
+        documentation_url: { type: string, in: body, description: "Documentation URL." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_password:
+      method: DELETE
+      path: /objects/password/{name}
+      access: dangerous
+      description: "Delete a password store entry. Rules referencing it break. Returns 204."
+      params:
+        name: { type: string, in: path, required: true, description: "Password ident to delete." }
+
+    list_time_periods:
+      method: GET
+      path: /domain-types/time_period/collections/all
+      access: read
+      description: >
+        All time periods. Time periods define when checks run and when notifications are sent
+        (e.g. "workhours", "24X7"). Note the domain type is singular: time_period.
+
+    get_time_period:
+      method: GET
+      path: /objects/time_period/{name}
+      access: read
+      description: "Show one time period with its active ranges, exceptions and exclusions."
+      params:
+        name: { type: string, in: path, required: true, description: "Time period name. The built-in '24X7' cannot be modified." }
+
+    create_time_period:
+      method: POST
+      path: /domain-types/time_period/collections/all
+      access: write
+      description: >
+        Create a time period. `active_time_ranges` is a list of
+        {"day": "monday"|...|"all", "time_ranges": [{"start": "08:00", "end": "17:00"}]}.
+        `exceptions` overrides single dates:
+        [{"date": "2026-12-24", "time_ranges": [{"start": "08:00", "end": "12:00"}]}].
+        `exclude` lists other time period names to subtract.
+      params:
+        name: { type: string, in: body, required: true, description: "Internal name of the time period." }
+        alias: { type: string, in: body, required: true, description: "Display name." }
+        active_time_ranges: { type: array, in: body, required: true, description: "[{day, time_ranges: [{start, end}]}] with 24h HH:MM times." }
+        exceptions: { type: array, in: body, description: "[{date: 'YYYY-MM-DD', time_ranges: [{start, end}]}]." }
+        exclude: { type: array, in: body, description: "Names of other time periods to exclude." }
+
+    update_time_period:
+      method: PUT
+      path: /objects/time_period/{name}
+      access: write
+      description: "Change a time period. Fields left out stay as they are; `active_time_ranges` is replaced as a whole when given."
+      params:
+        name: { type: string, in: path, required: true, description: "Time period to modify." }
+        alias: { type: string, in: body, description: "New display name." }
+        active_time_ranges: { type: array, in: body, description: "Complete new list of active ranges." }
+        exceptions: { type: array, in: body, description: "Complete new list of date exceptions." }
+        exclude: { type: array, in: body, description: "Complete new list of excluded time periods." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_time_period:
+      method: DELETE
+      path: /objects/time_period/{name}
+      access: dangerous
+      description: "Delete a time period. Fails while rules or users still reference it. Returns 204."
+      params:
+        name: { type: string, in: path, required: true, description: "Time period to delete." }
+
+    list_host_tag_groups:
+      method: GET
+      path: /domain-types/host_tag_group/collections/all
+      access: read
+      description: >
+        All host tag groups. Host tags are Checkmk's classification mechanism: every host carries
+        one tag per group (e.g. criticality: prod/test), and rules use them as conditions.
+
+    get_host_tag_group:
+      method: GET
+      path: /objects/host_tag_group/{name}
+      access: read
+      description: "Show one host tag group with its possible tags."
+      params:
+        name: { type: string, in: path, required: true, description: "Tag group id, e.g. 'criticality'." }
+
+    create_host_tag_group:
+      method: POST
+      path: /domain-types/host_tag_group/collections/all
+      access: write
+      description: >
+        Create a host tag group. `tags` is the list of choices:
+        [{"id": "prod", "title": "Production", "aux_tags": []}, {"id": "test", "title": "Test"}].
+        A tag with id null becomes the "no choice" option. Hosts then set the attribute
+        "tag_<group id>" to one of these ids.
+      params:
+        id: { type: string, in: body, required: true, description: "Tag group id, becomes the host attribute 'tag_<id>'." }
+        title: { type: string, in: body, required: true, description: "Display title." }
+        tags: { type: array, in: body, required: true, description: "[{id, title, aux_tags}] -- the selectable tags." }
+        topic: { type: string, in: body, description: "GUI topic to group it under, e.g. 'Custom'." }
+        help: { type: string, in: body, description: "Help text shown in the GUI." }
+
+    update_host_tag_group:
+      method: PUT
+      path: /objects/host_tag_group/{name}
+      access: write
+      description: >
+        Change a host tag group. `tags` replaces the whole choice list -- removing a tag that hosts
+        still use fails unless `repair` is true, which then reassigns those hosts.
+      params:
+        name: { type: string, in: path, required: true, description: "Tag group to modify." }
+        title: { type: string, in: body, description: "New display title." }
+        tags: { type: array, in: body, description: "Complete new list of selectable tags." }
+        topic: { type: string, in: body, description: "GUI topic." }
+        help: { type: string, in: body, description: "Help text." }
+        repair: { type: boolean, in: body, description: "Allow removing tags that are still in use, reassigning affected hosts (default false)." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_host_tag_group:
+      method: DELETE
+      path: /objects/host_tag_group/{name}
+      access: dangerous
+      description: >
+        Delete a host tag group. Fails when hosts or rules still use it unless `repair` is set.
+        Returns 204.
+      params:
+        name: { type: string, in: path, required: true, description: "Tag group to delete." }
+        repair: { type: boolean, in: query, description: "Remove the tag from all hosts/rules that use it instead of failing." }
+        mode: { type: string, in: query, description: "Deletion mode: 'abort' (default, fail if in use) or 'delete'." }
+
+    list_aux_tags:
+      method: GET
+      path: /domain-types/aux_tag/collections/all
+      access: read
+      description: >
+        All auxiliary tags. Aux tags are attached to host tags and add a second, orthogonal
+        dimension for rule conditions (e.g. tag 'snmp-v2' implies aux tag 'snmp').
+
+    get_aux_tag:
+      method: GET
+      path: /objects/aux_tag/{aux_tag_id}
+      access: read
+      description: "Show one auxiliary tag with its title, topic and help text. HTTP 404 if the id does not exist."
+      params:
+        aux_tag_id: { type: string, in: path, required: true, description: "Aux tag id." }
+
+    create_aux_tag:
+      method: POST
+      path: /domain-types/aux_tag/collections/all
+      access: write
+      description: "Create an auxiliary tag that host tags can reference in their aux_tags list."
+      params:
+        aux_tag_id: { type: string, in: body, required: true, description: "Unique aux tag id." }
+        title: { type: string, in: body, required: true, description: "Display title." }
+        topic: { type: string, in: body, description: "GUI topic." }
+        help: { type: string, in: body, description: "Help text." }
+
+    update_aux_tag:
+      method: PUT
+      path: /objects/aux_tag/{aux_tag_id}
+      access: write
+      description: "Change title, topic or help of an auxiliary tag. The id is immutable."
+      params:
+        aux_tag_id: { type: string, in: path, required: true, description: "Aux tag to modify." }
+        title: { type: string, in: body, required: true, description: "New display title." }
+        topic: { type: string, in: body, description: "GUI topic." }
+        help: { type: string, in: body, description: "Help text." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_aux_tag:
+      method: POST
+      path: /objects/aux_tag/{aux_tag_id}/actions/delete/invoke
+      access: dangerous
+      description: >
+        Delete an auxiliary tag -- POST on the delete action, NOT the DELETE method. Fails while
+        host tag groups still reference it.
+      params:
+        aux_tag_id: { type: string, in: path, required: true, description: "Aux tag to delete." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    # ──────────────────────────────────────────────
+    # Notification rules
+    # ──────────────────────────────────────────────
+
+    list_notification_rules:
+      method: GET
+      path: /domain-types/notification_rule/collections/all
+      access: admin
+      description: >
+        All notification rules in evaluation order. Notification rules decide who is informed about
+        which problem through which channel; they are evaluated top to bottom and all matching rules
+        contribute unless one cancels the others.
+
+    get_notification_rule:
+      method: GET
+      path: /objects/notification_rule/{rule_id}
+      access: admin
+      description: "Show one notification rule with its full rule_config."
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Notification rule id (a numeric string)." }
+
+    create_notification_rule:
+      method: POST
+      path: /domain-types/notification_rule/collections/all
+      access: admin
+      description: >
+        Create a notification rule. Everything lives in the single nested `rule_config` object:
+        {"rule_properties": {"description": "...", "comment": "", "documentation_url": "",
+        "do_not_notify": {"state": "disabled"}, "allow_users_to_deactivate": {"state": "enabled"}},
+        "notification_method": {"notify_plugin": {"option": "create_notification_with_the_following_parameters",
+        "plugin_params": {"plugin_name": "mail"}}},
+        "contact_selection": {...}, "conditions": {...}}.
+        The structure is deep and version-specific -- read an existing rule with
+        get_notification_rule first and modify a copy rather than writing one from scratch.
+      params:
+        rule_config: { type: object, in: body, required: true, description: "Complete notification rule definition (rule_properties, notification_method, contact_selection, conditions)." }
+
+    update_notification_rule:
+      method: PUT
+      path: /objects/notification_rule/{rule_id}
+      access: admin
+      description: "Replace the configuration of a notification rule. `rule_config` must be complete -- this is not a merge."
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Notification rule to modify." }
+        rule_config: { type: object, in: body, required: true, description: "Complete replacement rule configuration." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    delete_notification_rule:
+      method: POST
+      path: /objects/notification_rule/{rule_id}/actions/delete/invoke
+      access: dangerous
+      description: "Delete a notification rule -- POST on the delete action, NOT the DELETE method. Returns 204."
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Notification rule to delete." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    # ──────────────────────────────────────────────
+    # Site connections (distributed monitoring)
+    # ──────────────────────────────────────────────
+
+    list_site_connections:
+      method: GET
+      path: /domain-types/site_connection/collections/all
+      access: admin
+      description: "All configured site connections of this distributed monitoring setup, including their status host and socket configuration."
+
+    get_site_connection:
+      method: GET
+      path: /objects/site_connection/{site_id}
+      access: admin
+      description: >
+        Show one site connection: its basic settings, the Livestatus status connection (socket,
+        proxy, timeouts, status host) and the configuration connection used for replication.
+      params:
+        site_id: { type: string, in: path, required: true, description: "Site id, e.g. 'remote1'." }
+
+    create_site_connection:
+      method: POST
+      path: /domain-types/site_connection/collections/all
+      access: admin
+      description: >
+        Add a remote site to the distributed setup. Everything sits in the nested `site_config`
+        object: {"basic_settings": {"site_id": "remote1", "alias": "Remote 1", "customer": "..."},
+        "status_connection": {"connection": {"socket_type": "tcp", "host": "10.0.0.9", "port": 6557,
+        "encrypted": true, "verify": true}, "proxy": {"use_livestatus_daemon": "direct"},
+        "connect_timeout": 2, "status_host": {"status_host_set": "disabled"}, ...},
+        "configuration_connection": {"enable_replication": true, "url_of_remote_site":
+        "https://10.0.0.9/remote1/check_mk/", ...}}. After creating the connection you still have to
+        call login_site_connection.
+      params:
+        site_config: { type: object, in: body, required: true, description: "Complete site configuration (basic_settings, status_connection, configuration_connection)." }
+
+    update_site_connection:
+      method: PUT
+      path: /objects/site_connection/{site_id}
+      access: admin
+      description: "Replace the configuration of an existing site connection. `site_config` must be complete."
+      params:
+        site_id: { type: string, in: path, required: true, description: "Site to modify." }
+        site_config: { type: object, in: body, required: true, description: "Complete replacement site configuration." }
+        If-Match: { type: string, in: header, default: "*", description: "ETag, or '*'." }
+
+    login_site_connection:
+      method: POST
+      path: /objects/site_connection/{site_id}/actions/login/invoke
+      access: admin
+      description: >
+        Log into a remote site to establish the configuration replication. Needs the credentials of
+        an ADMIN user ON THE REMOTE SITE; Checkmk exchanges them for a permanent automation secret
+        and does not store the password. Required once after create_site_connection.
+      params:
+        site_id: { type: string, in: path, required: true, description: "Site to log into." }
+        username: { type: string, in: body, required: true, description: "Admin user on the REMOTE site." }
+        password: { type: string, in: body, required: true, description: "Password of that remote admin user." }
+
+    logout_site_connection:
+      method: POST
+      path: /objects/site_connection/{site_id}/actions/logout/invoke
+      access: admin
+      description: "Drop the replication credentials of a remote site. The connection stays configured but can no longer replicate."
+      params:
+        site_id: { type: string, in: path, required: true, description: "Site to log out of." }
+
+    delete_site_connection:
+      method: POST
+      path: /objects/site_connection/{site_id}/actions/delete/invoke
+      access: dangerous
+      description: "Remove a site connection -- POST on the delete action, NOT the DELETE method. Log out first."
+      params:
+        site_id: { type: string, in: path, required: true, description: "Site connection to remove." }
+
+    # ──────────────────────────────────────────────
+    # System, jobs, metrics, agents
+    # ──────────────────────────────────────────────
+
+    get_version:
+      method: GET
+      path: /version
+      access: read
+      description: >
+        Version and edition of the site: {"site", "group", "rest_api": {"revision"}, "versions":
+        {"checkmk", "python", "apache", ...}, "edition"}. Needs no parameters and almost no
+        permissions -- the ideal connectivity and credential smoke test, and the way to find out
+        which edition you are talking to before using edition-specific features. Edition strings:
+        "community" (the former Raw/cre, renamed in 2.5), "enterprise"/"cee", "cloud"/"cce",
+        "managed"/"cme". A 404 with an Apache error page instead of JSON means the configured URL
+        misses the site segment -- see setup.notes.
+      response:
+        result_path: "$"
+        allow_jq_override: true
+
+    list_audit_log:
+      method: GET
+      path: /domain-types/audit_log/collections/all
+      access: admin
+      description: >
+        Audit log entries of ONE day -- `date` is required and expects YYYY-MM-DD. Every Setup change
+        is recorded here with user, time, object and the diff text. Filter further by object_type
+        (e.g. "Host", "Folder", "Rule"), object_id, user_id or a regular expression on the text.
+      params:
+        date: { type: string, in: query, required: true, description: "Day to read, format YYYY-MM-DD." }
+        object_type: { type: string, in: query, description: "Filter by object type, e.g. 'Host'." }
+        object_id: { type: string, in: query, description: "Filter by object id, e.g. a host name." }
+        user_id: { type: string, in: query, description: "Filter by the acting user." }
+        regexp: { type: string, in: query, description: "Regular expression matched against the log text." }
+
+    archive_audit_log:
+      method: POST
+      path: /domain-types/audit_log/actions/archive/invoke
+      access: admin
+      description: "Move all current audit log entries into the archive, clearing the active log. Irreversible via the API. Returns 204."
+
+    get_background_job:
+      method: GET
+      path: /objects/background_job/{job_id}
+      access: read
+      description: >
+        State of any background job by id: whether it is active or finished, its state and its log
+        output. Use it for the jobs that have no dedicated wait tool, above all bulk discovery and
+        parent scan. The job id is part of the response of the tool that started the job.
+      params:
+        job_id: { type: string, in: path, required: true, description: "Background job id." }
+        site_id: { type: string, in: query, description: "Site running the job. Defaults to the local site." }
+
+    get_metric:
+      method: POST
+      path: /domain-types/metric/actions/get/invoke
+      access: read
+      description: >
+        Read the RRD time series behind a service graph. Read-only despite POST. `type` is
+        "single_metric" (plus metric_id, e.g. "cmk_time_agent") or "predefined_graph" (plus graph_id,
+        e.g. "cmk_cpu_time_by_phase"); both ids become visible in the GUI after enabling
+        "Show internal IDs" in the service view's display options. `time_range` takes ISO 8601
+        start/end, `reduce` how a segment is condensed (average, min, max). The answer is
+        {"time_range": {"start", "end"}, "step": <seconds>, "metrics": [{"title", "color",
+        "line_type", "data_points": [...]}]} -- data_points is a bare value array spaced `step`
+        seconds apart, with nulls for gaps. Passing `site` is strongly recommended in distributed
+        setups.
+      params:
+        type: { type: string, in: body, required: true, description: "single_metric | predefined_graph" }
+        host_name: { type: string, in: body, required: true, description: "The monitored host." }
+        service_description: { type: string, in: body, required: true, description: "Service display name, e.g. 'Check_MK' or 'CPU utilization'." }
+        time_range: { type: object, in: body, required: true, description: "{\"start\": \"2026-08-12T10:00:00Z\", \"end\": \"2026-08-12T11:00:00Z\"}." }
+        metric_id: { type: string, in: body, description: "Required for type 'single_metric', e.g. 'cmk_time_agent'." }
+        graph_id: { type: string, in: body, description: "Required for type 'predefined_graph', e.g. 'cmk_cpu_time_by_phase'." }
+        reduce: { type: string, in: body, description: "Consolidation of a segment into one point: average (default) | min | max." }
+        site: { type: string, in: body, description: "Site holding the data. Greatly improves performance in distributed setups." }
+      response:
+        result_path: "$"
+        allow_jq_override: true
+
+    download_agent:
+      method: GET
+      path: /domain-types/agent/actions/download/invoke
+      access: read
+      description: >
+        Download one of the vanilla agent packages shipped with Checkmk. `os_type` is linux_rpm,
+        linux_deb or windows_msi. These are the UNBAKED generic agents -- individually baked agents
+        with per-host configuration are an Enterprise feature and are not available here. The binary
+        is stored in the ToolMesh file broker and returned as a time-limited download URL, not as
+        inline data. This endpoint serves ONLY application/octet-stream, so it overrides the
+        backend-wide `Accept: application/json` via its own Accept parameter -- without that
+        override Checkmk answers HTTP 406 (verified on 2.5.0p11).
+      params:
+        os_type: { type: string, in: query, required: true, description: "linux_rpm | linux_deb | windows_msi" }
+        Accept: { type: string, in: header, default: "application/octet-stream", description: "Must stay application/octet-stream -- the JSON default of this backend triggers HTTP 406 here." }
+      response:
+        type: file_url
+        ttl: 24h
+
+    start_parent_scan:
+      method: POST
+      path: /domain-types/parent_scan/actions/start/invoke
+      access: write
+      description: >
+        Start a parent scan background job: Checkmk traceroutes to the given hosts and derives their
+        network parents, which makes the monitoring suppress notifications for hosts that are merely
+        UNREACHABLE behind a broken router. `gateway_hosts` decides what happens to gateways that are
+        not yet monitored ({"state": "monitor_in_folder"|"do_not_monitor", "folder": "~", "alias": ...}),
+        `performance` tunes the probing ({"responses_timeout", "hop_probes", "max_gateway_distance",
+        "ping_probes"}) and `configuration` holds {"force_explicit_parents": true}. Track it with
+        get_background_job.
+      params:
+        host_names: { type: array, in: body, required: true, description: "Hosts whose parents to determine." }
+        gateway_hosts: { type: object, in: body, description: "What to do with discovered gateways: {state, folder, alias}." }
+        performance: { type: object, in: body, description: "{responses_timeout, hop_probes, max_gateway_distance, ping_probes}." }
+        configuration: { type: object, in: body, description: "{force_explicit_parents: true|false}." }
+
+  composites:
+
+    get_problems:
+      description: >
+        The "what is broken right now" call. Returns {hosts, services, summary} with all hosts that
+        are not UP and all services that are not OK, by default hiding everything that is already
+        acknowledged or in a scheduled downtime. Set include_handled true to see those as well, or
+        limit the scope to a single host with host_name. This is one round trip instead of two
+        hand-written Livestatus queries and is the right entry point for any triage question.
+      access: read
+      params:
+        include_handled:
+          type: boolean
+          default: false
+          description: "Also include acknowledged problems and problems in a downtime."
+        host_name:
+          type: string
+          description: "Restrict the report to a single host."
+        limit:
+          type: integer
+          default: 200
+          description: "Maximum number of service problems returned (hosts are never truncated)."
+      timeout: 60s
+      depends_on: [list_hosts_status, list_services_status]
+      code: |
+        const handled = params.include_handled === true;
+
+        // The hosts table calls the host column "name", the services table "host_name".
+        const buildQuery = (hostColumn) => {
+          const parts = [{ op: "!=", left: "state", right: "0" }];
+          if (!handled) {
+            parts.push({ op: "=", left: "acknowledged", right: "0" });
+            parts.push({ op: "=", left: "scheduled_downtime_depth", right: "0" });
+          }
+          if (params.host_name) parts.push({ op: "=", left: hostColumn, right: params.host_name });
+          return parts.length === 1 ? parts[0] : { op: "and", expr: parts };
+        };
+        const hostQuery = buildQuery("name");
+        const serviceQuery = buildQuery("host_name");
+
+        const hosts = await api.list_hosts_status({
+          query: hostQuery,
+          columns: ["name", "state", "acknowledged", "scheduled_downtime_depth",
+                    "last_state_change", "plugin_output"],
+        });
+
+        const services = await api.list_services_status({
+          query: serviceQuery,
+          columns: ["host_name", "description", "state", "acknowledged",
+                    "scheduled_downtime_depth", "last_state_change", "plugin_output"],
+        });
+
+        const HOST_STATE = { 0: "UP", 1: "DOWN", 2: "UNREACHABLE" };
+        const SVC_STATE = { 0: "OK", 1: "WARN", 2: "CRIT", 3: "UNKNOWN" };
+        const hostList = (hosts || []).map((h) => ({
+          host: h.name, state: HOST_STATE[h.state] || h.state,
+          acknowledged: h.acknowledged === 1, in_downtime: h.scheduled_downtime_depth > 0,
+          since: h.last_state_change, output: h.plugin_output,
+        }));
+        const svcAll = (services || []).map((s) => ({
+          host: s.host_name, service: s.description, state: SVC_STATE[s.state] || s.state,
+          acknowledged: s.acknowledged === 1, in_downtime: s.scheduled_downtime_depth > 0,
+          since: s.last_state_change, output: s.plugin_output,
+        }));
+        const order = { CRIT: 0, UNKNOWN: 1, WARN: 2 };
+        svcAll.sort((a, b) => (order[a.state] ?? 9) - (order[b.state] ?? 9));
+        const max = params.limit || 200;
+
+        return {
+          summary: {
+            hosts_down: hostList.filter((h) => h.state === "DOWN").length,
+            hosts_unreachable: hostList.filter((h) => h.state === "UNREACHABLE").length,
+            services_crit: svcAll.filter((s) => s.state === "CRIT").length,
+            services_warn: svcAll.filter((s) => s.state === "WARN").length,
+            services_unknown: svcAll.filter((s) => s.state === "UNKNOWN").length,
+            services_truncated: svcAll.length > max,
+            handled_included: handled,
+          },
+          hosts: hostList,
+          services: svcAll.slice(0, max),
+        };
+
+    apply_pending_changes:
+      description: >
+        Activate all pending Setup changes and wait until the activation has really finished --
+        activate_changes alone only STARTS the job. Returns {activated, activation_id, changes,
+        state, sites}. Answers {activated: false, reason: "no_pending_changes"} when there is
+        nothing to do, so it is safe to call unconditionally at the end of a configuration session.
+        Set force_foreign true when other users have staged changes as well, otherwise Checkmk
+        refuses to activate them.
+      access: admin
+      params:
+        sites:
+          type: array
+          description: "Site ids to activate. Omit for all sites with pending changes."
+        force_foreign:
+          type: boolean
+          default: false
+          description: "Also activate changes staged by other users."
+        max_wait_polls:
+          type: integer
+          default: 20
+          description: "How often to poll for completion before giving up (the wait call itself blocks per poll)."
+      timeout: 120s
+      depends_on: [list_pending_changes, activate_changes, wait_activation_completion, get_activation_run]
+      code: |
+        const pending = await api.list_pending_changes();
+        if (!pending || pending.length === 0) {
+          return { activated: false, reason: "no_pending_changes", changes: [] };
+        }
+
+        const body = { force_foreign_changes: params.force_foreign === true };
+        if (params.sites && params.sites.length > 0) body.sites = params.sites;
+        const run = await api.activate_changes(body);
+        const activationId = run && (run.id || run.activation_id);
+        if (!activationId) {
+          return { activated: false, reason: "no_activation_id", raw: run, changes: pending };
+        }
+
+        // Completion is signalled by is_running === false on the activation run.
+        // There is no top-level "status" field -- per-site results live in status_per_site.
+        const maxPolls = params.max_wait_polls || 20;
+        for (let i = 0; i < maxPolls; i++) {
+          try {
+            await api.wait_activation_completion({ activation_id: activationId });
+          } catch (e) {
+            // 404 once the run has been reaped -- fall through to the status read.
+          }
+          const status = await api.get_activation_run({ activation_id: activationId });
+          if (status && status.is_running === false) {
+            return {
+              activated: true, activation_id: activationId, running: false,
+              sites: status.sites || null,
+              status_per_site: status.status_per_site || null,
+              changes: pending.map((c) => c.text || c.id),
+            };
+          }
+        }
+        return {
+          activated: true, activation_id: activationId, running: true,
+          note: "Activation did not finish within max_wait_polls -- poll get_activation_run yourself.",
+          changes: pending.map((c) => c.text || c.id),
+        };
+
+    add_host_monitored:
+      description: >
+        Create a host and take it all the way to "actually monitored": create_host, then a service
+        discovery in fix_all mode, then activation of the pending changes. Returns {host, folder,
+        discovered, activated, services}. This is the complete onboarding flow -- doing only
+        create_host leaves a host that exists in Setup but is never checked. Set activate false to
+        stage the change and activate later together with other work.
+      access: write
+      params:
+        host_name:
+          type: string
+          required: true
+          description: "Name of the new host."
+        folder:
+          type: string
+          default: "~"
+          description: "Target folder in tilde notation, '~' for the root folder."
+        attributes:
+          type: object
+          description: "Host attributes, e.g. {\"ipaddress\": \"10.0.0.5\", \"site\": \"prod\"}."
+        activate:
+          type: boolean
+          default: true
+          description: "Activate the changes at the end. Set false to batch several hosts first."
+      timeout: 120s
+      depends_on: [create_host, start_service_discovery, wait_service_discovery_completion, get_service_discovery_run, get_service_discovery, list_pending_changes, activate_changes, wait_activation_completion]
+      code: |
+        const host = await api.create_host({
+          host_name: params.host_name,
+          folder: params.folder || "~",
+          attributes: params.attributes || {},
+        });
+
+        await api.start_service_discovery({ host_name: params.host_name, mode: "fix_all" });
+
+        // A fast discovery finishes before the job record is queryable, and the wait endpoint
+        // then answers 404 ("Could not find a service discovery for host") -- that is a NORMAL
+        // outcome, not a failure, so it must not abort the composite. Slow SNMP scans are the
+        // reason to retry at all.
+        for (let i = 0; i < 3; i++) {
+          try {
+            await api.wait_service_discovery_completion({ host_name: params.host_name });
+            const run = await api.get_service_discovery_run({ host_name: params.host_name });
+            const active = run && (run.active === 1 || run.active === true || run.is_active === true);
+            if (!active) break;
+          } catch (e) {
+            break; // no job to wait for -- discovery already done
+          }
+        }
+
+        let services = [];
+        try {
+          const disc = await api.get_service_discovery({ host_name: params.host_name });
+          const table = (disc && (disc.check_table || disc.services)) || {};
+          services = Object.keys(table).map((k) => {
+            const e = table[k];
+            const ext = (e && e.extensions) || e || {};
+            return { service: ext.service_name || ext.description || k, phase: (e && e.value) || ext.phase };
+          });
+        } catch (e) {
+          services = [];
+        }
+
+        let activated = false;
+        let activation_note = null;
+        if (params.activate !== false) {
+          const pending = await api.list_pending_changes();
+          if (!pending || pending.length === 0) {
+            activation_note = "nothing to activate";
+          } else {
+            try {
+              // Deliberately no force_foreign_changes: publishing another user's staged
+              // config as a side effect of adding a host would be a nasty surprise.
+              const run = await api.activate_changes({ force_foreign_changes: false });
+              const activationId = run && run.id;
+              if (activationId) {
+                try { await api.wait_activation_completion({ activation_id: activationId }); } catch (e) {}
+                activated = true;
+              }
+            } catch (e) {
+              // Checkmk answers HTTP 401 when foreign changes are pending.
+              activation_note = "activation refused (foreign pending changes?) -- host is created " +
+                                "but NOT yet monitored; run apply_pending_changes with force_foreign true";
+            }
+          }
+        }
+
+        return {
+          host: params.host_name,
+          folder: params.folder || "~",
+          created: host || null,
+          discovered: services.length,
+          services: services,
+          activated: activated,
+          activation_note: activation_note,
+        };
+
+  hints:
+    list_hosts_status:
+      method_note: "POST is used to carry the query payload -- this is a read-only call"
+      min_version: "Checkmk 2.4 (HTTP 404 on 2.3 and older, where only the deprecated GET exists)"
+      default_columns: "only [name] -- always pass columns explicitly"
+      state_codes: "0=UP, 1=DOWN, 2=UNREACHABLE"
+    list_services_status:
+      min_version: "Checkmk 2.4 (HTTP 404 on 2.3 and older)"
+      default_columns: "only [host_name, description] -- always pass columns explicitly"
+      state_codes: "0=OK, 1=WARN, 2=CRIT, 3=UNKNOWN"
+      unhandled_filter: "add acknowledged=0 and scheduled_downtime_depth=0 to see only unhandled problems"
+      no_pagination: "returns EVERY matching service in one response -- always filter"
+    list_host_services:
+      min_version: "Checkmk 2.4 (HTTP 404 on 2.3 and older)"
+    get_host_status:
+      default_columns: "name, alias, address -- no state; use list_hosts_status for state columns"
+    create_downtime_host:
+      time_format: "ISO 8601 with timezone, e.g. 2026-08-12T20:00:00Z"
+      duration_unit: "seconds; 0 means fixed downtime spanning start_time..end_time"
+      host_downtime_scope: "does NOT silence the host's services -- schedule a service downtime as well"
+      returns: "HTTP 204 with empty body on success"
+    create_downtime_service:
+      duration_unit: "seconds; 0 means fixed downtime"
+      bulk_hint: "use downtime_type service_by_query to hit many services in one call"
+    delete_downtime:
+      http_method: "POST on the delete action, not DELETE"
+      params_scope: "delete_type 'params' without service_descriptions removes ALL downtimes of the host"
+    create_acknowledgement_host:
+      no_removal: "there is no API endpoint to remove an acknowledgement in REST API 1.0"
+      indirect_removal: "deleting the acknowledgement comment via delete_comments also drops the acknowledgement"
+    create_acknowledgement_service:
+      no_removal: "there is no API endpoint to remove an acknowledgement in REST API 1.0"
+    create_host:
+      folder_notation: "tilde separated: '~' is root, '~linux~web' is nested; slashes never work in the URL"
+      activation_required: "the host is not monitored until service discovery and activate_changes ran"
+      common_attributes: "ipaddress, ipv6address, site, alias, parents, labels, tag_agent, tag_address_family, tag_snmp_ds, contactgroups"
+    update_host:
+      strategy: "use update_attributes to merge; attributes REPLACES the whole set"
+      etag: "If-Match is mandatory; '*' is sent by default"
+    delete_folder:
+      default_override: "Checkmk defaults delete_mode to 'recursive'; this tool defaults to 'abort_on_nonempty' -- pass 'recursive' deliberately"
+    activate_changes:
+      etag: "HTTP 428 without If-Match, 412 on a stale ETag; '*' is sent by default"
+      foreign_changes: "HTTP 401 (not 403/409) when another user has pending changes -- set force_foreign_changes"
+      status_codes: "200 accepted, 303 running, 422 nothing to activate, 423 activation already running, 409 a site failed"
+      completion: "only STARTS the job -- is_running:false on get_activation_run is the done signal"
+    get_activation_run:
+      completion_field: "is_running:false means finished; there is no top-level status field"
+      per_site: "status_per_site is an array of {site, state, phase, status_text, ...}; state must be 'success'"
+    start_service_discovery:
+      modes: "fix_all (default) | new | remove | refresh | only_host_labels | only_service_labels | tabula_rasa"
+      returns_result: "on 2.5 it returns the discovery result directly, not a job handle"
+      fast_scan_404: "wait_service_discovery_completion answers 404 when the scan already finished -- that is success"
+      check_table_shape: "object keyed by <plugin>-<item>; phase in .value, display name in .extensions.service_name"
+      activation_required: "the discovery result is a pending change until activate_changes runs"
+    start_discovery_bulk:
+      options_default: "all options default to false -- an empty options object discovers nothing"
+      tracking: "no dedicated wait tool; poll get_background_job with the returned job id"
+    create_rule:
+      value_format: "value_raw is a PYTHON literal string, not JSON, e.g. \"{'levels': (80.0, 90.0)}\""
+      position: "new rules are inserted at the top of the folder's rule list"
+      discovery: "read an existing rule via list_rules to copy the exact value shape"
+    list_rules:
+      ruleset_required: "ruleset_name is mandatory -- there is no 'all rules' endpoint"
+    list_rulesets:
+      used_default: "server default is used=true -- without used=false you only search rulesets that already have rules"
+      catalogue_size: "used=false returns ~1700 rulesets (~400 KB) -- always combine with fulltext or group"
+    list_pending_changes:
+      flat_entries: "entries are flat {id, user_id, action_name, text, time} -- no extensions wrapper"
+      time_format: "`time` is an ISO 8601 string here; the audit log's `time` is a Unix epoch integer"
+      foreign_check: "compare user_id against your API user -- foreign entries make activate_changes 401"
+    get_metric:
+      id_discovery: "enable 'Show internal IDs' in the service view display options to see metric_id/graph_id"
+      data_shape: "data_points is a bare value array spaced `step` seconds apart, nulls mark gaps"
+      site_hint: "passing site greatly improves performance in distributed setups"
+    download_agent:
+      raw_agents_only: "only the vanilla packages; baked per-host agents are an Enterprise feature"
+      output: "returns a time-limited file broker URL, not inline binary data"
+      accept_header: "serves only application/octet-stream; the backend-wide Accept: application/json gives HTTP 406"
+    list_audit_log:
+      date_required: "date (YYYY-MM-DD) is mandatory -- the log is read one day at a time"
+    create_user:
+      automation_users: "auth_option {\"auth_type\": \"automation\", \"secret\": \"...\"} creates an API account"
+      activation_required: "a new user can only log in after activate_changes"
+    delete_aux_tag:
+      http_method: "POST on the delete action, not DELETE"
+    delete_notification_rule:
+      http_method: "POST on the delete action, not DELETE"
+    delete_site_connection:
+      http_method: "POST on the delete action, not DELETE"
+
+  examples:
+    - name: "Triage the current problems"
+      description: "All unhandled host and service problems in one call, with a summary."
+      code: |
+        return await api.get_problems({ limit: 50 });
+
+    - name: "Unacknowledged critical services"
+      description: "Raw Livestatus query for CRIT services that are neither acknowledged nor in a downtime."
+      code: |
+        return await api.list_services_status({
+          query: {
+            op: "and",
+            expr: [
+              { op: "=", left: "state", right: "2" },
+              { op: "=", left: "acknowledged", right: "0" },
+              { op: "=", left: "scheduled_downtime_depth", right: "0" },
+            ],
+          },
+          columns: ["host_name", "description", "state", "plugin_output", "last_state_change"],
+        });
+
+    - name: "Maintenance window for a host and its services"
+      description: "Two calls: a host downtime plus a service downtime by query, because a host downtime does not silence services."
+      code: |
+        const start = "2026-08-13T22:00:00Z";
+        const end = "2026-08-14T02:00:00Z";
+        await api.create_downtime_host({
+          downtime_type: "host",
+          host_name: "db01",
+          start_time: start,
+          end_time: end,
+          comment: "Kernel upgrade",
+        });
+        await api.create_downtime_service({
+          downtime_type: "service_by_query",
+          query: { op: "=", left: "host_name", right: "db01" },
+          start_time: start,
+          end_time: end,
+          comment: "Kernel upgrade",
+        });
+        return await api.list_downtimes({ host_name: "db01" });
+
+    - name: "Onboard a new host end to end"
+      description: "Create the host, discover its services and activate the changes in one composite call."
+      code: |
+        return await api.add_host_monitored({
+          host_name: "web05.example.com",
+          folder: "~linux~web",
+          attributes: { ipaddress: "10.0.0.15", site: "prod" },
+        });
+
+    - name: "Acknowledge a service problem"
+      description: "Sticky acknowledgement with a comment, then verify it is set."
+      code: |
+        await api.create_acknowledgement_service({
+          acknowledge_type: "service",
+          host_name: "web01",
+          service_description: "Filesystem /var",
+          comment: "Cleanup scheduled, ticket OPS-4711",
+          sticky: true,
+          notify: true,
+        });
+        return await api.get_service_status({
+          host_name: "web01",
+          service_description: "Filesystem /var",
+        });
+
+    - name: "Move hosts into a folder and publish"
+      description: "Bulk-update the folder attribute of several hosts, then activate the pending changes."
+      code: |
+        await api.update_hosts_bulk({
+          entries: [
+            { host_name: "web01", update_attributes: { site: "prod" } },
+            { host_name: "web02", update_attributes: { site: "prod" } },
+          ],
+        });
+        return await api.apply_pending_changes({});
+
+    - name: "Read a metric time series"
+      description: "The agent execution time of a host over the last hour."
+      code: |
+        return await api.get_metric({
+          type: "single_metric",
+          host_name: "web01",
+          service_description: "Check_MK",
+          metric_id: "cmk_time_agent",
+          time_range: { start: "2026-08-12T10:00:00Z", end: "2026-08-12T11:00:00Z" },
+          reduce: "max",
+        });
