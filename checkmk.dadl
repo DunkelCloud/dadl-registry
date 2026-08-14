@@ -92,8 +92,9 @@
 #     timezone, e.g. "2026-08-12T17:32:28Z".
 #   * What Livestatus RETURNS is Unix epoch SECONDS: last_check, last_state_change,
 #     next_check come back as integers like 1786571159, and so does the audit log's
-#     `time`. Downtimes, comments and pending changes, by contrast, return ISO strings.
-#     Never feed a status column straight back into a downtime field.
+#     `time`. Downtimes, comments, pending changes and EC events (first/last), by
+#     contrast, return ISO strings. Never feed a status column straight back into a
+#     downtime field.
 #   Downtime `duration` is in SECONDS (0 = fixed downtime spanning start_time..end_time).
 #
 # - THERE IS NO "remove acknowledgement" ENDPOINT in the 2.4 REST API. An
@@ -127,10 +128,46 @@
 #   configuration files. Do not try to fake it through a rule -- rules and global
 #   settings are different layers.
 #
-# - EDITIONS: `bake_agent`, agent baking, DCD, licensing and the event console are
-#   Enterprise/Managed features. On Raw Edition (CRE) they answer 404/403.
+# - EDITIONS: `bake_agent`, agent baking, DCD and licensing are Enterprise/Managed
+#   features. On the community edition (the former Raw/CRE) they answer 404/403.
 #   `customer` fields only exist on the Managed Edition (CME).
 #   download_agent only ships the vanilla agents (linux_rpm, linux_deb, windows_msi).
+#   The EVENT CONSOLE and BI are NOT edition-gated -- their endpoints exist on every
+#   edition including community (verified in the 2.5.0 sources and against a live
+#   community site).
+#
+# - EVENT CONSOLE (EC): Checkmk's subsystem for syslog / SNMP-trap / logfile events,
+#   a category of its own next to host and service states. EC tools live on the
+#   MONITORING side: effective immediately, no activation. States and phases are
+#   STRING NAMES on both sides: parameters take state ok|warning|critical|unknown and
+#   phase open|ack, and responses return the same names in plain, UN-prefixed fields
+#   ({id, site_id, host, application, text, state, phase, count, first, last,
+#   priority, facility, rule_id, service_level, comment, contact} -- verified on
+#   2.5.0p11). The event_-prefixed INTEGER columns exist only INSIDE Livestatus
+#   `query` filters, e.g. {"op": "=", "left": "event_host", "right": "srv1"} -- never
+#   mix the two layers. `site_id` is REQUIRED for every single-event operation (get,
+#   acknowledge, change state, archive by_id) -- EC events are only addressable per
+#   site. There is NO endpoint to CREATE an event (events arrive via syslog/SNMP/pipe
+#   only) and NO un-archive: archiving removes an event from the active list
+#   permanently (its history stays in the GUI; the historical-events REST endpoints
+#   exist only under the separate "unstable" API version, which this backend does not
+#   cover). Bulk EC actions answer HTTP 204 WITHOUT a count of affected events --
+#   verify with list_events afterwards.
+#
+# - BI (BUSINESS INTELLIGENCE): aggregation trees computed live from host/service
+#   states. A bi_pack CONTAINS bi_rules and bi_aggregations; every rule/aggregation
+#   body carries its pack_id. BI configuration does NOT go through the Setup
+#   pending-changes cycle -- creating, updating or deleting packs, rules and
+#   aggregations saves directly and is effective immediately, WITHOUT
+#   activate_changes. create (POST, refuses existing ids) and update (PUT, refuses
+#   unknown ids) take the SAME full-schema body, and the body `id` must equal the id
+#   in the URL path. The nested node/search/action schemas are deep -- always read an
+#   existing object (get_bi_rule / get_bi_aggregation) and mirror its structure
+#   instead of building bodies from scratch. get_bi_aggregation_states is the live
+#   state call ("POST for read" like the status tools); BI states there are INTEGERS
+#   (0=OK, 1=WARN, 2=CRIT, 3=UNKNOWN, -1=pending). Reads need the wato.bi_rules
+#   permission, rule/aggregation writes additionally wato.edit, pack writes
+#   wato.bi_admin on top.
 
 spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
@@ -139,19 +176,21 @@ credits:
 
 source_name: "Checkmk REST API"
 source_url: "https://docs.checkmk.com/latest/en/rest_api.html"
-date: "2026-08-12"
+date: "2026-08-14"
 
 backend:
   name: checkmk
   type: rest
-  version: "1.0"
+  version: "1.1"   # version of this DADL file -- the REST API version in the URL stays 1.0
   # base_url intentionally omitted -- self-hosted and site-specific,
   # provided via backends.yaml as https://<host>/<site>/check_mk/api/1.0
   description: >
     Checkmk REST API (version 1.0, Checkmk 2.4) -- live host and service status via Livestatus
-    queries, downtimes, acknowledgements and comments, plus the full Setup side: hosts, clusters,
-    folders, service discovery, rules and rulesets, host/service/contact groups, users, roles,
-    passwords, time periods, host tags, notification rules, site connections and change activation.
+    queries, downtimes, acknowledgements and comments, the Event Console (list, acknowledge,
+    change state and archive events) and BI (packs, rules, aggregations and live aggregation
+    state), plus the full Setup side: hosts, clusters, folders, service discovery, rules and
+    rulesets, host/service/contact groups, users, roles, passwords, time periods, host tags,
+    notification rules, site connections and change activation.
 
   auth:
     type: bearer
@@ -215,12 +254,12 @@ backend:
       allow_jq_override: true
 
   coverage:
-    endpoints: 125
+    endpoints: 146
     total_endpoints: 230
-    percentage: 54
-    focus: "Checkmk 2.4 REST API v1: host status and service status via Livestatus queries, downtimes for hosts and host groups, downtimes for services and service groups, downtime modification and deletion, acknowledgements, comments, host configuration, host clusters, host bulk operations, folders with attribute inheritance, folder moves, service discovery, service phase updates, rules, rulesets, rule ordering, activation of pending changes, host groups, service groups, contact groups, roles and user accounts, passwords, time periods, host tags, aux tags, notification rules, site connections, agent download, metrics, audit log, background jobs, parent scan."
-    missing: "HW/SW inventory trees, agent registration, BI (business intelligence) aggregations and packs, event console (current and historical events), LDAP connections, broker connections, quick setup wizards, configuration entities (notification parameters), DCD (dynamic host configuration), licensing, certificate management, custom host attributes, autocomplete helpers, graph timerange and icon endpoints, agent baking and signature keys (CEE), bulk update/delete for the three group types, deprecated GET variants of the status collections. NOT a gap: Checkmk's global settings have no REST endpoint in any 2.x version (see domain notes)."
-    last_reviewed: "2026-08-13"
+    percentage: 63
+    focus: "Checkmk 2.4 REST API v1: host status and service status via Livestatus queries, downtimes for hosts and host groups, downtimes for services and service groups, downtime modification and deletion, acknowledgements, comments, event console (current events, acknowledge, change state, archive), BI (packs, rules, aggregations, live aggregation state), host configuration, host clusters, host bulk operations, folders with attribute inheritance, folder moves, service discovery, service phase updates, rules, rulesets, rule ordering, activation of pending changes, host groups, service groups, contact groups, roles and user accounts, passwords, time periods, host tags, aux tags, notification rules, site connections, agent download, metrics, audit log, background jobs, parent scan."
+    missing: "HW/SW inventory trees, agent registration, event console HISTORY (its two endpoints exist only under the separate 'unstable' API version, unreachable below /api/1.0), the GET twin of the BI aggregation_state action (needs array query parameters), LDAP connections, broker connections, quick setup wizards, configuration entities (notification parameters), DCD (dynamic host configuration), licensing, certificate management, custom host attributes, autocomplete helpers, graph timerange and icon endpoints, agent baking and signature keys (CEE), bulk update/delete for the three group types, deprecated GET variants of the status collections. NOT a gap: Checkmk's global settings have no REST endpoint in any 2.x version (see domain notes)."
+    last_reviewed: "2026-08-14"
 
   setup:
     credential_steps:
@@ -590,6 +629,121 @@ backend:
         host_name: { type: string, in: body, description: "Required for delete_type 'params'." }
         service_descriptions: { type: array, in: body, description: "Narrow 'params' to these services of the host." }
         query: { type: object, in: body, description: "Required for delete_type 'query': Livestatus filter on the comments table." }
+
+    # ──────────────────────────────────────────────
+    # Event Console (monitoring side, effective immediately; available on ALL editions)
+    # ──────────────────────────────────────────────
+
+    list_events:
+      method: GET
+      path: /domain-types/event_console/collections/all
+      access: read
+      description: >
+        Current (non-archived) Event Console events -- syslog, SNMP-trap and logfile events, a
+        category of its own next to host/service states. Each entry has plain, un-prefixed fields:
+        id (event id as string), site_id, host, application, text, state (STRING critical |
+        warning | ok | unknown), phase (open|ack), count, first/last (ISO 8601), priority,
+        facility, rule_id, service_level, comment, contact, ipaddress. Only inside `query` do the
+        Livestatus column names apply -- event_-prefixed, as a JSON STRING here (GET), e.g.
+        '{"op": "=", "left": "event_host", "right": "srv1"}'.
+      params:
+        host: { type: string, in: query, description: "Only events whose event_host equals this name (need not be a monitored host)." }
+        application: { type: string, in: query, description: "Only events of this application / syslog program." }
+        state: { type: string, in: query, description: "Filter by state name: ok | warning | critical | unknown." }
+        phase: { type: string, in: query, description: "open (unacknowledged) or ack (acknowledged)." }
+        site_id: { type: string, in: query, description: "Restrict to one site of a distributed setup." }
+        query: { type: string, in: query, description: "Livestatus filter on the eventconsoleevents table as a JSON STRING; columns are event_-prefixed." }
+
+    get_event:
+      method: GET
+      path: /objects/event_console/{event_id}
+      access: read
+      description: >
+        Show ONE current Event Console event by its numeric id. Unlike most single-object GETs of
+        this API, `site_id` is REQUIRED -- EC events are only addressable per site. HTTP 404 when
+        the event does not exist on that site (or was already archived).
+      params:
+        event_id: { type: string, in: path, required: true, description: "Numeric event id, e.g. \"42\"." }
+        site_id: { type: string, in: query, required: true, description: "Site holding the event." }
+
+    acknowledge_event:
+      method: POST
+      path: /objects/event_console/{event_id}/actions/update_and_acknowledge/invoke
+      access: write
+      description: >
+        Acknowledge ONE Event Console event -- or reopen it with phase "open". Optionally updates
+        the event's comment and contact fields in the same call. Returns 204 with no body; 404
+        when the event id does not exist on that site.
+      params:
+        event_id: { type: string, in: path, required: true, description: "Numeric event id." }
+        site_id: { type: string, in: body, required: true, description: "Site holding the event." }
+        phase: { type: string, in: body, description: "ack (default) or open to un-acknowledge." }
+        change_comment: { type: string, in: body, description: "New comment text stored on the event." }
+        change_contact: { type: string, in: body, description: "New contact information stored on the event." }
+
+    acknowledge_events:
+      method: POST
+      path: /domain-types/event_console/actions/update_and_acknowledge/invoke
+      access: write
+      description: >
+        Acknowledge (or reopen) MANY Event Console events at once. `filter_type` selects the
+        targets: "query" (Livestatus filter OBJECT on eventconsoleevents), "params" (a `filters`
+        object with at least one of state/host/application -- phase is NOT accepted here) or
+        "all" (every event, optionally scoped by site_id). When acknowledging, only open events
+        are touched. Returns 204 with NO count of affected events -- verify with list_events.
+      params:
+        filter_type: { type: string, in: body, required: true, description: "query | params | all" }
+        query: { type: object, in: body, description: "Required for filter_type 'query': Livestatus filter OBJECT, e.g. {\"op\": \"=\", \"left\": \"event_host\", \"right\": \"srv1\"}." }
+        filters: { type: object, in: body, description: "Required for filter_type 'params': {state?, host?, application?} -- at least one key; phase is NOT accepted here." }
+        site_id: { type: string, in: body, description: "Restrict to one site; omit to act on all sites." }
+        phase: { type: string, in: body, description: "ack (default) or open." }
+        change_comment: { type: string, in: body, description: "New comment for the matched events." }
+        change_contact: { type: string, in: body, description: "New contact information for the matched events." }
+
+    change_event_state:
+      method: POST
+      path: /objects/event_console/{event_id}/actions/change_state/invoke
+      access: write
+      description: >
+        Set the state of ONE Event Console event. `new_state` is a STRING NAME (ok, warning,
+        critical, unknown) although responses report event_state as an integer. Returns 204; 404
+        when the event does not exist on that site.
+      params:
+        event_id: { type: string, in: path, required: true, description: "Numeric event id." }
+        site_id: { type: string, in: body, required: true, description: "Site holding the event." }
+        new_state: { type: string, in: body, required: true, description: "ok | warning | critical | unknown" }
+
+    change_event_states:
+      method: POST
+      path: /domain-types/event_console/actions/change_state/invoke
+      access: write
+      description: >
+        Set the state of MANY Event Console events at once. `filter_type` "query" takes a
+        Livestatus filter OBJECT, "params" a `filters` object with at least one of
+        state/host/application/phase. Returns 204 without an affected count.
+      params:
+        filter_type: { type: string, in: body, required: true, description: "query | params" }
+        new_state: { type: string, in: body, required: true, description: "ok | warning | critical | unknown" }
+        query: { type: object, in: body, description: "Required for filter_type 'query': Livestatus filter OBJECT on eventconsoleevents." }
+        filters: { type: object, in: body, description: "Required for filter_type 'params': {state?, host?, application?, phase?} -- at least one key." }
+        site_id: { type: string, in: body, description: "Restrict to one site." }
+
+    archive_events:
+      method: POST
+      path: /domain-types/event_console/actions/delete/invoke
+      access: write
+      description: >
+        Archive Event Console events -- the EC "delete": the events leave the active list
+        PERMANENTLY (no un-archive; their history stays visible in the GUI only). `filter_type`
+        "by_id" needs event_id (an INTEGER in this body, unlike the string path params) plus
+        site_id, "query" takes a Livestatus filter OBJECT, "params" a `filters` object with at
+        least one of state/host/application/phase. Returns 204 without an affected count.
+      params:
+        filter_type: { type: string, in: body, required: true, description: "by_id | query | params" }
+        event_id: { type: integer, in: body, description: "Required for filter_type 'by_id': the numeric event id as an INTEGER." }
+        site_id: { type: string, in: body, description: "Required for filter_type 'by_id'; optional scope otherwise." }
+        query: { type: object, in: body, description: "Required for filter_type 'query': Livestatus filter OBJECT on eventconsoleevents." }
+        filters: { type: object, in: body, description: "Required for filter_type 'params': {state?, host?, application?, phase?} -- at least one key." }
 
     # ──────────────────────────────────────────────
     # Host configuration (Setup -- needs activate_changes)
@@ -1967,6 +2121,226 @@ backend:
         performance: { type: object, in: body, description: "{responses_timeout, hop_probes, max_gateway_distance, ping_probes}." }
         configuration: { type: object, in: body, description: "{force_explicit_parents: true|false}." }
 
+    # ──────────────────────────────────────────────
+    # BI -- Business Intelligence (live immediately, NO activate_changes; all editions)
+    # ──────────────────────────────────────────────
+
+    list_bi_packs:
+      method: GET
+      path: /domain-types/bi_pack/collections/all
+      access: read
+      description: >
+        All BI packs as {id, title} entries. A pack is the container object: it owns BI rules and
+        BI aggregations and carries the contact-group permissions. Fresh sites ship one pack with
+        id "default". Call get_bi_pack to see which rules and aggregations a pack contains.
+      response:
+        result_path: "$"
+        # The API returns bare link entries here ({href, rel, title, ...}), not domain objects --
+        # extract the pack id from the href (verified on 2.5.0p11).
+        transform: |
+          [ .value[] | {id: (.href | split("/") | last), title} ]
+        allow_jq_override: true
+
+    get_bi_pack:
+      method: GET
+      path: /objects/bi_pack/{pack_id}
+      access: read
+      description: >
+        One BI pack: title, contact_groups and public flag, plus the ids of the rules and
+        aggregations it contains (this tool extracts them from the members links into plain
+        `rules` and `aggregations` arrays).
+      params:
+        pack_id: { type: string, in: path, required: true, description: "Pack id, e.g. \"default\"." }
+      response:
+        result_path: "$"
+        transform: |
+          {id, title, contact_groups: (.extensions.contact_groups // []),
+           public: (.extensions.public // false),
+           rules: [.members.rules.value[]?.href | split("/") | last],
+           aggregations: [.members.aggregations.value[]?.href | split("/") | last]}
+        allow_jq_override: true
+
+    create_bi_pack:
+      method: POST
+      path: /objects/bi_pack/{pack_id}
+      access: admin
+      description: >
+        Create a BI pack. ALL THREE body fields are required. Needs the wato.bi_admin permission
+        on top of wato.edit + wato.bi_rules. Fails when the pack_id already exists. Live
+        immediately -- BI configuration does not go through activate_changes.
+      params:
+        pack_id: { type: string, in: path, required: true, description: "New unique pack id." }
+        title: { type: string, in: body, required: true, description: "Display title of the pack." }
+        contact_groups: { type: array, in: body, required: true, description: "Contact group ids whose members may edit the pack; [] for none." }
+        public: { type: boolean, in: body, required: true, description: "Visible to all users (true) or only to members of the contact groups (false)." }
+
+    update_bi_pack:
+      method: PUT
+      path: /objects/bi_pack/{pack_id}
+      access: admin
+      description: >
+        Replace title, contact_groups and public of an existing BI pack -- all three fields are
+        required (full replace, no merge). The rules and aggregations inside the pack are
+        preserved. Needs wato.bi_admin.
+      params:
+        pack_id: { type: string, in: path, required: true, description: "Pack to update." }
+        title: { type: string, in: body, required: true, description: "Display title of the pack." }
+        contact_groups: { type: array, in: body, required: true, description: "Contact group ids whose members may edit the pack; [] for none." }
+        public: { type: boolean, in: body, required: true, description: "Visible to all users (true) or only to members of the contact groups (false)." }
+
+    delete_bi_pack:
+      method: DELETE
+      path: /objects/bi_pack/{pack_id}
+      access: dangerous
+      description: >
+        Delete a BI pack. Refuses (HTTP 404 with a "contains N rules" detail) while the pack
+        still contains RULES -- delete those first; contained aggregations do not block and are
+        deleted with the pack. Needs wato.bi_admin. Returns 204.
+      params:
+        pack_id: { type: string, in: path, required: true, description: "Pack to delete." }
+
+    get_bi_rule:
+      method: GET
+      path: /objects/bi_rule/{rule_id}
+      access: read
+      description: >
+        One BI rule as plain JSON: {pack_id, id, nodes, params, node_visualization, properties,
+        aggregation_function, computation_options}. This exact shape is what create_bi_rule and
+        update_bi_rule expect as body -- read a rule, adapt it, write it back.
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Rule id, e.g. \"applications\" (fresh sites ship sample rules in the \"default\" pack)." }
+
+    create_bi_rule:
+      method: POST
+      path: /objects/bi_rule/{rule_id}
+      access: write
+      description: >
+        Create a BI rule inside a pack. The body is the FULL rule schema -- easiest is to
+        get_bi_rule an existing rule and adapt it. `id` in the body must equal the rule_id in the
+        path. `nodes` lists the child nodes, each {search: {...}, action: {...}} with action.type
+        one of state_of_host, state_of_service, state_of_remaining_services or call_a_rule.
+        `aggregation_function` decides how child states combine (type worst | best | count_ok).
+        Fails when the rule_id already exists. Live immediately, no activation.
+      params:
+        rule_id: { type: string, in: path, required: true, description: "New unique rule id." }
+        pack_id: { type: string, in: body, required: true, description: "Pack that will own the rule." }
+        id: { type: string, in: body, required: true, description: "Must equal the rule_id in the path." }
+        nodes: { type: array, in: body, required: true, description: "Child nodes: [{search: {type: \"empty\"|\"host_search\"|\"service_search\"}, action: {type: \"state_of_host\"|\"state_of_service\"|\"state_of_remaining_services\"|\"call_a_rule\", ...}}]." }
+        params: { type: object, in: body, description: "Rule parameters: {arguments: [\"HOST\"]} -- usable as $1$, $2$ placeholders inside child nodes." }
+        properties: { type: object, in: body, description: "{title, comment, docu_url, icon, state_messages} -- the title is what aggregation results display." }
+        aggregation_function: { type: object, in: body, description: "How child states combine, e.g. {\"type\": \"worst\", \"count\": 1, \"restrict_state\": 2}; types worst | best | count_ok." }
+        node_visualization: { type: object, in: body, description: "Layout style, e.g. {\"type\": \"block\", \"style_config\": {}}." }
+        computation_options: { type: object, in: body, description: "{\"disabled\": false}" }
+
+    update_bi_rule:
+      method: PUT
+      path: /objects/bi_rule/{rule_id}
+      access: write
+      description: >
+        Update an existing BI rule -- FULL REPLACE with the same body shape as create_bi_rule
+        (get_bi_rule first, modify, write back). Fails when the rule_id does not exist. Live
+        immediately.
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Rule to update." }
+        pack_id: { type: string, in: body, required: true, description: "Pack owning the rule." }
+        id: { type: string, in: body, required: true, description: "Must equal the rule_id in the path." }
+        nodes: { type: array, in: body, required: true, description: "Complete replacement list of child nodes." }
+        params: { type: object, in: body, description: "Rule parameters: {arguments: [...]}." }
+        properties: { type: object, in: body, description: "{title, comment, docu_url, icon, state_messages}." }
+        aggregation_function: { type: object, in: body, description: "e.g. {\"type\": \"worst\", \"count\": 1, \"restrict_state\": 2}." }
+        node_visualization: { type: object, in: body, description: "Layout style object." }
+        computation_options: { type: object, in: body, description: "{\"disabled\": false}" }
+
+    delete_bi_rule:
+      method: DELETE
+      path: /objects/bi_rule/{rule_id}
+      access: dangerous
+      description: >
+        Delete a BI rule. HTTP 409 when the rule is still referenced by another rule or by an
+        aggregation -- remove those references first. Returns 204. Live immediately.
+      params:
+        rule_id: { type: string, in: path, required: true, description: "Rule to delete." }
+
+    get_bi_aggregation:
+      method: GET
+      path: /objects/bi_aggregation/{aggregation_id}
+      access: read
+      description: >
+        One BI aggregation as plain JSON: {pack_id, id, comment, customer, groups, node,
+        aggregation_visualization, computation_options}. This exact shape is what
+        create_bi_aggregation and update_bi_aggregation expect as body.
+      params:
+        aggregation_id: { type: string, in: path, required: true, description: "Aggregation id, e.g. \"default_aggregation\"." }
+
+    create_bi_aggregation:
+      method: POST
+      path: /objects/bi_aggregation/{aggregation_id}
+      access: write
+      description: >
+        Create a BI aggregation: the tree root that instantiates a rule (node.action.type
+        "call_a_rule") for a set of hosts found by node.search. Mirror an existing aggregation
+        from get_bi_aggregation. `groups.names` decides under which BI group headings the tree
+        appears. computation_options: {disabled, use_hard_states, escalate_downtimes_as_warn}.
+        Fails when the aggregation_id already exists. Live immediately, no activation.
+      params:
+        aggregation_id: { type: string, in: path, required: true, description: "New unique aggregation id." }
+        pack_id: { type: string, in: body, required: true, description: "Pack that will own the aggregation." }
+        id: { type: string, in: body, required: true, description: "Must equal the aggregation_id in the path." }
+        node: { type: object, in: body, required: true, description: "Root node, usually {search: {type: \"host_search\"|\"empty\", ...}, action: {type: \"call_a_rule\", rule_id: \"...\", params: {arguments: [...]}}}." }
+        groups: { type: object, in: body, description: "{names: [\"GroupA\"], paths: [[\"path\",\"to\",\"group\"]]} -- BI group headings this tree appears under." }
+        computation_options: { type: object, in: body, description: "{\"disabled\": false, \"use_hard_states\": false, \"escalate_downtimes_as_warn\": false}; 2.5 adds freeze_aggregations and downtime_only_on_full_problem_coverage. disabled:true excludes the aggregation from aggregation_state." }
+        aggregation_visualization: { type: object, in: body, description: "Visualization options object; copy from an existing aggregation." }
+        comment: { type: string, in: body, description: "Optional free-text comment." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only: customer id." }
+
+    update_bi_aggregation:
+      method: PUT
+      path: /objects/bi_aggregation/{aggregation_id}
+      access: write
+      description: >
+        Update an existing BI aggregation -- FULL REPLACE with the same body shape as
+        create_bi_aggregation. Fails when the aggregation_id does not exist. Live immediately.
+      params:
+        aggregation_id: { type: string, in: path, required: true, description: "Aggregation to update." }
+        pack_id: { type: string, in: body, required: true, description: "Pack owning the aggregation." }
+        id: { type: string, in: body, required: true, description: "Must equal the aggregation_id in the path." }
+        node: { type: object, in: body, required: true, description: "Complete replacement root node." }
+        groups: { type: object, in: body, description: "{names: [...], paths: [[...]]}." }
+        computation_options: { type: object, in: body, description: "{disabled, use_hard_states, escalate_downtimes_as_warn}." }
+        aggregation_visualization: { type: object, in: body, description: "Visualization options object." }
+        comment: { type: string, in: body, description: "Optional free-text comment." }
+        customer: { type: string, in: body, description: "Managed Edition (CME) only: customer id." }
+
+    delete_bi_aggregation:
+      method: DELETE
+      path: /objects/bi_aggregation/{aggregation_id}
+      access: dangerous
+      description: "Delete a BI aggregation. Returns 204. Live immediately, no activation."
+      params:
+        aggregation_id: { type: string, in: path, required: true, description: "Aggregation to delete." }
+
+    get_bi_aggregation_states:
+      method: POST
+      path: /domain-types/bi_aggregation/actions/aggregation_state/invoke
+      access: read
+      description: >
+        LIVE state of BI aggregations, computed on the fly from current host/service states.
+        Read-only despite POST (the GET twin needs array query parameters, which this backend
+        cannot send). Returns {aggregations: {<TITLE>: {state, output, hosts, acknowledged,
+        in_downtime, in_service_period, infos}}, missing_sites, missing_aggr}. The dict is keyed
+        by aggregation TITLE (properties.title), not id, and BI states are INTEGERS: 0=OK,
+        1=WARN, 2=CRIT, 3=UNKNOWN, -1=pending. Computing every aggregation can be expensive --
+        filter on big installations. An empty aggregations object means no aggregation matched,
+        none is configured, or the matching aggregations are DISABLED -- fresh sites ship
+        default_aggregation with computation_options.disabled=true, so a brand-new site returns
+        {} here until an aggregation is enabled.
+      params:
+        # default [] forces a JSON body on every call -- Checkmk answers HTTP 415 to a body-less
+        # POST on this action ("No content-type specified", verified on 2.5.0p11). An empty list
+        # means "no filter", identical to omitting the field.
+        filter_names: { type: array, in: body, default: [], description: "Only aggregations whose TITLE is in this list (exact match), e.g. [\"Host srv1\"]. Empty list = all aggregations." }
+        filter_groups: { type: array, in: body, description: "Only aggregations shown under these BI group names." }
+
   composites:
 
     get_problems:
@@ -2298,6 +2672,47 @@ backend:
       http_method: "POST on the delete action, not DELETE"
     delete_site_connection:
       http_method: "POST on the delete action, not DELETE"
+    list_events:
+      response_shape: "plain un-prefixed fields with STRING states (state: 'critical', phase: 'open') and ISO timestamps -- a response state can be fed straight into new_state"
+      query_format: "query is a JSON STRING on this GET; only THERE are columns event_-prefixed (event_host, event_state as integer)"
+      scope: "current events only -- archived/historical events are not reachable in REST API 1.0"
+      no_create: "there is no REST endpoint to create an EC event; events arrive via syslog/SNMP/pipe only"
+    get_event:
+      site_required: "site_id is REQUIRED -- EC events are addressed per site"
+    acknowledge_event:
+      reopen: "phase 'open' un-acknowledges the event"
+      not_found: "404 means unknown event id on that site (possibly already archived)"
+    acknowledge_events:
+      filters_shape: "filter_type 'params' takes filters {state, host, application} -- phase is NOT accepted here"
+      all_scope: "filter_type 'all' hits EVERY open event, across all sites unless site_id is set"
+      no_count: "returns 204 without an affected count -- verify with list_events"
+    change_event_state:
+      state_strings: "new_state is a string name, not an integer"
+    archive_events:
+      irreversible: "archived events cannot be brought back via the API; history stays in the GUI only"
+      by_id_type: "event_id is an INTEGER in this body, unlike the string event_id path params"
+    list_bi_packs:
+      default_pack: "fresh sites ship pack id 'default' with sample rules"
+    get_bi_pack:
+      members: "rules/aggregations arrays are extracted from the members links by this tool's transform"
+    create_bi_rule:
+      discovery: "get_bi_rule an existing rule and adapt it -- the nested node schemas are deep"
+      no_activation: "BI configuration changes are live immediately; activate_changes is NOT involved"
+      id_duplication: "the body id must equal the rule_id in the path"
+    create_bi_aggregation:
+      discovery: "get_bi_aggregation an existing aggregation and adapt it"
+      no_activation: "live immediately, no activate_changes"
+      id_duplication: "the body id must equal the aggregation_id in the path"
+    delete_bi_pack:
+      rules_block: "refuses while the pack contains rules; contained aggregations do not block"
+    delete_bi_rule:
+      conflict: "HTTP 409 while the rule is referenced by another rule or an aggregation"
+    get_bi_aggregation_states:
+      title_keyed: "the aggregations dict is keyed by aggregation TITLE, not id"
+      states: "BI states are integers 0..3, -1 = pending -- unlike the string states of the EC tools"
+      cost: "computes live -- use filter_names/filter_groups on big installations"
+      empty_result: "{} also happens when the aggregation is disabled -- fresh sites ship default_aggregation disabled"
+      body_quirk: "a body-less POST gets HTTP 415 from Checkmk; filter_names defaults to [] so a body is always sent"
 
   examples:
     - name: "Triage the current problems"
@@ -2388,3 +2803,24 @@ backend:
           time_range: { start: "2026-08-12T10:00:00Z", end: "2026-08-12T11:00:00Z" },
           reduce: "max",
         });
+
+    - name: "Event Console triage"
+      description: "List open critical EC events, acknowledge the ones of a host, then verify."
+      code: |
+        const events = await api.list_events({ state: "critical", phase: "open" });
+        if (events.length === 0) return "no open critical events";
+        await api.acknowledge_events({
+          filter_type: "params",
+          filters: { host: events[0].event_host },
+          change_comment: "Investigating, ticket OPS-4712",
+        });
+        return await api.list_events({ host: events[0].event_host });
+
+    - name: "BI aggregation state"
+      description: "Live state of all BI aggregations, reduced to the non-OK trees."
+      code: |
+        const state = await api.get_bi_aggregation_states({});
+        const broken = Object.entries(state.aggregations)
+          .filter(([, a]) => a.state !== 0)
+          .map(([title, a]) => ({ title, state: a.state, output: a.output, hosts: a.hosts }));
+        return { broken, missing_sites: state.missing_sites };
