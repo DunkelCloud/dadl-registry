@@ -82,7 +82,7 @@ date: "2026-08-15"
 backend:
   name: netbox
   type: rest
-  version: "2.1"
+  version: "2.2"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own NetBox instance address.
   description: "NetBox DCIM/IPAM API -- full v4 coverage: sites, racks, devices, modules, interfaces, cables, power, IPAM (prefixes, IPs, VLANs, VRFs, route-targets, VLAN translation), virtualization, circuits (including virtual circuits), tenants, contacts, VPN (IKE/IPSec/L2VPN), wireless, extras (webhooks, event-rules, scripts, config-templates, bookmarks, notifications), users/permissions/tokens, and core data sources & jobs"
@@ -3103,13 +3103,14 @@ backend:
       method: GET
       path: /ipam/prefixes/
       access: read
-      description: "List IP prefixes (subnets)"
+      description: "List IP prefixes (subnets). Results span ALL VRFs: overlapping private ranges (e.g. a customer VRF reusing an internal RFC1918 net) return look-alike rows -- check the vrf field and scope with vrf_id when a range is ambiguous."
       params:
         prefix: { type: string, in: query, description: "Exact CIDR match" }
         within: { type: string, in: query, description: "CIDR supernet (e.g. 10.0.0.0/8)" }
         contains: { type: string, in: query, description: "IP or prefix contained" }
         site: { type: string, in: query }
-        vrf: { type: string, in: query }
+        vrf: { type: string, in: query, description: "Filter by VRF route distinguisher (RD). Rejects VRF names; useless for VRFs without an RD -- prefer vrf_id." }
+        vrf_id: { type: integer, in: query, description: "Filter by VRF ID -- the reliable way to scope to one VRF" }
         vlan_id: { type: integer, in: query }
         status: { type: string, in: query, description: "container, active, reserved, deprecated" }
         role: { type: string, in: query }
@@ -3188,14 +3189,15 @@ backend:
       method: GET
       path: /ipam/ip-addresses/
       access: read
-      description: "List all IP addresses"
+      description: "List all IP addresses. Results span ALL VRFs: the same private address can exist once globally and again inside a customer VRF -- check the vrf field on each row and scope with vrf_id when an address is ambiguous."
       params:
         address: { type: string, in: query, description: "Exact IP (e.g. 10.0.0.1/24)" }
         parent: { type: string, in: query, description: "Parent prefix CIDR" }
         device: { type: string, in: query }
         virtual_machine: { type: string, in: query }
         interface: { type: string, in: query }
-        vrf: { type: string, in: query }
+        vrf: { type: string, in: query, description: "Filter by VRF route distinguisher (RD). Rejects VRF names; useless for VRFs without an RD -- prefer vrf_id." }
+        vrf_id: { type: integer, in: query, description: "Filter by VRF ID -- the reliable way to scope to one VRF" }
         status: { type: string, in: query, description: "active, reserved, deprecated, dhcp, slaac" }
         role: { type: string, in: query }
         tenant: { type: string, in: query }
