@@ -20,6 +20,8 @@
 # - Status values vary per model: "active", "planned", "staged", "decommissioning", etc.
 # - A "prefix" in IPAM is a CIDR block (e.g. 10.0.0.0/24). A "VRF" is a routing domain.
 #   Route-targets (e.g. "65000:100") attach to VRFs as import_targets/export_targets for L3VPN.
+# - 1:1 NAT pairs: set nat_inside (writable) on the OUTSIDE address; nat_outside is the
+#   read-only reverse view on the inside address.
 # - A "VLAN" has a numeric vid (1-4094) and belongs to a VLAN group and optional site.
 #   VLAN translation policies define 1:1 local-to-remote VID rewrites.
 # - FHRP (First Hop Redundancy Protocol) groups model virtual IP failover (VRRP, HSRP, CARP, GLBP).
@@ -32,6 +34,9 @@
 #   its components from the module-type templates; removing it deletes them.
 # - Virtual chassis (VC) groups multiple physical devices into one logical device with a master.
 #   Set virtual_chassis + vc_position + vc_priority on member devices via update_device.
+# - Devices carry primary_ip4/primary_ip6 and oob_ip (out-of-band management, e.g. BMC/iDRAC/iLO).
+#   All three are set via update_device and require the IP to already be assigned to an
+#   interface of that device (or NAT-linked to one) -- otherwise NetBox rejects with HTTP 400.
 # - Virtual device contexts (VDCs) split one physical device into multiple logical contexts
 #   (Cisco Nexus model). Interfaces can belong to one or more VDCs.
 # - Power model: power-panel -> power-feed -> power-port (device side) and power-outlet
@@ -72,12 +77,12 @@ credits:
 
 source_name: "NetBox REST API"
 source_url: "https://netboxlabs.com/docs/netbox/integrations/rest-api/"
-date: "2026-05-19"
+date: "2026-08-15"
 
 backend:
   name: netbox
   type: rest
-  version: "2.0"
+  version: "2.1"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own NetBox instance address.
   description: "NetBox DCIM/IPAM API -- full v4 coverage: sites, racks, devices, modules, interfaces, cables, power, IPAM (prefixes, IPs, VLANs, VRFs, route-targets, VLAN translation), virtualization, circuits (including virtual circuits), tenants, contacts, VPN (IKE/IPSec/L2VPN), wireless, extras (webhooks, event-rules, scripts, config-templates, bookmarks, notifications), users/permissions/tokens, and core data sources & jobs"
@@ -168,7 +173,7 @@ backend:
       authentication-check endpoint -- minor utility endpoints.
       Bulk update/delete on list endpoints (PUT/PATCH/DELETE on collections)
       -- prefer per-object operations in Code Mode.
-    last_reviewed: "2026-05-19"
+    last_reviewed: "2026-08-15"
 
   setup:
     credential_steps:
@@ -208,7 +213,12 @@ backend:
       filtering: "?device=hostname or ?device_id=123. ?type=1000base-t for specific types."
       lag: "lag_id filters interfaces by their LAG parent. Use ?type=lag to find the parent itself."
       vdc: "?vdc_id filters interfaces belonging to a specific virtual device context"
+    update_device:
+      oob_ip_workflow: "To set an out-of-band management IP: 1) ensure a mgmt interface exists (create_interface, e.g. mgmt_only=true), 2) create_ip_address with assigned_object_type='dcim.interface' + assigned_object_id, 3) update_device with oob_ip=<ip id>. Same flow applies to primary_ip4/primary_ip6."
+      nullable_fks: "primary_ip4, primary_ip6, oob_ip, virtual_chassis are nullable -- pass JSON null to clear."
+      vc_membership: "Join a virtual chassis with virtual_chassis=<id> + vc_position (unique per VC) + vc_priority. Leave it by passing virtual_chassis=null."
     update_interface:
+      mac_workflow: "MAC addresses are separate objects since NetBox 4.x: create_mac_address({mac_address, assigned_object_type:'dcim.interface', assigned_object_id}) first, then set primary_mac_address=<id> on the interface. The interface field mac_address is read-only."
       nullable_fks: "untagged_vlan, lag, parent, bridge, vrf, primary_mac_address are nullable -- pass JSON null in the PATCH body to clear them. Omitting the key leaves the current value unchanged."
       nullable_choices: "mode and duplex are nullable -- pass null to clear (mode=null reverts to access-mode default; duplex=null lets the driver auto-negotiate)."
       m2m_clear: "tagged_vlans, wireless_lans, and tags are many-to-many arrays -- pass [] (empty array) to detach all; pass null is not the right idiom for M2M."
@@ -228,7 +238,7 @@ backend:
       required: "address (CIDR notation, e.g. '10.0.0.1/24')"
       assign: "Set assigned_object_type='dcim.interface' and assigned_object_id=<id> to bind to an interface"
       vminterface: "For VM interfaces use assigned_object_type='virtualization.vminterface'"
-      nat: "nat_inside / nat_outside fields link 1:1 NAT IP pairs"
+      nat: "1:1 NAT: set nat_inside=<inside ip id> on the OUTSIDE address. nat_outside is read-only (reverse view) and cannot be written."
     create_service:
       netbox_4x: "NetBox 4.x replaced device/virtual_machine with GenericForeignKey: use parent_object_type ('dcim.device' or 'virtualization.virtualmachine') + parent_object_id"
       custom_fields: "Pass custom_fields as key-value object, e.g. {prom_http_url: 'http://...:9090/metrics'}"
@@ -1142,6 +1152,11 @@ backend:
         cluster: { type: integer, in: body, description: "ID of the virtualization cluster" }
         asset_tag: { type: string, in: body, description: "Unique asset tag" }
         airflow: { type: string, in: body, description: "front-to-rear, rear-to-front, left-to-right, right-to-left, side-to-rear, passive, mixed" }
+        virtual_chassis: { type: integer, in: body, description: "ID of the virtual chassis to join as a member" }
+        vc_position: { type: integer, in: body, description: "Position within the virtual chassis (0-255, unique per VC)" }
+        vc_priority: { type: integer, in: body, description: "Master election priority within the virtual chassis (0-255)" }
+        latitude: { type: number, in: body, description: "GPS latitude in decimal degrees" }
+        longitude: { type: number, in: body, description: "GPS longitude in decimal degrees" }
         description: { type: string, in: body }
         comments: { type: string, in: body }
         tags: { type: array, in: body }
@@ -1152,7 +1167,7 @@ backend:
       method: PATCH
       path: /dcim/devices/{id}/
       access: write
-      description: "Update a device"
+      description: "Update a device -- fields, rack placement, primary IPs, out-of-band (OOB) management IP, virtual-chassis membership, geolocation. IP fields (primary_ip4/primary_ip6/oob_ip) take an ip-address ID that must already be assigned to an interface of this device."
       params:
         id: { type: integer, in: path, required: true }
         name: { type: string, in: body }
@@ -1173,8 +1188,14 @@ backend:
         location: { type: integer, in: body, description: "ID of the location (room/floor)" }
         cluster: { type: integer, in: body, description: "ID of the virtualization cluster" }
         tenant: { type: integer, in: body, description: "ID of the tenant" }
-        primary_ip4: { type: integer, in: body, description: "ID of the primary IPv4 address" }
-        primary_ip6: { type: integer, in: body, description: "ID of the primary IPv6 address" }
+        primary_ip4: { type: integer, in: body, description: "ID of the primary IPv4 address. Must be assigned to an interface of this device. Nullable: pass null to clear." }
+        primary_ip6: { type: integer, in: body, description: "ID of the primary IPv6 address. Must be assigned to an interface of this device. Nullable: pass null to clear." }
+        oob_ip: { type: integer, in: body, description: "ID of the out-of-band management IP (BMC/iDRAC/iLO). Must be assigned to an interface of this device, or NAT-linked (nat_inside) to one -- otherwise HTTP 400. Nullable: pass null to clear." }
+        virtual_chassis: { type: integer, in: body, description: "ID of the virtual chassis this device is a member of. Nullable: pass null to remove from the VC." }
+        vc_position: { type: integer, in: body, description: "Position within the virtual chassis (0-255, unique per VC)" }
+        vc_priority: { type: integer, in: body, description: "Master election priority within the virtual chassis (0-255)" }
+        latitude: { type: number, in: body, description: "GPS latitude in decimal degrees" }
+        longitude: { type: number, in: body, description: "GPS longitude in decimal degrees" }
         custom_fields: { type: object, in: body, description: "Custom field values as key-value pairs" }
       pagination: none
 
@@ -1831,8 +1852,7 @@ backend:
         type: { type: string, in: body, required: true, description: "e.g. 1000base-t, 10gbase-x-sfpp, 25gbase-x-sfp28, virtual, lag" }
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
-        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
-        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x)" }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID. NetBox 4.x stores MACs as separate objects: create_mac_address first (assigned to this interface), then set its ID here. The interface's mac_address field itself is read-only." }
         mgmt_only: { type: boolean, in: body, description: "Management-only interface" }
         label: { type: string, in: body, description: "Physical label" }
         speed: { type: integer, in: body, description: "Speed in Kbps" }
@@ -1864,8 +1884,7 @@ backend:
         type: { type: string, in: body, description: "e.g. 1000base-t, 10gbase-x-sfpp, 25gbase-x-sfp28, virtual, lag" }
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
-        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
-        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x). Nullable: pass null to clear." }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID. NetBox 4.x stores MACs as separate objects: create_mac_address first (assigned to this interface), then set its ID here. The interface's mac_address field itself is read-only. Nullable: pass null to clear." }
         mgmt_only: { type: boolean, in: body, description: "Management-only interface" }
         label: { type: string, in: body, description: "Physical label" }
         speed: { type: integer, in: body, description: "Speed in Kbps" }
@@ -3209,6 +3228,7 @@ backend:
         tenant: { type: integer, in: body }
         assigned_object_type: { type: string, in: body, description: "dcim.interface or virtualization.vminterface" }
         assigned_object_id: { type: integer, in: body }
+        nat_inside: { type: integer, in: body, description: "ID of the inside (private) IP this address is the 1:1 NAT outside for. Set on the OUTSIDE address; nat_outside is the read-only reverse view." }
         dns_name: { type: string, in: body }
         description: { type: string, in: body }
         comments: { type: string, in: body }
@@ -3232,6 +3252,7 @@ backend:
         comments: { type: string, in: body }
         assigned_object_type: { type: string, in: body }
         assigned_object_id: { type: integer, in: body }
+        nat_inside: { type: integer, in: body, description: "ID of the inside (private) IP this address is the 1:1 NAT outside for. Set on the OUTSIDE address; nat_outside is the read-only reverse view. Nullable: pass null to clear." }
         tags: { type: array, in: body }
       pagination: none
 
@@ -4569,8 +4590,7 @@ backend:
         name: { type: string, in: body, required: true }
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
-        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
-        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x)" }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID. NetBox 4.x stores MACs as separate objects: create_mac_address first (assigned_object_type virtualization.vminterface), then set its ID here. The interface's mac_address field itself is read-only." }
         parent: { type: integer, in: body, description: "Parent interface ID" }
         bridge: { type: integer, in: body, description: "Bridge interface ID" }
         vrf: { type: integer, in: body, description: "VRF assignment" }
@@ -4600,8 +4620,7 @@ backend:
         name: { type: string, in: body }
         enabled: { type: boolean, in: body }
         mtu: { type: integer, in: body }
-        mac_address: { type: string, in: body, description: "MAC address (e.g. 00:1A:2B:3C:4D:5E)" }
-        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID (Netbox 4.x)" }
+        primary_mac_address: { type: integer, in: body, description: "Primary MAC address object ID. NetBox 4.x stores MACs as separate objects: create_mac_address first (assigned_object_type virtualization.vminterface), then set its ID here. The interface's mac_address field itself is read-only." }
         parent: { type: integer, in: body, description: "Parent interface ID" }
         bridge: { type: integer, in: body, description: "Bridge interface ID" }
         vrf: { type: integer, in: body, description: "VRF assignment" }
@@ -5074,7 +5093,7 @@ backend:
         object_type: { type: string, in: body, required: true, description: "e.g. dcim.device, circuits.circuit" }
         object_id: { type: integer, in: body, required: true }
         contact: { type: integer, in: body, required: true }
-        role: { type: integer, in: body }
+        role: { type: integer, in: body, required: true, description: "ID of the contact role. The NetBox data model requires it -- omitting it returns HTTP 400." }
         priority: { type: string, in: body, description: "primary, secondary, tertiary, inactive" }
         tags: { type: array, in: body }
       pagination: none
