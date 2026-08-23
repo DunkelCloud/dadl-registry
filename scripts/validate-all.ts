@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from "fs";
-import { join, basename } from "path";
+import { join, basename, resolve } from "path";
 import Ajv from "ajv";
 import { parse as parseYaml } from "yaml";
 
@@ -263,21 +263,42 @@ const ROOT_DIR = join(import.meta.dirname, "..");
 const SCHEMA_PATH = join(ROOT_DIR, "schema", "dadl-v0.2.schema.json");
 const MAX_FILE_SIZE = 500 * 1024; // 500 KB
 
+// The directory to check. Defaults to this repository, which is what CI runs.
+//
+// Passing one makes the same checks available to a DADL directory that never
+// reaches the registry — a deployment's working copies, say. Those are the
+// files nobody validates today: registry CI only ever sees what is published
+// to it, so a file that stays outside is checked by nothing at all. The schema
+// stays anchored here either way; there must be exactly one copy of it.
+//
+//   npm run validate -- /path/to/dadl
+const TARGET_DIR = process.argv[2] ? resolve(process.argv[2]) : ROOT_DIR;
+
 const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf-8"));
 const ajv = new Ajv({ allErrors: true, strict: false });
 const validate = ajv.compile(schema);
 
-const files = readdirSync(ROOT_DIR).filter((f) => f.endsWith(".dadl"));
+let files: string[];
+try {
+  files = readdirSync(TARGET_DIR).filter((f) => f.endsWith(".dadl"));
+} catch (e: any) {
+  console.error(`Cannot read directory ${TARGET_DIR}: ${e.message}`);
+  process.exit(1);
+}
 
 if (files.length === 0) {
-  console.error("No .dadl files found in repository root.");
+  console.error(`No .dadl files found in ${TARGET_DIR}.`);
   process.exit(1);
+}
+
+if (TARGET_DIR !== ROOT_DIR) {
+  console.log(`Validating ${files.length} file(s) in ${TARGET_DIR}\n`);
 }
 
 let hasErrors = false;
 
 for (const file of files) {
-  const filePath = join(ROOT_DIR, file);
+  const filePath = join(TARGET_DIR, file);
   const errors: string[] = [];
 
   // Size check
