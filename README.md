@@ -13,6 +13,20 @@ Community registry for [DADL](https://dadl.ai/spec) files — declarative API de
 
 Want to add a DADL for an API? Fork this repo, add your `.dadl` file, and open a PR. See the [creation guide](https://dadl.ai/guides/creating-a-dadl) for the format and validation rules.
 
+Run the same checks CI runs:
+
+```bash
+npm run validate
+```
+
+It also takes a directory, which is worth pointing at a DADL folder that never
+reaches this repo — a deployment's working copies, say. Those files are checked
+by nothing otherwise, since CI only ever sees what is published here:
+
+```bash
+npm run validate -- /path/to/dadl
+```
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
