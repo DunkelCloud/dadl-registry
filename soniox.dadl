@@ -1,0 +1,1404 @@
+# soniox.dadl — Soniox Speech AI REST API for ToolMesh
+# Speech-to-Text (async transcription of recorded audio), Text-to-Speech
+# (speech synthesis incl. voice cloning), speech translation, plus file,
+# model, usage and concurrency management.
+#
+# Domain Notes for LLM consumers:
+# - AUTH: one Bearer API key for every endpoint, created in the Soniox Console
+#   (https://console.soniox.com). The key is scoped to ONE project; every list
+#   endpoint only ever sees that project's objects. There are no scopes and no
+#   OAuth — a key is all-or-nothing for its project.
+# - TWO HOSTS. Everything under /v1 lives on api.soniox.com. The TTS REST
+#   endpoint does NOT: it is POST https://tts-rt.soniox.com/tts, and
+#   generate_speech therefore carries that ABSOLUTE URL in its path (verified
+#   2026-08-23: POST api.soniox.com/tts returns 404, tts-rt.soniox.com/tts
+#   returns 401). Soniox's own openapi.yaml lists /tts under api.soniox.com —
+#   that entry is wrong; do not "fix" the path to a relative one.
+# - REGIONS (data residency, per project): US api.soniox.com (default),
+#   EU api.eu.soniox.com, JP api.jp.soniox.com; TTS REST mirrors this as
+#   tts-rt.soniox.com / tts-rt.eu.soniox.com / tts-rt.jp.soniox.com. API keys
+#   are region-bound — a US key fails against the EU host. Override base_url
+#   via the backends.yaml url field; the absolute generate_speech path must be
+#   edited in this file for a non-US project.
+# - REST ONLY. This file covers the async/batch surface. Real-time streaming
+#   (STT wss://stt-rt.soniox.com, TTS wss://tts-rt.soniox.com/tts-websocket)
+#   is WebSocket-based and cannot be expressed in DADL. Use
+#   create_temporary_api_key to hand an untrusted client a short-lived key for
+#   those streams — that part IS covered here.
+# - ASYNC TRANSCRIPTION LIFECYCLE (the main flow):
+#     1. Provide audio either as a PUBLIC audio_url, or upload_file first and
+#        pass the returned file_id. audio_url and file_id are MUTUALLY
+#        EXCLUSIVE — sending both is a 400.
+#     2. create_transcription returns immediately with status "queued".
+#        It does NOT wait and does NOT return any text.
+#     3. Poll get_transcription until status is "completed" or "error", or
+#        supply webhook_url on creation to be called instead of polling.
+#        POLL ACROSS TURNS, NOT IN A LOOP: the Code Mode sandbox has no sleep
+#        or setTimeout, so a `while (!done)` loop spins at full speed, burns
+#        the per-run API-call budget in milliseconds and hammers Soniox
+#        without ever giving the job time to finish. Make ONE status call per
+#        run, return the status, and call again later — or use the webhook.
+#     4. get_transcription_transcript returns the text and per-token detail.
+#        It only works on status "completed".
+#     5. delete_transcription and delete_file when done. NOTHING is deleted
+#        automatically and the quotas below are hard.
+# - STATUS values are exactly: queued | processing | completed | error.
+#   (Some prose pages say "failed"; the API enum is "error".) On "error",
+#   error_type and error_message are populated and the job is NOT retried
+#   automatically — a failed job stays failed and still counts against quota.
+# - QUOTAS (429 limit_exceeded when hit; all raisable in the Console EXCEPT
+#   the duration cap): 300 minutes max audio duration per file (hard limit),
+#   1000 stored files, 10 GB total file storage, 100 pending transcriptions,
+#   2000 total transcriptions (pending + completed + failed combined). Once
+#   at 2000 no new transcription can be created until old ones are deleted —
+#   get_transcriptions_count and the cleanup_transcriptions composite exist
+#   for exactly that.
+# - TRANSCRIPT TOKENS are sub-word pieces, not words ("Wh", "at", " is"):
+#   {text, start_ms, end_ms, confidence, speaker, language, is_audio_event,
+#   translation_status}. The last four keys are always present but null
+#   unless the matching feature was enabled — test for null, not for absence.
+#   AUDIO EVENTS: create_transcription echoes back an
+#   enable_audio_event_detection flag that neither the OpenAPI spec nor the
+#   docs expose as a request parameter, so it cannot be turned on through
+#   this API and is_audio_event stays null. Do not build on it.
+#   Timestamps are MILLISECONDS from the start of the audio, not seconds. Token text
+#   carries its own leading whitespace, so concatenating tokens in order
+#   reproduces the text. An hour of diarized audio is many thousands of
+#   tokens — prefer get_transcript_text or get_transcript_segments over the
+#   raw get_transcription_transcript unless you actually need per-token data.
+# - TRANSLATION is configured on create_transcription via the translation
+#   object: {"type":"one_way","target_language":"de"} or
+#   {"type":"two_way","language_a":"en","language_b":"es"}. With translation
+#   enabled the transcript contains BOTH original and translated tokens,
+#   distinguished only by translation_status — filter, or the text reads as
+#   duplicated.
+# - CONTEXT improves accuracy on names, jargon and formatting. Either a plain
+#   string, or the structured form
+#   {"general":[{"key":"Domain","value":"medicine"}], "text":"...",
+#    "terms":["Soniox","ToolMesh"],
+#    "translation_terms":[{"source":"cloud","target":"Cloud"}]}.
+#   translation_terms are ignored unless translation is enabled.
+# - MODELS: never hardcode. Current STT models are stt-async-v5 (recorded
+#   audio) and stt-rt-v5 (streaming); stt-async-v4 / stt-rt-v4 are aliases
+#   pointing at v5. TTS: tts-rt-v1, tts-rt-v2. Call list_models /
+#   list_tts_models to see what the account can actually use, which languages
+#   each supports, and which translation pairs are available.
+# - TTS REST returns RAW AUDIO BYTES, not JSON. ToolMesh stores them in its
+#   File Broker and hands back a download URL with a 24h TTL. That URL is
+#   unauthenticated for its lifetime — treat generated speech as sensitive
+#   and do not paste the URL anywhere public.
+# - VOICE CLONING: create_voice uploads one reference clip and returns a voice
+#   whose models[] array carries PER-MODEL readiness
+#   (not_computed | processing | ready | failed). A voice is only usable with a
+#   model whose status is "ready" — otherwise TTS fails with 409
+#   voice_not_prepared or 503 voice_not_ready. After Soniox ships a new model,
+#   call recompute_voice to prepare existing voices for it. Voice names must be
+#   unique per project (409 voice_name_conflict).
+# - TEMPORARY API KEYS are the only safe way to let a browser or mobile client
+#   talk to Soniox directly. usage_type is transcribe_websocket or tts_rt,
+#   expires_in_seconds is capped at 3600, and single_use plus
+#   max_session_duration_seconds bound the damage of an intercepted key.
+#   Create them server-side with the long-lived key; never ship the real key.
+# - PAGINATION is cursor-based on the four list endpoints: pass limit (1..1000,
+#   API default 1000) and echo next_page_cursor back as cursor. next_page_cursor
+#   is null on the last page. NOTE: ToolMesh cannot auto-follow these cursors,
+#   because Soniox wraps results in an object ({"files": [...],
+#   "next_page_cursor": ...}) rather than returning a bare array — so
+#   pagination is exposed and the caller must loop. The list tools deliberately
+#   keep next_page_cursor in their result for that reason.
+# - client_reference_id is a free-form tracking string (max 256 chars, need not
+#   be unique) accepted by upload_file, create_transcription, generate_speech
+#   and create_temporary_api_key. It is echoed back in usage logs, which makes
+#   it the way to attribute cost to your own tenants/jobs.
+# - COSTS in usage logs and the usage summary are DECIMAL STRINGS
+#   ("0.0081000000"), not JSON numbers — parse them, do not sum them as
+#   floats naively. get_usage_logs windows must be <= 31 days and may not
+#   start more than 91 days ago; get_usage_summary aggregates whole UTC days
+#   over a half-open [start_time, end_time) window of at most 366 days.
+# - ERRORS come in TWO envelopes. Everything under /v1 uses
+#   {status_code, error_type, message, validation_errors[], request_id,
+#   more_info}. generate_speech (TTS REST) instead uses the WebSocket-style
+#   shape {error_code, error_type, error_message, request_id, more_info} —
+#   error_message, not message, and no validation_errors. error_type is the
+#   one field both share, which is another reason to branch on it.
+#   Branch on error_type, never on message text. Useful types:
+#   invalid_request, invalid_cursor,
+#   invalid_audio_file, model_not_available, unauthenticated,
+#   organization_balance_exhausted, file_not_found, transcription_not_found,
+#   voice_not_found, voice_name_conflict, voice_not_prepared,
+#   transcription_invalid_state, limit_exceeded, internal_error.
+#   Soniox sends NO Retry-After and NO rate-limit headers, so 429 handling is
+#   plain exponential backoff. Include request_id when contacting support.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+credits:
+  - "Dunkel Cloud GmbH"
+source_name: "Soniox Speech AI API"
+source_url: https://soniox.com/docs/api-reference
+date: "2026-08-23"
+
+# ─── Reusable fragments (underscore keys are ignored by ToolMesh) ────────────
+_shared:
+  # Soniox cursor pagination. Exposed, not auto: the response is an object
+  # wrapper, which ToolMesh's auto-pagination cannot concatenate.
+  pagination: &cursor-pagination
+    strategy: cursor
+    request:
+      cursor_param: cursor
+      limit_param: limit
+      limit_default: 100
+    response:
+      next_cursor: "$.next_page_cursor"
+    behavior: expose
+    max_pages: 10
+
+  limit_param: &p-limit
+    type: integer
+    in: query
+    default: 100
+    description: "Maximum number of items to return (1..1000; the API default is 1000)."
+
+  cursor_param: &p-cursor
+    type: string
+    in: query
+    description: "Pagination cursor — pass the next_page_cursor value from the previous response. Omit for the first page."
+
+  client_reference_id: &p-client-reference-id
+    type: string
+    in: body
+    description: "Free-form tracking identifier (max 256 chars, need not be unique). Echoed back in usage logs."
+
+backend:
+  name: soniox
+  type: rest
+  version: "1.0"
+  base_url: https://api.soniox.com
+  description: >
+    Soniox Speech AI — async speech-to-text for recorded audio (60+ languages,
+    speaker diarization, language identification, speech translation),
+    text-to-speech synthesis with voice cloning, audio file management,
+    model discovery, temporary API keys for untrusted clients, and per-request
+    usage, cost and concurrency reporting.
+
+  coverage:
+    endpoints: 25
+    total_endpoints: 27
+    percentage: 93
+    focus: >
+      Soniox Speech AI REST API v1: transcriptions (async speech-to-text,
+      speaker diarization, language identification, speech translation),
+      voices (voice cloning, per model readiness, recompute), files (audio
+      upload, storage quotas, counts), speech synthesis (audio formats,
+      sample rates, cloned voices), usage (cost logs, daily summary,
+      concurrency limits), models (transcription models, synthesis models),
+      temporary API keys.
+    missing: >
+      The two WebSocket APIs — real-time speech-to-text
+      (wss://stt-rt.soniox.com/transcribe-websocket) and real-time
+      text-to-speech (wss://tts-rt.soniox.com/tts-websocket). Both are
+      streaming protocols that DADL cannot describe; create_temporary_api_key
+      here mints the short-lived keys those clients authenticate with.
+    last_reviewed: "2026-08-23"
+
+  setup:
+    credential_steps:
+      - "Create a Soniox account at https://console.soniox.com (free credit is granted on signup; no credit card needed to start)."
+      - "Pick or create a PROJECT. Data residency and API keys are per project — if you need EU or JP processing, set the region when creating the project (contact support@soniox.com to have regions enabled)."
+      - "Open the API keys section of the Console and create a new API key. Copy it immediately — the full key is shown only once."
+      - "Store it in the ToolMesh credential store under the name 'soniox_api_key' (env var CREDENTIAL_SONIOX_API_KEY for the embedded store)."
+      - "Verify: curl -H \"Authorization: Bearer $SONIOX_API_KEY\" https://api.soniox.com/v1/models — a 200 with a models array means the key works, 401 unauthenticated means it does not."
+      - "For a non-US project, set url in backends.yaml to https://api.eu.soniox.com or https://api.jp.soniox.com AND edit the absolute path of the generate_speech tool in this file to the matching tts-rt.<region>.soniox.com host. A key from one region does not work against another."
+    env_var: CREDENTIAL_SONIOX_API_KEY
+    backends_yaml: |
+      - name: soniox
+        transport: rest
+        dadl: soniox.dadl
+        url: "https://api.soniox.com"
+    required_scopes: []
+    optional_scopes: []
+    docs_url: "https://soniox.com/docs/api-reference"
+    notes: >
+      Soniox API keys have no scopes — one key grants full access to its
+      project, so treat it as a secret and never ship it to a client. For
+      browser or mobile clients use create_temporary_api_key instead
+      (usage_type transcribe_websocket or tts_rt, max 3600s lifetime).
+      Billing is usage-based per audio minute and token; the free signup credit
+      is enough to exercise every tool in this file. Quotas that will bite in
+      production: 1000 stored files, 10 GB storage, 100 pending and 2000 total
+      transcriptions — delete what you have fetched, nothing expires by itself.
+
+  auth:
+    type: bearer
+    credential: soniox_api_key
+    inject_into: header
+    header_name: Authorization
+    prefix: "Bearer "
+
+  defaults:
+    headers:
+      Accept: application/json
+    content_type: application/json
+    # pagination is intentionally NOT set backend-wide: only four endpoints
+    # paginate, and they declare *cursor-pagination explicitly.
+    errors:
+      format: json
+      message_path: "$.message"
+      code_path: "$.error_type"
+      # Soniox sends no Retry-After and no rate-limit headers, so there is
+      # nothing to throttle proactively on — 429 is handled by backoff alone.
+      retry_on: [408, 429, 500, 502, 503, 504]
+      terminal: [400, 401, 402, 403, 404, 409, 413]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+      map:
+        400: invalid_input
+        401: unauthorized
+        402: forbidden
+        403: forbidden
+        404: not_found
+        408: timeout
+        409: conflict
+        413: invalid_input
+        429: rate_limited
+        500: internal
+        502: unavailable
+        503: unavailable
+        504: timeout
+    response:
+      result_path: "$"
+
+  tools:
+
+    # ─── Files ───────────────────────────────────────────────────────────────
+    # Audio storage for transcription. Upload here to get a file_id, or skip
+    # files entirely and pass a public audio_url to create_transcription.
+
+    list_files:
+      method: GET
+      path: /v1/files
+      access: read
+      description: >
+        List uploaded audio files in the project, newest first. Returns
+        {files: [{id, filename, size, created_at, client_reference_id}],
+        next_page_cursor}. size is in bytes. next_page_cursor is null on the
+        last page — pass it back as cursor to continue. The project holds at
+        most 1000 files / 10 GB by default; use get_files_count to check
+        headroom before uploading.
+      params:
+        limit: *p-limit
+        cursor: *p-cursor
+      pagination: *cursor-pagination
+
+    upload_file:
+      method: POST
+      path: /v1/files
+      access: write
+      content_type: multipart/form-data
+      max_body_size: 500MB
+      description: >
+        Upload an audio file for later transcription. The caller passes a URL;
+        ToolMesh fetches the bytes and posts them as the multipart 'file'
+        field. Returns the created file {id, filename, size, created_at,
+        client_reference_id} — pass that id as file_id to create_transcription.
+        Format is auto-detected (aac, aiff, amr, asf, flac, mp3, ogg, wav,
+        webm, m4a, mp4 and more); no encoding parameters exist. Audio longer
+        than 300 minutes is rejected, and that cap cannot be raised. Fails with
+        429 limit_exceeded when the 1000-file or 10 GB project cap would be
+        exceeded — delete unused files first. Files are NEVER auto-deleted.
+        Prefer create_transcription with a public audio_url when the audio is
+        already reachable on the web: that skips storage entirely.
+      params:
+        file:
+          type: file_url
+          in: body
+          required: true
+          description: "URL of the audio file — ToolMesh downloads it and uploads it as the multipart 'file' field."
+        client_reference_id: *p-client-reference-id
+
+    get_files_count:
+      method: GET
+      path: /v1/files/count
+      access: read
+      description: >
+        Count stored files, split by origin: {playground, public_api, total}.
+        total counts against the 1000-file project cap regardless of origin
+        (files created in the web Playground count too). Cheap — use it before
+        a bulk upload instead of paging through list_files.
+
+    get_file:
+      method: GET
+      path: /v1/files/{file_id}
+      access: read
+      description: >
+        Get metadata for one uploaded file: {id, filename, size, created_at,
+        client_reference_id}. There is no download endpoint — Soniox does not
+        serve the audio back. Returns 404 file_not_found if the id is unknown,
+        already deleted, or belongs to a different project.
+      params:
+        file_id:
+          type: string
+          in: path
+          required: true
+          description: "File UUID as returned by upload_file or list_files."
+
+    delete_file:
+      method: DELETE
+      path: /v1/files/{file_id}
+      access: dangerous
+      description: >
+        Permanently delete an uploaded file. Irreversible — Soniox keeps no
+        copy and there is no download endpoint to recover the audio from.
+        Returns 204 with no body on success, 404 file_not_found otherwise.
+        Deleting the file does NOT delete transcriptions made from it, and an
+        already-completed transcript stays readable. Do this as soon as the
+        transcript is fetched: storage caps are per project and nothing expires
+        on its own.
+      params:
+        file_id:
+          type: string
+          in: path
+          required: true
+          description: "File UUID to delete."
+
+    # ─── Transcriptions (async speech-to-text) ───────────────────────────────
+    # create -> poll get_transcription -> get_transcription_transcript -> delete
+
+    list_transcriptions:
+      method: GET
+      path: /v1/transcriptions
+      access: read
+      description: >
+        List transcription jobs, newest first. Returns {transcriptions: [{id,
+        status, created_at, model, filename, file_id, audio_url,
+        audio_duration_ms, language_hints, enable_speaker_diarization,
+        enable_language_identification, error_type, error_message,
+        webhook_status_code, client_reference_id}], next_page_cursor}. status
+        is queued | processing | completed | error. The webhook URL and secret
+        fields are dropped from this projection; call get_transcription for the
+        full object. Every entry — including failed ones — counts against the
+        2000 transcription cap.
+      params:
+        limit: *p-limit
+        cursor: *p-cursor
+      pagination: *cursor-pagination
+      response:
+        result_path: "$"
+        transform: |
+          {
+            transcriptions: [.transcriptions[] | {
+              id, status, created_at, model, filename, file_id, audio_url,
+              audio_duration_ms, language_hints,
+              enable_speaker_diarization, enable_language_identification,
+              error_type, error_message, webhook_status_code,
+              client_reference_id
+            }],
+            next_page_cursor
+          }
+
+    create_transcription:
+      method: POST
+      path: /v1/transcriptions
+      access: write
+      description: >
+        Submit recorded audio for asynchronous transcription. Returns the job
+        immediately with status "queued" — NO text. Poll get_transcription
+        until status is "completed" (then call get_transcription_transcript) or
+        "error", or set webhook_url to be notified instead.
+        Audio source: exactly one of audio_url (a public http/https URL Soniox
+        fetches itself) or file_id (from upload_file). Passing both is a 400.
+        model is required — use "stt-async-v5" for recorded audio (v4 is an
+        alias for it); call list_models for the authoritative list.
+        language_hints is an array of 2-letter codes (["en","de"]); omit it to
+        auto-detect. language_hints_strict makes the model trust those hints
+        harder. enable_speaker_diarization adds a speaker label to every token;
+        enable_language_identification adds a language label.
+        translation is an object, either {"type":"one_way","target_language":"de"}
+        or {"type":"two_way","language_a":"en","language_b":"es"} — with it the
+        transcript carries both original and translated tokens, tagged by
+        translation_status.
+        context accepts a plain string, or the structured form
+        {"general":[{"key":"Domain","value":"medicine"}],"text":"...",
+        "terms":["Soniox"],"translation_terms":[{"source":"cloud","target":"Cloud"}]}
+        to bias the model toward names and jargon.
+        webhook_url plus optional webhook_auth_header_name /
+        webhook_auth_header_value replace polling.
+        Fails with 429 limit_exceeded at 100 pending or 2000 total
+        transcriptions, and with 400 model_not_available for an unknown model.
+      params:
+        model:
+          type: string
+          in: body
+          required: true
+          description: "Speech-to-text model id, e.g. stt-async-v5. See list_models."
+        audio_url:
+          type: string
+          in: body
+          description: "Public http(s) URL of the audio Soniox should fetch. Mutually exclusive with file_id."
+        file_id:
+          type: string
+          in: body
+          description: "UUID of a file from upload_file. Mutually exclusive with audio_url."
+        language_hints:
+          type: array
+          in: body
+          description: "Expected languages as 2-letter codes, e.g. [\"en\",\"fr\"]. Omit to auto-detect."
+        language_hints_strict:
+          type: boolean
+          in: body
+          description: "Make the model rely more heavily on language_hints."
+        enable_speaker_diarization:
+          type: boolean
+          in: body
+          description: "Label each token with a speaker id."
+        enable_language_identification:
+          type: boolean
+          in: body
+          description: "Label each token with its detected language."
+        translation:
+          type: object
+          in: body
+          description: "{type: one_way|two_way, target_language | language_a + language_b}."
+        context:
+          type: object
+          in: body
+          description: "Structured context {general, text, terms, translation_terms}; a plain string is also accepted."
+        webhook_url:
+          type: string
+          in: body
+          description: "http(s) URL called when the job completes or fails (max 256 chars)."
+        webhook_auth_header_name:
+          type: string
+          in: body
+          description: "Auth header name sent with the webhook, e.g. Authorization."
+        webhook_auth_header_value:
+          type: string
+          in: body
+          description: "Auth header value sent with the webhook. Masked in every read response."
+        client_reference_id: *p-client-reference-id
+
+    get_transcriptions_count:
+      method: GET
+      path: /v1/transcriptions/count
+      access: read
+      description: >
+        Count transcriptions by origin: {playground, public_api, total}. total
+        is the number that counts against the 2000-transcription project cap
+        (queued + processing + completed + error, from any origin). Check this
+        before bulk-submitting; at the cap create_transcription returns 429
+        limit_exceeded until old jobs are deleted.
+
+    get_transcription:
+      method: GET
+      path: /v1/transcriptions/{transcription_id}
+      access: read
+      description: >
+        Get one transcription job with its current status. Returns {id, status,
+        created_at, model, audio_url, file_id, filename, language_hints,
+        enable_speaker_diarization, enable_language_identification,
+        audio_duration_ms, error_type, error_message, webhook_url,
+        webhook_auth_header_name, webhook_auth_header_value (masked),
+        webhook_status_code, client_reference_id}. status is queued |
+        processing | completed | error. This is the polling endpoint: repeat
+        until status leaves queued/processing. audio_duration_ms is only set
+        once processing has begun. On "error" read error_type (machine-readable,
+        e.g. invalid_audio_file, file_download_failed,
+        transcription_output_too_long) rather than error_message. Failed jobs
+        are never retried automatically.
+      params:
+        transcription_id:
+          type: string
+          in: path
+          required: true
+          description: "Transcription UUID returned by create_transcription."
+
+    get_transcription_transcript:
+      method: GET
+      path: /v1/transcriptions/{transcription_id}/transcript
+      access: read
+      depends_on: [create_transcription, get_transcription]
+      description: >
+        Get the full transcript of a COMPLETED transcription. Returns {id,
+        text, tokens} where text is the whole transcript as one string and
+        tokens is the per-token detail: {text, start_ms, end_ms, confidence,
+        speaker, language, is_audio_event, translation_status}. The last four
+        keys are ALWAYS PRESENT but are null unless the corresponding feature
+        was enabled on create_transcription — so test for null, not for
+        absence. translation_status is null with translation off and
+        "original" or "translation" with it on. is_audio_event is null in
+        practice: audio-event detection is not settable through this API (see
+        the domain notes). Timestamps are MILLISECONDS from the start of the
+        audio. Token text keeps its own leading whitespace, so joining tokens
+        in order rebuilds text exactly.
+        WARNING: this response is unbounded — an hour of diarized audio is
+        many thousands of tokens. Use the get_transcript_text composite when
+        you only need the words, or get_transcript_segments for
+        speaker-attributed passages; call this raw tool only when you truly
+        need per-token timings or confidences.
+        Only valid while status is "completed" — otherwise 409
+        transcription_invalid_state, or 404 transcription_not_found.
+      params:
+        transcription_id:
+          type: string
+          in: path
+          required: true
+          description: "Transcription UUID whose transcript to fetch."
+
+    delete_transcription:
+      method: DELETE
+      path: /v1/transcriptions/{transcription_id}
+      access: dangerous
+      description: >
+        Permanently delete a transcription and its transcript. Irreversible —
+        fetch the transcript first, Soniox keeps no copy. Returns 204 with no
+        body. A job that is currently processing cannot be deleted (409
+        transcription_invalid_state); wait for completed or error. Deleting is
+        the only way back under the 2000-transcription cap, and it does NOT
+        delete the source file — call delete_file for that.
+      params:
+        transcription_id:
+          type: string
+          in: path
+          required: true
+          description: "Transcription UUID to delete."
+
+    # ─── Voices (TTS voice cloning) ──────────────────────────────────────────
+
+    list_voices:
+      method: GET
+      path: /v1/voices
+      access: read
+      description: >
+        List the project's cloned voices. Returns {voices: [{id, name,
+        filename, created_at, models: [{model, status, error_type,
+        error_message}]}], next_page_cursor}. The models array is the important
+        part: a voice is only usable with a model whose status is "ready"
+        (other values: not_computed, processing, failed). Built-in voices such
+        as "Adrian" are NOT listed here — they come from list_tts_models.
+      params:
+        limit: *p-limit
+        cursor: *p-cursor
+      pagination: *cursor-pagination
+
+    create_voice:
+      method: POST
+      path: /v1/voices
+      access: write
+      content_type: multipart/form-data
+      max_body_size: 50MB
+      description: >
+        Clone a voice from one reference audio clip. The caller passes a URL;
+        ToolMesh fetches the bytes and posts them as the multipart 'file'
+        field, alongside the voice name. Returns the voice with a per-model
+        readiness array; preparation is asynchronous, so poll get_voice until
+        the model you want shows status "ready" before using the voice id in
+        generate_speech. name must be 1..128 chars and unique in the project
+        (409 voice_name_conflict otherwise). An over-long or unusable clip
+        surfaces as status "failed" with error_type voice_audio_too_long or
+        voice_invalid_audio on that model entry, not as an HTTP error.
+        Only clone voices you have permission to clone.
+      params:
+        name:
+          type: string
+          in: body
+          required: true
+          description: "Voice name, 1..128 chars, unique within the project."
+        file:
+          type: file_url
+          in: body
+          required: true
+          description: "URL of the reference audio clip — ToolMesh downloads it and uploads it as the multipart 'file' field."
+
+    get_voices_count:
+      method: GET
+      path: /v1/voices/count
+      access: read
+      description: >
+        Number of cloned voices in the project: {total}. Unlike the file and
+        transcription counters this is not split by origin.
+
+    get_voice:
+      method: GET
+      path: /v1/voices/{voice_id}
+      access: read
+      description: >
+        Get one cloned voice: {id, name, filename, created_at, models}. models
+        holds per-model readiness {model, status, error_type, error_message}
+        with status not_computed | processing | ready | failed. This is the
+        endpoint to poll after create_voice and after recompute_voice. Voice
+        preparation failures (clip too long, unusable audio) appear HERE as a
+        failed model entry — the create call itself will have returned 201.
+      params:
+        voice_id:
+          type: string
+          in: path
+          required: true
+          description: "Voice UUID returned by create_voice or list_voices."
+
+    delete_voice:
+      method: DELETE
+      path: /v1/voices/{voice_id}
+      access: dangerous
+      description: >
+        Permanently delete a cloned voice and all its computed embeddings.
+        Irreversible; the reference clip is not recoverable and re-cloning
+        needs the original audio again. Returns 204 with no body, or 404
+        voice_not_found. Any generate_speech call still referencing the id
+        then fails with voice_not_found.
+      params:
+        voice_id:
+          type: string
+          in: path
+          required: true
+          description: "Voice UUID to delete."
+
+    recompute_voice:
+      method: POST
+      path: /v1/voices/{voice_id}/recompute
+      access: write
+      description: >
+        Prepare an existing cloned voice for models it is not ready for yet —
+        the fix after Soniox ships a new TTS model and an older voice shows
+        status "not_computed" for it. Pass model to target one model, or omit
+        it to prepare the voice for every model it is missing. Models the voice
+        is already prepared for are left untouched, so this is safe to call
+        repeatedly. Returns the voice; preparation is asynchronous, so poll
+        get_voice until the target model reports "ready".
+      params:
+        voice_id:
+          type: string
+          in: path
+          required: true
+          description: "Voice UUID to prepare."
+        model:
+          type: string
+          in: body
+          description: "Single TTS model id to prepare for. Omit to prepare for all missing models."
+
+    # ─── Speech synthesis (Text-to-Speech REST) ──────────────────────────────
+
+    generate_speech:
+      method: POST
+      # ABSOLUTE URL ON PURPOSE: TTS REST is served by tts-rt.soniox.com, not
+      # by base_url's api.soniox.com (which answers 404 here). For an EU or JP
+      # project change this host to tts-rt.eu.soniox.com / tts-rt.jp.soniox.com.
+      path: https://tts-rt.soniox.com/tts
+      access: write
+      description: >
+        Synthesize speech from text and return it as a downloadable audio file.
+        The API answers with raw audio bytes, so ToolMesh stores them in its
+        File Broker and returns {url, content_type, size_bytes, expires} with a
+        download URL valid for 24 hours — that URL is unauthenticated while it
+        lives, so treat generated speech as sensitive. The returned
+        content_type is only best-effort (mp3 comes back as audio/mpeg, wav as
+        application/octet-stream); rely on the audio_format you requested, not
+        on that field.
+        Required: model (e.g. tts-rt-v2; see list_tts_models), language (the
+        2-letter code of the INPUT text), voice (a built-in name such as
+        "Adrian", or the UUID of a cloned voice from list_voices),
+        audio_format, and text.
+        audio_format is one of wav, mp3, aac, opus, flac, pcm_s16le, pcm_s16be,
+        pcm_f32le, pcm_mulaw, pcm_alaw. sample_rate (Hz) is one of 8000, 16000,
+        24000, 44100, 48000; bitrate (bits/s) one of 32000, 64000, 96000,
+        128000, 192000, 256000, 320000 — both optional and only meaningful for
+        the formats that carry them.
+        speed runs 0.7..1.3 (1.0 = normal) and only on models with
+        supports_speed_adjustment. reduce_silence shortens inter-word pauses
+        and only works on models with supports_silence_reduction — enabling it
+        elsewhere is a 400 invalid_request.
+        A cloned voice must be "ready" for this model or the call fails with
+        409 voice_not_prepared / 503 voice_not_ready — check get_voice first.
+        The two "bad voice" errors mean different things (verified live): an
+        unknown built-in NAME is 400 invalid_request "Invalid voice 'X' for
+        model 'Y'" — usually a typo, or a v2-only voice used on v1, so re-check
+        list_tts_models. An unknown or deleted UUID is 404 voice_not_found —
+        the cloned voice is gone and has to be recreated.
+        This endpoint is synchronous: long text means a long request.
+      params:
+        model:
+          type: string
+          in: body
+          required: true
+          description: "TTS model id, e.g. tts-rt-v2. See list_tts_models."
+        language:
+          type: string
+          in: body
+          required: true
+          description: "2-letter language code of the input text, e.g. en."
+        voice:
+          type: string
+          in: body
+          required: true
+          description: "Built-in voice name (e.g. Adrian) or the UUID of a cloned voice."
+        audio_format:
+          type: string
+          in: body
+          required: true
+          description: "wav | mp3 | aac | opus | flac | pcm_s16le | pcm_s16be | pcm_f32le | pcm_mulaw | pcm_alaw."
+        text:
+          type: string
+          in: body
+          required: true
+          description: "The text to speak."
+        sample_rate:
+          type: integer
+          in: body
+          description: "Output sample rate in Hz: 8000, 16000, 24000, 44100 or 48000."
+        bitrate:
+          type: integer
+          in: body
+          description: "Output bitrate in bits/s: 32000, 64000, 96000, 128000, 192000, 256000 or 320000."
+        speed:
+          type: number
+          in: body
+          description: "Speaking rate 0.7..1.3, default 1.0. Requires supports_speed_adjustment."
+        reduce_silence:
+          type: boolean
+          in: body
+          description: "Shorten pauses between words. Requires supports_silence_reduction."
+        client_reference_id: *p-client-reference-id
+      response:
+        type: file_url
+        ttl: 24h
+      # TTS REST does NOT use the /v1 error envelope. It answers with the
+      # WebSocket-style shape {error_code, error_type, error_message,
+      # request_id, more_info} — note error_message, not message. Verified
+      # live 2026-08-23. A tool-level errors block REPLACES defaults.errors
+      # outright (no merge), so the whole config is repeated here.
+      errors:
+        format: json
+        message_path: "$.error_message"
+        code_path: "$.error_type"
+        retry_on: [408, 429, 500, 502, 503, 504]
+        terminal: [400, 401, 402, 403, 404, 409, 413]
+        retry_strategy:
+          max_retries: 3
+          backoff: exponential
+          initial_delay: 2s
+        map:
+          400: invalid_input
+          401: unauthorized
+          402: forbidden
+          403: forbidden
+          404: not_found
+          408: timeout
+          409: conflict
+          413: invalid_input
+          429: rate_limited
+          500: internal
+          502: unavailable
+          503: unavailable
+          504: timeout
+
+    # ─── Models ──────────────────────────────────────────────────────────────
+
+    list_models:
+      method: GET
+      path: /v1/models
+      access: read
+      description: >
+        List the speech-to-text models this account can use. Returns
+        {models: [{id, name, aliased_model_id, transcription_mode,
+        context_version, language_codes, translation_targets,
+        two_way_translation_pairs, one_way_translation, two_way_translation,
+        supports_language_hints_strict, supports_max_endpoint_delay,
+        supports_endpoint_sensitivity, supports_endpoint_latency_adjustment,
+        endpoint_latency_adjustment_max_level}]}. transcription_mode is "async"
+        (recorded audio, for create_transcription) or "real_time" (WebSocket
+        only). aliased_model_id is non-null for aliases such as stt-async-v4,
+        which points at stt-async-v5. language_codes is projected down to the
+        2-letter codes; one_way_translation containing "all_languages" means
+        any listed language may be a translation target. Call this instead of
+        hardcoding model ids — the catalog changes.
+      response:
+        result_path: "$"
+        transform: |
+          {models: [.models[] | {
+            id, name, aliased_model_id, transcription_mode, context_version,
+            language_codes: [.languages[].code],
+            translation_targets: [.translation_targets[]?.target_language],
+            two_way_translation_pairs, one_way_translation, two_way_translation,
+            supports_language_hints_strict, supports_max_endpoint_delay,
+            supports_endpoint_sensitivity, supports_endpoint_latency_adjustment,
+            endpoint_latency_adjustment_max_level
+          }]}
+
+    list_tts_models:
+      method: GET
+      path: /v1/tts-models
+      access: read
+      description: >
+        List the text-to-speech models and their BUILT-IN voices. Returns
+        {models: [{id, name, aliased_model_id, language_codes,
+        voices: [{id, description, gender}], supports_timestamps,
+        supports_speed_adjustment, speed_min, speed_max,
+        supports_silence_reduction}]}. The voices array is where built-in voice
+        names such as "Adrian" come from — cloned voices live in list_voices
+        instead. Check supports_speed_adjustment / supports_silence_reduction
+        here before passing speed or reduce_silence to generate_speech, or the
+        call is rejected. language_codes is projected down to the 2-letter
+        codes.
+      response:
+        result_path: "$"
+        transform: |
+          {models: [.models[] | {
+            id, name, aliased_model_id,
+            language_codes: [.languages[].code],
+            voices, supports_timestamps, supports_speed_adjustment,
+            speed_min, speed_max, supports_silence_reduction
+          }]}
+
+    # ─── Auth (temporary keys for untrusted clients) ─────────────────────────
+
+    create_temporary_api_key:
+      method: POST
+      path: /v1/auth/temporary-api-key
+      access: admin
+      description: >
+        Mint a short-lived API key so a browser or mobile client can open a
+        Soniox WebSocket stream directly, without ever seeing the long-lived
+        key. Returns {api_key, expires_at} — the key is returned in FULL, so
+        hand it straight to the intended client and never log it.
+        usage_type locks the key to one service and is required:
+        "transcribe_websocket" (real-time speech-to-text) or "tts_rt"
+        (text-to-speech, WebSocket and REST). expires_in_seconds is required
+        and capped at 3600 — it bounds how long NEW streams may be opened, not
+        how long an already-open stream lives. Set single_use to true when the
+        client needs exactly one session, and max_session_duration_seconds
+        (1..18000) to cap how long a single stream may stay open. Always call
+        this from your backend with the real key; a temporary key is the only
+        credential that belongs in untrusted code.
+      params:
+        usage_type:
+          type: string
+          in: body
+          required: true
+          description: "transcribe_websocket | tts_rt."
+        expires_in_seconds:
+          type: integer
+          in: body
+          required: true
+          description: "Lifetime in seconds, 1..3600."
+        single_use:
+          type: boolean
+          in: body
+          description: "When true the key may open exactly one stream."
+        max_session_duration_seconds:
+          type: integer
+          in: body
+          description: "Cap on a single stream's open duration, 1..18000. Unset means no cap."
+        client_reference_id: *p-client-reference-id
+
+    # ─── Usage, cost and concurrency ─────────────────────────────────────────
+
+    list_usage_logs:
+      method: GET
+      path: /v1/usage-logs
+      access: read
+      description: >
+        Per-request usage and cost entries for the project, filtered by request
+        END time. Returns {usage_logs: [{uuid, request_scope,
+        client_reference_id, model, start_time, end_time, input_text_tokens,
+        input_audio_tokens, input_audio_duration_ms, output_text_tokens,
+        output_audio_tokens, output_audio_duration_ms, cost_usd,
+        input_cost_usd, input_text_cost_usd, input_audio_cost_usd,
+        output_cost_usd, output_text_cost_usd, output_audio_cost_usd}],
+        next_page_cursor}. All cost fields are DECIMAL STRINGS
+        ("0.0081000000"), not numbers. start_time and end_time are required ISO
+        8601 UTC timestamps; the window must be at most 31 days and start_time
+        may not be more than 91 days ago. sort is end_time_asc (default) or
+        end_time_desc — pass the same sort value alongside cursor when paging.
+        client_reference_id is how you attribute cost back to your own jobs or
+        tenants. This can be a very large result set; narrow the window rather
+        than paging blindly, and prefer get_usage_summary for totals.
+      params:
+        start_time:
+          type: string
+          in: query
+          required: true
+          description: "Window start, inclusive. ISO 8601 UTC, e.g. 2026-08-01T00:00:00Z."
+        end_time:
+          type: string
+          in: query
+          required: true
+          description: "Window end, exclusive. ISO 8601 UTC. At most 31 days after start_time."
+        sort:
+          type: string
+          in: query
+          default: "end_time_asc"
+          description: "end_time_asc | end_time_desc."
+        limit: *p-limit
+        cursor: *p-cursor
+      pagination: *cursor-pagination
+
+    get_usage_summary:
+      method: GET
+      path: /v1/usage/summary
+      access: read
+      description: >
+        Daily cost and activity for the project, aggregated per whole UTC day
+        and broken down per model. Returns {total, models: [...]} where each
+        entry is {model (null for the total), days: ["2026-08-01", ...],
+        total_cost_usd, total_input_cost_usd, total_output_cost_usd,
+        total_duration_cost_usd, cost_usd[], input_cost_usd[],
+        output_cost_usd[], duration_cost_usd[], total_num_requests,
+        total_input_text_tokens, total_input_audio_tokens,
+        total_input_audio_duration_ms, total_output_text_tokens,
+        total_output_audio_tokens, total_output_audio_duration_ms,
+        total_duration_ms, num_requests[], and the matching per-day arrays}.
+        The per-day arrays are POSITIONALLY aligned with days — index i of
+        cost_usd is the cost on days[i]. Cost values are decimal strings, not
+        numbers. The window is half-open [start_time, end_time): a day is
+        included when the window covers any part of it, so an end_time exactly
+        at midnight excludes that day. At most 366 UTC days per call. Cheaper
+        than list_usage_logs for "what did this cost" questions.
+      params:
+        start_time:
+          type: string
+          in: query
+          required: true
+          description: "Window start, inclusive. ISO 8601 UTC; its UTC day is included."
+        end_time:
+          type: string
+          in: query
+          required: true
+          description: "Window end, exclusive. ISO 8601 UTC, strictly after start_time; at most 366 days."
+
+    get_concurrency_limits:
+      method: GET
+      path: /v1/concurrency-limits
+      access: read
+      description: >
+        Current concurrent stream counts and the configured caps, for both the
+        project and its organization. Returns {project: {current: {...},
+        limits: {...}}, organization: {current: {...}, limits: {...}}}, where
+        each inner object carries transcribe_concurrent, tts_concurrent and
+        voice_agent_concurrent. A limits value of null means "no project-level
+        cap set — the organization limit applies", so always compare against
+        the organization numbers too. Region-scoped: it reports the region of
+        the host being called. Check this when streams start failing with
+        max_concurrent_streams_reached, since the organization cap can bind
+        even when the project looks idle.
+
+    list_concurrent_streams_history:
+      method: GET
+      path: /v1/concurrent-streams-history
+      access: read
+      description: >
+        Historical concurrent stream counts per aggregation period. Returns
+        {kind, entries: [{period_start, period_sec, sample_min, sample_max,
+        sample_sum, sample_count, total_count}]} ordered by period_start
+        ascending, with NO gaps — idle periods are returned with every field 0.
+        sample_max is the peak concurrency and stays exact when minutes roll up
+        into hours or days; sample_min is always 0 by construction, so use
+        sample_max for headroom questions. sample_sum / sample_count is the
+        average while streams were active, sample_sum / total_count the average
+        across the whole period.
+        All four parameters are required: start_time and end_time as ISO 8601
+        UTC (half-open, filtered on period_start), period_sec as 60, 3600 or
+        86400 (the period also caps how long the window may be), and kind as
+        "stt" (speech-to-text WebSocket sessions) or "tts" (text-to-speech
+        WebSocket streams and REST requests). Region-scoped.
+      params:
+        start_time:
+          type: string
+          in: query
+          required: true
+          description: "Window start, inclusive. ISO 8601 UTC."
+        end_time:
+          type: string
+          in: query
+          required: true
+          description: "Window end, exclusive. ISO 8601 UTC, strictly after start_time."
+        period_sec:
+          type: integer
+          in: query
+          required: true
+          description: "Aggregation period: 60 (per minute), 3600 (hourly) or 86400 (daily)."
+        kind:
+          type: string
+          in: query
+          required: true
+          description: "stt | tts."
+
+  composites:
+
+    get_transcript_text:
+      description: >
+        Get just the words of a completed transcription — {id, text,
+        character_count, token_count} — without pulling the full token array
+        into context. This is the cheap default for "what was said"; use
+        get_transcript_segments when you need speakers, and the raw
+        get_transcription_transcript only for per-token timings or confidences.
+      access: read
+      depends_on: [get_transcription_transcript]
+      timeout: 60s
+      params:
+        transcription_id:
+          type: string
+          required: true
+          description: "Transcription UUID (status must be completed)."
+      code: |
+        const t = await api.get_transcription_transcript({
+          transcription_id: params.transcription_id,
+        });
+        const text = typeof t.text === "string" ? t.text : "";
+        const tokens = Array.isArray(t.tokens) ? t.tokens : [];
+        return {
+          id: t.id,
+          text: text,
+          character_count: text.length,
+          token_count: tokens.length,
+        };
+
+    get_transcript_segments:
+      description: >
+        Fetch a completed transcript and merge its sub-word tokens into
+        readable segments, collapsing thousands of tokens into a handful of
+        passages. Returns {id, group_by, segment_count, segments: [{group,
+        translation_status, start_ms, end_ms, text, token_count}]}. group_by
+        selects what starts a new segment: "speaker" (default — requires
+        enable_speaker_diarization), "language" (requires
+        enable_language_identification) or "translation_status". A gap longer
+        than max_gap_ms also splits a segment, and a change of
+        translation_status ALWAYS does — original and translated tokens share
+        the same timestamps, so they must never be merged into one passage.
+        Set the translation_status parameter to "original" or "translation" to
+        drop one side of a translated transcript entirely. Costs exactly one
+        API call.
+      access: read
+      depends_on: [get_transcription_transcript]
+      timeout: 60s
+      params:
+        transcription_id:
+          type: string
+          required: true
+          description: "Transcription UUID (status must be completed)."
+        group_by:
+          type: string
+          default: "speaker"
+          description: "speaker | language | translation_status."
+        max_gap_ms:
+          type: integer
+          default: 2000
+          description: "Silence in ms that forces a new segment even within the same group."
+        translation_status:
+          type: string
+          description: "Keep only tokens with this translation_status: none | original | translation. Omit to keep all."
+      code: |
+        const t = await api.get_transcription_transcript({
+          transcription_id: params.transcription_id,
+        });
+        const tokens = Array.isArray(t.tokens) ? t.tokens : [];
+        const groupBy = params.group_by || "speaker";
+        const maxGap = params.max_gap_ms === undefined || params.max_gap_ms === null
+          ? 2000
+          : params.max_gap_ms;
+        const want = params.translation_status || null;
+
+        const segments = [];
+        for (const tok of tokens) {
+          const status = tok.translation_status || "none";
+          if (want && status !== want) continue;
+
+          let group;
+          if (groupBy === "language") group = tok.language || null;
+          else if (groupBy === "translation_status") group = status;
+          else group = tok.speaker || null;
+
+          // translation_status always breaks a run: a translated transcript
+          // interleaves original and translated tokens over the SAME
+          // timestamps, so merging them would splice two languages into one
+          // unreadable segment.
+          const prev = segments.length > 0 ? segments[segments.length - 1] : null;
+          const sameRun = prev
+            && prev.group === group
+            && prev.translation_status === status
+            && (tok.start_ms - prev.end_ms) <= maxGap;
+
+          if (sameRun) {
+            prev.text += tok.text;
+            prev.end_ms = tok.end_ms;
+            prev.token_count += 1;
+          } else {
+            segments.push({
+              group: group,
+              translation_status: status,
+              start_ms: tok.start_ms,
+              end_ms: tok.end_ms,
+              text: tok.text,
+              token_count: 1,
+            });
+          }
+        }
+        for (const s of segments) s.text = s.text.trim();
+
+        return {
+          id: t.id,
+          group_by: groupBy,
+          segment_count: segments.length,
+          segments: segments,
+        };
+
+    get_transcription_result:
+      description: >
+        Status-and-transcript in one call: read a transcription's status and,
+        if it is already "completed", return the transcript text with it.
+        Returns {id, status, ready, model, filename, audio_duration_ms, text,
+        token_count} when finished, and {id, status, ready: false, error_type,
+        error_message, text: null} while queued/processing or on error. This is
+        the tool to call in a polling loop — it saves a round trip on the
+        iteration that finally succeeds. Set include_tokens to also return the
+        raw token array (large). It does NOT wait or sleep: call it again from
+        the agent side, and space the calls out rather than busy-looping.
+      access: read
+      depends_on: [get_transcription, get_transcription_transcript]
+      timeout: 60s
+      params:
+        transcription_id:
+          type: string
+          required: true
+          description: "Transcription UUID returned by create_transcription."
+        include_tokens:
+          type: boolean
+          default: false
+          description: "Also return the full per-token array. Large — leave false unless timings are needed."
+      code: |
+        const tr = await api.get_transcription({
+          transcription_id: params.transcription_id,
+        });
+        if (tr.status !== "completed") {
+          return {
+            id: tr.id,
+            status: tr.status,
+            ready: false,
+            error_type: tr.error_type || null,
+            error_message: tr.error_message || null,
+            text: null,
+          };
+        }
+        const t = await api.get_transcription_transcript({
+          transcription_id: params.transcription_id,
+        });
+        const tokens = Array.isArray(t.tokens) ? t.tokens : [];
+        const out = {
+          id: tr.id,
+          status: tr.status,
+          ready: true,
+          model: tr.model,
+          filename: tr.filename,
+          audio_duration_ms: tr.audio_duration_ms,
+          text: t.text,
+          token_count: tokens.length,
+        };
+        if (params.include_tokens) out.tokens = tokens;
+        return out;
+
+    cleanup_transcriptions:
+      description: >
+        Delete finished transcriptions to get back under the 2000-transcription
+        project cap. DRY RUN BY DEFAULT — it reports what it would delete and
+        changes nothing until dry_run is explicitly false. Considers only
+        finished jobs ("completed" and "error"); queued and processing jobs are
+        never touched and cannot be deleted anyway. status narrows that to one
+        value, keep_newest protects the N most recent matches, and at most 40
+        deletions happen per call (the composite sandbox caps API calls) — run
+        it again for more. Returns {dry_run, matched, would_delete, ids} in dry
+        run, and {dry_run, matched, deleted_count, deleted, failed} when armed.
+        Deletion is irreversible and does NOT remove the underlying files.
+      access: dangerous
+      depends_on: [list_transcriptions, delete_transcription]
+      timeout: 120s
+      params:
+        dry_run:
+          type: boolean
+          default: true
+          description: "Report only. Must be explicitly false to actually delete."
+        status:
+          type: string
+          description: "Only delete jobs with this status: completed | error. Omit for both."
+        keep_newest:
+          type: integer
+          default: 0
+          description: "Keep this many of the newest matching transcriptions."
+      code: |
+        const MAX_DELETES = 40;
+        const listed = await api.list_transcriptions({ limit: 1000 });
+        const items = listed && Array.isArray(listed.transcriptions)
+          ? listed.transcriptions
+          : [];
+
+        const finished = params.status
+          ? items.filter((t) => t.status === params.status)
+          : items.filter((t) => t.status === "completed" || t.status === "error");
+
+        const sorted = finished.slice().sort((a, b) => {
+          if (a.created_at === b.created_at) return 0;
+          return a.created_at < b.created_at ? 1 : -1;
+        });
+
+        const keep = params.keep_newest ? params.keep_newest : 0;
+        const victims = sorted.slice(keep, keep + MAX_DELETES);
+
+        if (params.dry_run !== false) {
+          return {
+            dry_run: true,
+            matched: finished.length,
+            would_delete: victims.length,
+            ids: victims.map((t) => t.id),
+          };
+        }
+
+        const deleted = [];
+        const failed = [];
+        for (const t of victims) {
+          try {
+            await api.delete_transcription({ transcription_id: t.id });
+            deleted.push(t.id);
+          } catch (e) {
+            failed.push({ id: t.id, error: String(e && e.message ? e.message : e) });
+          }
+        }
+        return {
+          dry_run: false,
+          matched: finished.length,
+          deleted_count: deleted.length,
+          deleted: deleted,
+          failed: failed,
+        };
+
+  examples:
+    - name: "Submit a public audio URL for transcription"
+      description: "Create the job and return its id. Transcription is asynchronous — never wait for it inside one call."
+      code: |
+        const job = await api.create_transcription({
+          model: "stt-async-v5",
+          audio_url: "https://soniox.com/media/examples/coffee_shop.mp3",
+          language_hints: ["en"],
+          enable_speaker_diarization: true,
+        });
+
+        // status is "queued": there is nothing to read yet. Collect the result
+        // in a LATER call with get_transcription_result. Do NOT poll in a while
+        // loop here — this sandbox has no sleep, so the loop would spin at full
+        // speed, exhaust the per-run API-call budget and hammer Soniox.
+        return { transcription_id: job.id, status: job.status };
+
+    - name: "Collect a transcription once it has finished"
+      description: "One status check per agent turn; returns ready:false while the job is still running."
+      code: |
+        const result = await api.get_transcription_result({
+          transcription_id: "73d4357d-cad2-4338-a60d-ec6f2044f721",
+        });
+
+        // Still queued or processing, or the job failed — hand the status back
+        // and call again on a later turn rather than looping here.
+        if (!result.ready) return result;
+
+        const segments = await api.get_transcript_segments({
+          transcription_id: result.id,
+          group_by: "speaker",
+        });
+        await api.delete_transcription({ transcription_id: result.id });
+        return segments;
+
+    - name: "Upload a local file and transcribe it"
+      description: "Store audio in Soniox first, then submit it by file_id. Returns both ids for the later collect step."
+      code: |
+        const file = await api.upload_file({
+          file: "https://example.com/meeting.m4a",
+          client_reference_id: "meeting-2026-08-23",
+        });
+        const job = await api.create_transcription({
+          model: "stt-async-v5",
+          file_id: file.id,
+          enable_speaker_diarization: true,
+          enable_language_identification: true,
+          context: { terms: ["ToolMesh", "DADL", "Soniox"] },
+          client_reference_id: "meeting-2026-08-23",
+        });
+
+        // Keep both ids: once get_transcription_result reports ready, delete the
+        // transcription AND the file — neither is cleaned up automatically.
+        return { file_id: file.id, transcription_id: job.id, status: job.status };
+
+    - name: "Translate speech into German"
+      description: "One-way translation, then keep only the translated side of the transcript."
+      code: |
+        const job = await api.create_transcription({
+          model: "stt-async-v5",
+          audio_url: "https://example.com/english-call.mp3",
+          language_hints: ["en"],
+          translation: { type: "one_way", target_language: "de" },
+        });
+
+        const result = await api.get_transcription_result({ transcription_id: job.id });
+        if (!result.ready) return { transcription_id: job.id, status: result.status };
+
+        // A translated transcript holds original AND translated tokens, so
+        // filtering is what keeps the text from reading doubled.
+        return await api.get_transcript_segments({
+          transcription_id: job.id,
+          group_by: "speaker",
+          translation_status: "translation",
+        });
+
+    - name: "Synthesize speech with a cloned voice"
+      description: "Check that the voice is ready for the model before generating; cloning is asynchronous too."
+      code: |
+        const model = "tts-rt-v2";
+        const voice = await api.get_voice({ voice_id: "8f14e45f-ceea-467a-9f6a-1b2c3d4e5f60" });
+        const entry = voice.models.filter((m) => m.model === model)[0];
+
+        // not_computed -> call recompute_voice; processing -> check again on a
+        // later turn; failed -> read error_type. Only "ready" can synthesize.
+        if (!entry || entry.status !== "ready") {
+          return { ready: false, voice_status: entry ? entry.status : "not_computed" };
+        }
+
+        // Returns a File-Broker download URL (24h TTL), not audio bytes.
+        return await api.generate_speech({
+          model: model,
+          language: "de",
+          voice: voice.id,
+          audio_format: "mp3",
+          bitrate: 128000,
+          text: "Willkommen bei ToolMesh.",
+        });
+
+    - name: "Free capacity when the transcription cap is reached"
+      description: "Check the counters, preview the cleanup, then run it for real."
+      code: |
+        const counts = await api.get_transcriptions_count();
+        if (counts.total < 1800) return { action: "none", total: counts.total };
+
+        const preview = await api.cleanup_transcriptions({ keep_newest: 50 });
+        if (preview.would_delete === 0) return { action: "none", matched: preview.matched };
+
+        return await api.cleanup_transcriptions({ keep_newest: 50, dry_run: false });
+
+    - name: "Attribute last week's cost per model"
+      description: "Daily summary instead of per-request logs; costs are decimal strings."
+      code: |
+        const summary = await api.get_usage_summary({
+          start_time: "2026-08-16T00:00:00Z",
+          end_time: "2026-08-23T00:00:00Z",
+        });
+        return summary.models.map((m) => ({
+          model: m.model,
+          days: m.days,
+          total_cost_usd: parseFloat(m.total_cost_usd),
+          requests: m.total_num_requests,
+        }));
+
+    - name: "Hand a browser client a temporary key"
+      description: "Mint a single-use, 60-second key for one real-time transcription session."
+      code: |
+        return await api.create_temporary_api_key({
+          usage_type: "transcribe_websocket",
+          expires_in_seconds: 60,
+          single_use: true,
+          max_session_duration_seconds: 300,
+          client_reference_id: "browser-session-42",
+        });
