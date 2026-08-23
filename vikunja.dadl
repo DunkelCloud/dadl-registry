@@ -4,7 +4,7 @@ credits:
   - "Dunkel Cloud GmbH"
 source_name: "Vikunja REST API"
 source_url: "https://vikunja.io/docs/api/"
-date: "2026-07-19"
+date: "2026-08-23"
 
 backend:
   name: vikunja
@@ -14,12 +14,12 @@ backend:
   description: "Vikunja open-source task management — project planning, kanban boards, and task tracking"
 
   coverage:
-    endpoints: 28
+    endpoints: 29
     total_endpoints: 80
-    percentage: 35
+    percentage: 36
     focus: "projects, tasks, views, buckets, labels, comments, positions, filters, attachments"
     missing: "teams, users, shares, assignees, task relations, reactions, notifications, webhooks, subscriptions, saved filters"
-    last_reviewed: "2026-07-19"
+    last_reviewed: "2026-08-23"
 
   setup:
     credential_steps:
@@ -560,6 +560,16 @@ backend:
       params:
         task_id: { type: integer, in: path, required: true }
         label_id: { type: integer, in: body, required: true }
+      pagination: none
+
+    remove_label_from_task:
+      method: DELETE
+      path: /tasks/{task_id}/labels/{label_id}
+      access: write
+      description: "Remove a label from a task. The label itself is not deleted and stays available for other tasks."
+      params:
+        task_id: { type: integer, in: path, required: true }
+        label_id: { type: integer, in: path, required: true }
       pagination: none
 
     # ─────────────── Comments ───────────────
