@@ -97,7 +97,7 @@ date: "2026-08-31"
 backend:
   name: xen-orchestra
   type: rest
-  version: "3.6"
+  version: "3.7"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
   description: "Xen Orchestra REST API (XO 6.4+, current through 6.8) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode + PIF rescan), pools (incl. add_host), storage (SR create/delete, VDI incl. PATCH update, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories incl. health + benchmark/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), proxies, servers, dashboards, SDN traffic rules (add/delete/update), IPMI sensor inventory (plugin), health check"
@@ -124,14 +124,14 @@ backend:
       format: json
       message_path: "$.message"
       code_path: "$.code"
-      # 503 is NOT retried: since XO 6.8 it is the semantic serviceUnavailable error
-      # (e.g. "host has no IPMI device") -- deterministic, retrying only adds latency.
+      # 503 is terminal, not retried: since XO 6.8 it is the semantic serviceUnavailable
+      # error (e.g. "host has no IPMI device") -- deterministic, retrying only adds latency.
       retry_on: [429, 502, 504]
       retry_strategy:
         max_retries: 3
         backoff: exponential
         initial_delay: 2s
-      terminal: [400, 401, 403, 404]
+      terminal: [400, 401, 403, 404, 503]
     response:
       max_items: 500
 
