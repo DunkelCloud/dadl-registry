@@ -3,7 +3,7 @@
 #
 # Domain Notes for LLM consumers:
 # - Xen Orchestra (XO) is the web management UI for XCP-ng / XenServer hypervisors.
-# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added); current through XO 6.6 (June 2026).
+# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added); current through XO 6.8 (August 2026).
 # - Swagger docs available at /rest/v0/docs (OpenAPI spec for runtime discovery).
 # - Access control: pre-6.4 was admin-only; XO 6.4+ uses fine-grained RBAC v2 (acl-privileges/acl-roles).
 #   Endpoints with no declared privilege still require admin -- see /users/me/acl-privileges to inspect yours.
@@ -45,6 +45,10 @@
 # - Snapshot revert: POST /vms/{id}/actions/revert_snapshot (revert_vm_to_snapshot); set snapshotBefore to make it undoable.
 # - SDN traffic rules: /plugins/sdn-controller/{networks|vifs}/{id}/actions/{add|delete|update}_traffic_rule -- only present
 #   when the xo-server-sdn-controller plugin is loaded; calls fail with 404 otherwise. The update_* variants were added in XO 6.6.
+#   add/delete take the rule fields FLAT in the body; update takes {oldRule, newRule} -- oldRule in full, newRule partial,
+#   and since XO 6.8 a newRule field sent as null is removed from the rule (pre-6.8 kept e.g. the old port silently).
+# - IPMI sensors (XO 6.8): GET /plugins/ipmi-sensors/hosts/{id}/ipmi returns the raw sensor inventory incl. 'unknown'
+#   sensors. Needs the xo-server-ipmi-sensors plugin (404 otherwise); 503 = host has no reachable IPMI device (not transient).
 # - Backup repositories ("remotes") became WRITABLE in XO 6.6: POST /backup-repositories (create),
 #   PATCH /backup-repositories/{id} (update). Pre-6.6 they were read-only. There is NO DELETE route --
 #   removal is POST /backup-repositories/{id}/actions/forget (forget_backup_repository).
@@ -55,6 +59,8 @@
 #   disable/enable/management_reconfigure.
 # - Maintenance mode (XO 6.7): POST /hosts/{id}/actions/disable accepts autoEnable -- set it to false so the host
 #   STAYS disabled across a reboot (safe hardware intervention). Default behaviour re-enables the host on boot.
+# - PIF rescan (XO 6.8): POST /hosts/{id}/actions/scan_pifs makes XAPI re-detect the physical NICs of a RUNNING host
+#   (409 if halted) and creates PIF objects for new ones. 404 on pre-6.8 builds.
 # - Pool membership: POST /pools/{id}/actions/add_host makes a standalone host join the pool (XO 6.6). The changelog
 #   calls this "hosts/:id/actions/join_pool" but the route lives on the pool.
 # - SR creation (XO 6.7): POST /srs creates a storage repository (hostId + SR_type + device_config). Note that the
@@ -74,7 +80,9 @@
 # - UUID "_" means "any/default" for collection-level actions (e.g. /pools/_/actions does not exist anymore --
 #   action discovery is now via Swagger spec at /rest/v0/docs).
 # - Backup jobs: use /backup-jobs (modern). Old /backup/jobs/vm subroutes are DEPRECATED (removal 2026-09-12).
-# - Auth tokens: prefer POST /users/{id}/authentication_tokens (POST /users/authentication_tokens is DEPRECATED).
+# - Auth tokens: the authentication-token endpoints (GET/POST /users/{id}/authentication_tokens) are deliberately
+#   NOT exposed as tools -- their responses contain plaintext bearer tokens (the GET list even includes the token
+#   used to make the request). Create or revoke tokens outside ToolMesh: xo-cli --createToken or the XO web UI.
 # - User id "me" is a shortcut for the current authenticated user.
 
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
@@ -84,15 +92,15 @@ credits:
 
 source_name: "Xen Orchestra REST API"
 source_url: "https://docs.xen-orchestra.com/restapi"
-date: "2026-07-30"
+date: "2026-08-31"
 
 backend:
   name: xen-orchestra
   type: rest
-  version: "3.3"
+  version: "3.6"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
-  description: "Xen Orchestra REST API (XO 6.4+, current through 6.7) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode), pools (incl. add_host), storage (SR create/delete, VDI incl. PATCH update, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories incl. health + benchmark/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), proxies, servers, dashboards, auth tokens, SDN traffic rules (add/delete/update), health check"
+  description: "Xen Orchestra REST API (XO 6.4+, current through 6.8) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode + PIF rescan), pools (incl. add_host), storage (SR create/delete, VDI incl. PATCH update, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories incl. health + benchmark/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), proxies, servers, dashboards, SDN traffic rules (add/delete/update), IPMI sensor inventory (plugin), health check"
 
   auth:
     type: bearer
@@ -116,7 +124,9 @@ backend:
       format: json
       message_path: "$.message"
       code_path: "$.code"
-      retry_on: [429, 502, 503, 504]
+      # 503 is NOT retried: since XO 6.8 it is the semantic serviceUnavailable error
+      # (e.g. "host has no IPMI device") -- deterministic, retrying only adds latency.
+      retry_on: [429, 502, 504]
       retry_strategy:
         max_retries: 3
         backoff: exponential
@@ -127,11 +137,11 @@ backend:
 
   coverage:
     endpoints: 267
-    total_endpoints: 267
-    percentage: 100
+    total_endpoints: 269
+    percentage: 99
     focus: "Complete REST API coverage for XO 6.4+ (current through 6.7): all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full host power/lifecycle control (start, clean/smart reboot, clean/emergency shutdown, restart toolstack, disable/enable incl. reboot-persistent maintenance mode, detach, forget, pool join), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges, plus reading role-to-user/group assignments), backups (archives, jobs, logs, restore-logs, writable repositories incl. health check and throughput benchmark, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update incl. pinned-VM handling, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
-    missing: "Backup RESTORE is not exposed over REST -- backup archives, jobs and logs can be read, but restoring a restore-point onto a target SR must be done in the XO GUI or via the JSON-RPC API. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13. Version floor: routes marked 'XO 6.7+' in their description return 404 on 6.6.x -- create_sr, update_vdi, list_acl_role_users, list_acl_role_groups, list_group_acl_roles -- and the 6.7 body params autoEnable (disable_host), shutdownPinnedVms (rolling_reboot_pool / rolling_update_pool) and high_availability (create_vm) are ignored by older builds"
-    last_reviewed: "2026-07-30"
+    missing: "Authentication-token routes (GET/POST /users/{id}/authentication_tokens) are deliberately NOT exposed: their responses contain plaintext bearer tokens -- the GET list even includes the token used to make the request (see XO PR #10233) -- which must never enter an LLM context. Create/revoke tokens via xo-cli --createToken or the XO web UI instead; do NOT re-add these routes. Backup RESTORE is not exposed over REST -- backup archives, jobs and logs can be read, but restoring a restore-point onto a target SR must be done in the XO GUI or via the JSON-RPC API. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed; the IPMI inventory route (/plugins/ipmi-sensors/*) likewise requires the xo-server-ipmi-sensors plugin (>= 2.1.1, XO 6.8+) and returns 503 on hosts without a reachable IPMI device. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13. Version floor: routes marked 'XO 6.7+' in their description return 404 on 6.6.x -- create_sr, update_vdi, list_acl_role_users, list_acl_role_groups, list_group_acl_roles -- and the 6.7 body params autoEnable (disable_host), shutdownPinnedVms (rolling_reboot_pool / rolling_update_pool) and high_availability (create_vm) are ignored by older builds"
+    last_reviewed: "2026-08-31"
 
   setup:
     credential_steps:
@@ -230,9 +240,6 @@ backend:
       note: "Aggregated overview: pool/host/VM counts, storage usage, recent backup-jobs (7d), disconnected servers, disabled hosts. Pre-6.4 path was /dashboards (now removed); use /dashboard (singular)."
     create_user:
       permission_field: "Permission strings: 'admin', 'user', 'none'. Omit for default user-level access."
-    create_auth_token:
-      expires_in: "Accepts either a number (milliseconds) or a duration string (e.g. '1 hour', '7 days', '30d')"
-      note: "Use user_id='me' for self. POST /users/authentication_tokens (without user id in path) is DEPRECATED -- removal 2026-10-13."
     create_acl_role:
       flow: "1) Create role via POST /acl-roles. 2) Add privileges via POST /acl-privileges (with roleId). 3) Attach role to user/group via PUT /acl-roles/{id}/{users|groups}/{userId|groupId}."
     add_server:
@@ -405,26 +412,8 @@ backend:
         limit: { type: integer, in: query }
         ndjson: { type: boolean, in: query }
 
-    list_auth_tokens:
-      method: GET
-      path: /users/{id}/authentication_tokens
-      access: admin
-      description: "List all authentication tokens for a user. Use id='me' for self."
-      params:
-        id: { type: string, in: path, required: true, description: "User UUID or 'me'" }
-      pagination: none
-
-    create_auth_token:
-      method: POST
-      path: /users/{id}/authentication_tokens
-      access: admin
-      description: "Create a new authentication token. You can only create tokens for yourself (use id='me'). Returns {token} including the secret (store it securely; cannot be retrieved later)."
-      params:
-        id: { type: string, in: path, required: true, description: "Must be your own user UUID or 'me'" }
-        client: { type: object, in: body, description: "Optional {id: string} to identify the client" }
-        description: { type: string, in: body, description: "Human-readable purpose, e.g. 'CI pipeline'" }
-        expiresIn: { type: string, in: body, description: "Duration string ('1 hour', '7 days') or milliseconds" }
-      pagination: none
+    # NOTE: /users/{id}/authentication_tokens (GET/POST) is deliberately NOT exposed as tools --
+    # responses carry plaintext bearer tokens. See coverage.missing before re-adding anything here.
 
     # =========================================================================
     # GROUPS -- RBAC v2 (XO 6.4+)
@@ -1728,6 +1717,16 @@ backend:
         sync: { type: boolean, in: query }
       pagination: none
 
+    scan_pifs_host:
+      method: POST
+      path: /hosts/{uuid}/actions/scan_pifs
+      access: admin
+      description: "Rescan a host's physical NICs (XAPI PIF.scan) and create PIF objects for newly detected interfaces. The host must be RUNNING (409 otherwise). Idempotent on unchanged hardware. Requires XO 6.8+ (404 on older builds)."
+      params:
+        uuid: { type: string, in: path, required: true }
+        sync: { type: boolean, in: query }
+      pagination: none
+
     # =========================================================================
     # POOLS
     # =========================================================================
@@ -2756,14 +2755,11 @@ backend:
       method: POST
       path: /plugins/sdn-controller/networks/{uuid}/actions/update_traffic_rule
       access: write
-      description: "Update an existing traffic rule on a private SDN network -- match the rule by direction/ipRange/protocol/port, then set the new allow value. Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
+      description: "Update an existing traffic rule on a private SDN network. oldRule must contain the FULL existing rule (allow/direction/ipRange/protocol, plus port if set) to identify it; newRule is a PARTIAL update -- only the fields you send change, and a field sent as null is REMOVED from the rule (XO 6.8+; before 6.8 e.g. the old port was silently kept). Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "Network UUID" }
-        direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to update: 'from' or 'to'" }
-        ipRange: { type: string, in: body, required: true, description: "IP range of the rule to update" }
-        protocol: { type: string, in: body, required: true, description: "Protocol of the rule to update" }
-        port: { type: integer, in: body, description: "Port of the rule to update (for TCP/UDP)" }
-        allow: { type: boolean, in: body, required: true, description: "New value: true to allow matching traffic, false to drop it" }
+        oldRule: { type: object, in: body, required: true, description: "Full existing rule to match: {allow: boolean, direction: 'from'|'to', ipRange: string, protocol: string, port?: integer}" }
+        newRule: { type: object, in: body, required: true, description: "Fields to change: any of {allow, direction, ipRange, protocol, port}; port: null removes the port from the rule" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2800,15 +2796,25 @@ backend:
       method: POST
       path: /plugins/sdn-controller/vifs/{uuid}/actions/update_traffic_rule
       access: write
-      description: "Update an existing traffic rule on a VIF connected to a private SDN network -- match the rule by direction/ipRange/protocol/port, then set the new allow value. Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
+      description: "Update an existing traffic rule on a VIF connected to a private SDN network. oldRule must contain the FULL existing rule (allow/direction/ipRange/protocol, plus port if set) to identify it; newRule is a PARTIAL update -- only the fields you send change, and a field sent as null is REMOVED from the rule (XO 6.8+; before 6.8 e.g. the old port was silently kept). Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "VIF UUID" }
-        direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to update: 'from' or 'to'" }
-        ipRange: { type: string, in: body, required: true, description: "IP range of the rule to update" }
-        protocol: { type: string, in: body, required: true, description: "Protocol of the rule to update" }
-        port: { type: integer, in: body, description: "Port of the rule to update (for TCP/UDP)" }
-        allow: { type: boolean, in: body, required: true, description: "New value: true to allow matching traffic, false to drop it" }
+        oldRule: { type: object, in: body, required: true, description: "Full existing rule to match: {allow: boolean, direction: 'from'|'to', ipRange: string, protocol: string, port?: integer}" }
+        newRule: { type: object, in: body, required: true, description: "Fields to change: any of {allow, direction, ipRange, protocol, port}; port: null removes the port from the rule" }
         sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
+    # IPMI SENSORS (xo-server-ipmi-sensors plugin, XO 6.8+)
+    # =========================================================================
+
+    get_host_ipmi_sensors:
+      method: GET
+      path: /plugins/ipmi-sensors/hosts/{uuid}/ipmi
+      access: read
+      description: "Raw IPMI sensor inventory of a host: {productName, systemManufacturer, sensors: [{name, value, event, dataType}]}. dataType is one of totalPower/inletTemp/outletTemp/cpuTemp/fanSpeed/fanStatus/psuPower/psuStatus/bmcStatus/ip/unknown -- 'unknown' sensors are included here (unlike the categorized XO5 view). Requires XO 6.8+ with the xo-server-ipmi-sensors plugin loaded (404 otherwise); returns 503 if the host has no reachable IPMI device -- treat 503 as a definitive answer, not a transient error."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
       pagination: none
 
     # =========================================================================
