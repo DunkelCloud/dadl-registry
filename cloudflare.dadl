@@ -14,6 +14,45 @@
 # - Proxied DNS records route traffic through Cloudflare (orange cloud); non-proxied are DNS-only (grey cloud).
 # - Workers KV is eventually consistent. R2 is strongly consistent.
 # - Pages deployments use multipart uploads for direct upload or Git integration for auto-deploy.
+# - Registrar: list/get/update operate on domains ALREADY in Cloudflare Registrar; update only toggles
+#   auto_renew, privacy (WHOIS redaction), and the registrar lock (nameservers are managed on the zone).
+#   As of the 2026-04-15 Registrar API beta you can also discover, price and register NEW domains:
+#   search_registrar_domains (suggestions), check_registrar_domains (availability + registration_cost /
+#   renewal_cost at at-cost wholesale), register_registrar_domain (PLACES A PAID ORDER via the account
+#   billing profile + default registrant contact). Transfer-IN of external domains is still not exposed.
+#   The domain name is the natural identifier (a domain registers only once).
+# - Secondary DNS has two directions: "incoming" = Cloudflare acts as SECONDARY and pulls the zone from
+#   your external primary (zone-scoped: /zones/{zone_id}/secondary_dns/incoming); "outgoing" = Cloudflare
+#   acts as PRIMARY and pushes to external secondaries (/zones/{zone_id}/secondary_dns/outgoing).
+# - Secondary DNS peers, TSIGs (transfer auth keys), and ACLs (IP allowlists) are ACCOUNT-scoped and are
+#   referenced from the incoming/outgoing configs by their tag/id -- create them before referencing.
+# - force_axfr triggers an immediate inbound zone transfer; enable/disable/force_notify govern outbound.
+# - DNS Firewall clusters are account-scoped recursive resolvers (resolver caching + anti-DDoS) and are
+#   UNRELATED to authoritative zone DNS records -- do not confuse them with zone firewall rules or DNSSEC.
+# - Email Routing (inbound forwarding for a zone) is a two-level model: destination addresses are
+#   ACCOUNT-scoped (/accounts/{account_id}/email/routing/addresses) and must be verified by the recipient
+#   clicking the link in Cloudflare's verification mail before any rule may forward to them; routing
+#   rules, the catch-all rule, settings and the MX/SPF DNS records are ZONE-scoped
+#   (/zones/{zone_id}/email/routing/...). Enabling routing (POST .../email/routing/dns) adds AND LOCKS the
+#   zone's MX + SPF records; DELETE removes them, PATCH unlocks them. The older POST .../enable, .../disable
+#   and .../unlock endpoints are deprecated and not exposed here.
+# - Routing rules: matchers [{type: literal, field: to, value: "alias@zone"}] (or [{type: all}] for the
+#   catch-all), actions [{type: forward, value: ["dest@example.net"]}] | [{type: drop}] |
+#   [{type: worker, value: ["script"]}]. forward needs exactly ONE verified destination. Rule update is PUT
+#   (full replace). The account-level GET .../email/routing/rules lists rules across all zones.
+# - Email Sending (outbound transactional mail) splits the same way: sending subdomains with their
+#   DKIM/SPF/DMARC/return-path DNS are ZONE-scoped (/zones/{zone_id}/email/sending/subdomains, the id is
+#   the 'tag' field), while sending itself, quota, reputation and suppressions are ACCOUNT-scoped
+#   (/accounts/{account_id}/email/sending/...). from must be on an enabled sending subdomain whose DNS
+#   status is 'ready'. Suppressions are cursor-paginated (result_info.next_cursor) unlike everything else.
+#   The legacy /email/sending/suppression and /email/routing/suppression (singular) endpoints are
+#   deprecated and omitted; only /email/sending/suppressions (plural) is exposed.
+# - Email Auth: /zones/{zone_id}/email/auth/dmarc-reports toggles Cloudflare's DMARC aggregate-report
+#   collection (RUA) and returns the zone's live SPF/DKIM/DMARC/BIMI records; spf/inspect parses one SPF
+#   TXT record (by DNS record id) into a lookup-count tree (RFC 7208 limit: 10 lookups).
+# - Email Security (Area 1 cloud email security, /accounts/{account_id}/email-security/...) is an
+#   Enterprise add-on and intentionally not covered; Radar email statistics are public analytics, not
+#   account management, and are left out as well.
 
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
 
@@ -22,14 +61,14 @@ credits:
 
 source_name: "Cloudflare REST API v4"
 source_url: "https://developers.cloudflare.com/api/"
-date: "2026-03-30"
+date: "2026-09-27"
 
 backend:
   name: cloudflare
   type: rest
-  version: "1.0"
+  version: "1.1"
   base_url: https://api.cloudflare.com/client/v4
-  description: "Cloudflare API -- DNS, Pages, Workers, KV, R2, D1, Zones, SSL/TLS, Cache, Load Balancers, Firewall/WAF, Page Rules, Access (Zero Trust), and account management"
+  description: "Cloudflare API -- DNS, Pages, Workers, KV, R2, D1, Zones, SSL/TLS, Cache, Load Balancers, Firewall/WAF, Page Rules, Access (Zero Trust), Email Routing, Email Sending, DMARC/SPF email auth, and account management"
 
   auth:
     type: bearer
@@ -68,12 +107,12 @@ backend:
       max_items: 200
 
   coverage:
-    endpoints: 248
+    endpoints: 284
     total_endpoints: 1500
-    percentage: 17
-    focus: "zones, DNS records, DNSSEC, DNS settings, Pages projects/deployments/domains, Workers scripts/routes/secrets/cron/deployments/tails, KV namespaces/keys, R2 buckets/lifecycle/CORS/domains, D1 databases/queries, SSL/TLS certificates/custom hostnames, cache purge/settings, load balancers/pools/monitors, firewall rules/rulesets/rate limits, page rules, Access apps/policies/groups, accounts/members/roles"
-    missing: "Argo, Spectrum, Stream, Images (transformations), Email Routing, Waiting Room, Web3, Registrar, Turnstile, Queues, Hyperdrive, Vectorize, AI Gateway, Durable Objects, Zone Lockdown, IP Access Rules, User-Agent Blocking, Logpush, Notifications, Audit Logs"
-    last_reviewed: "2026-03-30"
+    percentage: 19
+    focus: "zones, DNS records, DNSSEC, DNS settings, secondary DNS incoming/outgoing/peers/TSIGs/ACLs, DNS Firewall clusters, Registrar domains/search/pricing/registration, Pages projects/deployments/domains, Workers scripts/routes/secrets/cron/deployments/tails, KV namespaces/keys, R2 buckets/lifecycle/CORS/domains, D1 databases/queries, SSL/TLS certificates/custom hostnames, cache purge/settings, load balancers/pools/monitors, firewall rules/rulesets/rate limits, page rules, Access apps/policies/groups, accounts/members/roles, Email Routing settings/DNS/rules/catch-all/destination addresses, Email Sending send/raw MIME/sending subdomains/DNS status/suppressions/reputation/limits, Email Auth DMARC reports/SPF inspection"
+    missing: "Argo, Spectrum, Stream, Images (transformations), Email Security (Area 1), Email Routing wrangler plan endpoint, Radar email statistics, Waiting Room, Web3, Turnstile, Queues, Hyperdrive, Vectorize, AI Gateway, Durable Objects, Zone Lockdown, IP Access Rules, User-Agent Blocking, Logpush, Notifications, Audit Logs"
+    last_reviewed: "2026-09-27"
 
   setup:
     credential_steps:
@@ -86,7 +125,7 @@ backend:
     backends_yaml: |
       - name: cloudflare
         transport: rest
-        dadl: /app/dadl/cloudflare.dadl
+        dadl: cloudflare.dadl
     required_scopes:
       - "zone:read"
       - "zone:edit"
@@ -107,8 +146,18 @@ backend:
       - "load_balancer:edit"
       - "access:read"
       - "access:edit"
+      - "dns_firewall:read"
+      - "dns_firewall:edit"
+      - "registrar:read"
+      - "registrar:edit"
+      - "email_routing:read"
+      - "email_routing:edit"
+      - "email_sending:read"
+      - "email_sending:edit"
+      - "dmarc_management:read"
+      - "dmarc_management:edit"
     docs_url: "https://developers.cloudflare.com/fundamentals/api/get-started/create-token/"
-    notes: "API Tokens (scoped) are preferred over Global API Key. Tokens can be restricted to specific zones and permissions. The Global API Key uses X-Auth-Email + X-Auth-Key headers instead of Bearer token."
+    notes: "API Tokens (scoped) are preferred over the Global API Key. Tokens can be restricted to specific zones and permissions. The Global API Key (X-Auth-Email + X-Auth-Key headers) grants full account access and is only needed for the rare endpoints that reject tokens. Registrar: the registrar/domains endpoints DO work with a scoped API Token, but only if it carries the 'Account > Registrar > Domains' permission (Read for list/get, Edit for update) -- without it Cloudflare returns HTTP 403 (code 10000). Verified working against the live API with a scoped token plus that permission; the Global API Key is not required. The Registrar API beta tools (search_registrar_domains, check_registrar_domains, register_registrar_domain) additionally require the token's Registrar permission at Edit/write level AND a billing profile + default registrant contact configured on the account. Email: routing settings, DNS, rules and catch-all need the zone permission 'Email Routing Rules' (Read/Edit); destination addresses need the account permission 'Email Routing Addresses' (Read/Edit); DMARC/SPF tools need 'DMARC Management' (Read/Edit); Email Sending (send, sending subdomains, suppressions, reputation, limits) needs the account permission 'Email Sending' (Read/Edit) plus a sending subdomain whose DNS status is ready. Verified 2026-09-27 against the live API: routing settings/DNS/rules/catch-all, destination addresses, DMARC status/config, SPF inspection, sending limits, sending-subdomain preview and the suppression CRUD work with a scoped token carrying those permissions; the account-wide rules list still returned 403 with per-zone rule permissions, and reputation returns 404 until Email Sending is activated."
 
   hints:
     list_zones:
@@ -136,6 +185,54 @@ backend:
       modes: "purge_everything=true for full purge, or use files/tags/hosts/prefixes for selective purge"
     create_load_balancer:
       steering: "Steering policies: off, geo, random, dynamic_latency, proximity, least_outstanding_requests, least_connections"
+    list_registrar_domains:
+      note: "Lists only domains managed by Cloudflare Registrar in this account. expires_at and current_registrar indicate renewal/transfer state; locked is the registrar transfer lock."
+      auth: "Needs the 'Account > Registrar > Domains' token permission (Read). A scoped API Token without it returns HTTP 403 (code 10000); WITH it a scoped token works -- the Global API Key is NOT required."
+    get_registrar_domain:
+      auth: "Needs the 'Account > Registrar > Domains' token permission (Read)."
+      response_note: "Raw API object is large (administrator/billing/registrant/technical contacts repeated under top-level + .contacts + .whois, plus a .whois.raw blob); this tool transforms it down to the key fields."
+    update_registrar_domain:
+      editable: "Only auto_renew, privacy (WHOIS redaction), and locked (registrar lock) can be changed."
+      cannot: "This endpoint does not register or transfer domains; use register_registrar_domain for new registrations. Transfer-IN is not exposed via the API. Nameservers are managed on the zone."
+      auth: "Needs the 'Account > Registrar > Domains' token permission at EDIT level. A Read-only token is rejected by Cloudflare with HTTP 422 'You are not allowed to perform this action' (verified 2026-06-17)."
+    check_registrar_domains:
+      pricing: "pricing.registration_cost / renewal_cost are Cloudflare's at-cost wholesale prices in pricing.currency. Not-registrable domains return reason (e.g. domain_unavailable, extension_not_supported_via_api) and omit pricing. Note: .io and .ai currently return extension_not_supported_via_api."
+      batch: "Send up to 20 domains per call as {\"domains\": [\"a.com\", \"b.dev\"]}. The response may return FEWER domains than requested -- match results by name, not by position."
+      auth: "Verified working with a Read-level Registrar token (2026-06-17); unlike register_registrar_domain it does NOT need write/Edit permission."
+    search_registrar_domains:
+      note: "Returns suggestions WITH availability + pricing (same per-domain shape as check_registrar_domains)."
+      auth: "Verified working with a Read-level Registrar token (2026-06-17)."
+    register_registrar_domain:
+      warning: "PLACES A PAID ORDER (irreversible billing). Always check_registrar_domains first. Uses the account billing profile + default registrant contact."
+      auth: "Registrar API beta -- needs the token's Registrar permission at EDIT/write level plus a billing profile + default registrant contact."
+    list_token_permission_groups:
+      registrar: "To grant registrar writes, locate the Registrar write group here (filter name=Registrar), then attach its id when creating a token via POST /user/tokens. Account-owned tokens use the parallel catalog at /accounts/{account_id}/tokens/permission_groups."
+    create_secondary_dns_incoming:
+      direction: "incoming = Cloudflare is the SECONDARY, pulling the zone from your external primary. peers must reference account-scoped peer tags created via create_dns_peer."
+      refresh: "auto_refresh_seconds sets how often to re-pull regardless of DNS NOTIFY; force_axfr_secondary_dns triggers an immediate transfer."
+    create_secondary_dns_outgoing:
+      direction: "outgoing = Cloudflare is the PRIMARY, notifying external secondaries. peers are account-scoped peer tags. Use enable/disable/force_notify_secondary_dns_outgoing to control transfers."
+    create_dns_peer:
+      tsig: "Set tsig_id to an account TSIG for authenticated transfers. ixfr_enable requests incremental zone transfer; ip+port identify the peer nameserver."
+    create_dns_tsig:
+      algo: "algo is the TSIG algorithm name WITH a trailing dot, e.g. 'hmac-sha256.'. secret is base64-encoded."
+    create_dns_acl:
+      ip_range: "ip_range is a CIDR (e.g. 192.0.2.0/24) that restricts which peer IPs may transfer."
+    create_dns_firewall_cluster:
+      scope: "Account-scoped recursive resolver cluster (NOT authoritative zone DNS). upstream_ips are your origin resolvers; the dns_firewall_ips in the response are the anycast IPs to point clients at."
+      ttls: "minimum_cache_ttl / maximum_cache_ttl / negative_cache_ttl override upstream TTLs (seconds); ratelimit is queries/sec per cluster IP."
+    create_email_destination_address:
+      verification: "Cloudflare emails a verification link to the address; until it is clicked, verified stays null and forward rules to it are rejected. list_email_destination_addresses with verified=false shows only pending addresses; without the filter all addresses are returned."
+    enable_email_routing:
+      dns: "Adds and LOCKS MX (route1/2/3.mx.cloudflare.net) plus an SPF TXT record at the zone apex. Foreign MX records must be removed first, otherwise status becomes misconfigured."
+    create_email_routing_rule:
+      matchers: "matchers: [{type: 'literal', field: 'to', value: 'alias@yourzone.tld'}] -- one matcher per rule; the catch-all is a separate endpoint (update_email_routing_catch_all)."
+      actions: "actions: [{type: 'forward', value: ['verified@dest.tld']}] | [{type: 'drop'}] | [{type: 'worker', value: ['worker-script-name']}]. forward needs exactly one VERIFIED destination address."
+    send_email:
+      sender: "from must belong to an enabled sending subdomain of the account (create_email_sending_subdomain, DNS status ready). Address fields accept 'user@example.com' or {address, name}; to/cc/bcc accept arrays of either."
+      body: "At least one of text or html. attachments: {disposition: 'attachment' | 'inline', filename, type (MIME), content (base64), content_id (inline only, referenced as cid: in html)}."
+    list_email_sending_suppressions:
+      pagination: "Cursor-based unlike the rest of the API: the tool returns {suppressions, next_cursor}; pass next_cursor as cursor for the following page. page/per_page paging does not apply."
 
   tools:
 
@@ -251,6 +348,32 @@ backend:
         account_id: { type: string, in: path, required: true }
         role_id: { type: string, in: path, required: true }
       pagination: none
+
+    # =========================================================================
+    # API TOKENS (self-introspection / diagnostics, user-scoped)
+    # =========================================================================
+
+    verify_token:
+      method: GET
+      path: /user/tokens/verify
+      access: read
+      description: "Verify the API token used for this request: returns its id and status (active/expired/disabled) plus validity window. Confirms auth works; does NOT list the token's own permissions (use GET /user/tokens/{id} for that)."
+      pagination: none
+
+    list_token_permission_groups:
+      method: GET
+      path: /user/tokens/permission_groups
+      access: read
+      description: "List the catalog of grantable API token permission groups (id, name, scopes). Use to find the exact group ID to attach when creating a token via the API -- e.g. filter name=Registrar to locate the registrar read vs write groups. Returns the global catalog, NOT the current token's permissions. Needs the token permission User > API Tokens (Read); without it Cloudflare answers HTTP 403 code 9109."
+      params:
+        name: { type: string, in: query, description: "Filter by permission group name (substring), e.g. Registrar, DNS, Domain" }
+        scope: { type: string, in: query, description: "Filter by scope, e.g. com.cloudflare.api.account" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+      response:
+        result_path: "$.result"
+        transform: |
+          map({ id, name, scopes })
 
     # =========================================================================
     # ZONES
@@ -428,6 +551,123 @@ backend:
         zone_id: { type: string, in: path, required: true }
         rate_plan: { type: object, in: body, required: true }
         component_values: { type: array, in: body }
+      pagination: none
+
+    # =========================================================================
+    # REGISTRAR (account-scoped domains)
+    # =========================================================================
+
+    list_registrar_domains:
+      method: GET
+      path: /accounts/{account_id}/registrar/domains
+      access: read
+      description: "List all domains managed by Cloudflare Registrar in this account. Returns name, status, expiry, current registrar, and lock/auto-renew/privacy flags. Does not include zones that are merely using Cloudflare DNS."
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+      response:
+        result_path: "$.result"
+        transform: |
+          map({
+            id, name,
+            status: (.registry_statuses // null),
+            current_registrar,
+            expires_at, created_at, updated_at,
+            auto_renew: .auto_renew,
+            locked, privacy,
+            can_register, supported_tld, transfer_in
+          })
+
+    get_registrar_domain:
+      method: GET
+      path: /accounts/{account_id}/registrar/domains/{domain_name}
+      access: read
+      description: "Get details for a single Cloudflare Registrar domain (status, expiry, contacts, nameservers, lock/auto-renew/privacy). Response is trimmed to key fields; pass a jq filter to override if you need the raw WHOIS object."
+      params:
+        account_id: { type: string, in: path, required: true }
+        domain_name: { type: string, in: path, required: true, description: "Fully-qualified domain name, e.g. example.com" }
+      response:
+        result_path: "$.result"
+        allow_jq_override: true
+        transform: |
+          {
+            name, current_registrar, previous_registrar,
+            expires_at, payment_expires_at,
+            auto_renew, locked, privacy, privacy_mode,
+            registry_statuses, last_known_status,
+            available, can_register, supported_tld,
+            pending_transfer,
+            name_servers,
+            registrant: (.registrant_contact // {} | { first_name, last_name, organization, email, country, state }),
+            created_at, updated_at, last_transferred_at
+          }
+      pagination: none
+
+    update_registrar_domain:
+      method: PUT
+      path: /accounts/{account_id}/registrar/domains/{domain_name}
+      access: admin
+      description: "Update an existing Cloudflare Registrar domain. Only auto_renew, privacy (WHOIS redaction), and locked (registrar transfer lock) are editable here; nameservers are managed on the zone. To register a NEW domain use register_registrar_domain instead."
+      params:
+        account_id: { type: string, in: path, required: true }
+        domain_name: { type: string, in: path, required: true }
+        auto_renew: { type: boolean, in: body, description: "Automatically renew the domain at expiration" }
+        privacy: { type: boolean, in: body, description: "Redact WHOIS contact information" }
+        locked: { type: boolean, in: body, description: "Registrar lock to prevent unauthorized transfers" }
+      pagination: none
+
+    # --- Registrar API beta (released 2026-04-15): discover, price & register new domains ---
+
+    search_registrar_domains:
+      method: GET
+      path: /accounts/{account_id}/registrar/domain-search
+      access: read
+      description: "Search for registrable domain suggestions by keyword/phrase (Registrar API beta). Returns candidate domains across TLDs WITH availability and pricing (registration_cost/renewal_cost), same per-domain shape as check_registrar_domains."
+      params:
+        account_id: { type: string, in: path, required: true }
+        q: { type: string, in: query, required: true, description: "Keyword or phrase to search for" }
+        limit: { type: integer, in: query, description: "Max number of suggestions to return" }
+      response:
+        result_path: "$.result.domains"
+        allow_jq_override: true
+        transform: |
+          map({
+            name, registrable, tier, reason,
+            currency: .pricing.currency,
+            registration_cost: .pricing.registration_cost,
+            renewal_cost: .pricing.renewal_cost
+          })
+      pagination: none
+
+    check_registrar_domains:
+      method: POST
+      path: /accounts/{account_id}/registrar/domain-check
+      access: read
+      description: "Check availability AND pricing for up to 20 domains at once (Registrar API beta). For each domain returns registrable, tier, reason (when not registrable), and pricing (currency, registration_cost, renewal_cost) at Cloudflare's at-cost wholesale rate."
+      params:
+        account_id: { type: string, in: path, required: true }
+        domains: { type: array, in: body, required: true, description: "Array of domain names to check, max 20 (sent as {\"domains\": [...]})" }
+      response:
+        result_path: "$.result.domains"
+        allow_jq_override: true
+        transform: |
+          map({
+            name, registrable, tier, reason,
+            currency: .pricing.currency,
+            registration_cost: .pricing.registration_cost,
+            renewal_cost: .pricing.renewal_cost
+          })
+      pagination: none
+
+    register_registrar_domain:
+      method: POST
+      path: /accounts/{account_id}/registrar/registrations
+      access: dangerous
+      description: "Register a NEW domain via Cloudflare Registrar (Registrar API beta). PLACES A PAID ORDER charged to the account billing profile, using the account's default registrant contact. Run check_registrar_domains first to confirm availability and price. Irreversible billing action."
+      params:
+        account_id: { type: string, in: path, required: true }
+        domain_name: { type: string, in: body, required: true, description: "Fully-qualified domain to register, e.g. example.com" }
       pagination: none
 
     # =========================================================================
@@ -683,6 +923,389 @@ backend:
         sort: { type: string, in: query }
         limit: { type: integer, in: query }
         time_delta: { type: string, in: query, description: "Time interval: hour, day, dekaminute, etc." }
+      pagination: none
+
+    # =========================================================================
+    # SECONDARY DNS -- Incoming (Cloudflare as secondary, zone-scoped)
+    # =========================================================================
+
+    get_secondary_dns_incoming:
+      method: GET
+      path: /zones/{zone_id}/secondary_dns/incoming
+      access: read
+      description: "Get the incoming (secondary) zone transfer configuration. Cloudflare pulls this zone from your external primary."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_secondary_dns_incoming:
+      method: POST
+      path: /zones/{zone_id}/secondary_dns/incoming
+      access: write
+      description: "Create the incoming (secondary) zone transfer config so Cloudflare pulls the zone from your primary. peers references account-scoped peer tags."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Zone name" }
+        peers: { type: array, in: body, required: true, description: "List of account-scoped peer tags (IDs) to pull from" }
+        auto_refresh_seconds: { type: integer, in: body, description: "How often to auto-refresh regardless of DNS NOTIFY (seconds)" }
+      pagination: none
+
+    update_secondary_dns_incoming:
+      method: PUT
+      path: /zones/{zone_id}/secondary_dns/incoming
+      access: write
+      description: "Update the incoming (secondary) zone transfer configuration"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        peers: { type: array, in: body, required: true, description: "List of account-scoped peer tags (IDs)" }
+        auto_refresh_seconds: { type: integer, in: body }
+      pagination: none
+
+    delete_secondary_dns_incoming:
+      method: DELETE
+      path: /zones/{zone_id}/secondary_dns/incoming
+      access: dangerous
+      description: "Delete the incoming (secondary) zone transfer configuration"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    force_axfr_secondary_dns:
+      method: POST
+      path: /zones/{zone_id}/secondary_dns/incoming/force_axfr
+      access: write
+      description: "Force an immediate AXFR (full zone transfer) from the primary for a secondary zone"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SECONDARY DNS -- Outgoing (Cloudflare as primary, zone-scoped)
+    # =========================================================================
+
+    get_secondary_dns_outgoing:
+      method: GET
+      path: /zones/{zone_id}/secondary_dns/outgoing
+      access: read
+      description: "Get the outgoing (primary) zone transfer configuration. Cloudflare serves this zone as primary and notifies external secondaries."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_secondary_dns_outgoing:
+      method: POST
+      path: /zones/{zone_id}/secondary_dns/outgoing
+      access: write
+      description: "Create the outgoing (primary) zone transfer config so external secondaries can pull this zone from Cloudflare. peers references account-scoped peer tags."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Zone name" }
+        peers: { type: array, in: body, required: true, description: "List of account-scoped peer tags (IDs) to notify/allow" }
+      pagination: none
+
+    update_secondary_dns_outgoing:
+      method: PUT
+      path: /zones/{zone_id}/secondary_dns/outgoing
+      access: write
+      description: "Update the outgoing (primary) zone transfer configuration"
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        peers: { type: array, in: body, required: true, description: "List of account-scoped peer tags (IDs)" }
+      pagination: none
+
+    delete_secondary_dns_outgoing:
+      method: DELETE
+      path: /zones/{zone_id}/secondary_dns/outgoing
+      access: dangerous
+      description: "Delete the outgoing (primary) zone transfer configuration"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    enable_secondary_dns_outgoing:
+      method: POST
+      path: /zones/{zone_id}/secondary_dns/outgoing/enable
+      access: write
+      description: "Enable outgoing zone transfers (resume notifying external secondaries)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    disable_secondary_dns_outgoing:
+      method: POST
+      path: /zones/{zone_id}/secondary_dns/outgoing/disable
+      access: write
+      description: "Disable outgoing zone transfers (stop notifying external secondaries)"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    force_notify_secondary_dns_outgoing:
+      method: POST
+      path: /zones/{zone_id}/secondary_dns/outgoing/force_notify
+      access: write
+      description: "Send a DNS NOTIFY to all external secondaries to prompt an immediate pull"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_secondary_dns_outgoing_status:
+      method: GET
+      path: /zones/{zone_id}/secondary_dns/outgoing/status
+      access: read
+      description: "Get the enabled/disabled status of outgoing zone transfers"
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SECONDARY DNS -- Peers (account-scoped)
+    # =========================================================================
+
+    list_dns_peers:
+      method: GET
+      path: /accounts/{account_id}/secondary_dns/peers
+      access: read
+      description: "List all secondary DNS peers (nameservers) for an account. Peer tags are referenced from zone incoming/outgoing configs."
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    get_dns_peer:
+      method: GET
+      path: /accounts/{account_id}/secondary_dns/peers/{peer_id}
+      access: read
+      description: "Get a single secondary DNS peer"
+      params:
+        account_id: { type: string, in: path, required: true }
+        peer_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_dns_peer:
+      method: POST
+      path: /accounts/{account_id}/secondary_dns/peers
+      access: write
+      description: "Create a secondary DNS peer (a primary/secondary nameserver Cloudflare transfers with)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Peer name/tag" }
+        ip: { type: string, in: body, description: "Peer nameserver IPv4/IPv6 address" }
+        port: { type: integer, in: body, description: "DNS service port (default 53)" }
+        ixfr_enable: { type: boolean, in: body, description: "Enable incremental zone transfer (IXFR)" }
+        tsig_id: { type: string, in: body, description: "TSIG key ID for authenticated transfers" }
+        allow_ixfr: { type: boolean, in: body, description: "Allow IXFR requests from this peer" }
+      pagination: none
+
+    update_dns_peer:
+      method: PUT
+      path: /accounts/{account_id}/secondary_dns/peers/{peer_id}
+      access: write
+      description: "Update a secondary DNS peer"
+      params:
+        account_id: { type: string, in: path, required: true }
+        peer_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        ip: { type: string, in: body }
+        port: { type: integer, in: body }
+        ixfr_enable: { type: boolean, in: body }
+        tsig_id: { type: string, in: body }
+        allow_ixfr: { type: boolean, in: body }
+      pagination: none
+
+    delete_dns_peer:
+      method: DELETE
+      path: /accounts/{account_id}/secondary_dns/peers/{peer_id}
+      access: dangerous
+      description: "Delete a secondary DNS peer"
+      params:
+        account_id: { type: string, in: path, required: true }
+        peer_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SECONDARY DNS -- TSIGs (transfer auth keys, account-scoped)
+    # =========================================================================
+
+    list_dns_tsigs:
+      method: GET
+      path: /accounts/{account_id}/secondary_dns/tsigs
+      access: read
+      description: "List all secondary DNS TSIG keys for an account"
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    get_dns_tsig:
+      method: GET
+      path: /accounts/{account_id}/secondary_dns/tsigs/{tsig_id}
+      access: read
+      description: "Get a single secondary DNS TSIG key"
+      params:
+        account_id: { type: string, in: path, required: true }
+        tsig_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_dns_tsig:
+      method: POST
+      path: /accounts/{account_id}/secondary_dns/tsigs
+      access: write
+      description: "Create a TSIG key for authenticated zone transfers"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "TSIG key name (with trailing dot, e.g. tsig.example.com.)" }
+        secret: { type: string, in: body, required: true, description: "Base64-encoded TSIG secret" }
+        algo: { type: string, in: body, required: true, description: "TSIG algorithm with trailing dot, e.g. hmac-sha256." }
+      pagination: none
+
+    update_dns_tsig:
+      method: PUT
+      path: /accounts/{account_id}/secondary_dns/tsigs/{tsig_id}
+      access: write
+      description: "Update a secondary DNS TSIG key"
+      params:
+        account_id: { type: string, in: path, required: true }
+        tsig_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        secret: { type: string, in: body, required: true }
+        algo: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_dns_tsig:
+      method: DELETE
+      path: /accounts/{account_id}/secondary_dns/tsigs/{tsig_id}
+      access: dangerous
+      description: "Delete a secondary DNS TSIG key"
+      params:
+        account_id: { type: string, in: path, required: true }
+        tsig_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SECONDARY DNS -- ACLs (IP allowlists, account-scoped)
+    # =========================================================================
+
+    list_dns_acls:
+      method: GET
+      path: /accounts/{account_id}/secondary_dns/acls
+      access: read
+      description: "List all secondary DNS ACLs (IP-range allowlists) for an account"
+      params:
+        account_id: { type: string, in: path, required: true }
+
+    get_dns_acl:
+      method: GET
+      path: /accounts/{account_id}/secondary_dns/acls/{acl_id}
+      access: read
+      description: "Get a single secondary DNS ACL"
+      params:
+        account_id: { type: string, in: path, required: true }
+        acl_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_dns_acl:
+      method: POST
+      path: /accounts/{account_id}/secondary_dns/acls
+      access: write
+      description: "Create a secondary DNS ACL restricting which peer IP ranges may transfer"
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "ACL name" }
+        ip_range: { type: string, in: body, required: true, description: "Allowed IP range in CIDR notation (e.g. 192.0.2.0/24)" }
+      pagination: none
+
+    update_dns_acl:
+      method: PUT
+      path: /accounts/{account_id}/secondary_dns/acls/{acl_id}
+      access: write
+      description: "Update a secondary DNS ACL"
+      params:
+        account_id: { type: string, in: path, required: true }
+        acl_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        ip_range: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_dns_acl:
+      method: DELETE
+      path: /accounts/{account_id}/secondary_dns/acls/{acl_id}
+      access: dangerous
+      description: "Delete a secondary DNS ACL"
+      params:
+        account_id: { type: string, in: path, required: true }
+        acl_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DNS FIREWALL (account-scoped recursive resolver clusters)
+    # =========================================================================
+
+    list_dns_firewall_clusters:
+      method: GET
+      path: /accounts/{account_id}/dns_firewall
+      access: read
+      description: "List all DNS Firewall clusters (account-scoped recursive resolvers). Distinct from authoritative zone DNS and from zone firewall rules."
+      params:
+        account_id: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_dns_firewall_cluster:
+      method: GET
+      path: /accounts/{account_id}/dns_firewall/{dns_firewall_id}
+      access: read
+      description: "Get a DNS Firewall cluster's configuration, including the anycast dns_firewall_ips to point clients at"
+      params:
+        account_id: { type: string, in: path, required: true }
+        dns_firewall_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_dns_firewall_cluster:
+      method: POST
+      path: /accounts/{account_id}/dns_firewall
+      access: write
+      description: "Create a DNS Firewall cluster. upstream_ips are your origin resolvers; the response returns anycast IPs to use as your nameservers."
+      params:
+        account_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Cluster name" }
+        upstream_ips: { type: array, in: body, required: true, description: "Origin resolver IPs the cluster forwards to" }
+        deprecate_any_requests: { type: boolean, in: body, description: "Reject ANY queries (recommended)" }
+        minimum_cache_ttl: { type: integer, in: body, description: "Minimum cache TTL in seconds" }
+        maximum_cache_ttl: { type: integer, in: body, description: "Maximum cache TTL in seconds" }
+        negative_cache_ttl: { type: integer, in: body, description: "Negative (NXDOMAIN) cache TTL in seconds" }
+        ratelimit: { type: integer, in: body, description: "Per-IP query rate limit (queries/sec)" }
+        retries: { type: integer, in: body, description: "Upstream retry count" }
+        ecs_fallback: { type: boolean, in: body, description: "Disable EDNS Client Subnet fallback" }
+        attack_mitigation: { type: object, in: body, description: "Automated DDoS mitigation settings" }
+      pagination: none
+
+    update_dns_firewall_cluster:
+      method: PATCH
+      path: /accounts/{account_id}/dns_firewall/{dns_firewall_id}
+      access: write
+      description: "Update a DNS Firewall cluster's configuration (rate limits, cache TTLs, upstreams, mitigation)"
+      params:
+        account_id: { type: string, in: path, required: true }
+        dns_firewall_id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        upstream_ips: { type: array, in: body }
+        deprecate_any_requests: { type: boolean, in: body }
+        minimum_cache_ttl: { type: integer, in: body }
+        maximum_cache_ttl: { type: integer, in: body }
+        negative_cache_ttl: { type: integer, in: body }
+        ratelimit: { type: integer, in: body }
+        retries: { type: integer, in: body }
+        ecs_fallback: { type: boolean, in: body }
+        attack_mitigation: { type: object, in: body }
+      pagination: none
+
+    delete_dns_firewall_cluster:
+      method: DELETE
+      path: /accounts/{account_id}/dns_firewall/{dns_firewall_id}
+      access: dangerous
+      description: "Delete a DNS Firewall cluster"
+      params:
+        account_id: { type: string, in: path, required: true }
+        dns_firewall_id: { type: string, in: path, required: true }
       pagination: none
 
     # =========================================================================
@@ -2549,6 +3172,509 @@ backend:
         group_id: { type: string, in: path, required: true }
       pagination: none
 
+    # =========================================================================
+    # EMAIL ROUTING -- Zone settings & DNS
+    # =========================================================================
+
+    get_email_routing_settings:
+      method: GET
+      path: /zones/{zone_id}/email/routing
+      access: read
+      description: "Get the Email Routing state of a zone: enabled, status (ready | unconfigured | misconfigured | misconfigured/locked | unlocked), support_subaddress (plus-addressing), skip_wizard, created/modified. Call this first -- routing rules only take effect while status is 'ready'."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_email_routing_settings:
+      method: PATCH
+      path: /zones/{zone_id}/email/routing
+      access: write
+      description: "Update Email Routing zone settings: support_subaddress (honor plus-addressing like user+tag@zone when matching rules) and skip_wizard. Omitted fields keep their value. Cannot switch routing on or off -- use enable_email_routing / disable_email_routing for that."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        support_subaddress: { type: boolean, in: body, description: "Honor subaddressing (user+tag@zone) when matching incoming mail against rules" }
+        skip_wizard: { type: boolean, in: body, description: "Mark the dashboard configuration wizard as skipped" }
+      pagination: none
+
+    get_email_routing_dns_records:
+      method: GET
+      path: /zones/{zone_id}/email/routing/dns
+      access: read
+      description: "Show the DNS records Email Routing needs on this zone -- MX route1/2/3.mx.cloudflare.net, an SPF TXT record at the apex and the DKIM TXT record cf2024-1._domainkey -- each as {type, name, content, priority, ttl}. Works for zones where routing is not enabled yet (shows what enable_email_routing would create and lock)."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    enable_email_routing:
+      method: POST
+      path: /zones/{zone_id}/email/routing/dns
+      access: write
+      description: "Enable Email Routing on a zone: Cloudflare adds AND LOCKS the required MX records and the SPF TXT record at the zone apex. Existing foreign MX records must be removed first, otherwise the zone ends up with status 'misconfigured'. Returns the settings object -- check that status == 'ready'."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, description: "Zone domain name (optional, defaults to the zone)" }
+      pagination: none
+
+    disable_email_routing:
+      method: DELETE
+      path: /zones/{zone_id}/email/routing/dns
+      access: dangerous
+      description: "Disable Email Routing on a zone and REMOVE the MX/SPF records it added. Incoming mail to the zone stops being routed immediately; routing rules and destination addresses are kept but become inactive."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, description: "Zone domain name (optional, defaults to the zone)" }
+      pagination: none
+
+    unlock_email_routing_dns:
+      method: PATCH
+      path: /zones/{zone_id}/email/routing/dns
+      access: write
+      description: "Unlock the MX records that Email Routing locked so they can be edited with the DNS tools (status becomes 'unlocked'). Editing them can break routing; run enable_email_routing again to restore and re-lock the records."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, description: "Zone domain name (optional, defaults to the zone)" }
+      pagination: none
+
+    # =========================================================================
+    # EMAIL ROUTING -- Rules & catch-all (zone-scoped)
+    # =========================================================================
+
+    list_email_routing_rules:
+      method: GET
+      path: /zones/{zone_id}/email/routing/rules
+      access: read
+      description: "List the custom-address routing rules of a zone: id, name, enabled, priority, matchers [{type: literal | all, field: to, value}], actions [{type: forward | drop | worker, value: [target]}], source (api | wrangler). The catch-all rule is included as well (matchers [{type: all}], priority 2147483647) -- manage it via get/update_email_routing_catch_all, not via update_email_routing_rule."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        enabled: { type: boolean, in: query, description: "Filter by enabled state" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_email_routing_rule:
+      method: GET
+      path: /zones/{zone_id}/email/routing/rules/{rule_id}
+      access: read
+      description: "Get one routing rule by id (matchers, actions, enabled, priority, source)."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        rule_id: { type: string, in: path, required: true, description: "Routing rule id from list_email_routing_rules" }
+      pagination: none
+
+    create_email_routing_rule:
+      method: POST
+      path: /zones/{zone_id}/email/routing/rules
+      access: write
+      description: "Create a routing rule for a custom address of the zone. matchers: [{type: 'literal', field: 'to', value: 'alias@yourzone.tld'}]. actions: [{type: 'forward', value: ['dest@example.net']}] forwards to exactly ONE destination address that is already VERIFIED in the account (create_email_destination_address + link click), [{type: 'drop'}] discards the mail, [{type: 'worker', value: ['script-name']}] hands it to an Email Worker. Lower priority number wins when several rules match. Requires Email Routing to be enabled on the zone."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        matchers: { type: array, in: body, required: true, description: "[{type: 'literal', field: 'to', value: 'alias@yourzone.tld'}]" }
+        actions: { type: array, in: body, required: true, description: "[{type: 'forward' | 'drop' | 'worker', value: ['target']}] -- forward needs one verified destination address, drop takes no value" }
+        name: { type: string, in: body, description: "Human-readable rule name" }
+        enabled: { type: boolean, in: body, description: "Default true" }
+        priority: { type: integer, in: body, description: "Lower number = evaluated first (default 0)" }
+      pagination: none
+
+    update_email_routing_rule:
+      method: PUT
+      path: /zones/{zone_id}/email/routing/rules/{rule_id}
+      access: write
+      description: "Replace a routing rule (PUT = full replace: matchers AND actions are required again, omitted name/enabled/priority fall back to their defaults). Use it to change the forward target, disable a rule, or re-prioritize. Forward actions need exactly one verified destination address."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        rule_id: { type: string, in: path, required: true, description: "Routing rule id from list_email_routing_rules" }
+        matchers: { type: array, in: body, required: true, description: "[{type: 'literal', field: 'to', value: 'alias@yourzone.tld'}]" }
+        actions: { type: array, in: body, required: true, description: "[{type: 'forward' | 'drop' | 'worker', value: ['target']}]" }
+        name: { type: string, in: body }
+        enabled: { type: boolean, in: body }
+        priority: { type: integer, in: body }
+      pagination: none
+
+    delete_email_routing_rule:
+      method: DELETE
+      path: /zones/{zone_id}/email/routing/rules/{rule_id}
+      access: dangerous
+      description: "Delete a routing rule. Mail to that custom address is no longer matched and falls through to the catch-all rule (which drops by default)."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        rule_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_routing_catch_all:
+      method: GET
+      path: /zones/{zone_id}/email/routing/rules/catch_all
+      access: read
+      description: "Get the zone's catch-all rule -- what happens to mail for addresses no custom rule matches: enabled, actions [{type: forward | drop | worker, value}], matchers [{type: all}]."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    update_email_routing_catch_all:
+      method: PUT
+      path: /zones/{zone_id}/email/routing/rules/catch_all
+      access: write
+      description: "Set the zone's catch-all rule: enable or disable it and choose the action -- forward all unmatched mail to one verified destination address ([{type: 'forward', value: ['dest@example.net']}]), drop it ([{type: 'drop'}]), or route it to an Email Worker ([{type: 'worker', value: ['script-name']}]). matchers must be [{type: 'all'}]. PUT = full replace."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        actions: { type: array, in: body, required: true, description: "[{type: 'forward' | 'drop' | 'worker', value: ['target']}]" }
+        matchers: { type: array, in: body, required: true, description: "Always [{type: 'all'}]" }
+        enabled: { type: boolean, in: body, description: "false disables the catch-all (unmatched mail is rejected)" }
+        name: { type: string, in: body }
+      pagination: none
+
+    # =========================================================================
+    # EMAIL ROUTING -- Destination addresses & cross-zone rules (account-scoped)
+    # =========================================================================
+
+    list_email_destination_addresses:
+      method: GET
+      path: /accounts/{account_id}/email/routing/addresses
+      access: read
+      description: "List the Email Routing destination addresses of the account (the mailboxes forward rules may deliver to): id, email, verified (timestamp, or null while the recipient has not clicked the verification link), created, modified. Without the verified filter ALL addresses are returned (verified and pending); verified=true or verified=false narrows the list. account_id is required; get it via list_accounts."
+      params:
+        account_id: { type: string, in: path, required: true }
+        verified: { type: boolean, in: query, description: "true = only verified addresses, false = only unverified/pending ones; omit for all" }
+        direction: { type: string, in: query, description: "asc or desc" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    get_email_destination_address:
+      method: GET
+      path: /accounts/{account_id}/email/routing/addresses/{destination_address_id}
+      access: read
+      description: "Get one destination address by id, including its verified timestamp (null = not yet verified)."
+      params:
+        account_id: { type: string, in: path, required: true }
+        destination_address_id: { type: string, in: path, required: true, description: "Destination address id from list_email_destination_addresses" }
+      pagination: none
+
+    create_email_destination_address:
+      method: POST
+      path: /accounts/{account_id}/email/routing/addresses
+      access: write
+      description: "Register a destination address for forwarding. Cloudflare immediately emails a verification link to that address; until the recipient clicks it, verified stays null and routing rules that forward to it are rejected. Returns the address object (id, email, verified: null)."
+      params:
+        account_id: { type: string, in: path, required: true }
+        email: { type: string, in: body, required: true, description: "Mailbox that should receive forwarded mail, e.g. inbox@example.net" }
+      pagination: none
+
+    update_email_destination_address:
+      method: PATCH
+      path: /accounts/{account_id}/email/routing/addresses/{destination_address_id}
+      access: write
+      description: "Change a destination address status. With a regular API token this can only reset a verified address to 'unverified' (forcing re-verification); setting 'verified' requires Cloudflare admin privileges and is rejected otherwise."
+      params:
+        account_id: { type: string, in: path, required: true }
+        destination_address_id: { type: string, in: path, required: true }
+        status: { type: string, in: body, required: true, description: "unverified or verified" }
+      pagination: none
+
+    delete_email_destination_address:
+      method: DELETE
+      path: /accounts/{account_id}/email/routing/addresses/{destination_address_id}
+      access: dangerous
+      description: "Delete a destination address. Routing rules that forward to it stop working -- update or delete those rules first. Cloudflare refuses to delete an address that was created only moments ago (HTTP 429 code 2032 'created too recently') -- wait a few minutes and retry."
+      params:
+        account_id: { type: string, in: path, required: true }
+        destination_address_id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_email_routing_rules_across_zones:
+      method: GET
+      path: /accounts/{account_id}/email/routing/rules
+      access: read
+      description: "List the routing rules of ALL zones in the account in one call; each rule carries zone {name, tag} in addition to id, name, enabled, priority, matchers, actions. Use it to audit which custom addresses forward where without iterating zones. Permission caveat: a token whose Email Routing Rules permission is granted per zone gets HTTP 403 (code 10000) here even though the per-zone list_email_routing_rules works -- fall back to iterating zones in that case."
+      params:
+        account_id: { type: string, in: path, required: true }
+        enabled: { type: boolean, in: query, description: "Filter by enabled state" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query }
+
+    # =========================================================================
+    # EMAIL SENDING -- Send, quota, reputation (account-scoped)
+    # =========================================================================
+
+    send_email:
+      method: POST
+      path: /accounts/{account_id}/email/sending/send
+      access: write
+      description: "Send an outbound email through Cloudflare Email Sending. from must be an address on an ENABLED sending subdomain of the account (create_email_sending_subdomain, DNS status 'ready'); recipients can be any external addresses. Every address value is either a plain string 'user@example.com' or {address, name}; to/cc/bcc take arrays of those and at least one of the three is required. Provide subject and at least one of text/html. Returns {message_id, delivered[], queued[], permanent_bounces[], suppressed_recipients[]}. Each send counts against the daily quota (get_email_sending_limits)."
+      params:
+        account_id: { type: string, in: path, required: true }
+        from: { type: object, in: body, required: true, description: "Sender: 'noreply@mail.example.com' or {address: 'noreply@mail.example.com', name: 'Display Name'} -- must be on an enabled sending subdomain" }
+        to: { type: array, in: body, description: "Recipients: ['a@example.net', {address: 'b@example.org', name: 'B'}]. Optional only when cc or bcc is given" }
+        cc: { type: array, in: body, description: "Carbon-copy recipients, same format as to" }
+        bcc: { type: array, in: body, description: "Blind-carbon-copy recipients, same format as to" }
+        reply_to: { type: object, in: body, description: "'user@example.com' or {address, name}" }
+        subject: { type: string, in: body, required: true }
+        text: { type: string, in: body, description: "Plain-text body (at least one of text/html)" }
+        html: { type: string, in: body, description: "HTML body (at least one of text/html)" }
+        headers: { type: object, in: body, description: "Additional headers as {Header-Name: value}" }
+        attachments: { type: array, in: body, description: "[{disposition: 'attachment' | 'inline', filename, type: 'application/pdf', content: '<base64>', content_id: 'logo'}] -- content_id only for inline, referenced from html as cid:logo" }
+      pagination: none
+
+    send_email_raw:
+      method: POST
+      path: /accounts/{account_id}/email/sending/send_raw
+      access: write
+      description: "Send a pre-built RFC 5322 MIME message (headers + body, optionally multipart) through Email Sending. from and recipients form the SMTP envelope and must be plain addresses; the message's From header must still use an enabled sending subdomain. Prefer send_email unless you need full control over the MIME structure. Returns {message_id, delivered[], queued[], permanent_bounces[], suppressed_recipients[]}."
+      params:
+        account_id: { type: string, in: path, required: true }
+        from: { type: string, in: body, required: true, description: "Envelope sender (MAIL FROM), plain address on an enabled sending subdomain" }
+        recipients: { type: array, in: body, required: true, description: "Envelope recipients (RCPT TO), plain addresses" }
+        mime_message: { type: string, in: body, required: true, description: "Complete MIME message including From, To, Subject and Content-Type headers" }
+      pagination: none
+
+    get_email_sending_limits:
+      method: GET
+      path: /accounts/{account_id}/email/sending/limits
+      access: read
+      description: "Get the account's Email Sending quota and current usage: {quota: {value, unit: day | hour}, usage: {sent, over_quota, resets_at}}. quota and usage are null while no quota is resolved yet (Email Sending not activated). Check before bulk sends."
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_sending_reputation:
+      method: GET
+      path: /accounts/{account_id}/email/sending/reputation
+      access: read
+      description: "Get the account's Email Sending reputation: status (healthy | warning | at_risk | suspended), status_since, evaluated_at, grace_started_at, and the active_policy thresholds (complaint, customer_bounce and spam_rejection rates with warning_at/at_risk_at/minimum_denominator, suspension_after_hours). While suspended, sends are rejected. Accounts that have not activated Email Sending get HTTP 404 (code 10001 'Unable to authenticate request') from this endpoint even with the right permission -- check get_email_sending_limits (quota null) first."
+      params:
+        account_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_sending_message:
+      method: GET
+      path: /accounts/{account_id}/email/sending/messages/{message_id}
+      access: read
+      description: "Fetch the raw RFC 5322 MIME of a message sent via Email Sending, by the message_id returned from send_email / send_email_raw. The body is message/rfc822 (not JSON), so ToolMesh returns a file-broker download URL. Only available for subdomains with preview_enabled=true (activity-log preview)."
+      params:
+        account_id: { type: string, in: path, required: true }
+        message_id: { type: string, in: path, required: true, description: "message_id from the send response" }
+      response:
+        binary: true
+        content_type: message/rfc822
+      pagination: none
+
+    # =========================================================================
+    # EMAIL SENDING -- Suppressions (account-scoped, cursor-paginated)
+    # =========================================================================
+
+    list_email_sending_suppressions:
+      method: GET
+      path: /accounts/{account_id}/email/sending/suppressions
+      access: read
+      description: "List active Email Sending suppressions (addresses that will NOT be delivered to): id, email, reason (manual | complaint | hard_bounce | soft_bounce | policy), scope ({type: 'account'} or {type: 'sending_domain', value}), expires_at (null = permanent), read_only, note. Sending-domain suppressions come first, then account-wide ones. CURSOR pagination unlike the rest of the API: the result is {suppressions: [...], next_cursor}; pass next_cursor as cursor to fetch the next page (page/per_page paging does not apply)."
+      params:
+        account_id: { type: string, in: path, required: true }
+        per_page: { type: integer, in: query, description: "Max suppressions per page (API default 100)" }
+        cursor: { type: string, in: query, description: "next_cursor from the previous response" }
+        email: { type: string, in: query, description: "Exact email address filter" }
+        search: { type: string, in: query, description: "Full address = exact match; 'user@' matches that user on every domain" }
+        reason: { type: string, in: query, description: "manual, complaint, hard_bounce, soft_bounce, policy" }
+        scope_type: { type: string, in: query, description: "account or sending_domain" }
+        scope_value: { type: string, in: query, description: "Exact sending domain; requires scope_type=sending_domain" }
+      response:
+        result_path: "$"
+        transform: |
+          { suppressions: .result, next_cursor: (.result_info.next_cursor // null) }
+      pagination: none
+
+    get_email_sending_suppression:
+      method: GET
+      path: /accounts/{account_id}/email/sending/suppressions/{suppression_id}
+      access: read
+      description: "Get one Email Sending suppression by id (email, reason, scope, expires_at, read_only, note)."
+      params:
+        account_id: { type: string, in: path, required: true }
+        suppression_id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_email_sending_suppression:
+      method: POST
+      path: /accounts/{account_id}/email/sending/suppressions
+      access: write
+      description: "Suppress an address so Email Sending never delivers to it -- for every sending domain of the account by default, or for one sending domain via scope {type: 'sending_domain', value: 'mail.example.com'}. Creating an already active suppression returns its existing id. Scope is immutable afterwards (delete and recreate to change it). Returns {id, scope}."
+      params:
+        account_id: { type: string, in: path, required: true }
+        email: { type: string, in: body, required: true, description: "Address to suppress" }
+        expires_at: { type: string, in: body, description: "ISO 8601 expiry; omit for a permanent suppression" }
+        note: { type: string, in: body, description: "Advisory note (free text, not enforced)" }
+        scope: { type: object, in: body, description: "{type: 'account'} (default) or {type: 'sending_domain', value: 'mail.example.com'}" }
+      pagination: none
+
+    bulk_create_email_sending_suppressions:
+      method: POST
+      path: /accounts/{account_id}/email/sending/suppressions/bulk
+      access: write
+      description: "Import up to 1,000 Email Sending suppressions in one request. items: [{email, expires_at?, note?, scope?}] with the same semantics as create_email_sending_suppression; duplicates (same email + scope) are deduplicated. Returns counts (total, processed, deduplicated, invalid, skipped, errors) and per-item results {index, email, status: processed | invalid | error | skipped, id?, error?} in request order."
+      params:
+        account_id: { type: string, in: path, required: true }
+        items: { type: array, in: body, required: true, description: "[{email: 'a@example.net', expires_at: '2027-01-01T00:00:00Z', note: 'bounced', scope: {type: 'account'}}]" }
+      pagination: none
+
+    update_email_sending_suppression:
+      method: PATCH
+      path: /accounts/{account_id}/email/sending/suppressions/{suppression_id}
+      access: write
+      description: "Update the expiry or note of a suppression. Send expires_at as null to make it permanent, note as '' to clear it; omitted fields stay unchanged. Scope cannot be changed (400 scope_immutable) and read_only suppressions (reason policy) cannot be edited."
+      params:
+        account_id: { type: string, in: path, required: true }
+        suppression_id: { type: string, in: path, required: true }
+        expires_at: { type: string, in: body, description: "New ISO 8601 expiry, or null for permanent" }
+        note: { type: string, in: body, description: "Replacement note; empty string clears it" }
+      pagination: none
+
+    delete_email_sending_suppression:
+      method: DELETE
+      path: /accounts/{account_id}/email/sending/suppressions/{suppression_id}
+      access: dangerous
+      description: "Delete a suppression so the address can receive Email Sending mail again."
+      params:
+        account_id: { type: string, in: path, required: true }
+        suppression_id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # EMAIL SENDING -- Sending subdomains & their DNS (zone-scoped)
+    # =========================================================================
+
+    list_email_sending_subdomains:
+      method: GET
+      path: /zones/{zone_id}/email/sending/subdomains
+      access: read
+      description: "List the sending-enabled (sub)domains of a zone: tag (this is the subdomain_id for the other subdomain tools), name, enabled, dkim_selector, return_path_domain, preview_enabled, drop_suppressed_recipients. A zone has none until create_email_sending_subdomain is called."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_sending_subdomain:
+      method: GET
+      path: /zones/{zone_id}/email/sending/subdomains/{subdomain_id}
+      access: read
+      description: "Get one sending subdomain by id (the tag field of list_email_sending_subdomains)."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        subdomain_id: { type: string, in: path, required: true, description: "tag from list_email_sending_subdomains" }
+      pagination: none
+
+    create_email_sending_subdomain:
+      method: POST
+      path: /zones/{zone_id}/email/sending/subdomains
+      access: write
+      description: "Enable Email Sending on a domain of the zone, e.g. 'mail.example.com' or the apex 'example.com' ('*.example.com' wildcards need the wildcard entitlement). Cloudflare creates and locks the DKIM, SPF, DMARC and return-path DNS records and returns the subdomain (tag = subdomain_id). Run preview_email_sending_subdomain first to detect conflicts with existing MX/SPF/DMARC records, then confirm readiness with get_email_sending_subdomain_dns_status. Also re-enables a previously deleted subdomain."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Domain within the zone, e.g. mail.example.com" }
+      pagination: none
+
+    preview_email_sending_subdomain:
+      method: POST
+      path: /zones/{zone_id}/email/sending/subdomains/preview
+      access: read
+      description: "Dry run for create_email_sending_subdomain: returns the DNS records Cloudflare would create for the name plus errors[] with codes such as mx.missing, mx.foreign, spf.multiple, dkim.conflict, dmarc.incompatible, sending_subdomain.conflict (each with the existing/missing/multiple records involved). Nothing is created or modified."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true, description: "Domain within the zone to check, e.g. mail.example.com" }
+      pagination: none
+
+    update_email_sending_subdomain:
+      method: PATCH
+      path: /zones/{zone_id}/email/sending/subdomains/{subdomain_id}
+      access: write
+      description: "Update a sending subdomain (at least one field required): preview_enabled lets sent messages be previewed in the activity log (needed for get_email_sending_message); drop_suppressed_recipients=true makes send_email drop suppressed recipients and deliver to the rest instead of failing the whole request."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        subdomain_id: { type: string, in: path, required: true }
+        preview_enabled: { type: boolean, in: body }
+        drop_suppressed_recipients: { type: boolean, in: body }
+      pagination: none
+
+    delete_email_sending_subdomain:
+      method: DELETE
+      path: /zones/{zone_id}/email/sending/subdomains/{subdomain_id}
+      access: dangerous
+      description: "Disable sending on the subdomain and remove its sending DNS records (DKIM/SPF/DMARC/return-path). Email Routing on the same name is unaffected. Sends with a from address on this subdomain fail afterwards."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        subdomain_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_sending_subdomain_dns:
+      method: GET
+      path: /zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns
+      access: read
+      description: "Return the DNS records a sending subdomain is expected to have (desired state as {type, name, content, priority, ttl}) -- no live comparison; use get_email_sending_subdomain_dns_status for that."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        subdomain_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_sending_subdomain_dns_status:
+      method: GET
+      path: /zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns/status
+      access: read
+      description: "Live DNS health of a sending subdomain: status (ready | unconfigured | unlocked | misconfigured), the desired records, and errors[] (mx.missing, mx.foreign, spf.missing, spf.foreign, spf.multiple, dkim.missing, dkim.conflict, dmarc.missing, dmarc.multiple, dmarc.incompatible, domainkey.delegated, sending_subdomain.conflict). Call this before fix_email_sending_subdomain_dns."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        subdomain_id: { type: string, in: path, required: true }
+      pagination: none
+
+    fix_email_sending_subdomain_dns:
+      method: POST
+      path: /zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns
+      access: write
+      description: "Idempotently repair a sending subdomain's DNS: re-creates missing sending records and re-applies the lock on unlocked ones. Refuses with HTTP 409 while foreign MX, multiple SPF, multiple DMARC or multiple DKIM records exist at the relevant names -- clean those up with the DNS tools first. Returns the same shape as get_email_sending_subdomain_dns_status."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        subdomain_id: { type: string, in: path, required: true }
+      pagination: none
+
+    get_email_sending_subdomain_complaints:
+      method: GET
+      path: /zones/{zone_id}/email/sending/subdomains/{subdomain_id}/reputation/complaints
+      access: read
+      description: "Number of spam complaints matched to a sending subdomain in the half-open window [start_at, end_at), at most seven days long. Returns {complaints}."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        subdomain_id: { type: string, in: path, required: true }
+        start_at: { type: string, in: query, required: true, description: "ISO 8601 window start (inclusive)" }
+        end_at: { type: string, in: query, required: true, description: "ISO 8601 window end (exclusive), at most 7 days after start_at" }
+      pagination: none
+
+    # =========================================================================
+    # EMAIL AUTH -- DMARC reports & SPF inspection (zone-scoped)
+    # =========================================================================
+
+    get_dmarc_reports_status:
+      method: GET
+      path: /zones/{zone_id}/email/auth/dmarc-reports
+      access: read
+      description: "Get the zone's DMARC Management state: enabled (Cloudflare collects DMARC aggregate reports through its RUA address), rua_prefix, status (missing-dmarc-report | multiple-dmarc-reports | missing-dmarc-rua | cname-on-dmarc-record | unauthorized-reporting-domain; the field is absent when DMARC is configured correctly), approved_sources (sending sources seen in reports, with resolved IPs) and records -- the zone's live SPF, DKIM, DMARC and BIMI TXT/CNAME records grouped by type. A good first call for any email-deliverability audit of a zone."
+      params:
+        zone_id: { type: string, in: path, required: true }
+      pagination: none
+
+    configure_dmarc_reports:
+      method: PATCH
+      path: /zones/{zone_id}/email/auth/dmarc-reports
+      access: write
+      description: "Enable or disable Cloudflare DMARC report collection for the zone (at least one of enabled/skip_wizard required). enabled=true ensures the zone's DMARC TXT record carries Cloudflare's rua= reporting address (creating it if needed) so aggregate reports flow into DMARC Management. Returns the same shape as get_dmarc_reports_status."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        enabled: { type: boolean, in: body, description: "Turn DMARC aggregate-report collection on or off" }
+        skip_wizard: { type: boolean, in: body, description: "Skip the dashboard DMARC setup wizard" }
+      pagination: none
+
+    inspect_spf_record:
+      method: GET
+      path: /zones/{zone_id}/email/auth/spf/inspect
+      access: read
+      description: "Parse one SPF TXT record of the zone into a component tree: every mechanism (A, MX, IP4, IP6, INCLUDE, REDIRECT, EXISTS, PTR, ALL) with its qualifier result, nested includes resolved recursively, lookup_count per component and total_lookups (RFC 7208 allows 10), plus errors[] (lookup_failed, spf_not_found, invalid_spf, invalid_domain, loop_detected, invalid_mechanism, ...). id is the DNS record id of the SPF TXT record -- find it with list_dns_records(type='TXT')."
+      params:
+        zone_id: { type: string, in: path, required: true }
+        id: { type: string, in: query, required: true, description: "DNS record id of the SPF TXT record (from list_dns_records)" }
+      pagination: none
+
   # ===========================================================================
   # EXAMPLES
   # ===========================================================================
@@ -2585,3 +3711,69 @@ backend:
         const settings = await api.list_zone_settings({ zone_id: zoneId });
         const cacheSettings = settings.filter(s => ["browser_cache_ttl", "cache_level", "development_mode"].includes(s.id));
         return cacheSettings;
+
+    - name: "Audit and lock Registrar domains"
+      description: "List Cloudflare Registrar domains and enable auto-renew plus registrar lock on each"
+      code: |
+        const domains = await api.list_registrar_domains({ account_id: accountId });
+        for (const d of domains) {
+          await api.update_registrar_domain({
+            account_id: accountId,
+            domain_name: d.name,
+            auto_renew: true,
+            locked: true
+          });
+        }
+        return domains.map(d => ({ name: d.name, expires_at: d.expires_at }));
+
+    - name: "Configure Cloudflare as secondary DNS"
+      description: "Create an account-scoped peer, then point a zone's incoming transfer at it"
+      code: |
+        const peer = await api.create_dns_peer({
+          account_id: accountId,
+          name: "primary-ns1",
+          ip: "203.0.113.53",
+          port: 53,
+          ixfr_enable: true
+        });
+        return await api.create_secondary_dns_incoming({
+          zone_id: zoneId,
+          name: "example.com",
+          peers: [peer.id],
+          auto_refresh_seconds: 86400
+        });
+
+    - name: "Set up email forwarding for a domain"
+      description: "Register a destination mailbox, enable Email Routing on the zone, forward one alias to it and drop everything else"
+      code: |
+        const dest = await api.create_email_destination_address({ account_id: accountId, email: "inbox@example.net" });
+        // The recipient must click the verification link Cloudflare sends before rules can forward to it.
+        await api.enable_email_routing({ zone_id: zoneId });
+        await api.create_email_routing_rule({
+          zone_id: zoneId,
+          name: "hello alias",
+          matchers: [{ type: "literal", field: "to", value: "hello@example.com" }],
+          actions: [{ type: "forward", value: [dest.email] }]
+        });
+        await api.update_email_routing_catch_all({
+          zone_id: zoneId,
+          name: "catch-all",
+          enabled: true,
+          matchers: [{ type: "all" }],
+          actions: [{ type: "drop" }]
+        });
+        return await api.list_email_routing_rules({ zone_id: zoneId });
+
+    - name: "Send a transactional email"
+      description: "Check the daily quota, then send an HTML email from a sending subdomain"
+      code: |
+        const limits = await api.get_email_sending_limits({ account_id: accountId });
+        if (limits.usage && limits.usage.over_quota) throw new Error("daily sending quota exhausted");
+        return await api.send_email({
+          account_id: accountId,
+          from: { address: "noreply@mail.example.com", name: "Example App" },
+          to: ["user@example.net"],
+          subject: "Your report is ready",
+          text: "Your report is ready. Open the dashboard to view it.",
+          html: "<p>Your report is ready. <a href='https://example.com/reports'>Open the dashboard</a>.</p>"
+        });
