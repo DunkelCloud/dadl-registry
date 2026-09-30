@@ -3,7 +3,7 @@
 #
 # Domain Notes for LLM consumers:
 # - Xen Orchestra (XO) is the web management UI for XCP-ng / XenServer hypervisors.
-# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added); current through XO 6.8 (August 2026).
+# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added); current through XO 6.9 (September 2026).
 # - Swagger docs available at /rest/v0/docs (OpenAPI spec for runtime discovery).
 # - Access control: pre-6.4 was admin-only; XO 6.4+ uses fine-grained RBAC v2 (acl-privileges/acl-roles).
 #   Endpoints with no declared privilege still require admin -- see /users/me/acl-privileges to inspect yours.
@@ -49,6 +49,39 @@
 #   and since XO 6.8 a newRule field sent as null is removed from the rule (pre-6.8 kept e.g. the old port silently).
 # - IPMI sensors (XO 6.8): GET /plugins/ipmi-sensors/hosts/{id}/ipmi returns the raw sensor inventory incl. 'unknown'
 #   sensors. Needs the xo-server-ipmi-sensors plugin (404 otherwise); 503 = host has no reachable IPMI device (not transient).
+# - VERSION SKEW: this DADL is used against several XO releases at once (floor 6.4). Routes marked 'XO 6.x+' return 404
+#   on older builds. Body fields are validated strictly by XO's REST layer (tsoa, throw-on-extras) wherever a route has a
+#   typed body -- a field the build does not know is REJECTED with HTTP 400, not ignored (e.g. bypassBackupCheck on 6.8).
+#   Only the pre-6.7 rolling_reboot/rolling_update routes had no body at all and ignored whatever was sent. Rule: omit
+#   fields that are newer than the target XO, and say so in every tool description that carries such a field.
+# - Rolling pool reboot/update (XO 6.9): both are refused with 409 'incorrect state' while a backup job runs on the pool
+#   unless bypassBackupCheck=true. On XCP-ng / XenServer 8.4+ pools an interrupted rolling update leaves a recovery
+#   record: GET /pools/{id}/rolling_update_recovery shows it (404 = nothing to recover), a new rolling_update is refused
+#   until POST /pools/{id}/actions/finalize_rolling_update closes it (force=true abandons unrestored items), and a pool
+#   whose master is already patched while other hosts are not needs acceptCurrentStateAsBaseline=true.
+# - Backup repository space reclaim (XO 6.9): POST /backup-repositories/{id}/actions/reclaim-space -- note the HYPHEN,
+#   unlike /srs/{id}/actions/reclaim_space. Runs XO's per-VM cleanVm (merge orphaned incremental chains, remove disks
+#   without metadata); vmUuid scopes it to one VM. 409 while a job referencing the repository runs, 502 = unreachable.
+# - Live mount (XO 6.9, admin only): POST /backup-archives/{id}/actions/mount_live_disk serves one disk of a backup as a
+#   read-only iSCSI LUN and attaches it to a host as an SR -- nothing is copied. The response id is the liveDiskId for
+#   POST /backup-archives/{id}/live_disks/{liveDiskId}/actions/unmount. Deleting the SR or the VM using the disk
+#   releases the mount on its own. This is the closest REST gets to a restore (a real restore is still GUI/JSON-RPC).
+# - list_backups (GET /backup-archives) returns an EMPTY list unless the query param backup-repository is given:
+#   '*' for all repositories or one repository id (all XO versions, verified live on 6.8 and 6.9). Archive ids contain
+#   slashes, e.g. '<repoId>//xo-vm-backups/<vmUuid>/<timestamp>.json' (double slash as returned by XO) -- pass them
+#   exactly as returned; disks[].id is the diskId for mount_live_disk.
+# - VDI export formats: .vhd and .raw everywhere, .qcow2 added in XO 6.9 (also for VDI snapshots; 422 'Invalid format'
+#   on older builds). Since 6.9 vhd/qcow2 exports read over NBD automatically when available and every format sends
+#   content-length. There are NO preferNbd/nbdConcurrency query params on these routes. Import stays vhd/raw only.
+# - SSE subscriptions (XO 6.9): besides XAPI collections (VM, host, pool, SR, VDI, ...) plus alarm/task, the collection
+#   field accepts user, group, acl-privilege, acl-role, proxy, server, backup-repository, backup-job, schedule.
+#   The stream starts with an 'init' event carrying the connection (subscriber) id.
+# - SDN traffic-rule delete (XO 6.9): a rule is identified by allow + direction + ipRange + protocol + port -- 'allow' is
+#   REQUIRED in delete bodies and a rule that does not match returns 404 (pre-6.9 builds matched without allow and
+#   returned 204 even when nothing was deleted).
+# - Audit records (XO 6.9 Swagger): GET /plugins/audit/records and /records/{id} are xo-server-audit plugin routes,
+#   404 when the plugin is not loaded. They are the XO-side action log (who called which API method from which IP);
+#   the host-level XAPI audit log is GET /hosts/{id}/audit.txt.
 # - Backup repositories ("remotes") became WRITABLE in XO 6.6: POST /backup-repositories (create),
 #   PATCH /backup-repositories/{id} (update). Pre-6.6 they were read-only. There is NO DELETE route --
 #   removal is POST /backup-repositories/{id}/actions/forget (forget_backup_repository).
@@ -57,8 +90,11 @@
 # - Host power/lifecycle over REST (XO 6.6): start, clean_shutdown, clean_reboot, smart_reboot, restart_toolstack,
 #   emergency_shutdown, detach and forget are all POST /hosts/{id}/actions/<name>. Older builds only had
 #   disable/enable/management_reconfigure.
-# - Maintenance mode (XO 6.7): POST /hosts/{id}/actions/disable accepts autoEnable -- set it to false so the host
-#   STAYS disabled across a reboot (safe hardware intervention). Default behaviour re-enables the host on boot.
+# - Maintenance mode: since XO 6.7 POST /hosts/{id}/actions/disable is PERSISTENT by default -- the host stays disabled
+#   across toolstack restarts and reboots until enable_host (XAPI host.disable with transient=false). autoEnable=true
+#   makes it transient again (XAPI default: re-enabled at the next toolstack restart). XO 6.6 had no such field, always
+#   disabled transiently, and rejects autoEnable with 400. The persistent form needs XAPI >= 25.31.0 on the host
+#   (older XAPI fails the call) -- send autoEnable=true against older hosts. Verified in xo-server code 2026-09-30.
 # - PIF rescan (XO 6.8): POST /hosts/{id}/actions/scan_pifs makes XAPI re-detect the physical NICs of a RUNNING host
 #   (409 if halted) and creates PIF objects for new ones. 404 on pre-6.8 builds.
 # - Pool membership: POST /pools/{id}/actions/add_host makes a standalone host join the pool (XO 6.6). The changelog
@@ -76,10 +112,11 @@
 # - Sub-resources: alarms, messages, tasks are exposed per-object as /<type>/{id}/{alarms|messages|tasks}.
 # - Stats: /vms/{id}/stats and /hosts/{id}/stats accept ?granularity=seconds|minutes|hours|days.
 # - VM export: .xva (native), .ova. Compression: gzip (slow), zstd (fast, XCP-ng only).
-# - VDI export: .vhd (default), .raw. Import to existing VDI requires exact size match.
+# - VDI export: .vhd (default), .raw, .qcow2 (XO 6.9+). Import to existing VDI (vhd/raw only) requires exact size match.
 # - UUID "_" means "any/default" for collection-level actions (e.g. /pools/_/actions does not exist anymore --
 #   action discovery is now via Swagger spec at /rest/v0/docs).
-# - Backup jobs: use /backup-jobs (modern). Old /backup/jobs/vm subroutes are DEPRECATED (removal 2026-09-12).
+# - Backup jobs: use /backup-jobs (modern). Old /backup/jobs/vm subroutes are DEPRECATED (removal announced for
+#   2026-09-12, still present in 6.9 -- do not rely on them).
 # - Auth tokens: the authentication-token endpoints (GET/POST /users/{id}/authentication_tokens) are deliberately
 #   NOT exposed as tools -- their responses contain plaintext bearer tokens (the GET list even includes the token
 #   used to make the request). Create or revoke tokens outside ToolMesh: xo-cli --createToken or the XO web UI.
@@ -92,15 +129,15 @@ credits:
 
 source_name: "Xen Orchestra REST API"
 source_url: "https://docs.xen-orchestra.com/restapi"
-date: "2026-08-31"
+date: "2026-09-30"
 
 backend:
   name: xen-orchestra
   type: rest
-  version: "3.8"
+  version: "3.9"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
-  description: "Xen Orchestra REST API (XO 6.4+, current through 6.8) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode + PIF rescan), pools (incl. add_host), storage (SR create/delete, VDI incl. PATCH update, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (jobs/logs/repositories incl. health + benchmark/restore), schedules, messages, alarms, events (SSE), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), proxies, servers, dashboards, SDN traffic rules (add/delete/update), IPMI sensor inventory (plugin), health check"
+  description: "Xen Orchestra REST API (XO 6.4+, current through 6.9) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode + PIF rescan), pools (incl. add_host, rolling reboot/update with interrupted-update recovery + finalize), storage (SR create/delete, VDI incl. PATCH update + vhd/raw/qcow2 export, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (archives incl. live mount of backup disks, jobs/logs, repositories incl. health + benchmark + space reclaim), schedules, messages, alarms, events (SSE incl. non-XAPI collections), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), proxies, servers, dashboards, SDN traffic rules (add/delete/update), IPMI sensor inventory (plugin), audit records (plugin), health check"
 
   auth:
     type: bearer
@@ -136,12 +173,12 @@ backend:
       max_items: 500
 
   coverage:
-    endpoints: 267
-    total_endpoints: 269
+    endpoints: 275
+    total_endpoints: 277
     percentage: 99
-    focus: "Complete REST API coverage for XO 6.4+: all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full host power/lifecycle control (start, clean/smart reboot, clean/emergency shutdown, restart toolstack, disable/enable incl. reboot-persistent maintenance mode, detach, forget, pool join, PIF rescan), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges, plus reading role-to-user/group assignments), backups (archives, jobs, logs, restore-logs, writable repositories incl. health check and throughput benchmark, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update incl. pinned-VM handling, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), IPMI sensor inventory (ipmi-sensors plugin), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + import_vdi_to_existing + import_vdi_to_existing_raw)."
-    missing: "Authentication-token routes (GET/POST /users/{id}/authentication_tokens) are deliberately NOT exposed: their responses contain plaintext bearer tokens -- the GET list even includes the token used to make the request (see XO PR #10233) -- which must never enter an LLM context. Create/revoke tokens via xo-cli --createToken or the XO web UI instead; do NOT re-add these routes. Backup RESTORE is not exposed over REST -- backup archives, jobs and logs can be read, but restoring a restore-point onto a target SR must be done in the XO GUI or via the JSON-RPC API. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed; the IPMI inventory route (/plugins/ipmi-sensors/*) likewise requires the xo-server-ipmi-sensors plugin (>= 2.1.1, XO 6.8+) and returns 503 on hosts without a reachable IPMI device. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- removal scheduled for 2026-09-12 / 2026-10-13. Version floor: routes marked 'XO 6.7+' in their description return 404 on 6.6.x -- create_sr, update_vdi, list_acl_role_users, list_acl_role_groups, list_group_acl_roles -- and the 6.7 body params autoEnable (disable_host), shutdownPinnedVms (rolling_reboot_pool / rolling_update_pool) and high_availability (create_vm) are ignored by older builds"
-    last_reviewed: "2026-08-31"
+    focus: "Complete REST API coverage for XO 6.4+: all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full host power/lifecycle control (start, clean/smart reboot, clean/emergency shutdown, restart toolstack, disable/enable incl. reboot-persistent maintenance mode, detach, forget, pool join, PIF rescan), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges, plus reading role-to-user/group assignments), backups (archives incl. live mount of backup disks, jobs, logs, restore-logs, writable repositories incl. health check, throughput benchmark and space reclaim, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update incl. pinned-VM handling, interrupted-update recovery and finalize, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), IPMI sensor inventory (ipmi-sensors plugin), audit records (audit plugin), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + export_vdi_qcow2 + import_vdi_to_existing + import_vdi_to_existing_raw)."
+    missing: "Authentication-token routes (GET/POST /users/{id}/authentication_tokens) are deliberately NOT exposed: their responses contain plaintext bearer tokens -- the GET list even includes the token used to make the request (see XO PR #10233) -- which must never enter an LLM context. Create/revoke tokens via xo-cli --createToken or the XO web UI instead; do NOT re-add these routes. Backup RESTORE is not exposed over REST -- backup archives, jobs and logs can be read, but restoring a restore-point onto a target SR must be done in the XO GUI or via the JSON-RPC API; since XO 6.9 a backup disk can at least be live-mounted read-only on a host (mount_backup_live_disk) to read its content without a restore. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed; the IPMI inventory route (/plugins/ipmi-sensors/*) likewise requires the xo-server-ipmi-sensors plugin (>= 2.1.1, XO 6.8+) and returns 503 on hosts without a reachable IPMI device; the audit-record routes (/plugins/audit/*) require the xo-server-audit plugin. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- announced for removal on 2026-09-12 / 2026-10-13 and still present in 6.9; do not rely on them. Version floor: routes marked 'XO 6.7+' return 404 on 6.6.x (create_sr, update_vdi, list_acl_role_users, list_acl_role_groups, list_group_acl_roles), 'XO 6.8+' on 6.7.x (scan_pifs_host, get_host_ipmi_sensors) and 'XO 6.9+' on 6.8.x (get_pool_rolling_update_recovery, finalize_rolling_update_pool, reclaim_space_backup_repository, mount_backup_live_disk, unmount_backup_live_disk, list_audit_records, get_audit_record; export_vdi_qcow2 answers 422 there). Body fields newer than the target build are REJECTED with HTTP 400 by XO's typed routes -- bypassBackupCheck and acceptCurrentStateAsBaseline (6.9) on 6.7/6.8 -- so omit them on older XO; only the pre-6.7 rolling_reboot/rolling_update routes had no body at all and silently ignore shutdownPinnedVms"
+    last_reviewed: "2026-09-30"
 
   setup:
     credential_steps:
@@ -207,9 +244,14 @@ backend:
     emergency_shutdown_pool:
       warning: "Shuts down ALL VMs and hosts in the pool. Use only in emergencies."
     rolling_reboot_pool:
-      note: "Reboots each host sequentially, migrating VMs automatically. No downtime. VMs that cannot migrate (PCI passthrough, SR-IOV, vGPU, affinity) abort the run unless shutdownPinnedVms=true (XO 6.7+)."
+      note: "Reboots each host sequentially, migrating VMs automatically. No downtime. VMs that cannot migrate (PCI passthrough, SR-IOV, vGPU, affinity) fail the run (409) unless shutdownPinnedVms=true (XO 6.7+). XO 6.9+: refused (409) while a backup job runs on the pool unless bypassBackupCheck=true -- do not send that field to 6.7/6.8 (400)."
     rolling_update_pool:
-      note: "Applies pending updates to each host sequentially with live migration. Same shutdownPinnedVms handling as rolling_reboot_pool (XO 6.7+). XO 6.7 also refuses to start a second concurrent run on the same pool."
+      note: "Applies pending updates to each host sequentially with live migration. Same shutdownPinnedVms/bypassBackupCheck handling as rolling_reboot_pool. XO 6.9+ on XCP-ng/XS 8.4+ pools: refused (409) while a previous run is running or left an unfinalized recovery record (get_pool_rolling_update_recovery / finalize_rolling_update_pool); a pool whose master is already up to date needs acceptCurrentStateAsBaseline=true."
+    finalize_rolling_update_pool:
+      added: "XO 6.9 -- 404 on older builds."
+      note: "Read get_pool_rolling_update_recovery first. Without force the call fails with 409 while HA/WLB/schedules/disabled hosts/halted VMs are still unrestored; force=true abandons them (listed in the task) and changes nothing in the pool."
+    get_pool_rolling_update_recovery:
+      added: "XO 6.9 -- 404 on older builds and when there is nothing to recover."
     create_pool_network:
       modes: "Three flavors: create_network (basic with PIF), create_bonded_network (link aggregation across pifIds with bondMode), create_internal_network (host-internal, no physical PIF)"
       body_fields: "All three share name/description/mtu/nbd -- NOT name_label/name_description. nbd=true enables Network Block Device for backup traffic (XO 6.6+)."
@@ -218,7 +260,7 @@ backend:
     management_reconfigure_pool:
       warning: "Takes a NETWORK id, unlike management_reconfigure_host which takes a PIF id. XO resolves the matching PIF on each host itself."
     disable_host:
-      maintenance_mode: "This is 'maintenance mode'. autoEnable=false (XO 6.7+) keeps the host disabled across reboots -- set it before pulling hardware, otherwise the host re-enables itself on boot and XAPI starts placing VMs on it again."
+      maintenance_mode: "This is 'maintenance mode'. Since XO 6.7 the REST default (autoEnable omitted/false) keeps the host disabled across toolstack restarts and reboots until enable_host -- right for hardware interventions. autoEnable=true = transient: XAPI re-enables the host at the next toolstack restart. XO 6.6: always transient, autoEnable rejected with 400. Persistent form needs XAPI >= 25.31.0 on the host."
     smart_reboot_host:
       note: "Suspends resident VMs, reboots, resumes them -- no migration target needed. Prefer this over clean_reboot_host when the pool has no spare capacity for evacuation."
     forget_host:
@@ -233,7 +275,7 @@ backend:
       granularity: "seconds (last 10min) | minutes (last 2h) | hours (last week) | days (last year)"
       data_sources: "Use add/delete data_source endpoints to enable/disable specific RRD metrics (e.g. cpu0, vif_0_rx)"
     open_events_stream:
-      note: "Server-Sent Events (SSE) connection. The endpoint returns a subscription ID; then use POST /events/{id}/subscriptions to add object-type listeners (VM, host, pool, etc.). Events emitted: ping, add, update, remove."
+      note: "Server-Sent Events (SSE) connection. The first event is 'init' with the connection id; then use POST /events/{id}/subscriptions to add collection listeners (VM, host, pool, ... and since XO 6.9 also user, group, acl-role, acl-privilege, proxy, server, backup-repository, backup-job, schedule). Events emitted: init, ping, add, update, remove."
     run_schedule:
       note: "Manually triggers a backup-job execution outside its cron schedule. Returns a task reference."
     get_dashboard:
@@ -249,7 +291,7 @@ backend:
     add_network_traffic_rule:
       note: "Requires the xo-server-sdn-controller plugin; returns 404 if not loaded. Applies to private (tunnel) networks managed by the SDN controller. allow=false drops matching traffic."
     delete_network_traffic_rule:
-      note: "Identify the rule to remove by matching its direction + ipRange + protocol + port. Requires the SDN controller plugin."
+      note: "Identify the rule to remove by allow + direction + ipRange + protocol + port (allow is required since XO 6.9; 6.9+ answers 404 when no rule matches). Requires the SDN controller plugin."
     add_vif_traffic_rule:
       note: "Per-VIF variant of add_network_traffic_rule -- scopes the rule to a single VM interface. Requires the SDN controller plugin."
     get_mcp_status:
@@ -279,6 +321,18 @@ backend:
       note: "Requires the xo-server-sdn-controller plugin (404 otherwise). Identify the existing rule by direction+ipRange+protocol+port, then send the new allow value. Added XO 6.6."
     update_vif_traffic_rule:
       note: "Per-VIF variant of update_network_traffic_rule. Requires the SDN controller plugin. Added XO 6.6."
+    reclaim_space_backup_repository:
+      added: "XO 6.9 -- 404 on older builds. The path uses a hyphen (reclaim-space), unlike reclaim_space_sr."
+      note: "remove=true deletes orphaned backup disks irreversibly; 409 while a job on this repository runs. Async: poll the task."
+    mount_backup_live_disk:
+      added: "XO 6.9 -- 404 on older builds. Administrators only."
+      flow: "get_backup -> pick disks[].id -> mount_backup_live_disk (?sync gives {id, srUuid, vdiUuid}) -> attach the VDI to a VM (create_vbd) -> read -> unmount_backup_live_disk with the returned id."
+    export_vdi_qcow2:
+      added: "XO 6.9 -- older builds answer 422 Invalid format."
+    list_backups:
+      note: "backup-repository='*' or a repository id is required in practice -- XO returns [] without it (all versions)."
+    list_audit_records:
+      note: "xo-server-audit plugin routes; 404 when the plugin is not loaded. fields='*' for full records, from + limit for paging."
 
   tools:
 
@@ -1607,13 +1661,13 @@ backend:
       method: POST
       path: /hosts/{uuid}/actions/disable
       access: admin
-      description: "Disable a host = enter maintenance mode. Optionally evacuate VMs in the same call (body.evacuate=true, optional force/vmIdsToForceMigrate). Pass autoEnable=false (XO 6.7+) to keep the host disabled across a reboot -- use that for hardware interventions, otherwise the host re-enables itself on boot."
+      description: "Disable a host = enter maintenance mode (no new VMs are placed on it). Optionally evacuate VMs in the same call (evacuate=true, optional force/vmIdsToForceMigrate). Since XO 6.7 the disable is PERSISTENT by default: the host stays disabled across toolstack restarts and reboots until enable_host. Send autoEnable=true for a transient disable that XAPI lifts at the next toolstack restart. XO 6.6 always disabled transiently and rejects autoEnable with HTTP 400. The persistent form requires XAPI >= 25.31.0 on the host; on older hosts the call fails unless autoEnable=true."
       params:
         uuid: { type: string, in: path, required: true }
         evacuate: { type: boolean, in: body, description: "True = evacuate VMs to other hosts" }
         force: { type: boolean, in: body, description: "Force migration even if rules disagree (with evacuate=true)" }
         vmIdsToForceMigrate: { type: array, in: body, description: "Specific VM UUIDs to force-migrate" }
-        autoEnable: { type: boolean, in: body, description: "XO 6.7+: false = stay in maintenance mode across reboots; true (default) = re-enable on boot. Ignored by older builds." }
+        autoEnable: { type: boolean, in: body, description: "XO 6.7+: true = transient disable, XAPI re-enables the host at the next toolstack restart; false/omitted (default) = stays disabled until enable_host (needs XAPI >= 25.31.0 on the host). XO 6.6 rejects the field with 400." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1797,6 +1851,15 @@ backend:
         ndjson: { type: boolean, in: query }
         markdown: { type: boolean, in: query }
 
+    get_pool_rolling_update_recovery:
+      method: GET
+      path: /pools/{uuid}/rolling_update_recovery
+      access: read
+      description: "XO 6.9+ (404 on older builds). Recovery status of an incomplete rolling pool update: run status (preparing|running|interrupted|resuming|failed|cleaning|succeeded), per-host step statuses, lastError, taskId and haltedPinnedVms (VM UUID -> UUID of the host it must be started on); or {status: 'blocked', blockedReason} when the record is unreadable. HTTP 404 means nothing to recover: the last rolling update completed, or the pool master is not XCP-ng / XenServer 8.4+ (no record is kept for older pools). Check it before rolling_update_pool (refused while a record exists) and before finalize_rolling_update_pool."
+      params:
+        uuid: { type: string, in: path, required: true }
+      pagination: none
+
     list_pool_messages:
       method: GET
       path: /pools/{uuid}/messages
@@ -1878,10 +1941,11 @@ backend:
       method: POST
       path: /pools/{pool_id}/actions/rolling_reboot
       access: admin
-      description: "Sequentially reboot hosts with automatic VM migration. Zero downtime for migratable VMs."
+      description: "Sequentially reboot hosts with automatic VM migration; zero downtime for migratable VMs. Returns a task (poll with get_task). XO 6.9+: refused with HTTP 409 'incorrect state' while a backup job runs on the pool unless bypassBackupCheck=true, and VMs are moved back to their original host more reliably."
       params:
         pool_id: { type: string, in: path, required: true }
-        shutdownPinnedVms: { type: boolean, in: body, description: "XO 6.7+: shut down VMs that cannot be migrated (PCI passthrough, SR-IOV, vGPU, affinity-pinned) instead of aborting the run. They are restarted afterwards. Ignored by older builds." }
+        shutdownPinnedVms: { type: boolean, in: body, description: "XO 6.7+: shut down VMs that cannot be migrated (PCI passthrough, SR-IOV, vGPU, affinity-pinned) instead of failing the run with 409; they are started again on their host afterwards. Pre-6.7 builds have no body on this route and ignore it." }
+        bypassBackupCheck: { type: boolean, in: body, description: "XO 6.9+: skip the safety check that refuses the run (409) while a backup job runs on the pool. Default false. Only send on XO 6.9+ -- 6.7/6.8 reject the unknown field with HTTP 400." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -1889,10 +1953,23 @@ backend:
       method: POST
       path: /pools/{pool_id}/actions/rolling_update
       access: admin
-      description: "Apply updates to hosts sequentially with live migration"
+      description: "Apply pending updates to hosts sequentially with live migration. Returns a task (poll with get_task). XO 6.9+: refused with HTTP 409 'incorrect state' while a backup job runs on the pool (bypassBackupCheck=true overrides), while a previous rolling update is still running, and -- on XCP-ng / XenServer 8.4+ pools -- while an interrupted run has not been closed with finalize_rolling_update_pool, or when the master is already up to date but other hosts are not (send acceptCurrentStateAsBaseline=true to continue from that state). XO 6.7/6.8 already refused a second concurrent run."
       params:
         pool_id: { type: string, in: path, required: true }
-        shutdownPinnedVms: { type: boolean, in: body, description: "XO 6.7+: shut down VMs that cannot be migrated (PCI passthrough, SR-IOV, vGPU, affinity-pinned) instead of aborting the run. They are restarted afterwards. Ignored by older builds." }
+        shutdownPinnedVms: { type: boolean, in: body, description: "XO 6.7+: shut down VMs that cannot be migrated (PCI passthrough, SR-IOV, vGPU, affinity-pinned) instead of failing the run with 409; they are started again on their host afterwards. Pre-6.7 builds have no body on this route and ignore it." }
+        bypassBackupCheck: { type: boolean, in: body, description: "XO 6.9+: skip the safety check that refuses the run (409) while a backup job runs on the pool. Default false. Only send on XO 6.9+ -- 6.7/6.8 reject the unknown field with HTTP 400." }
+        acceptCurrentStateAsBaseline: { type: boolean, in: body, description: "XO 6.9+: start even though the master is already up to date while another host is not (pool left partially updated). Ignored on pre-8.4 XenServer / Citrix Hypervisor pools, which are never refused. Default false. Only send on XO 6.9+ -- 6.7/6.8 reject the unknown field with HTTP 400." }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    finalize_rolling_update_pool:
+      method: POST
+      path: /pools/{pool_id}/actions/finalize_rolling_update
+      access: admin
+      description: "XO 6.9+ (404 on older builds). Close the recovery record of an interrupted rolling pool update once the pool has been reviewed -- until then a new rolling_update_pool on this pool is refused. Refused with HTTP 409 'incorrect state' listing what the update changed and did not restore (HA, auto power-on, WLB, load balancer, backup schedules, disabled hosts, displaced or halted VMs) while any such item remains; displaced VMs alone are only listed. force=true closes it anyway: the items are abandoned and listed in the task, nothing is restored or changed in the pool. 404 when the pool has no recovery record (check get_pool_rolling_update_recovery first). Only XCP-ng / XenServer 8.4+ pools keep such records. Returns a task."
+      params:
+        pool_id: { type: string, in: path, required: true }
+        force: { type: boolean, in: body, description: "Close the record even though items are left unrestored or the record cannot be read -- they are abandoned and listed in the task; nothing in the pool is changed. Default false." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2237,11 +2314,9 @@ backend:
       method: GET
       path: /vdis/{uuid}.vhd
       access: read
-      description: "Export a VDI as VHD"
+      description: "Export a VDI as VHD, whatever format the disk is stored in. Binary download. Since XO 6.9 the export reads the disk over NBD automatically when available and always sends content-length; the route has no NBD tuning query params."
       params:
         uuid: { type: string, in: path, required: true }
-        preferNbd: { type: boolean, in: query }
-        nbdConcurrency: { type: integer, in: query }
       response:
         binary: true
         content_type: application/octet-stream
@@ -2251,11 +2326,21 @@ backend:
       method: GET
       path: /vdis/{uuid}.raw
       access: read
-      description: "Export a VDI as raw disk image"
+      description: "Export a VDI as a raw disk image, whatever format the disk is stored in. Binary download; since XO 6.9 content-length is always sent. The route has no NBD tuning query params."
       params:
         uuid: { type: string, in: path, required: true }
-        preferNbd: { type: boolean, in: query }
-        nbdConcurrency: { type: integer, in: query }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    export_vdi_qcow2:
+      method: GET
+      path: /vdis/{uuid}.qcow2
+      access: read
+      description: "XO 6.9+ (older builds answer 422 'Invalid format'). Export a VDI as qcow2, whatever format the disk is stored in; reads over NBD when available and sends content-length. Binary download. Importing back is vhd/raw only (import_vdi_to_existing, import_vdi_to_sr)."
+      params:
+        uuid: { type: string, in: path, required: true }
       response:
         binary: true
         content_type: application/octet-stream
@@ -2332,10 +2417,10 @@ backend:
       method: GET
       path: /vdi-snapshots/{uuid}.{format}
       access: read
-      description: "Export a VDI snapshot as VHD or raw. Format is the file extension ('vhd' or 'raw')."
+      description: "Export a VDI snapshot as VHD, raw or (XO 6.9+) qcow2. Format is the file extension; qcow2 on older builds answers 422 'Invalid format'. Binary download."
       params:
         uuid: { type: string, in: path, required: true }
-        format: { type: string, in: path, required: true, description: "'vhd' or 'raw'" }
+        format: { type: string, in: path, required: true, description: "'vhd', 'raw' or 'qcow2' (qcow2 requires XO 6.9+)" }
       response:
         binary: true
         content_type: application/octet-stream
@@ -2741,9 +2826,10 @@ backend:
       method: POST
       path: /plugins/sdn-controller/networks/{uuid}/actions/delete_traffic_rule
       access: write
-      description: "Remove a traffic rule from a private SDN network. Match the existing rule by direction/ipRange/protocol/port. Requires the SDN Controller plugin."
+      description: "Remove a traffic rule from a private SDN network. The rule is identified by allow + direction + ipRange + protocol + port exactly as it was added. Since XO 6.9 a non-matching rule returns HTTP 404 (older builds returned 204 without deleting anything and ignored allow). Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "Network UUID" }
+        allow: { type: boolean, in: body, required: true, description: "true for an allow rule, false for a deny rule -- part of the rule identity. Required since XO 6.9 (400 without it); accepted and ignored by older builds." }
         direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to remove: 'from' or 'to'" }
         ipRange: { type: string, in: body, required: true, description: "IP range of the rule to remove" }
         protocol: { type: string, in: body, required: true, description: "Protocol of the rule to remove" }
@@ -2782,9 +2868,10 @@ backend:
       method: POST
       path: /plugins/sdn-controller/vifs/{uuid}/actions/delete_traffic_rule
       access: write
-      description: "Remove a traffic rule from a VIF connected to a private SDN network. Match the existing rule by direction/ipRange/protocol/port. Requires the SDN Controller plugin."
+      description: "Remove a traffic rule from a VIF connected to a private SDN network. The rule is identified by allow + direction + ipRange + protocol + port exactly as it was added. Since XO 6.9 a non-matching rule returns HTTP 404 (older builds returned 204 without deleting anything and ignored allow). Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "VIF UUID" }
+        allow: { type: boolean, in: body, required: true, description: "true for an allow rule, false for a deny rule -- part of the rule identity. Required since XO 6.9 (400 without it); accepted and ignored by older builds." }
         direction: { type: string, in: body, required: true, description: "Traffic direction of the rule to remove: 'from' or 'to'" }
         ipRange: { type: string, in: body, required: true, description: "IP range of the rule to remove" }
         protocol: { type: string, in: body, required: true, description: "Protocol of the rule to remove" }
@@ -2815,6 +2902,28 @@ backend:
       description: "Raw IPMI sensor inventory of a host: {productName, systemManufacturer, sensors: [{name, value, event, dataType}]}. dataType is one of totalPower/inletTemp/outletTemp/cpuTemp/fanSpeed/fanStatus/psuPower/psuStatus/bmcStatus/ip/unknown -- 'unknown' sensors are included here (unlike the categorized XO5 view). Requires XO 6.8+ with the xo-server-ipmi-sensors plugin loaded (404 otherwise); returns 503 if the host has no reachable IPMI device -- treat 503 as a definitive answer, not a transient error."
       params:
         uuid: { type: string, in: path, required: true, description: "Host UUID" }
+      pagination: none
+
+    # Audit plugin (xo-server-audit) -- routes documented in the XO 6.9 Swagger; 404 when the plugin is not loaded
+    list_audit_records:
+      method: GET
+      path: /plugins/audit/records
+      access: admin
+      description: "List XO audit records (who called which API method with which params, from which IP), newest first. Requires the xo-server-audit plugin (404 otherwise; route documented in Swagger since XO 6.9). Without fields the result is a list of record hrefs; fields='*' returns full records {id, previousId, event, time (ms epoch), subject:{userId,userName,userIp}, data:{method,params}}. Page with limit plus from (id of the record to continue from). filter uses XO filter syntax, e.g. 'event:apiCall'. The host-level XAPI audit log is get_host_audit_log."
+      params:
+        from: { type: string, in: query, description: "Record id to continue from, taken from the previous page" }
+        limit: { type: integer, in: query, description: "Maximum number of records, e.g. 100" }
+        filter: { type: string, in: query, description: "XO filter expression, e.g. 'event:apiCall'" }
+        fields: { type: string, in: query, description: "'*' for full records or a comma-separated field list" }
+      pagination: none
+
+    get_audit_record:
+      method: GET
+      path: /plugins/audit/records/{id}
+      access: admin
+      description: "Get one XO audit record by id: {id, previousId, event, time, subject:{userId,userName,userIp}, data:{method,params}}. Requires the xo-server-audit plugin (404 otherwise, and 404 for unknown ids). Route documented in Swagger since XO 6.9."
+      params:
+        id: { type: string, in: path, required: true, description: "Audit record id (base64 hash)" }
       pagination: none
 
     # =========================================================================
@@ -3103,7 +3212,7 @@ backend:
       method: GET
       path: /events
       access: read
-      description: "Open an SSE (Server-Sent Events) connection. Returns a subscriber id which is used to add/remove subscriptions. Events emitted: ping (keepalive), add (object created), update (object changed), remove (object deleted)."
+      description: "Open an SSE (Server-Sent Events) connection. The first event is 'init' and carries the connection id, i.e. the subscriber id for add_event_subscription / remove_event_subscription; afterwards ping (keepalive), add (object created), update (object changed), remove (object deleted). Since XO 6.9 subscriptions can also cover non-XAPI collections (users, groups, ACL roles/privileges, proxies, servers, backup repositories/jobs, schedules)."
       pagination: none
 
     add_event_subscription:
@@ -3113,7 +3222,7 @@ backend:
       description: "Add an object-type subscription to an open SSE connection. Returns the subscription id (= collection name)."
       params:
         id: { type: string, in: path, required: true, description: "Subscriber UUID returned by open_events_stream" }
-        collection: { type: string, in: body, required: true, description: "XO collection: 'VM', 'host', 'pool', 'SR', 'VDI', 'task', etc." }
+        collection: { type: string, in: body, required: true, description: "Collection to watch. XAPI types ('VM', 'host', 'pool', 'SR', 'VDI', 'VBD', 'VIF', 'network', 'PIF', 'PBD', 'VM-snapshot', 'VM-template', ...) plus 'alarm' and 'task'. XO 6.9+ also accepts 'user', 'group', 'acl-privilege', 'acl-role', 'proxy', 'server', 'backup-repository', 'backup-job', 'schedule' -- not accepted by older builds." }
         fields: { type: string, in: body, description: "Either '*' (all fields) or array of field names" }
       pagination: none
 
@@ -3135,8 +3244,9 @@ backend:
       method: GET
       path: /backup-archives
       access: read
-      description: "List all backup archives"
+      description: "List backup archives (restore points) stored on backup repositories. backup-repository is effectively REQUIRED: '*' lists every repository, or pass one repository id (from list_backup_repositories) -- without it XO answers an empty list (all versions). Archive ids contain slashes (e.g. '<repoId>//xo-vm-backups/<vmUuid>/<timestamp>.json') -- pass them to get_backup / mount_backup_live_disk exactly as returned; use fields=id,backupRepository,vm,timestamp,mode,disks for structured restore points. Filter example: filter='disks:length:>0'."
       params:
+        backup-repository: { type: string, in: query, required: true, description: "'*' for all repositories or one backup repository id" }
         fields: { type: string, in: query }
         filter: { type: string, in: query }
         limit: { type: integer, in: query }
@@ -3150,6 +3260,29 @@ backend:
       description: "Get details of a backup archive."
       params:
         id: { type: string, in: path, required: true }
+      pagination: none
+
+    mount_backup_live_disk:
+      method: POST
+      path: /backup-archives/{id}/actions/mount_live_disk
+      access: admin
+      description: "XO 6.9+ (404 on older builds), administrators only. Serve one disk of a backup archive as a read-only iSCSI LUN and attach it to a host as a new SR, so its content can be read (e.g. attach the VDI to a VM with create_vbd) WITHOUT restoring: nothing is copied, blocks are read from the backup repository on demand. diskId is one of the archive's disks[].id (see get_backup), hostId the host that receives the SR. With ?sync the result is {id, srUuid, vdiUuid, iqn, address, port} (HTTP 201) -- keep id: it is the liveDiskId for unmount_backup_live_disk. Without sync a task is returned. The mount is released automatically when the SR or the VM holding the disk is deleted; otherwise unmount it. XO's address must be reachable from the host (auto-detected, or set iscsi.advertisedAddress in the xo-server config)."
+      params:
+        id: { type: string, in: path, required: true, description: "Backup archive id exactly as returned by list_backups, e.g. '<repoId>//xo-vm-backups/<vmUuid>/<timestamp>.json'" }
+        diskId: { type: string, in: body, required: true, description: "One of the archive's disks[].id" }
+        hostId: { type: string, in: body, required: true, description: "UUID of the host to attach the read-only SR to" }
+        sync: { type: boolean, in: query, description: "Return the mount object directly instead of a task" }
+      pagination: none
+
+    unmount_backup_live_disk:
+      method: POST
+      path: /backup-archives/{id}/live_disks/{liveDiskId}/actions/unmount
+      access: admin
+      description: "XO 6.9+ (404 on older builds), administrators only. Detach a disk mounted by mount_backup_live_disk: the SR is unplugged and forgotten and the iSCSI target is stopped. liveDiskId is the id returned by the mount; 404 if it does not belong to this archive. 204 on success (with ?sync), otherwise a task."
+      params:
+        id: { type: string, in: path, required: true, description: "Backup archive id the disk was mounted from" }
+        liveDiskId: { type: string, in: path, required: true, description: "id returned by mount_backup_live_disk" }
+        sync: { type: boolean, in: query }
       pagination: none
 
     list_backup_jobs:
@@ -3290,6 +3423,19 @@ backend:
       params:
         id: { type: string, in: path, required: true }
         sync: { type: boolean, in: query, description: "Block until the benchmark finishes -- likely to hit a request timeout; prefer the async task." }
+      pagination: none
+
+    reclaim_space_backup_repository:
+      method: POST
+      path: /backup-repositories/{id}/actions/reclaim-space
+      access: dangerous
+      description: "XO 6.9+ (404 on older builds; note the HYPHEN in reclaim-space, unlike the SR route). Reclaim space on a backup repository by running XO's per-VM cleanup: merge=true merges orphaned incremental chains, remove=true deletes backup disks that have no metadata left (both default true -- irreversible for that orphaned data; intact restore points are not touched). vmUuid limits the run to one VM (404 if that VM has no backups on this repository); without it every VM on the repository is cleaned. Refused with HTTP 409 while a backup job referencing the repository is running; 502 = repository unreachable. Proxied repositories are supported (10 min timeout). Long-running: omit sync and poll the returned task, whose result lists per-VM merge/size figures."
+      params:
+        id: { type: string, in: path, required: true }
+        vmUuid: { type: string, in: body, description: "Limit the cleanup to the backups of this VM (UUID). Omit to clean the whole repository." }
+        merge: { type: boolean, in: body, description: "Merge orphaned incremental chains. Default true." }
+        remove: { type: boolean, in: body, description: "Delete backup disks without metadata. Default true; set false to only merge." }
+        sync: { type: boolean, in: query, description: "Block until the cleanup finishes -- likely to hit a request timeout on large repositories; prefer the async task." }
       pagination: none
 
     # =========================================================================
