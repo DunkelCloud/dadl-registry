@@ -4,7 +4,7 @@ credits:
   - "Dunkel Cloud GmbH"
 source_name: "Vikunja REST API"
 source_url: "https://vikunja.io/docs/api/"
-date: "2026-08-23"
+date: "2026-10-10"
 
 backend:
   name: vikunja
@@ -19,7 +19,7 @@ backend:
     percentage: 36
     focus: "projects, tasks, views, buckets, labels, comments, positions, filters, attachments"
     missing: "teams, users, shares, assignees, task relations, reactions, notifications, webhooks, subscriptions, saved filters"
-    last_reviewed: "2026-08-23"
+    last_reviewed: "2026-10-10"
 
   setup:
     credential_steps:
@@ -142,8 +142,11 @@ backend:
   #
   # Views & saved filters:
   #   A project view can carry its own persisted `filter` query; it is returned in full
-  #   by list_views (incl. view_kind). Standalone "saved filters" (/filters/*) are a
-  #   separate resource and are not yet exposed.
+  #   by list_views (incl. view_kind). list_project_tasks applies the view's filter ON TOP
+  #   of the caller's filter. Vikunja creates the default List view with "done = false",
+  #   so completed tasks are invisible through that view -- for done/all tasks of a project
+  #   use list_tasks with "project = N" / "done = true && project = N" (no view filter).
+  #   Standalone "saved filters" (/filters/*) are a separate resource and are not yet exposed.
   #
   # Labels:
   #   create_label uses PUT /labels (Vikunja creates labels with PUT, not POST).
@@ -209,7 +212,14 @@ backend:
       method: GET
       path: /projects/{project_id}/views/{view_id}/tasks
       access: read
-      description: "List all tasks in a project view. Use view_id from list_views. Supports sorting by position, due_date, created, etc. Kanban views return buckets with nested tasks, not a flat list."
+      description: >
+        List tasks in a project view (view_id from list_views). The view's OWN saved filter
+        is applied on top of yours: the default List view is created with filter
+        "done = false", so completed tasks never show up there -- check the view's filter
+        field in list_views before concluding a project has no done tasks. For done or all
+        tasks of a project use list_tasks with filter "project = N" or
+        "done = true && project = N". Supports sorting by position, due_date, created, etc.
+        Kanban views return buckets with nested tasks, not a flat list.
       params:
         project_id: { type: integer, in: path, required: true }
         view_id: { type: integer, in: path, required: true }
@@ -236,7 +246,10 @@ backend:
         Query tasks across ALL projects the user can access (not scoped to a single view).
         Supports the Vikunja filter DSL, full-text search (s) and multi-field sorting —
         the best endpoint for analytics/reporting (velocity, ETA, throughput): filter or
-        sort by done_at, created, updated, due_date, percent_done. Returns a flat task array.
+        sort by done_at, created, updated, due_date, percent_done. Scope to one project with
+        filter "project = N"; "done = true && project = N" returns a project's completed
+        tasks, which list_project_tasks hides on views with a "done = false" filter (the
+        default List view). Returns a flat task array; no view filter is applied here.
       params:
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 50 }
@@ -452,7 +465,7 @@ backend:
       method: GET
       path: /projects/{project_id}/views
       access: read
-      description: "List all views (list, kanban, gantt, table) for a project. Each view has its own task positions. Call this first to get view_id for list_project_tasks."
+      description: "List all views (list, kanban, gantt, table) for a project. Each view has its own task positions and may carry its own saved filter (field filter, e.g. the default List view has \"done = false\") that list_project_tasks applies on top of yours. Call this first to get view_id for list_project_tasks."
       params:
         project_id: { type: integer, in: path, required: true }
       pagination: none

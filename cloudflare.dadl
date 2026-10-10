@@ -3,7 +3,9 @@
 #
 # Domain Notes for LLM consumers:
 # - Most endpoints require either {account_id} or {zone_id} as path parameter.
-# - account_id: identifies your Cloudflare account (found in dashboard URL or /accounts endpoint).
+# - account_id: identifies your Cloudflare account and is REQUIRED by every account-scoped tool
+#   (Pages, Workers, KV, R2, D1, Access, Email Sending, ...). Get it from list_accounts (field id)
+#   -- it is not a zone_id. With a single account, list_accounts returns exactly that one.
 # - zone_id: identifies a domain/zone within your account (found via list_zones).
 # - Pages, Workers, KV, R2, D1, Access are account-scoped (/accounts/{account_id}/...).
 # - DNS, SSL, Cache, Page Rules, Load Balancers are zone-scoped (/zones/{zone_id}/...).
@@ -61,12 +63,12 @@ credits:
 
 source_name: "Cloudflare REST API v4"
 source_url: "https://developers.cloudflare.com/api/"
-date: "2026-09-27"
+date: "2026-10-10"
 
 backend:
   name: cloudflare
   type: rest
-  version: "1.1"
+  version: "1.1.1"
   base_url: https://api.cloudflare.com/client/v4
   description: "Cloudflare API -- DNS, Pages, Workers, KV, R2, D1, Zones, SSL/TLS, Cache, Load Balancers, Firewall/WAF, Page Rules, Access (Zero Trust), Email Routing, Email Sending, DMARC/SPF email auth, and account management"
 
@@ -112,7 +114,7 @@ backend:
     percentage: 19
     focus: "zones, DNS records, DNSSEC, DNS settings, secondary DNS incoming/outgoing/peers/TSIGs/ACLs, DNS Firewall clusters, Registrar domains/search/pricing/registration, Pages projects/deployments/domains, Workers scripts/routes/secrets/cron/deployments/tails, KV namespaces/keys, R2 buckets/lifecycle/CORS/domains, D1 databases/queries, SSL/TLS certificates/custom hostnames, cache purge/settings, load balancers/pools/monitors, firewall rules/rulesets/rate limits, page rules, Access apps/policies/groups, accounts/members/roles, Email Routing settings/DNS/rules/catch-all/destination addresses, Email Sending send/raw MIME/sending subdomains/DNS status/suppressions/reputation/limits, Email Auth DMARC reports/SPF inspection"
     missing: "Argo, Spectrum, Stream, Images (transformations), Email Security (Area 1), Email Routing wrangler plan endpoint, Radar email statistics, Waiting Room, Web3, Turnstile, Queues, Hyperdrive, Vectorize, AI Gateway, Durable Objects, Zone Lockdown, IP Access Rules, User-Agent Blocking, Logpush, Notifications, Audit Logs"
-    last_reviewed: "2026-09-27"
+    last_reviewed: "2026-10-10"
 
   setup:
     credential_steps:
@@ -244,7 +246,7 @@ backend:
       method: GET
       path: /accounts
       access: read
-      description: "List all accounts you have access to"
+      description: "List all accounts you have access to. The returned id is the account_id that every account-scoped tool requires (Pages, Workers, KV, R2, D1, Access, Email Sending) -- call this first when you do not know it; most users see exactly one account."
       params:
         page: { type: integer, in: query }
         per_page: { type: integer, in: query }
@@ -1316,7 +1318,7 @@ backend:
       method: GET
       path: /accounts/{account_id}/pages/projects
       access: read
-      description: "List all Cloudflare Pages projects"
+      description: "List all Cloudflare Pages projects. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         page: { type: integer, in: query }
@@ -1342,7 +1344,7 @@ backend:
       method: GET
       path: /accounts/{account_id}/pages/projects/{project_name}
       access: read
-      description: "Get a Pages project by name"
+      description: "Get a Pages project by name. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1352,7 +1354,7 @@ backend:
       method: POST
       path: /accounts/{account_id}/pages/projects
       access: write
-      description: "Create a new Pages project"
+      description: "Create a new Pages project. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         name: { type: string, in: body, required: true, description: "Project name (slug format)" }
@@ -1366,7 +1368,7 @@ backend:
       method: PATCH
       path: /accounts/{account_id}/pages/projects/{project_name}
       access: write
-      description: "Update Pages project attributes"
+      description: "Update Pages project attributes. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1380,7 +1382,7 @@ backend:
       method: DELETE
       path: /accounts/{account_id}/pages/projects/{project_name}
       access: dangerous
-      description: "Delete a Pages project and all deployments. Irreversible."
+      description: "Delete a Pages project and all deployments. Irreversible. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1390,7 +1392,7 @@ backend:
       method: POST
       path: /accounts/{account_id}/pages/projects/{project_name}/purge_build_cache
       access: write
-      description: "Purge all cached build artifacts for a Pages project"
+      description: "Purge all cached build artifacts for a Pages project. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1404,7 +1406,7 @@ backend:
       method: GET
       path: /accounts/{account_id}/pages/projects/{project_name}/deployments
       access: read
-      description: "List all deployments for a Pages project"
+      description: "List all deployments for a Pages project. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1430,7 +1432,7 @@ backend:
       method: GET
       path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}
       access: read
-      description: "Get a specific deployment"
+      description: "Get a specific deployment. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1441,7 +1443,7 @@ backend:
       method: POST
       path: /accounts/{account_id}/pages/projects/{project_name}/deployments
       access: write
-      description: "Create a new deployment (direct upload via multipart or trigger Git build)"
+      description: "Create a new deployment (direct upload via multipart or trigger Git build). Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       content_type: multipart/form-data
       params:
         account_id: { type: string, in: path, required: true }
@@ -1453,7 +1455,7 @@ backend:
       method: DELETE
       path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}
       access: dangerous
-      description: "Delete a deployment"
+      description: "Delete a deployment. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1464,7 +1466,7 @@ backend:
       method: POST
       path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/retry
       access: write
-      description: "Retry a failed deployment"
+      description: "Retry a failed deployment. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1475,7 +1477,7 @@ backend:
       method: POST
       path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/rollback
       access: write
-      description: "Rollback production to a previous deployment"
+      description: "Rollback production to a previous deployment. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1486,7 +1488,7 @@ backend:
       method: GET
       path: /accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/history/logs
       access: read
-      description: "Get build/deployment logs for a specific deployment"
+      description: "Get build/deployment logs for a specific deployment. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1501,7 +1503,7 @@ backend:
       method: GET
       path: /accounts/{account_id}/pages/projects/{project_name}/domains
       access: read
-      description: "List all custom domains for a Pages project"
+      description: "List all custom domains for a Pages project. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1510,7 +1512,7 @@ backend:
       method: GET
       path: /accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}
       access: read
-      description: "Get a specific Pages domain"
+      description: "Get a specific Pages domain. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1521,7 +1523,7 @@ backend:
       method: POST
       path: /accounts/{account_id}/pages/projects/{project_name}/domains
       access: write
-      description: "Add a custom domain to a Pages project"
+      description: "Add a custom domain to a Pages project. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1532,7 +1534,7 @@ backend:
       method: PATCH
       path: /accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}
       access: write
-      description: "Retry domain validation for a Pages custom domain"
+      description: "Retry domain validation for a Pages custom domain. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }
@@ -1543,7 +1545,7 @@ backend:
       method: DELETE
       path: /accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}
       access: dangerous
-      description: "Remove a custom domain from a Pages project"
+      description: "Remove a custom domain from a Pages project. Requires account_id -- the Cloudflare account ID from list_accounts (field id), not a zone_id."
       params:
         account_id: { type: string, in: path, required: true }
         project_name: { type: string, in: path, required: true }

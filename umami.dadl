@@ -5,7 +5,7 @@ credits:
 
 source_name: "Umami Analytics REST API"
 source_url: "https://umami.is/docs/api"
-date: "2026-03-31"
+date: "2026-10-10"
 
 backend:
   name: umami
@@ -20,7 +20,7 @@ backend:
     percentage: 100
     focus: "authentication, me, websites, statistics, metrics, pageviews, events, event-data, sessions, session-data, realtime, users, teams, reports, share, links, pixels, admin"
     missing: "none"
-    last_reviewed: "2026-03-31"
+    last_reviewed: "2026-10-10"
 
   setup:
     credential_steps:
@@ -32,7 +32,7 @@ backend:
     backends_yaml: |
       - name: umami
         transport: rest
-        dadl: /app/dadl/umami.dadl
+        dadl: umami.dadl
         url: "https://your-umami-instance.com/api"
     required_scopes:
       - "admin or view-only access depending on endpoints used"
@@ -73,11 +73,23 @@ backend:
   #   in MILLISECONDS (not seconds). Example: 1711929600000 for 2024-04-01.
   #   Report endpoints use ISO date strings (startDate, endDate) instead.
   #
-  # Metrics types:
-  #   The metrics endpoint accepts a 'type' parameter to select what to measure:
-  #   path, entry, exit, title, query, referrer, channel, domain,
-  #   country, region, city, browser, os, device, language, screen,
-  #   event, hostname, tag, distinctId
+  # Metrics types (Umami v3, verified against v3.4.0 source and a live instance 2026-10-10):
+  #   The metrics endpoints (get_website_metrics, get_website_metrics_expanded) accept a
+  #   'type' parameter to select what to measure. Page/event columns:
+  #   path, fullPath, entry, exit, referrer, domain, title, query, event, tag, hostname,
+  #   utmSource, utmMedium, utmCampaign, utmContent, utmTerm.
+  #   Session columns: browser, os, device, screen, language, country, city, region, distinctId.
+  #   Plus the synthetic 'channel' (direct / organicSearch / referral / ...).
+  #   Any other value is a 400 "Bad request" -- in particular the Umami v2 name "url"
+  #   (use "path"). get_website_metrics returns [{x, y}]; get_website_metrics_expanded
+  #   returns [{name, pageviews, visitors, visits, bounces, totaltime}] (bounces/totaltime
+  #   are 0 for page/event types).
+  #
+  # Website visibility:
+  #   /websites and /me/websites return only websites OWNED by the token's user; team-owned
+  #   websites appear only with includeTeams=true (teams the user belongs to). /admin/websites
+  #   (admin role) lists everything. A typical "list_websites returns count: 0" is a
+  #   team-ownership effect, not an auth failure.
   #
   # Filters:
   #   Stats, metrics, pageviews, events, and sessions endpoints accept
@@ -98,7 +110,7 @@ backend:
   #
   # Typical workflow:
   #   1. authenticate (login) → get token
-  #   2. list_websites → pick websiteId
+  #   2. list_websites (includeTeams: true) or admin_list_websites → pick websiteId
   #   3. get_website_stats(websiteId, startAt, endAt) → overview
   #   4. get_website_metrics(websiteId, startAt, endAt, type) → drill down
   #   5. get_website_active(websiteId) → realtime visitors
@@ -144,7 +156,11 @@ backend:
       method: GET
       path: /me/websites
       access: read
-      description: "Get all websites the current authenticated user has access to."
+      description: >
+        Websites of the current user -- same semantics as list_websites: only directly owned
+        websites unless includeTeams is true, which adds the websites of the user's teams.
+        Returns {data, count, page, pageSize}. For every website on the instance use
+        admin_list_websites (admin role).
       params:
         includeTeams: { type: boolean, in: query }
       pagination: none
@@ -167,7 +183,13 @@ backend:
       method: GET
       path: /websites
       access: read
-      description: "List all websites registered in Umami. Returns website IDs, names, domains, and creation dates."
+      description: >
+        List websites OWNED BY THE CALLING USER (userId = token user). Websites that belong to
+        a team are NOT included unless includeTeams is true (then: all websites of teams the
+        user is a member of). An empty result therefore usually means the websites are
+        team-owned -- retry with includeTeams: true, or use admin_list_websites (admin role,
+        every website on the instance) / list_team_websites(teamId). Returns {data: [...],
+        count, page, pageSize}; each item has id (websiteId), name, domain, teamId, createdAt.
       params:
         includeTeams: { type: boolean, in: query }
         search: { type: string, in: query }
@@ -306,7 +328,11 @@ backend:
       method: GET
       path: /websites/{websiteId}/metrics
       access: read
-      description: "Get metrics for a website grouped by type. Types: path, entry, exit, title, query, referrer, channel, domain, country, region, city, browser, os, device, language, screen, event, hostname, tag, distinctId. Returns [{x: value, y: count}]."
+      description: >
+        Get metrics for a website grouped by type (Umami v3 vocabulary): path, fullPath (path incl. query string), entry, exit, referrer, domain (referrer domain), title, query, event, tag, hostname, utmSource, utmMedium, utmCampaign, utmContent, utmTerm, browser, os, device, screen, language, country, city, region, distinctId, channel.
+        Any other value -- notably the Umami v2 name "url" -- is rejected with HTTP 400;
+        use "path" for page URLs. Returns [{x: value, y: count}] sorted by y desc, limit/offset
+        apply (channel ignores them). startAt/endAt are Unix MILLISECONDS.
       params:
         websiteId: { type: string, in: path, required: true }
         startAt: { type: integer, in: query, required: true }
@@ -326,7 +352,14 @@ backend:
       method: GET
       path: /websites/{websiteId}/metrics/expanded
       access: read
-      description: "Get expanded metrics with pageviews, visitors, visits, bounces, and totaltime per entry. Same parameters as get_website_metrics."
+      description: >
+        Expanded metrics per entry: returns [{name, pageviews, visitors, visits, bounces, totaltime}]
+        (NOT the {x, y} shape of get_website_metrics; region/city rows also carry country).
+        type accepts the same Umami v3 vocabulary as get_website_metrics: path, fullPath (path incl. query string), entry, exit, referrer, domain (referrer domain), title, query, event, tag, hostname, utmSource, utmMedium, utmCampaign, utmContent, utmTerm, browser, os, device, screen, language, country, city, region, distinctId, channel.
+        Anything else (e.g. the v2 name "url") returns HTTP 400 -- use "path". bounces and
+        totaltime are always 0 for page/event types (path, referrer, title, ...) and only
+        populated for session types (country, browser, ...) and channel; numeric fields may
+        arrive as strings. startAt/endAt are Unix MILLISECONDS.
       params:
         websiteId: { type: string, in: path, required: true }
         startAt: { type: integer, in: query, required: true }
@@ -1159,7 +1192,11 @@ backend:
       method: GET
       path: /admin/websites
       access: read
-      description: "List all websites across all users. Admin only."
+      description: >
+        List EVERY website on the instance regardless of owner or team (requires the admin
+        role). This is the reliable way to find a websiteId when list_websites /
+        get_my_websites come back empty because the websites are team-owned. Returns
+        {data, count, page, pageSize}; items include id, name, domain, user and team.
       params:
         search: { type: string, in: query }
         page: { type: integer, in: query }
