@@ -4,7 +4,7 @@ credits:
   - "Dunkel Cloud GmbH"
 source_name: "GitLab REST API v4"
 source_url: "https://docs.gitlab.com/ee/api/rest/"
-date: "2026-03-29"
+date: "2026-10-10"
 
 backend:
   name: gitlab
@@ -18,7 +18,7 @@ backend:
     percentage: 19
     focus: "GitLab REST API v4: projects, issues, merge requests, pipelines, jobs, branches, commits, releases, groups, users, repository files, labels, milestones, code search"
     missing: "deploy tokens, container registry, packages, wikis, snippets, epics, environments, cluster agents, protected branches, webhooks, project hooks"
-    last_reviewed: "2026-03-26"
+    last_reviewed: "2026-10-10"
 
   setup:
     credential_steps:
@@ -118,6 +118,16 @@ backend:
   # Dates:
   #   ISO 8601 format. Pass timezone offsets literally
   #   ("2026-01-01T00:00:00+02:00"); query values are escaped for you.
+  #
+  # Delta queries (what changed since the last run):
+  #   The merge-request list tools (list_merge_requests, list_project_merge_requests,
+  #   list_group_merge_requests) accept created_after/created_before and
+  #   updated_after/updated_before (all inclusive). Use them instead of paging through
+  #   the whole list -- without updated_after a 30-MR delta meant loading ~150 KB.
+  #   Note that the DADL defaults state to "opened"; a delta that must see merged/closed
+  #   MRs needs state: "all". GitLab's newer merged_after/merged_before filters are NOT
+  #   exposed: the instance this was verified against (2026-10-10) ignored them silently
+  #   and returned the unfiltered list, so a caller could not tell filter from no-op.
   #
   # Arrays in params:
   #   Array-typed BODY params (assignee_ids, reviewer_ids) work — they are
@@ -355,7 +365,12 @@ backend:
       method: GET
       path: /merge_requests
       access: read
-      description: "List all merge requests visible to the authenticated user."
+      description: >
+        List all merge requests visible to the authenticated user. Date filters
+        (created_after/created_before, updated_after/updated_before) take ISO 8601
+        datetimes and are inclusive. state defaults to "opened" here -- pass state "all"
+        when computing a delta that must include merged or closed MRs. Returns one page
+        (page/per_page).
       params:
         state: { type: string, in: query, default: "opened" }
         scope: { type: string, in: query }
@@ -371,6 +386,8 @@ backend:
         sort: { type: string, in: query, default: "desc" }
         created_after: { type: string, in: query }
         created_before: { type: string, in: query }
+        updated_after: { type: string, in: query }
+        updated_before: { type: string, in: query }
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 20 }
 
@@ -378,7 +395,12 @@ backend:
       method: GET
       path: /projects/{id}/merge_requests
       access: read
-      description: "List merge requests for a specific project."
+      description: >
+        List merge requests for a specific project. For delta/sync queries use the
+        date filters instead of paging through everything: created_after/created_before,
+        updated_after/updated_before (ISO 8601 datetimes, e.g. "2026-03-15T08:00:00Z",
+        inclusive). state defaults to "opened" here -- pass state "all" when the delta
+        must include merged or closed MRs. Returns one page (page/per_page, max 100).
       params:
         id: { type: string, in: path, required: true }
         state: { type: string, in: query, default: "opened" }
@@ -390,6 +412,10 @@ backend:
         search: { type: string, in: query }
         order_by: { type: string, in: query, default: "created_at" }
         sort: { type: string, in: query, default: "desc" }
+        created_after: { type: string, in: query }
+        created_before: { type: string, in: query }
+        updated_after: { type: string, in: query }
+        updated_before: { type: string, in: query }
         # iids[] omitted — see list_project_issues above and the domain notes.
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 20 }
@@ -398,7 +424,11 @@ backend:
       method: GET
       path: /groups/{id}/merge_requests
       access: read
-      description: "List merge requests for a group."
+      description: >
+        List merge requests for a group (all its projects). Same date filters as
+        list_project_merge_requests: created_after/created_before, updated_after/updated_before
+        (ISO 8601, inclusive). state defaults to "opened" here -- pass state "all" for
+        deltas over merged or closed MRs. Returns one page.
       params:
         id: { type: string, in: path, required: true }
         state: { type: string, in: query, default: "opened" }
@@ -407,6 +437,10 @@ backend:
         search: { type: string, in: query }
         order_by: { type: string, in: query, default: "created_at" }
         sort: { type: string, in: query, default: "desc" }
+        created_after: { type: string, in: query }
+        created_before: { type: string, in: query }
+        updated_after: { type: string, in: query }
+        updated_before: { type: string, in: query }
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 20 }
 
