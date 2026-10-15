@@ -14,6 +14,16 @@
 # - Some endpoints are public (no auth): regions, types, kernels.
 # - Destructive actions (delete, rebuild) are immediate and irreversible.
 # - Statistics endpoints have stricter rate limits (50 req/min).
+# - Support tickets: a ticket's opening message is its `description`; the
+#   conversation after that lives in /support/tickets/{id}/replies, where
+#   `from_linode: true` marks answers from Linode staff. Reading tickets needs
+#   the `account:read_only` scope; there is no separate tickets scope. Only
+#   the read side is covered: opening, replying and closing would reach
+#   Linode's human support team, so they are left out until they can be
+#   verified without bothering support staff.
+# - Ticket status filtering needs the X-Filter header ({"status": "open"});
+#   list_support_tickets exposes it as the `X-Filter` param.
+# - SSH keys live under /profile/sshkeys (no hyphen).
 
 spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
 
@@ -22,7 +32,7 @@ credits:
 
 source_name: "Linode REST API v4"
 source_url: "https://techdocs.akamai.com/linode-api/reference/api"
-date: "2026-03-29"
+date: "2026-10-15"
 
 backend:
   name: linode
@@ -67,12 +77,12 @@ backend:
       max_items: 200
 
   coverage:
-    endpoints: 118
-    total_endpoints: 400
-    percentage: 30
+    endpoints: 182
+    total_endpoints: 539
+    percentage: 34
     focus: "linodes, volumes, domains, nodebalancers, firewalls, VPCs, LKE, databases, object storage, images, stackscripts, regions, account, profile, events, tags"
-    missing: "longview, managed services, monitor, IAM/delegation, service transfers, beta programs, placement groups, support tickets"
-    last_reviewed: "2026-03-29"
+    missing: "longview, managed services, monitor, IAM/delegation, service transfers, beta programs, placement groups, support ticket write operations (open, reply, close, attachments)"
+    last_reviewed: "2026-10-15"
 
   setup:
     credential_steps:
@@ -85,7 +95,7 @@ backend:
     backends_yaml: |
       - name: linode
         transport: rest
-        dadl: /app/dadl/linode.dadl
+        dadl: linode.dadl
     required_scopes:
       - "linodes:read_write"
       - "volumes:read_write"
@@ -2043,6 +2053,59 @@ backend:
       pagination: none
 
     # =========================================================================
+    # SUPPORT TICKETS
+    # =========================================================================
+
+    list_support_tickets:
+      method: GET
+      path: /support/tickets
+      access: read
+      description: >
+        List support tickets of the account: tickets you opened and tickets Linode
+        support opened about your account. Open tickets come first. Each ticket has
+        id, summary, description, status (new, open, closed), severity, opened,
+        opened_by, updated, updated_by, closed, closable, attachments (filenames)
+        and entity (type, id, label of the affected object, or null). Replies are
+        not included; call list_support_ticket_replies for the conversation.
+        Filter with the X-Filter param, a JSON string sent as the X-Filter header,
+        e.g. '{"status": "open"}' or '{"+order_by": "updated", "+order": "desc"}'.
+        Filterable fields: status, opened, opened_by, updated, closed.
+        Needs token scope account:read_only.
+      params:
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query, description: "25-500, default 100" }
+        X-Filter: { type: string, in: header, description: "JSON filter, e.g. {\"status\": \"open\"}. Filterable: status, opened, opened_by, updated, closed." }
+
+    get_support_ticket:
+      method: GET
+      path: /support/tickets/{ticketId}
+      access: read
+      description: >
+        Get one support ticket by ID: summary, description (the opening message),
+        status (new, open, closed), severity, entity, opened/updated/closed
+        timestamps and attachment filenames. The replies are not included; call
+        list_support_ticket_replies with the same ticketId.
+        Needs token scope account:read_only.
+      params:
+        ticketId: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_support_ticket_replies:
+      method: GET
+      path: /support/tickets/{ticketId}/replies
+      access: read
+      description: >
+        List the replies of a support ticket. Each reply has id, created,
+        created_by, description (the message body) and from_linode (true when a
+        Linode employee wrote it). The ticket's opening message is not a reply;
+        it is the description returned by get_support_ticket.
+        Needs token scope account:read_only.
+      params:
+        ticketId: { type: integer, in: path, required: true }
+        page: { type: integer, in: query }
+        page_size: { type: integer, in: query, description: "25-500, default 100" }
+
+    # =========================================================================
     # PROFILE
     # =========================================================================
 
@@ -2071,7 +2134,7 @@ backend:
 
     list_ssh_keys:
       method: GET
-      path: /profile/ssh-keys
+      path: /profile/sshkeys
       access: read
       description: "List SSH keys on the current user's profile"
       params:
@@ -2080,7 +2143,7 @@ backend:
 
     get_ssh_key:
       method: GET
-      path: /profile/ssh-keys/{sshKeyId}
+      path: /profile/sshkeys/{sshKeyId}
       access: read
       description: "Get a specific SSH key"
       params:
@@ -2089,7 +2152,7 @@ backend:
 
     create_ssh_key:
       method: POST
-      path: /profile/ssh-keys
+      path: /profile/sshkeys
       access: write
       description: "Add an SSH key to the profile"
       params:
@@ -2099,7 +2162,7 @@ backend:
 
     update_ssh_key:
       method: PUT
-      path: /profile/ssh-keys/{sshKeyId}
+      path: /profile/sshkeys/{sshKeyId}
       access: write
       description: "Update an SSH key's label"
       params:
@@ -2109,7 +2172,7 @@ backend:
 
     delete_ssh_key:
       method: DELETE
-      path: /profile/ssh-keys/{sshKeyId}
+      path: /profile/sshkeys/{sshKeyId}
       access: dangerous
       description: "Remove an SSH key from the profile"
       params:
