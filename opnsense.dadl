@@ -52,6 +52,13 @@
 #   "inet"), not the map. Model set endpoints are full-replace — post the COMPLETE item.
 # - Authentication: HTTP Basic Auth with API key (username) + API secret (password).
 #   Generate via System → Access → Users → API keys section.
+# - Health check (backend.health): get_system_time. Every API controller authenticates the
+#   key/secret before routing (ApiControllerBase), so any read proves the credential; this
+#   one is ~170 bytes, side-effect-free and needs only the "Lobby: Dashboard" privilege
+#   (ACL page-system-login-logout), so a narrowly privileged monitoring user passes too. A
+#   wrong or revoked key/secret answers 401 "Authentication Failed", a user without that
+#   privilege 403 "Forbidden". OPNsense API keys have no expiry date — there is nothing for
+#   auth_expires_path to read.
 # - HA config sync (hasync, //OPNsense/hasync): the model fields are `username` / `password`
 #   (NOT synchronizeusername/synchronizepassword) plus pfsync* / verifypeer / syncitems.
 #   `syncitems` is a MULTI-SELECT — the set of config sections XMLRPC-synced to the peer
@@ -139,18 +146,18 @@
 #   are mangled into non-matching substrings and the call returns {"result":"ok",
 #   "dropped_states":0}. For IPv6/CIDR: query_firewall_states → del_firewall_state per state, or
 #   flush_firewall_states.
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "OPNsense REST API"
 source_url: "https://docs.opnsense.org/development/api.html"
-date: "2026-08-02"
+date: "2026-11-01"
 
 backend:
   name: opnsense
   type: rest
-  version: "1.0"
+  version: "1.1"
   # base_url intentionally omitted — self-hosted, provided via backends.yaml
   description: "OPNsense firewall REST API — manage firewall rules, aliases, interfaces, VPN, DHCP, DNS, diagnostics, firmware, and services on OPNsense appliances"
 
@@ -158,6 +165,13 @@ backend:
     type: basic
     username_credential: opnsense_api_key
     password_credential: opnsense_api_secret
+
+  # Reachability + credential check (DADL spec v0.2 §4.6), see the Domain Notes. The check
+  # sees the raw response {datetime, uptime, boottime, config, loadavg}; the backend-wide
+  # response transform does not run on it. No auth_expires_path: API keys do not expire.
+  health:
+    tool: get_system_time
+    expect_path: $.datetime
 
   defaults:
     headers:
@@ -300,7 +314,7 @@ backend:
     required_scopes:
       - "GUI access to relevant OPNsense pages (permissions are page-based, not scope-based)"
     docs_url: "https://docs.opnsense.org/development/how-tos/api.html"
-    notes: "OPNsense uses page-based permissions. The API user needs GUI access to the same pages they want to access via API. For full API access, assign the user to the 'admins' group. API key + secret are used as HTTP Basic Auth (key=username, secret=password)."
+    notes: "OPNsense uses page-based permissions. The API user needs GUI access to the same pages they want to access via API. For full API access, assign the user to the 'admins' group. API key + secret are used as HTTP Basic Auth (key=username, secret=password). The health check calls get_system_time, which needs only the 'Lobby: Dashboard' privilege, so a dedicated monitoring user with that single privilege is enough for it. OPNsense API keys do not expire, so the check reports no expiry date."
 
   hints:
     search_firewall_aliases:
@@ -1472,7 +1486,10 @@ backend:
       method: GET
       path: /diagnostics/system/system_time
       access: read
-      description: "Get current system time and uptime"
+      description: >
+        Current system time and uptime: datetime, uptime, boottime, config (time of the last
+        config change) and loadavg, all as display strings. Also serves as the backend's
+        health check; to test reachability and the credential, call the `health` tool instead.
       pagination: none
 
     get_system_swap:
@@ -4548,6 +4565,9 @@ backend:
         monitor, monitor_disable, monitor_noroute, monitor_killstates,
         monitor_killstates_priority, force_down, priority, weight, latencylow,
         latencyhigh, losslow, losshigh, interval, time_period, loss_interval, data_length.
+        apply:true runs reconfigure_gateways (access admin), which ToolMesh checks against the
+        caller's own rights like a direct call.
+      access: write
       params:
         uuid:
           type: string
@@ -4622,6 +4642,9 @@ backend:
         Does NOT apply by default — pass apply:true or call reconfigure_gateway_groups.
         Other writable fields for `changes`: name, trigger (down | downloss | downlatency |
         downlosslatency), poolopts ("" | "round-robin" | "round-robin sticky-address"), descr.
+        apply:true runs reconfigure_gateway_groups (access admin), which ToolMesh checks against
+        the caller's own rights like a direct call.
+      access: write
       params:
         uuid:
           type: string
@@ -4720,6 +4743,7 @@ backend:
         update_hasync_settings({changes:{synchronizetoip:"…"}}) leaves the stored password
         untouched. A `changes` value that is itself the redaction marker is rejected rather than
         written.
+      access: admin
       params:
         changes:
           type: object
@@ -4796,6 +4820,9 @@ backend:
         AdvDefaultPreference (low|medium|high), AdvCurHopLimit, AdvDefaultLifetime, AdvLinkMTU,
         AdvPreferredLifetime, AdvValidLifetime, AdvRDNSSLifetime, AdvRouteLifetime, AdvDNSSLLifetime,
         AdvRASrcAddress, nat64prefix. On failure returns {ok:false, validations, raw}.
+        apply:true runs reconfigure_radvd (access admin), which ToolMesh checks against the
+        caller's own rights like a direct call.
+      access: write
       params:
         uuid:
           type: string
