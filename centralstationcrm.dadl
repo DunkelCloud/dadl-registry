@@ -1,0 +1,3339 @@
+# centralstationcrm.dadl — CentralStationCRM REST API for ToolMesh
+# CentralStationCRM (42he GmbH, Cologne) is a German small-business CRM: people,
+# companies, deals in pipelines, projects, tasks, calendar, notes and an activity
+# stream. Written against the official OpenAPI 3.0 document at
+# https://api.centralstationcrm.net/api-docs/v1/swagger.json (retrieved 2026-07-21)
+# plus https://centralstationcrm.com/api-basics.
+#
+# LIVE-VERIFIED 2026-07-21 against a real production account: auth, both host forms,
+# the root-envelope unwrapping (lists, singles, polymorphic contact details and
+# protocols, count objects, scalar arrays, empty collections), includes/methods,
+# search and reverse lookup, stats, maildrops, and a full create -> verify -> update ->
+# delete cycle for a person incl. nested tels/emails/addrs/tags plus a protocol, and a
+# company create with nested addrs/emails/homepages/custom_fields plus a position link
+# and a company delete. Deviations from the OpenAPI document are marked "LIVE:" below.
+# LIVE-VERIFIED 2026-11-01: custom field VALUES end to end on companies (string),
+# people (date), deals (select) and projects (decimal) — set on create, change by
+# value id, clear with an empty value, remove with _destroy, the 422 on a second value
+# of the same type, on an unknown type id, on a non-numeric decimal and on a select
+# value outside the options — with the three custom-field composites;
+# custom-field-TYPE create/get/update/delete; deal and project create/delete;
+# check_connection as the health check.
+# NOT exercised: attachment/avatar UPLOAD, webhooks (create_hook), calendar writes,
+# merge_person/merge_company, and the url custom field type.
+#
+# Domain Notes for LLM consumers:
+# - AUTH: a per-user API key sent in the header `X-apikey` (no prefix, no "Bearer").
+#   Every user creates their own key under "My settings"; the key inherits exactly
+#   that user's permissions. Passing it as ?apikey= is deprecated. HTTPS only.
+# - BASE URL: this DADL defaults to https://api.centralstationcrm.net/api — the host
+#   the official Swagger UI targets. The classic per-account form
+#   https://{account}.centralstationcrm.net/api is equivalent; override it via the
+#   backends.yaml `url:` field if your setup requires the account host.
+# - ROOT WRAPPING — the single most important quirk. Every response is wrapped in a
+#   one-key envelope named after the resource: {"person": {...}} for one record,
+#   [{"person": {...}}, ...] for a list. This DADL unwraps that envelope for you and
+#   moves the envelope name into a `kind` field, so you receive
+#   {id: 42, name: "Mäh", ..., kind: "person"} and lists arrive as flat arrays.
+#   -> Polymorphic collections keep their subtype in `kind`: contact details come
+#      back as "tel" | "email" | "homepage" | "im" | "sm", protocols as
+#      "protocol_object_note" | "protocol_email" | "protocol_external" |
+#      "protocol_attachment" | "protocol_user_note". Branch on `kind`.
+#   -> LIVE: child records pulled in via `includes` arrive ALREADY FLAT — person.emails
+#      is [{id, atype, name, ...}], person.companies / person.positions / person.tags
+#      likewise, and deal_type.deal_type_stages too. No second envelope to peel, but
+#      they carry no `kind` either.
+#   -> ATTACHMENTS ARE THE EXCEPTION: an attachment arrives as the TWO-key object
+#      {"attachment": {...metadata...}, "data": "<base64>"} — the envelope sits next to
+#      the payload instead of around it. The attachment tools use their own transform
+#      that lifts the metadata and drops `data` on list/search (a single 400 KB PDF
+#      otherwise inlines as ~570 KB of base64); only get_attachment and its two
+#      sibling get_* tools return `data`. Avatars nest `data` INSIDE the envelope and
+#      are stripped the same way on list tools.
+# - WRITES MIRROR THE ENVELOPE. Request bodies must be wrapped the same way, so every
+#   write tool takes exactly ONE object parameter named after the resource:
+#     api.create_person({ person: { name: "Mäh", first_name: "Jolly" } })
+#     api.update_deal({ id: 42, deal: { deal_type_stage_id: 7 } })
+#   Passing fields at the top level yields 422. The writable fields of each resource
+#   are listed in that tool's description.
+# - NESTED ATTRIBUTES ON CREATE save round trips: create_person / create_company /
+#   create_deal / create_project accept child records inside the same body under
+#   `<child>_attributes` keys —
+#     person:  tels_attributes, emails_attributes, homepages_attributes,
+#              ims_attributes, sms_attributes, addrs_attributes, assis_attributes,
+#              positions_attributes, historic_events_attributes, tags_attributes,
+#              custom_fields_attributes, avatar_attributes
+#     company: custom_fields_attributes, avatar_attributes, tels_attributes,
+#              emails_attributes, homepages_attributes, ims_attributes,
+#              sms_attributes, addrs_attributes, tags_attributes,
+#              connections_attributes
+#     deal, project: custom_fields_attributes, tags_attributes
+#   The same keys work on update_*: an element WITH `id` changes that child, one with
+#   `id` + `_destroy: true` removes it, one without `id` adds a new child.
+# - CUSTOM FIELDS (the account's own fields, e.g. a customer number on companies) are
+#   two layers: the DEFINITIONS (list_custom_field_types — id, name = the label,
+#   category Person|Company|Deal|Project, ftype string|select|decimal|date|url,
+#   options for selects) and the VALUES on each record ({id, custom_fields_type_id,
+#   custom_fields_type_name, name = the value, name_date, name_decimal}).
+#   -> Only PEOPLE have their own value routes (/people/{id}/custom_fields). For
+#      companies, deals and projects the API has none: read values with
+#      includes=custom_fields on get_* / list_*, write them as
+#      custom_fields_attributes on update_* (or create_*).
+#   -> LIVE: one value per definition and record. Adding a second one for the same
+#      custom_fields_type_id answers 422 on "custom_fields.custom_fields_type"
+#      ("already taken", worded in the account's language) — change the existing
+#      value by its id instead. An empty value deletes the value row, and an unknown
+#      type id answers 422 on "custom_fields.custom_fields_type_id".
+#   -> LIVE per ftype: a DATE keeps the text you sent in `name` and the parsed date in
+#      `name_date` — "16.01.2027" is accepted and stored as name "16.01.2027",
+#      name_date "2027-01-16". A DECIMAL answers 422 {"custom_fields.name": [is not a
+#      number]} for "13,75" and for text; "12.5" works and comes back in name_decimal.
+#      A SELECT value outside the options answers 422 {"custom_fields.name": [is not a
+#      valid value]}; set_custom_field_value checks the options before the call and
+#      names the allowed ones.
+#   -> The composites get_custom_field_values, set_custom_field_value and
+#      find_records_by_custom_field do this bookkeeping for all four record types:
+#      resolve the field by id or label, pick create / change / remove, re-read.
+# - IDs are integers but NOT sequential (id 5 may be followed by id 324). Never
+#   guess, derive or iterate an ID — always look it up. LIVE EXCEPTION: calendar
+#   events, group calendars and attachments use UUID STRINGS
+#   ("123e4567-e89b-12d3-a456-426614174000"), which is why those tools declare their
+#   id parameters as strings.
+# - LIVE: PUT and DELETE return an EMPTY body (HTTP 200, no JSON). update_* and
+#   delete_* therefore yield nothing useful — re-read with the matching get_* tool
+#   when you need the new state. Only POST returns the created record.
+# - PAGINATION: `page` + `perpage` (max 250; this DADL defaults to 100). There is no
+#   has_more flag and no Link header — keep paging until a page returns fewer rows
+#   than perpage. Every major collection has a count_* tool returning
+#   {"total_entries": N}; call that when you only need the number.
+# - INCLUDES / METHODS: most read endpoints accept `includes` (embed child records)
+#   and `methods` (computed convenience fields such as responsible_user_natural_name
+#   or salutation_formal). Both take a SPACE-separated list or the literal "all",
+#   e.g. list_people({ includes: "companies tags", methods: "salutation_formal" }).
+#   Prefer them over N+1 loops; each tool lists its valid values.
+# - CONTACT DETAILS are one polymorphic collection (/people/{id}/contact_details and
+#   /companies/{id}/contact_details): phone numbers (tel), e-mail addresses (email),
+#   websites (homepage), messengers (im) and social profiles (sm). The wrapper key
+#   you SEND decides the type — { tel: {...} } vs { email: {...} } — and `atype`
+#   sub-classifies it (office, office_hq, mobile, private, ...). Postal addresses are
+#   a SEPARATE collection (/addrs) with street/zip/city/country_code.
+# - PROTOCOLS are the CRM's notes and logged interactions (calls, meetings, e-mails).
+#   Create one with `content` plus a `badge` (note, call, email, meeting, other) and
+#   attach it to any mix of person_ids / company_ids / deal_ids / project_ids in the
+#   same call. `format` is plaintext or markdown. ACTIVITIES (/activities) are the
+#   read-only audit stream of who changed what and cannot be written via the API.
+# - DEALS live in pipelines: deal_type_id = pipeline, deal_type_stage_id = stage
+#   inside it. Call list_deal_types FIRST to learn the pipelines, their stages and
+#   which optional fields they enable (has_monetary_value, has_probability,
+#   has_target_date, has_muted_until_date). Each stage carries its own stage_type
+#   (won, lost, ...) next to name and position.
+#   LIVE: current_state comes back WITHOUT the underscore — "open75", not the
+#   "open_75" the API docs print (values seen: open0, open25, open50, open75, won,
+#   lost). Mirror the format you read back rather than the documented one.
+#   LIVE: the deal READ model returns `description` where the write schema documents
+#   `background` — read the field you got, and if a background write is silently
+#   dropped, try `description`.
+#   Monetary values are decimal STRINGS ("60.0"); currency is EUR (default), CHF or
+#   USD; value_type is total, monthly, hourly or daily. PROJECTS work the same way
+#   minus the monetary fields.
+# - TASKS require user_id (the responsible user) and name. Link them to a record via
+#   attachable_type (Person, Company, Deal, Project) + attachable_id, set a `badge`
+#   (task, call, email, visit, preparation, important), a `precise_time`, and
+#   `fuzzy: true` when only the day matters. `finished: true` closes the task.
+# - no_log=true on the main write tools suppresses the activity-stream entry — use it
+#   for bulk imports and sync jobs so you do not flood the customer's stream.
+# - RATE LIMIT: 50 requests per 10 seconds. Above that the API returns 429 with a
+#   Retry-After header (honored automatically by ToolMesh). Batch via `includes`
+#   instead of looping, and prefer count_* over fetching every page.
+# - ERRORS: 401 and 507 return {"description": ..., "error": ...}; 422 returns a bare
+#   field -> messages map such as {"name": ["has to be filled"]}, so on 422 read the
+#   whole body to see which field failed. 507 means the account's storage quota is
+#   exhausted (attachment and avatar uploads).
+# - FILE UPLOADS (attachments, avatars) are base64 JSON, not multipart: send
+#   `filename`, `content_type` and `data` (base64 of the raw bytes) inside the
+#   wrapper object.
+# - DATES: YYYY-MM-DD for date fields, ISO 8601 timestamps for *_at fields.
+# - NOT MODELED: the `filter[field][modifier]` query syntax that list endpoints also
+#   accept (equal, like, in, smaller_than, larger_than, between). DADL query
+#   parameters are flat scalars, so bracket-nested filters cannot be expressed here.
+#   Use the plain filters that ARE modeled (tag_id, tag_name, stream_updated_at_*,
+#   state, before/after, date_from/date_to), a saved filter_group, or an
+#   allow_jq_override filter on the response.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+
+credits:
+  - "Dunkel Cloud GmbH — maintainer"
+
+source_name: "CentralStationCRM API v1"
+source_url: "https://centralstationcrm.com/api-basics"
+date: "2026-11-01"
+
+# ── Shared YAML anchors (underscore-prefixed keys are ignored by ToolMesh) ──
+_anchors:
+  # CentralStationCRM root-wraps EVERY payload in a one-key envelope named after the
+  # resource. This transform lifts the inner object up and records the envelope name
+  # in `kind`, which is what keeps polymorphic collections (contact details,
+  # protocols) usable. It is deliberately defensive:
+  #   - arrays are mapped element-wise, objects handled directly
+  #   - only single-key objects whose value is itself an OBJECT are unwrapped, so
+  #     {"total_entries": 42} (count endpoints) and {"name","record_type","ids"}
+  #     (filter-group ids) pass through untouched
+  #   - arrays of scalars (tags/list) pass through untouched
+  unwrap_envelope: &unwrap_envelope |
+    def unwrap: if type == "object" and (keys|length) == 1 and ((to_entries[0].value|type) == "object")
+                then (to_entries[0].value + {kind: to_entries[0].key})
+                else . end;
+    if type == "array" then map(unwrap) else unwrap end
+
+  # Attachments break the pattern: the API returns the TWO-key object
+  # {"attachment": {...}, "data": "<base64>"}, so the generic unwrap (single-key only)
+  # leaves it alone. These two lift the metadata instead. Verified live: one 413 KB PDF
+  # inlines as 573 KB of base64 on EVERY list row, which is why list/search drop it.
+  attachment_meta: &attachment_meta |
+    def att: if type == "object" and has("attachment") then (.attachment + {kind: "attachment"}) else . end;
+    if type == "array" then map(att) else att end
+
+  attachment_full: &attachment_full |
+    def att: if type == "object" and has("attachment")
+             then (.attachment + {kind: "attachment"} + (if has("data") then {data: .data} else {} end))
+             else . end;
+    if type == "array" then map(att) else att end
+
+  # Avatars DO use a normal single-key envelope, but carry `data` inside it — unwrap
+  # first, then drop the base64 for list views.
+  avatar_meta: &avatar_meta |
+    def unwrap: if type == "object" and (keys|length) == 1 and ((to_entries[0].value|type) == "object")
+                then (to_entries[0].value + {kind: to_entries[0].key})
+                else . end;
+    if type == "array" then map(unwrap | del(.data)) else (unwrap | del(.data)) end
+
+backend:
+  name: centralstationcrm
+  type: rest
+  version: "1.1"
+  base_url: https://api.centralstationcrm.net/api
+  description: "CentralStationCRM REST API v1 — German small-business CRM: people, companies, deals in pipelines, projects, tasks, notes (protocols), calendar, tags, custom fields, attachments, activity stream and webhooks"
+
+  coverage:
+    endpoints: 175
+    total_endpoints: 199
+    percentage: 88
+    focus: "CRM v1: people (contact details, addresses, positions, assistants, historic events), companies (contact details, addresses, avatars), deals (pipelines, stages, values, states), projects (states, target dates), tasks (badges, owners, due times), protocols (notes, calls, meetings), tags, custom fields, calendar (events, attendees, group calendars), activity stream, filter groups, webhooks, users."
+    missing: "deprecated nested protocol-attachment routes (/people|companies|deals|projects/{id}/protocols/{id}/attachments — use the flat /protocols/{id}/attachments tools), nested avatar show/destroy (covered by the account-level get_avatar/delete_avatar), bracket-nested filter[field][modifier] query syntax and the custom_fields[type_id]=value filter on people (find_records_by_custom_field pages instead), the reference_for_webhooks echo parameter, OAuth2 authorization-code flow (API key only here)"
+    last_reviewed: "2026-11-01"
+
+  setup:
+    credential_steps:
+      - "Log in to your CentralStationCRM account (https://YOUR_ACCOUNT.centralstationcrm.net)"
+      - "Open 'My settings' (Meine Einstellungen) from the user menu in the top right"
+      - "Go to the API / API keys section and create a new API key — it is bound to YOUR user and inherits your permissions, so use a dedicated integration user if you want to limit access"
+      - "Copy the key and store it as CREDENTIAL_CENTRALSTATIONCRM_API_KEY in .env — ToolMesh sends it as the X-apikey header"
+      - "Verify the wiring by calling the health tool (or check_connection directly); a valid key passes, an invalid or revoked one answers 401"
+    env_var: CREDENTIAL_CENTRALSTATIONCRM_API_KEY
+    backends_yaml: |
+      - name: centralstationcrm
+        transport: rest
+        dadl: centralstationcrm.dadl
+        url: "https://api.centralstationcrm.net/api"
+    required_scopes: []
+    optional_scopes: []
+    docs_url: "https://centralstationcrm.com/api-basics"
+    notes: >
+      One credential is needed: CREDENTIAL_CENTRALSTATIONCRM_API_KEY. CentralStationCRM
+      has no OAuth scopes for API keys — a key carries the full rights of the user who
+      created it, so create it under a dedicated integration user if you want to
+      restrict what the agent can reach. The url above works for any account; the
+      per-account host https://YOUR_ACCOUNT.centralstationcrm.net/api is equivalent and
+      can be substituted. Rate limit is 50 requests per 10 seconds (429 + Retry-After).
+      A free Starter account for development is available at
+      https://centralstationcrm.com/signup/new?plan=Starter; developer questions go to
+      dev-support@42he.com.
+
+  auth:
+    type: apikey
+    credential: centralstationcrm_api_key
+    inject_into: header
+    header_name: X-apikey
+    # No prefix — the header value is the raw key. Every user generates their own key
+    # under "My settings"; passing it as the ?apikey= query parameter is deprecated.
+
+  # check_connection is the API's own key probe: GET without parameters, no side
+  # effects, an empty 2xx body for a valid key and 401 for an invalid one. The body
+  # carries nothing to match, so the status code alone decides.
+  health:
+    tool: check_connection
+
+  defaults:
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    pagination:
+      strategy: page
+      request:
+        page_param: page
+        limit_param: perpage
+        limit_default: 100
+      # No has_more flag, no next-page field, no Link header: the caller pages until a
+      # short page (< perpage) comes back, or asks the matching count_* tool first.
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      # 401/507 bodies are {"description": ..., "error": ...}. A 422 body is a bare
+      # field -> messages map with no single message field, so inspect the raw body.
+      message_path: "$.error"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 422, 507]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+      rate_limit:
+        # 50 requests / 10 s; the API sets Retry-After on 429.
+        retry_after_header: Retry-After
+    response:
+      # Strips CentralStationCRM's root envelope on every tool — see _anchors above.
+      transform: *unwrap_envelope
+      max_items: 250
+      allow_jq_override: true
+
+  hints:
+    create_person:
+      wrapping: "wrap all fields under the `person` key: { person: { name: ... } }"
+      required: "only `name` (last name) is mandatory; first_name is separate"
+      nested: "tels_attributes, emails_attributes, addrs_attributes, positions_attributes, tags_attributes, custom_fields_attributes and more can be embedded in the same call"
+      gender: "use gender_identity (male|female|diverse|family|unknown); the legacy `gender` field is deprecated"
+    create_company:
+      wrapping: "wrap all fields under the `company` key"
+      nested: "tels_attributes, emails_attributes, addrs_attributes, tags_attributes, custom_fields_attributes, connections_attributes"
+      custom_fields: "there is no /companies/{id}/custom_fields route — custom_fields_attributes on create/update is the only write path, includes=custom_fields the only read path"
+    update_company:
+      custom_fields: "change a value with custom_fields_attributes: [{ id: <value id>, name: <new value> }], remove it with [{ id, _destroy: true }]; a second value of the same type answers 422 — or let set_custom_field_value decide"
+    list_companies:
+      custom_fields: "includes=custom_fields returns company custom fields for the whole page — the only way to audit a company-level field across the account"
+    set_custom_field_value:
+      lookup: "pass custom_fields_type_id or field_name (the label, case-insensitive); an empty value removes the field from the record"
+    create_deal:
+      pipeline_first: "call list_deal_types to pick deal_type_id and deal_type_stage_id before creating"
+      money: "value / value_sum / value_count are decimal STRINGS; currency is EUR, CHF or USD"
+      people: "person_ids_set assigns contacts by comma-separated ids, e.g. '42,4711'"
+    update_deal:
+      partial: "send only the fields you change inside the `deal` object; move a deal by setting deal_type_stage_id"
+      state_format: "live records use open0/open25/open50/open75/won/lost — without the underscore the API docs show"
+      empty_response: "PUT returns an empty body; re-read with get_deal to see the result"
+    list_activities:
+      scope_required: "at least one of person_id, company_id, deal_id, project_id, user_id or account_id — otherwise HTTP 400"
+    list_attachments:
+      base64_stripped: "list/search return metadata only; the API would otherwise inline the whole file as base64 in every row"
+      ids: "attachment ids are UUID strings, not integers"
+    get_attachment:
+      size: "returns the full file as base64 in `data` — hundreds of KB per call, never loop over it"
+    create_protocol:
+      attach: "person_ids / company_ids / deal_ids / project_ids are arrays — one protocol can hang on several records"
+      badge: "note, call, email, meeting or other for a ProtocolObjectNote"
+      format: "content is plain text unless format is set to markdown"
+      file: "an attachment can be created in the same call by adding the `attachment` object with filename, content_type and base64 `data`"
+    create_task:
+      required: "user_id (owner) and name are mandatory"
+      link: "attachable_type (Person|Company|Deal|Project) + attachable_id links the task to a record"
+    create_person_contact_detail:
+      polymorphic: "the wrapper key picks the type: tel, email, homepage, im or sm"
+      atype: "tel: office, office_hq, mobile, fax, private, voip, skype, other — email: office, office_hq, private, invoice, other — homepage: office, private, other"
+    list_people:
+      includes: "space-separated list, e.g. 'companies tags addrs' or 'all'"
+      changed_since: "stream_updated_at_after (ISO 8601) returns only people with newer stream activity — the cheapest incremental sync"
+    search_people:
+      exclusivity: "email and phone are mutually exclusive; name matches the last name"
+    create_attachment:
+      encoding: "base64 in `data`, plus filename and content_type; 507 means the account storage quota is full"
+    create_hook:
+      payload: "object_type picks the webhook body shape: nested, api, lean or hook_with_structure_and_record"
+      events: "one hook = one model + one event; create several hooks for several events"
+    list_filter_groups:
+      usage: "filter groups are the saved segments from the UI; get_filter_group returns the matching records, list_filter_group_ids only their ids"
+
+  tools:
+    # ══════════════════════════════════════════════════════════════════
+    # Connection, current user, users
+    # ══════════════════════════════════════════════════════════════════
+    check_connection:
+      method: GET
+      path: /check_connection
+      access: read
+      description: >
+        Verify that the configured API key is valid. Returns 200/204 for a working key
+        and 401 otherwise. Cheapest possible health check — call it once before a batch
+        of writes instead of discovering a bad key mid-workflow.
+      pagination: none
+
+    get_current_user:
+      method: GET
+      path: /user
+      access: read
+      description: >
+        Details of the user the API key belongs to: id, first, last, name (login
+        e-mail), accounts (all accounts this user can reach), current_account (the
+        account subdomain this key operates on), timezone and the three salutation
+        variants. Use it to find out WHICH account and user an agent is acting as.
+      pagination: none
+
+    get_user_maildrop:
+      method: GET
+      path: /user/maildrop
+      access: read
+      description: >
+        The current user's maildrop address for people and companies. Forwarding or
+        BCC-ing an e-mail to this address files it into the CRM as a protocol on the
+        matching record. Returns {email_address, entity_type, entity_id, ...}.
+      pagination: none
+
+    list_users:
+      method: GET
+      path: /users
+      access: read
+      description: >
+        All users of the account (id, first, name, login e-mail). Needed to resolve the
+        user_id required by tasks, deals, calendar events and the responsible-user field
+        on people and companies. Pass active=true to skip deactivated users.
+      params:
+        active: { type: string, in: query, description: "Set to true to return only currently active users" }
+        perpage: { type: integer, in: query, default: 100, description: "Max 250" }
+        page: { type: integer, in: query }
+
+    get_user:
+      method: GET
+      path: /users/{id}
+      access: read
+      description: "Retrieve one user of the account by numeric id."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    search_users:
+      method: GET
+      path: /users/search
+      access: read
+      description: >
+        Find users by first name (`first`) and/or last name (`name`). Returns the same
+        objects as list_users. Use it to turn a human name from a prompt into the
+        user_id that tasks and deals require.
+      params:
+        first: { type: string, in: query, description: "Retrieve users by their first name" }
+        name: { type: string, in: query, description: "Retrieve users by their last name" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    search_records:
+      method: GET
+      path: /search
+      access: read
+      description: >
+        Global full-text search across the account — the same box as the CRM's own
+        search field. Pass `term` and receive matching records of mixed types (people,
+        companies, deals, projects). Use it when you do not yet know which object type
+        you are looking for; use search_people / search_companies / search_deals when
+        you do, because those return typed, unwrapped objects.
+      params:
+        term: { type: string, in: query, description: "Search term, e.g. 'Jolly'" }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # People (contacts)
+    # ══════════════════════════════════════════════════════════════════
+    list_people:
+      method: GET
+      path: /people
+      access: read
+      description: >
+        List people (contacts) of the account. Returns unwrapped person objects: id,
+        first_name, name (last name), salutation, title, gender_identity, country_code,
+        background, user_id (responsible user), group_id, created_at, updated_at.
+        Embed children with includes: positions, companies, deals, projects, tags,
+        tasks, pending_tasks, upcoming_cal_events, tels, emails, ims, sms, homepages,
+        addrs, addrs_from_company, custom_fields, historic_events, assis, connections,
+        user — or "all". Extra computed fields via methods: responsible_user_natural_name,
+        salutation_official, salutation_formal, salutation_informal, backlink,
+        stream_updated_at, absolute_url, absolute_avatar_url — or "all".
+        For an incremental sync use stream_updated_at_after.
+        To find people by a custom field value call find_records_by_custom_field — the
+        API's custom_fields[type_id]=value filter is bracket-keyed and cannot be sent as
+        a flat parameter (LIVE: a flat custom_fields value answers HTTP 500).
+      params:
+        perpage: { type: integer, in: query, default: 100, description: "Max 250" }
+        page: { type: integer, in: query }
+        order: { type: string, in: query, description: "abc-asc, abc-desc, new-asc, new-desc, update-asc, update-desc" }
+        includes: { type: string, in: query, description: "Space-separated child records, or 'all'" }
+        methods: { type: string, in: query, description: "Space-separated computed fields, or 'all'" }
+        tag_id: { type: integer, in: query, description: "Only people carrying this tag id" }
+        tag_name: { type: string, in: query, description: "Only people carrying this tag name" }
+        stream_updated_at_after: { type: string, in: query, description: "ISO 8601 — only people with stream activity AFTER this point (incremental sync)" }
+        stream_updated_at_before: { type: string, in: query, description: "ISO 8601 — only people with stream activity BEFORE this point" }
+
+    get_person:
+      method: GET
+      path: /people/{id}
+      access: read
+      description: >
+        Retrieve one person by numeric id. Combine with includes ("all" pulls positions,
+        companies, tels, emails, addrs, tags, custom_fields, historic_events, assis,
+        tasks, upcoming_cal_events) and methods ("all" adds the salutation variants,
+        absolute_url, absolute_avatar_url) to build a complete contact view in ONE call
+        instead of a dozen sub-resource requests.
+      params:
+        id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Space-separated child records, or 'all'" }
+        methods: { type: string, in: query, description: "Space-separated computed fields, or 'all'" }
+      pagination: none
+
+    create_person:
+      method: POST
+      path: /people
+      access: write
+      description: >
+        Create a person. Wrap everything under the `person` key.
+        Writable fields: name (last name, REQUIRED, max 80), first_name, salutation
+        (a custom salutation; one is generated automatically otherwise), title (e.g.
+        "Dr."), gender_identity (male|female|diverse|family|unknown), country_code
+        (ISO-639-1 language code of the person, e.g. "de"), background (free text notes
+        such as hobbies), user_id (responsible user), group_id.
+        Child records can be embedded in the same request via tels_attributes,
+        emails_attributes, homepages_attributes, ims_attributes, sms_attributes,
+        addrs_attributes, assis_attributes, positions_attributes,
+        historic_events_attributes, tags_attributes, custom_fields_attributes and
+        avatar_attributes — each an array of the corresponding child objects.
+        Example: api.create_person({ person: { name: "Mäh", first_name: "Jolly",
+        emails_attributes: [{ atype: "office", name: "jolly@example.com" }] } })
+      params:
+        person: { type: object, in: body, required: true, description: "Person object — see description for writable and nested fields" }
+        includes: { type: string, in: query, description: "Child records to return with the created person" }
+        methods: { type: string, in: query, description: "Computed fields to return with the created person" }
+        no_log: { type: boolean, in: query, description: "true suppresses the activity-stream entry (bulk imports)" }
+      pagination: none
+
+    update_person:
+      method: PUT
+      path: /people/{id}
+      access: write
+      description: >
+        Update a person. Send only the fields you want to change inside the `person`
+        object — same schema as create_person (name, first_name, salutation, title,
+        gender_identity, country_code, background, user_id, group_id, plus the
+        *_attributes children). `name` is the last name and must stay non-empty.
+      params:
+        id: { type: string, in: path, required: true }
+        person: { type: object, in: body, required: true, description: "Person object with the fields to change — same schema as create_person" }
+        no_log: { type: boolean, in: query, description: "true suppresses the activity-stream entry" }
+      pagination: none
+
+    delete_person:
+      method: DELETE
+      path: /people/{id}
+      access: dangerous
+      description: >
+        Permanently delete a person including their contact details, addresses,
+        positions and notes. Irreversible — confirm with the user first, and prefer
+        tagging or a background note when the record only needs to be retired.
+      params:
+        id: { type: string, in: path, required: true }
+        no_log: { type: boolean, in: query, description: "true suppresses the activity-stream entry" }
+      pagination: none
+
+    search_people:
+      method: GET
+      path: /people/search
+      access: read
+      description: >
+        Find people by exact-ish attributes: name (LAST name), first_name, email or
+        phone. email and phone are mutually exclusive — pass one or the other. This is
+        the correct way to answer "do we already know this address?" before creating a
+        duplicate contact. Supports the same includes/methods as list_people.
+      params:
+        name: { type: string, in: query, description: "Retrieve people by their last name" }
+        first_name: { type: string, in: query, description: "Retrieve people by their first name" }
+        email: { type: string, in: query, description: "Retrieve people by e-mail address (mutually exclusive with phone)" }
+        phone: { type: string, in: query, description: "Retrieve people by phone number (mutually exclusive with email)" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_people:
+      method: GET
+      path: /people/count
+      access: read
+      description: >
+        Total number of people, as {"total_entries": N}. Honors tag_id / tag_name.
+        Call this before paging a large account — it costs one request instead of ten.
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    get_person_stats:
+      method: GET
+      path: /people/stats
+      access: read
+      description: "Key aggregate figures for people (total count and related metrics), optionally narrowed by tag_id or tag_name."
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    merge_person:
+      method: POST
+      path: /people/{id}/merge
+      access: dangerous
+      description: >
+        Merge one or more duplicate people INTO the person given by {id}. The records
+        listed in looser_ids are consumed and disappear; their contact details, notes
+        and relations move to the surviving person. Irreversible — verify both sides
+        with get_person before calling.
+      params:
+        id: { type: string, in: path, required: true, description: "The surviving person" }
+        looser_ids: { type: array, in: body, required: true, description: "Array of person ids merged into {id} and then removed" }
+        group_id: { type: integer, in: body, description: "Optionally move the surviving person to this group while merging" }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    list_person_external_emails:
+      method: GET
+      path: /people/{person_id}/external_emails
+      access: read
+      description: "E-mails filed into the CRM (via maildrop or an e-mail integration) that belong to this person. Read-only. Use includes=comments to pull discussion threads."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_person_external_emails:
+      method: GET
+      path: /people/{person_id}/external_emails/count
+      access: read
+      description: "Number of filed e-mails for this person, as {\"total_entries\": N}."
+      params:
+        person_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Companies
+    # ══════════════════════════════════════════════════════════════════
+    list_companies:
+      method: GET
+      path: /companies
+      access: read
+      description: >
+        List companies. Returns unwrapped company objects: id, name, background,
+        user_id (responsible user), group_id, created_at, updated_at.
+        includes: positions, deals, projects, tags, tasks, pending_tasks, cal_events,
+        upcoming_cal_events, tels, emails, ims, sms, homepages, addrs, connections,
+        custom_fields — or "all". methods: responsible_user_natural_name, related_tasks,
+        stream_updated_at, absolute_url — or "all". Use stream_updated_at_after for
+        incremental syncs.
+        LIVE: includes=custom_fields is the ONLY way to read a company's custom fields —
+        the API has no /companies/{id}/custom_fields route — and it returns them for the
+        whole page in one request, which makes this the right tool for auditing a
+        company-level field across the account. Each entry carries id (the value id),
+        custom_fields_type_id, custom_fields_type_name (the label) and name (the value).
+        To look up companies by a value use find_records_by_custom_field.
+      params:
+        perpage: { type: integer, in: query, default: 100, description: "Max 250" }
+        page: { type: integer, in: query }
+        order: { type: string, in: query, description: "abc-asc, abc-desc, new-asc, new-desc, update-asc, update-desc" }
+        includes: { type: string, in: query, description: "Space-separated child records, or 'all'" }
+        methods: { type: string, in: query, description: "Space-separated computed fields, or 'all'" }
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+        stream_updated_at_after: { type: string, in: query, description: "ISO 8601 — only companies with newer stream activity" }
+        stream_updated_at_before: { type: string, in: query, description: "ISO 8601 — only companies with older stream activity" }
+
+    get_company:
+      method: GET
+      path: /companies/{id}
+      access: read
+      description: "Retrieve one company by numeric id. Use includes=all / methods=all for a complete company view (people via positions, deals, addresses, contact details, tags, custom fields) in a single request."
+      params:
+        id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    create_company:
+      method: POST
+      path: /companies
+      access: write
+      description: >
+        Create a company. Wrap everything under the `company` key.
+        Writable fields: name (REQUIRED, max 120), background (free text, e.g. company
+        history), user_id (responsible user), group_id.
+        Embeddable children in the same request: custom_fields_attributes,
+        avatar_attributes, tels_attributes, emails_attributes, homepages_attributes,
+        ims_attributes, sms_attributes, addrs_attributes, tags_attributes,
+        connections_attributes.
+        LIVE: custom_fields_attributes is the ONLY way to write a custom field on a
+        company — the API has no /companies/{id}/custom_fields route (custom-field CRUD
+        exists for people only). Verified working with
+        custom_fields_attributes: [{ custom_fields_type_id: <id from
+        list_custom_field_types>, name: "<value>" }]; read it back with
+        get_company({ includes: "custom_fields" }). Only one value per field type and
+        company — to change it later use update_company or set_custom_field_value.
+        Example: api.create_company({ company: { name: "Example GmbH",
+        addrs_attributes: [{ atype: "work_hq", street: "Musterstr. 1", zip: "50667",
+        city: "Köln", country_code: "DE" }],
+        custom_fields_attributes: [{ custom_fields_type_id: 1234, name: "C-1001" }] } })
+      params:
+        company: { type: object, in: body, required: true, description: "Company object — see description for writable and nested fields" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        no_log: { type: boolean, in: query, description: "true suppresses the activity-stream entry" }
+      pagination: none
+
+    update_company:
+      method: PUT
+      path: /companies/{id}
+      access: write
+      description: >
+        Update a company. Send the changed fields inside the `company` object — same
+        schema as create_company (name, background, user_id, group_id, plus the
+        *_attributes children, which are also the only route to a company's custom
+        fields). LIVE for custom fields: change a value with custom_fields_attributes:
+        [{ id: <value id from includes=custom_fields>, name: "<new value>" }], remove it
+        with [{ id, _destroy: true }] or an empty name, add one with
+        [{ custom_fields_type_id, name }] — adding a second value for a type the company
+        already has answers 422. set_custom_field_value does this lookup for you.
+        LIVE: the response body is empty — re-read with get_company.
+      params:
+        id: { type: string, in: path, required: true }
+        company: { type: object, in: body, required: true, description: "Company object with the fields to change — same schema as create_company" }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    delete_company:
+      method: DELETE
+      path: /companies/{id}
+      access: dangerous
+      description: >
+        Permanently delete a company with its addresses, contact details and notes.
+        Irreversible. LIVE: the people who worked there survive, but their position rows
+        are NOT cleaned up — such a person still reports positions_count 1 and
+        includes=companies still resolves the deleted company's name, while get_company
+        on that id answers 404. Delete the stale positions yourself with
+        delete_person_position if the dangling link matters.
+      params:
+        id: { type: string, in: path, required: true }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    search_companies:
+      method: GET
+      path: /companies/search
+      access: read
+      description: "Find companies by name. The duplicate check to run before create_company. Supports the same includes/methods as list_companies."
+      params:
+        name: { type: string, in: query, description: "Retrieve companies by their name" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_companies:
+      method: GET
+      path: /companies/count
+      access: read
+      description: "Total number of companies as {\"total_entries\": N}, optionally narrowed by tag_id or tag_name."
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    get_company_stats:
+      method: GET
+      path: /companies/stats
+      access: read
+      description: "Key aggregate figures for companies, optionally narrowed by tag_id or tag_name."
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    merge_company:
+      method: POST
+      path: /companies/{id}/merge
+      access: dangerous
+      description: >
+        Merge duplicate companies INTO the company given by {id}. Records in looser_ids
+        are consumed and removed; their people, deals, notes and contact details move to
+        the survivor. Irreversible.
+      params:
+        id: { type: string, in: path, required: true, description: "The surviving company" }
+        looser_ids: { type: array, in: body, required: true, description: "Array of company ids merged into {id} and then removed" }
+        group_id: { type: integer, in: body, description: "Optionally move the surviving company to this group while merging" }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    list_company_external_emails:
+      method: GET
+      path: /companies/{company_id}/external_emails
+      access: read
+      description: "E-mails filed into the CRM that belong to this company. Read-only."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_company_external_emails:
+      method: GET
+      path: /companies/{company_id}/external_emails/count
+      access: read
+      description: "Number of filed e-mails for this company, as {\"total_entries\": N}."
+      params:
+        company_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Deals (opportunities) and pipelines
+    # ══════════════════════════════════════════════════════════════════
+    list_deal_types:
+      method: GET
+      path: /deal_types
+      access: read
+      description: >
+        List the account's deal pipelines ("deal types") WITH their stages. Each entry
+        has id, name, singular_item_name / plural_item_name (the account's own wording,
+        e.g. "Offer"), default_view, position, the capability flags has_monetary_value,
+        has_probability, has_target_date, has_muted_until_date, and deal_type_stages
+        (the ordered stages). ALWAYS call this before creating or moving a deal — it
+        supplies the deal_type_id and deal_type_stage_id values and tells you which
+        optional deal fields the pipeline actually uses.
+      pagination: none
+
+    get_deal_type:
+      method: GET
+      path: /deal_types/{id}
+      access: read
+      description: "Retrieve one pipeline with its stages by id — same shape as one entry of list_deal_types."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_deals:
+      method: GET
+      path: /deals
+      access: read
+      description: >
+        List deals (opportunities). Returns unwrapped deal objects: id, name, company_id,
+        user_id, group_id, value / value_type / value_sum / value_count (decimal
+        STRINGS), currency (EUR|CHF|USD), current_state (LIVE: open0|open25|open50|
+        open75|won|lost — no underscore, unlike the API docs), deal_type_id (pipeline),
+        deal_type_stage_id (stage, may be null), probability (0-100), target_date,
+        finished_at, previous_deal_id, description (the free-text background),
+        created_at, updated_at.
+        includes: tags, people, company, task_lists, tasks, pending_tasks, cal_events,
+        upcoming_cal_events, custom_fields — or "all". methods:
+        responsible_user_natural_name, people_ids, absolute_url, stream_updated_at.
+        Sort with order: value-desc for the biggest deals, state-asc, date-desc, etc.
+      params:
+        perpage: { type: integer, in: query, default: 100, description: "Max 250" }
+        page: { type: integer, in: query }
+        order: { type: string, in: query, description: "date-asc, date-desc, new-asc, new-desc, update-asc, update-desc, value-asc, value-desc, state-asc, state-desc, abc-asc, abc-desc" }
+        includes: { type: string, in: query, description: "Space-separated child records, or 'all'" }
+        methods: { type: string, in: query, description: "Space-separated computed fields, or 'all'" }
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+        stream_updated_at_after: { type: string, in: query, description: "ISO 8601 — only deals with newer stream activity" }
+        stream_updated_at_before: { type: string, in: query, description: "ISO 8601 — only deals with older stream activity" }
+
+    get_deal:
+      method: GET
+      path: /deals/{id}
+      access: read
+      description: "Retrieve one deal by id. includes=all also returns the linked company, the assigned people, tasks, calendar events, tags and custom fields."
+      params:
+        id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    create_deal:
+      method: POST
+      path: /deals
+      access: write
+      description: >
+        Create a deal. Wrap everything under the `deal` key. Call list_deal_types first.
+        Writable fields: name (REQUIRED), deal_type_id (pipeline), deal_type_stage_id
+        (stage inside it), company_id, user_id (responsible), group_id, value (decimal
+        STRING, e.g. "1000.00"), value_type (total|monthly|hourly|daily), value_count
+        (decimal string, only relevant when value_type is not total), currency
+        (EUR|CHF|USD, default EUR), probability (integer 0-100), target_date
+        (YYYY-MM-DD, when the deal should be won), finished_at, current_state
+        (LIVE format open0|open25|open50|open75|won|lost — the API docs print
+        open_0|open_25|..., but records come back without the underscore), background
+        (free text; LIVE: reads return this as `description`),
+        person_ids_set (comma-separated person ids to attach, e.g. "42,4711").
+        Also accepts tags_attributes and custom_fields_attributes. Whether value,
+        probability and target_date are used at all depends on the pipeline's
+        capability flags.
+      params:
+        deal: { type: object, in: body, required: true, description: "Deal object — see description for writable fields" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        no_log: { type: boolean, in: query, description: "true suppresses the activity-stream entry" }
+      pagination: none
+
+    update_deal:
+      method: PUT
+      path: /deals/{id}
+      access: write
+      description: >
+        Update a deal — the tool you use to MOVE a deal through its pipeline (set
+        deal_type_stage_id) or to close it (current_state won|lost, optionally
+        finished_at). Send only the changed fields inside the `deal` object; the schema
+        is identical to create_deal (name, deal_type_id, deal_type_stage_id, company_id,
+        user_id, group_id, value, value_type, value_count, currency, probability,
+        target_date, finished_at, current_state, background, person_ids_set).
+        LIVE: the response body of a PUT is EMPTY — re-read with get_deal to see the
+        result, and use the underscore-free current_state format (open75, not open_75).
+      params:
+        id: { type: string, in: path, required: true }
+        deal: { type: object, in: body, required: true, description: "Deal object with the fields to change — same schema as create_deal" }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    delete_deal:
+      method: DELETE
+      path: /deals/{id}
+      access: dangerous
+      description: "Permanently delete a deal and its notes. Irreversible — to record a loss, prefer update_deal with current_state 'lost' so the history stays intact."
+      params:
+        id: { type: string, in: path, required: true }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    search_deals:
+      method: GET
+      path: /deals/search
+      access: read
+      description: "Find deals by name. Supports the same includes/methods as list_deals."
+      params:
+        name: { type: string, in: query, description: "Retrieve deals by their name" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_deals:
+      method: GET
+      path: /deals/count
+      access: read
+      description: "Total number of deals as a total_entries object, optionally narrowed by tag_id or tag_name."
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    get_deal_stats:
+      method: GET
+      path: /deals/stats
+      access: read
+      description: >
+        Aggregate deal figures — total count plus the summed deal value (the `sum`
+        field). The cheapest way to answer "what is our pipeline worth?" without
+        pulling every deal. Optionally narrowed by tag_id or tag_name.
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    get_deal_maildrop:
+      method: GET
+      path: /deals/{deal_id}/maildrop
+      access: read
+      description: "The maildrop e-mail address of this deal — forwarding or BCC-ing mail there files it onto the deal as a protocol."
+      params:
+        deal_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_deal_external_emails:
+      method: GET
+      path: /deals/{deal_id}/external_emails
+      access: read
+      description: "E-mails filed into the CRM that belong to this deal. Read-only."
+      params:
+        deal_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_deal_external_emails:
+      method: GET
+      path: /deals/{deal_id}/external_emails/count
+      access: read
+      description: "Number of filed e-mails for this deal, as a total_entries object."
+      params:
+        deal_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Projects
+    # ══════════════════════════════════════════════════════════════════
+    list_projects:
+      method: GET
+      path: /projects
+      access: read
+      description: >
+        List projects. A project is the delivery-side counterpart of a deal: same
+        pipeline mechanics, no monetary fields. Returns id, name, company_id, deal_id
+        (the deal it came from), user_id, group_id, current_state (LIVE format
+        open0|open25|open50|open75|won|lost — the API docs print open_0|open_25|...),
+        target_date, finished_at, background.
+        includes: tags, people, company, task_lists, tasks, pending_tasks, cal_events,
+        upcoming_cal_events, custom_fields — or "all".
+      params:
+        perpage: { type: integer, in: query, default: 100, description: "Max 250" }
+        page: { type: integer, in: query }
+        order: { type: string, in: query, description: "date-asc, date-desc, new-asc, new-desc, update-asc, update-desc, state-asc, state-desc, abc-asc, abc-desc" }
+        includes: { type: string, in: query, description: "Space-separated child records, or 'all'" }
+        methods: { type: string, in: query, description: "Space-separated computed fields, or 'all'" }
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+        stream_updated_at_after: { type: string, in: query, description: "ISO 8601 — only projects with newer stream activity" }
+        stream_updated_at_before: { type: string, in: query, description: "ISO 8601 — only projects with older stream activity" }
+
+    get_project:
+      method: GET
+      path: /projects/{id}
+      access: read
+      description: "Retrieve one project by id. includes=all returns company, people, tasks, calendar events, tags and custom fields."
+      params:
+        id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    create_project:
+      method: POST
+      path: /projects
+      access: write
+      description: >
+        Create a project. Wrap everything under the `project` key.
+        Writable fields: name (REQUIRED, max 120), target_date (REQUIRED, YYYY-MM-DD —
+        when the project should be finished; may be null), company_id, deal_id (the deal
+        this project originates from), user_id (responsible), group_id, current_state
+        (LIVE format open0|open25|open50|open75|won|lost), finished_at, background.
+        Also accepts tags_attributes and custom_fields_attributes.
+      params:
+        project: { type: object, in: body, required: true, description: "Project object — see description for writable fields" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    update_project:
+      method: PUT
+      path: /projects/{id}
+      access: write
+      description: "Update a project. Send the changed fields inside the `project` object — same schema as create_project (name, target_date, company_id, deal_id, user_id, group_id, current_state, finished_at, background)."
+      params:
+        id: { type: string, in: path, required: true }
+        project: { type: object, in: body, required: true, description: "Project object with the fields to change — same schema as create_project" }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    delete_project:
+      method: DELETE
+      path: /projects/{id}
+      access: dangerous
+      description: "Permanently delete a project and its notes. Irreversible — prefer update_project with current_state 'won' or 'lost' to close it."
+      params:
+        id: { type: string, in: path, required: true }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    search_projects:
+      method: GET
+      path: /projects/search
+      access: read
+      description: "Find projects by name. Supports the same includes/methods as list_projects."
+      params:
+        name: { type: string, in: query, description: "Retrieve projects by their name" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_projects:
+      method: GET
+      path: /projects/count
+      access: read
+      description: "Total number of projects as a total_entries object, optionally narrowed by tag_id or tag_name."
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    get_project_stats:
+      method: GET
+      path: /projects/stats
+      access: read
+      description: "Key aggregate figures for projects, optionally narrowed by tag_id or tag_name."
+      params:
+        tag_id: { type: integer, in: query }
+        tag_name: { type: string, in: query }
+      pagination: none
+
+    get_project_maildrop:
+      method: GET
+      path: /projects/{project_id}/maildrop
+      access: read
+      description: "The maildrop e-mail address of this project — mail sent there is filed onto the project as a protocol."
+      params:
+        project_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_project_external_emails:
+      method: GET
+      path: /projects/{project_id}/external_emails
+      access: read
+      description: "E-mails filed into the CRM that belong to this project. Read-only."
+      params:
+        project_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    count_project_external_emails:
+      method: GET
+      path: /projects/{project_id}/external_emails/count
+      access: read
+      description: "Number of filed e-mails for this project, as a total_entries object."
+      params:
+        project_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Tasks
+    # ══════════════════════════════════════════════════════════════════
+    list_tasks:
+      method: GET
+      path: /tasks
+      access: read
+      description: >
+        List tasks (to-dos) of the account. Returns id, name, user_id (owner),
+        attachable_type / attachable_id (the linked Person, Company, Deal or Project),
+        task_list_id, badge, precise_time, finished, fuzzy.
+        Narrow with state=open|closed, before / after (YYYY-MM-DD) and user_id — e.g.
+        "what is due for user 7 this week?" is state=open plus before/after.
+        includes: user, comments. methods: responsible_user_natural_name.
+      params:
+        state: { type: string, in: query, description: "open or closed" }
+        before: { type: string, in: query, description: "YYYY-MM-DD — only tasks before this date" }
+        after: { type: string, in: query, description: "YYYY-MM-DD — only tasks after this date" }
+        user_id: { type: string, in: query, description: "Only tasks of this user" }
+        includes: { type: string, in: query, description: "user, comments — or 'all'" }
+        methods: { type: string, in: query, description: "responsible_user_natural_name" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100, description: "Max 250" }
+        page: { type: integer, in: query }
+
+    get_task:
+      method: GET
+      path: /tasks/{id}
+      access: read
+      description: "Retrieve one task by id, optionally with its user and comments."
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "user, comments — or 'all'" }
+        methods: { type: string, in: query }
+      pagination: none
+
+    create_task:
+      method: POST
+      path: /tasks
+      access: write
+      description: >
+        Create a task. Wrap everything under the `task` key.
+        Writable fields: user_id (REQUIRED — the responsible user; resolve it with
+        search_users), name (REQUIRED — the to-do text), attachable_type
+        (Person|Company|Deal|Project) and attachable_id to link the task to a record,
+        task_list_id (a list inside that record), badge (task|call|email|visit|
+        preparation|important, default task), precise_time (ISO 8601 due date/time),
+        fuzzy (true when only the day matters, not the clock time), finished (true
+        creates an already-closed task).
+        Example: api.create_task({ task: { user_id: 7, name: "Call back about the offer",
+        attachable_type: "Person", attachable_id: 42, badge: "call",
+        precise_time: "2026-07-28T09:00:00Z", fuzzy: true } })
+      params:
+        task: { type: object, in: body, required: true, description: "Task object — see description for writable fields" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    update_task:
+      method: PUT
+      path: /tasks/{id}
+      access: write
+      description: "Update a task — including closing it with finished: true. Send the changed fields inside the `task` object; same schema as create_task (user_id, name, attachable_type, attachable_id, task_list_id, badge, precise_time, fuzzy, finished)."
+      params:
+        id: { type: string, in: path, required: true }
+        task: { type: object, in: body, required: true, description: "Task object with the fields to change — same schema as create_task" }
+      pagination: none
+
+    delete_task:
+      method: DELETE
+      path: /tasks/{id}
+      access: dangerous
+      description: "Permanently delete a task. Irreversible — to mark it done use update_task with finished: true, which keeps it in the history."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Protocols (notes, calls, meetings — the CRM's interaction log)
+    # ══════════════════════════════════════════════════════════════════
+    list_protocols:
+      method: GET
+      path: /protocols
+      access: read
+      description: >
+        List protocols — the notes and logged interactions of the account. Narrow to one
+        record with person_id, company_id, deal_id or project_id (this is how you read
+        "the history of contact X"). Protocols are polymorphic; after unwrapping, `kind`
+        tells you the subtype: protocol_object_note (a manual note), protocol_email,
+        protocol_external, protocol_user_note or protocol_attachment. Fields include id,
+        name, content, badge, confidential, format, user_id, created_at.
+        includes: comments. methods: responsible_user_natural_name, absolute_url,
+        conversion_step_names.
+      params:
+        person_id: { type: integer, in: query, description: "Only protocols of this person" }
+        company_id: { type: integer, in: query, description: "Only protocols of this company" }
+        deal_id: { type: integer, in: query, description: "Only protocols of this deal" }
+        project_id: { type: integer, in: query, description: "Only protocols of this project" }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        methods: { type: string, in: query, description: "responsible_user_natural_name, absolute_url, conversion_step_names — or 'all'" }
+        order: { type: string, in: query, description: "id-asc or id-desc (id-desc = newest first)" }
+        perpage: { type: integer, in: query, default: 100, description: "Max 250" }
+        page: { type: integer, in: query }
+
+    get_protocol:
+      method: GET
+      path: /protocols/{id}
+      access: read
+      description: "Retrieve one protocol by id. The unwrapped object carries `kind` with its subtype (protocol_object_note, protocol_email, protocol_external, protocol_user_note, protocol_attachment)."
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        methods: { type: string, in: query }
+      pagination: none
+
+    create_protocol:
+      method: POST
+      path: /protocols
+      access: write
+      description: >
+        Create a protocol — the standard way to log a call, meeting or note on one or
+        more records. Wrap the note under the `protocol` key.
+        Writable fields: content (REQUIRED — the note text), badge (note|call|email|
+        meeting|other for a ProtocolObjectNote; email for a ProtocolEmail), name (a
+        short headline, max 100), type (ProtocolObjectNote|ProtocolExternal|
+        ProtocolEmail, default ProtocolObjectNote), format (plaintext|markdown —
+        plaintext unless you set markdown), confidential (true limits visibility to
+        power users), person_ids / company_ids / deal_ids / project_ids (ARRAYS of ids;
+        one protocol can hang on several records at once), conversion_step_names.
+        Optionally attach a file in the SAME call by also passing the `attachment`
+        object with filename, content_type and base64 `data`.
+        Example: api.create_protocol({ protocol: { content: "Discussed the renewal.",
+        badge: "call", person_ids: [42], deal_ids: [7] } })
+      params:
+        protocol: { type: object, in: body, required: true, description: "Protocol object — see description for writable fields" }
+        attachment: { type: object, in: body, description: "Optional file to attach: { filename, content_type, data (base64), attachment_category_name }" }
+        only_object_logging: { type: boolean, in: query, description: "true shows the protocol only on the record pages, not in the account status stream" }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        methods: { type: string, in: query }
+      pagination: none
+
+    update_protocol:
+      method: PUT
+      path: /protocols/{id}
+      access: write
+      description: "Update a protocol. Send the changed fields inside the `protocol` object — same schema as create_protocol (content, badge, name, type, format, confidential, person_ids, company_ids, deal_ids, project_ids). An `attachment` object may be added as well."
+      params:
+        id: { type: string, in: path, required: true }
+        protocol: { type: object, in: body, required: true, description: "Protocol object with the fields to change — same schema as create_protocol" }
+        attachment: { type: object, in: body, description: "Optional file to attach: { filename, content_type, data (base64) }" }
+      pagination: none
+
+    delete_protocol:
+      method: DELETE
+      path: /protocols/{id}
+      access: dangerous
+      description: "Permanently delete a protocol and its attachments. Irreversible — this removes documented customer history, so confirm before calling."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    count_protocols:
+      method: GET
+      path: /protocols/count
+      access: read
+      description: "Total number of protocols in the account, as a total_entries object."
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Attachments (files on protocols, comments and e-mails)
+    # ══════════════════════════════════════════════════════════════════
+    list_protocol_attachments:
+      method: GET
+      path: /protocols/{protocol_id}/attachments
+      access: read
+      response:
+        transform: *attachment_meta
+        max_items: 250
+        allow_jq_override: true
+      description: >
+        Files attached to one protocol — metadata only (id as UUID, filename,
+        content_type, size, attachment_category_id, user_id); the inlined base64 `data`
+        is stripped, fetch it with get_protocol_attachment. This is the preferred route:
+        the nested /people|companies|deals|projects/{id}/protocols/{id}/attachments
+        variants are deprecated and not modeled here.
+      params:
+        protocol_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "user, attachment_category, comments — or 'all'" }
+        methods: { type: string, in: query, description: "responsible_user_natural_name, attachment_category_name — or 'all'" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_protocol_attachment:
+      method: POST
+      path: /protocols/{protocol_id}/attachments
+      access: write
+      response:
+        transform: *attachment_meta
+        max_items: 250
+        allow_jq_override: true
+      description: >
+        Attach a file to an existing protocol. Wrap the upload under the `attachment`
+        key: filename (REQUIRED), content_type (REQUIRED, e.g. "application/pdf"),
+        data (base64-encoded file bytes), attachment_category_id or
+        attachment_category_name (the category is created if the name is unknown).
+        A 507 response means the account's storage quota is exhausted.
+      params:
+        protocol_id: { type: integer, in: path, required: true }
+        attachment: { type: object, in: body, required: true, description: "{ filename, content_type, data (base64), attachment_category_name }" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    get_protocol_attachment:
+      method: GET
+      path: /protocols/{protocol_id}/attachments/{id}
+      access: read
+      response:
+        transform: *attachment_full
+        max_items: 250
+        allow_jq_override: true
+      description: "Retrieve one attachment of a protocol INCLUDING its bytes in the base64 `data` field — the response can be several hundred KB."
+      params:
+        protocol_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    delete_protocol_attachment:
+      method: DELETE
+      path: /protocols/{protocol_id}/attachments/{id}
+      access: dangerous
+      description: "Permanently delete one attachment of a protocol. Irreversible."
+      params:
+        protocol_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_attachments:
+      method: GET
+      path: /attachments/
+      access: read
+      response:
+        transform: *attachment_meta
+        max_items: 250
+        allow_jq_override: true
+      description: >
+        All attachments of the account across every record. Returns METADATA only —
+        id (a UUID), filename, content_type, size in bytes, attachable_type /
+        attachable_id, user_id. LIVE: the API inlines the whole file as base64 in every
+        list row (a 413 KB PDF becomes 573 KB of base64); this tool strips that field.
+        Call get_attachment when you actually need the bytes. Use
+        list_protocol_attachments when you already know the protocol, or
+        search_attachments to look one up by filename.
+      params:
+        includes: { type: string, in: query, description: "user, attachment_category, comments — or 'all'" }
+        methods: { type: string, in: query, description: "responsible_user_natural_name, attachment_category_name — or 'all'" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_attachment:
+      method: GET
+      path: /attachments/{id}
+      access: read
+      response:
+        transform: *attachment_full
+        max_items: 250
+        allow_jq_override: true
+      description: >
+        Retrieve one attachment by id (a UUID) INCLUDING its bytes: the `data` field
+        carries the whole file base64-encoded, so the response can be several hundred KB
+        — only call this when you really need the content, and never in a loop. The
+        metadata (filename, content_type, size, attachable_type/_id) comes alongside.
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    create_attachment:
+      method: POST
+      path: /attachments/
+      access: write
+      response:
+        transform: *attachment_meta
+        max_items: 250
+        allow_jq_override: true
+      description: >
+        Upload a file. Wrap it under the `attachment` key: filename (REQUIRED),
+        content_type (REQUIRED), data (base64-encoded bytes), attachable_type
+        (Protocol|Comment|ExternalEmail) plus attachable_id to bind it to a record, and
+        attachment_category_id or attachment_category_name.
+        Prefer create_protocol (with its `attachment` parameter) or
+        create_protocol_attachment when the file belongs to a note — those keep the
+        file and its context in one call. 507 means the storage quota is full.
+      params:
+        attachment: { type: object, in: body, required: true, description: "{ filename, content_type, data (base64), attachable_type, attachable_id, attachment_category_name }" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    delete_attachment:
+      method: DELETE
+      path: /attachments/{id}
+      access: dangerous
+      description: "Permanently delete an attachment. Irreversible."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    search_attachments:
+      method: GET
+      path: /attachments/search
+      access: read
+      response:
+        transform: *attachment_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "Find attachments whose filename contains or matches the given input — the way to locate a document when you only remember its name. Returns metadata only (the base64 `data` field is stripped); fetch the bytes with get_attachment."
+      params:
+        filename: { type: string, in: query, description: "Filename fragment or exact name" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    count_attachments:
+      method: GET
+      path: /attachments/count
+      access: read
+      description: "Total number of attachments AND their combined file size (total_entries plus total_size in bytes) — use it to check storage consumption before uploading."
+      pagination: none
+
+    list_external_email_attachments:
+      method: GET
+      path: /external_emails/{external_email_id}/attachments
+      access: read
+      response:
+        transform: *attachment_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "Files attached to a filed e-mail (external_email)."
+      params:
+        external_email_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_external_email_attachment:
+      method: POST
+      path: /external_emails/{external_email_id}/attachments
+      access: write
+      response:
+        transform: *attachment_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "Attach a file to a filed e-mail. Wrap it under the `attachment` key: { filename, content_type, data (base64) }."
+      params:
+        external_email_id: { type: integer, in: path, required: true }
+        attachment: { type: object, in: body, required: true, description: "{ filename, content_type, data (base64), attachment_category_name }" }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    get_external_email_attachment:
+      method: GET
+      path: /external_emails/{external_email_id}/attachments/{id}
+      access: read
+      response:
+        transform: *attachment_full
+        max_items: 250
+        allow_jq_override: true
+      description: "Retrieve the metadata of one attachment on a filed e-mail."
+      params:
+        external_email_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query }
+        methods: { type: string, in: query }
+      pagination: none
+
+    delete_external_email_attachment:
+      method: DELETE
+      path: /external_emails/{external_email_id}/attachments/{id}
+      access: dangerous
+      description: "Permanently delete one attachment of a filed e-mail. Irreversible."
+      params:
+        external_email_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # External e-mails (mail filed into the CRM) and comments
+    # ══════════════════════════════════════════════════════════════════
+    list_external_emails:
+      method: GET
+      path: /external_emails
+      access: read
+      description: >
+        All e-mails filed into the CRM account (through a maildrop address or an e-mail
+        integration). Read-only: the API cannot send or create them. Fields include
+        subject, content_html, confidential and the record links. For one record use
+        list_person_external_emails / list_company_external_emails /
+        list_deal_external_emails / list_project_external_emails.
+      params:
+        includes: { type: string, in: query, description: "Possible value: comments" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_external_email:
+      method: GET
+      path: /external_emails/{id}
+      access: read
+      description: "Retrieve one filed e-mail by id, including subject and content_html."
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: comments" }
+      pagination: none
+
+    count_external_emails:
+      method: GET
+      path: /external_emails/count
+      access: read
+      description: "Total number of filed e-mails in the account, as a total_entries object."
+      pagination: none
+
+    list_comments:
+      method: GET
+      path: /comments
+      access: read
+      description: "Comments of the account. A comment is a threaded reply on an Attachment, CalEvent, Protocol, ExternalEmail or Task — the internal discussion layer. Returns id, name (the comment text), user_id, attachable_type, attachable_id."
+      params:
+        methods: { type: string, in: query, description: "responsible_user_natural_name" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_comment:
+      method: GET
+      path: /comments/{id}
+      access: read
+      description: "Retrieve one comment by id."
+      params:
+        id: { type: string, in: path, required: true }
+        methods: { type: string, in: query }
+      pagination: none
+
+    create_comment:
+      method: POST
+      path: /comments
+      access: write
+      description: >
+        Add a comment to a record. Wrap it under the `comment` key.
+        Writable fields: name (REQUIRED — the comment text), attachable_type
+        (Attachment|CalEvent|Protocol|ExternalEmail|Task), attachable_id, user_id (the
+        author; defaults to the API key's user).
+        Use this to reply on an existing note instead of creating another protocol.
+      params:
+        comment: { type: object, in: body, required: true, description: "{ name, attachable_type, attachable_id, user_id }" }
+        methods: { type: string, in: query }
+      pagination: none
+
+    update_comment:
+      method: PUT
+      path: /comments/{id}
+      access: write
+      description: "Update a comment. Send the changed fields inside the `comment` object — same schema as create_comment (name, attachable_type, attachable_id, user_id)."
+      params:
+        id: { type: string, in: path, required: true }
+        comment: { type: object, in: body, required: true, description: "Comment object with the fields to change — same schema as create_comment" }
+      pagination: none
+
+    delete_comment:
+      method: DELETE
+      path: /comments/{id}
+      access: dangerous
+      description: "Permanently delete a comment. Irreversible."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Tags
+    # ══════════════════════════════════════════════════════════════════
+    list_tags:
+      method: GET
+      path: /tags
+      access: read
+      description: >
+        List tag assignments of the account. Each tag is an assignment of a name to ONE
+        record, so the same word appears once per tagged record. Narrow with person_id,
+        company_id, deal_id or project_id to see the tags of a single record. Returns
+        id, name, attachable_type, attachable_id, api_input.
+      params:
+        person_id: { type: integer, in: query, description: "Only tags of this person" }
+        company_id: { type: integer, in: query, description: "Only tags of this company" }
+        deal_id: { type: integer, in: query, description: "Only tags of this deal" }
+        project_id: { type: integer, in: query, description: "Only tags of this project" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    list_tag_names:
+      method: GET
+      path: /tags/list
+      access: read
+      description: "The distinct tag NAMES used in the account, as a plain array of strings. Call this before tagging so you reuse an existing label instead of inventing a near-duplicate."
+      params:
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_tag:
+      method: POST
+      path: /tags
+      access: write
+      description: >
+        Tag any record. Wrap it under the `tag` key.
+        Writable fields: name (REQUIRED, max 60), attachable_type (REQUIRED —
+        Person|Company|Deal|Project), attachable_id (REQUIRED — the record's id),
+        api_input (marks the tag as machine-created).
+        Example: api.create_tag({ tag: { name: "top-customer", attachable_type: "Person",
+        attachable_id: 42 } })
+      params:
+        tag: { type: object, in: body, required: true, description: "{ name, attachable_type, attachable_id, api_input }" }
+      pagination: none
+
+    list_person_tags:
+      method: GET
+      path: /people/{person_id}/tags
+      access: read
+      description: "Tags assigned to one person."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_tag:
+      method: POST
+      path: /people/{person_id}/tags
+      access: write
+      description: "Tag a person. Wrap it under the `tag` key — only `name` is needed here, attachable_type and attachable_id are set automatically from the route."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        tag: { type: object, in: body, required: true, description: "{ name, api_input }" }
+      pagination: none
+
+    get_person_tag:
+      method: GET
+      path: /people/{person_id}/tags/{id}
+      access: read
+      description: "Retrieve one tag assignment of a person."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_person_tag:
+      method: PUT
+      path: /people/{person_id}/tags/{id}
+      access: write
+      description: "Rename a person's tag assignment. Send the new value inside the `tag` object ({ name })."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+        tag: { type: object, in: body, required: true, description: "{ name, api_input }" }
+      pagination: none
+
+    delete_person_tag:
+      method: DELETE
+      path: /people/{person_id}/tags/{id}
+      access: dangerous
+      description: "Remove a tag from a person. The tag name survives on other records."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Contact details — phones, e-mails, websites, messengers, socials
+    # ══════════════════════════════════════════════════════════════════
+    list_person_contact_details:
+      method: GET
+      path: /people/{person_id}/contact_details
+      access: read
+      description: >
+        All contact details of a person in ONE polymorphic collection. After unwrapping,
+        `kind` names the type: tel (phone), email, homepage (website), im (messenger) or
+        sm (social profile). Each entry has id, atype (the sub-type such as office or
+        mobile), name (the actual number/address/URL) and primary ordering info.
+        Postal addresses are NOT here — use list_person_addrs.
+      params:
+        person_id: { type: integer, in: path, required: true }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_contact_detail:
+      method: POST
+      path: /people/{person_id}/contact_details
+      access: write
+      description: >
+        Add ONE contact detail to a person. The WRAPPER KEY picks the type — pass
+        exactly one of tel, email, homepage, im or sm; each object needs { atype, name }
+        (attachable_type/_id are filled in from the route).
+        atype values — tel: office, office_hq, mobile, fax, private, voip, skype, other.
+        email: office, office_hq, private, invoice, other (plus optional doi flag for
+        double-opt-in). homepage: office, private, other. im: aim, ghangouts, icq,
+        jabber, msn, signal, skype, telegram, threema, whatsapp, wechat, yahootalk,
+        other. sm: the social network name.
+        `name` always carries the value itself (the number, the address, the URL).
+        Example: api.create_person_contact_detail({ person_id: 42,
+        email: { atype: "office", name: "jolly@example.com" } })
+      params:
+        person_id: { type: integer, in: path, required: true }
+        tel: { type: object, in: body, description: "Phone number: { atype, name }" }
+        email: { type: object, in: body, description: "E-mail address: { atype, name, doi }" }
+        homepage: { type: object, in: body, description: "Website: { atype, name }" }
+        im: { type: object, in: body, description: "Messenger handle: { atype, name }" }
+        sm: { type: object, in: body, description: "Social media profile: { atype, name }" }
+      pagination: none
+
+    get_person_contact_detail:
+      method: GET
+      path: /people/{person_id}/contact_details/{id}
+      access: read
+      description: "Retrieve one contact detail of a person; `kind` in the result names its type."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_person_contact_detail:
+      method: PUT
+      path: /people/{person_id}/contact_details/{id}
+      access: write
+      description: "Update one contact detail of a person. Wrap the changed fields in the key matching its type (tel, email, homepage, im or sm) — same schema as create_person_contact_detail."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        tel: { type: object, in: body, description: "Phone number: { atype, name }" }
+        email: { type: object, in: body, description: "E-mail address: { atype, name, doi }" }
+        homepage: { type: object, in: body, description: "Website: { atype, name }" }
+        im: { type: object, in: body, description: "Messenger handle: { atype, name }" }
+        sm: { type: object, in: body, description: "Social media profile: { atype, name }" }
+      pagination: none
+
+    delete_person_contact_detail:
+      method: DELETE
+      path: /people/{person_id}/contact_details/{id}
+      access: dangerous
+      description: "Delete one contact detail (phone, e-mail, website, messenger or social profile) of a person. Irreversible."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_company_contact_details:
+      method: GET
+      path: /companies/{company_id}/contact_details
+      access: read
+      description: "All contact details of a company — same polymorphic collection as for people (`kind` is tel, email, homepage, im or sm)."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_company_contact_detail:
+      method: POST
+      path: /companies/{company_id}/contact_details
+      access: write
+      description: "Add ONE contact detail to a company. Pass exactly one of tel, email, homepage, im or sm, each { atype, name } — see create_person_contact_detail for the atype values."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        tel: { type: object, in: body, description: "Phone number: { atype, name }" }
+        email: { type: object, in: body, description: "E-mail address: { atype, name, doi }" }
+        homepage: { type: object, in: body, description: "Website: { atype, name }" }
+        im: { type: object, in: body, description: "Messenger handle: { atype, name }" }
+        sm: { type: object, in: body, description: "Social media profile: { atype, name }" }
+      pagination: none
+
+    get_company_contact_detail:
+      method: GET
+      path: /companies/{company_id}/contact_details/{id}
+      access: read
+      description: "Retrieve one contact detail of a company; `kind` names its type."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_company_contact_detail:
+      method: PUT
+      path: /companies/{company_id}/contact_details/{id}
+      access: write
+      description: "Update one contact detail of a company. Wrap the changed fields in the key matching its type (tel, email, homepage, im or sm)."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        tel: { type: object, in: body, description: "Phone number: { atype, name }" }
+        email: { type: object, in: body, description: "E-mail address: { atype, name, doi }" }
+        homepage: { type: object, in: body, description: "Website: { atype, name }" }
+        im: { type: object, in: body, description: "Messenger handle: { atype, name }" }
+        sm: { type: object, in: body, description: "Social media profile: { atype, name }" }
+      pagination: none
+
+    delete_company_contact_detail:
+      method: DELETE
+      path: /companies/{company_id}/contact_details/{id}
+      access: dangerous
+      description: "Delete one contact detail of a company. Irreversible."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    search_contact_details:
+      method: GET
+      path: /contact_details/search
+      access: read
+      description: >
+        Reverse lookup: find the PEOPLE or COMPANIES that own a given contact detail.
+        `name` (REQUIRED) is the search term — an e-mail address, phone number or URL —
+        and `type` selects the record class (people, the default, or companies). Returns
+        person/company objects, so `kind` is person or company. This is the tool for
+        "who is calling from +49221123456?" and for de-duplication before an import.
+      params:
+        name: { type: string, in: query, required: true, description: "Search term: e-mail address, phone number or URL" }
+        type: { type: string, in: query, description: "people (default) or companies" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    # ══════════════════════════════════════════════════════════════════
+    # Postal addresses
+    # ══════════════════════════════════════════════════════════════════
+    list_person_addrs:
+      method: GET
+      path: /people/{person_id}/addrs
+      access: read
+      description: "Postal addresses of a person: street, zip, city, state_code, country_code, atype and the `primary` ordering flag."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_addr:
+      method: POST
+      path: /people/{person_id}/addrs
+      access: write
+      description: >
+        Add a postal address to a person. Wrap it under the `addr` key.
+        Writable fields: city (REQUIRED unless country_code is given), street (including
+        house number, c/o or building), zip, state_code (e.g. NW, BY — must match the
+        country), country_code (e.g. DE, AT), atype (work_hq|work|invoice|delivery|
+        private|other), primary (true puts it first), api_input.
+      params:
+        person_id: { type: integer, in: path, required: true }
+        addr: { type: object, in: body, required: true, description: "{ street, zip, city, state_code, country_code, atype, primary }" }
+      pagination: none
+
+    get_person_addr:
+      method: GET
+      path: /people/{person_id}/addrs/{id}
+      access: read
+      description: "Retrieve one postal address of a person."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_person_addr:
+      method: PUT
+      path: /people/{person_id}/addrs/{id}
+      access: write
+      description: "Update a person's postal address. Send the changed fields inside the `addr` object — same schema as create_person_addr (street, zip, city, state_code, country_code, atype, primary)."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        addr: { type: object, in: body, required: true, description: "Address object with the fields to change — same schema as create_person_addr" }
+      pagination: none
+
+    delete_person_addr:
+      method: DELETE
+      path: /people/{person_id}/addrs/{id}
+      access: dangerous
+      description: "Delete a postal address of a person. Irreversible."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_company_addrs:
+      method: GET
+      path: /companies/{company_id}/addrs
+      access: read
+      description: "Postal addresses of a company (headquarters, invoice and delivery addresses)."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_company_addr:
+      method: POST
+      path: /companies/{company_id}/addrs
+      access: write
+      description: "Add a postal address to a company. Wrap it under the `addr` key: { street, zip, city, state_code, country_code, atype (work_hq|work|invoice|delivery|private|other), primary }. city is required unless country_code is given."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        addr: { type: object, in: body, required: true, description: "{ street, zip, city, state_code, country_code, atype, primary }" }
+      pagination: none
+
+    get_company_addr:
+      method: GET
+      path: /companies/{company_id}/addrs/{id}
+      access: read
+      description: "Retrieve one postal address of a company."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_company_addr:
+      method: PUT
+      path: /companies/{company_id}/addrs/{id}
+      access: write
+      description: "Update a company's postal address. Send the changed fields inside the `addr` object — same schema as create_company_addr."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        addr: { type: object, in: body, required: true, description: "Address object with the fields to change — same schema as create_company_addr" }
+      pagination: none
+
+    delete_company_addr:
+      method: DELETE
+      path: /companies/{company_id}/addrs/{id}
+      access: dangerous
+      description: "Delete a postal address of a company. Irreversible."
+      params:
+        company_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Positions (person works at company) and assistants
+    # ══════════════════════════════════════════════════════════════════
+    list_person_positions:
+      method: GET
+      path: /people/{person_id}/positions
+      access: read
+      description: >
+        The positions of a person — the links between a person and the companies they
+        work for, carrying job title (name), department, company_name, primary_function
+        and former. This is how person and company are connected; a person can hold
+        several positions. includes: person, company.
+      params:
+        person_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "person, company — or 'all'" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_position:
+      method: POST
+      path: /people/{person_id}/positions
+      access: write
+      description: >
+        Link a person to a company. Wrap it under the `position` key.
+        Writable fields: company_id (REQUIRED — the employer; person_id comes from the
+        route), name (the job title, e.g. "Head of Sales"), department, company_name
+        (free-text employer when no company record exists), primary_function (true marks
+        the main employer — only one position may be primary), former (true for past
+        employments).
+      params:
+        person_id: { type: integer, in: path, required: true }
+        position: { type: object, in: body, required: true, description: "{ company_id, name, department, company_name, primary_function, former }" }
+      pagination: none
+
+    get_person_position:
+      method: GET
+      path: /people/{person_id}/positions/{id}
+      access: read
+      description: "Retrieve one position of a person, optionally with the person and company embedded."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "person, company — or 'all'" }
+      pagination: none
+
+    update_person_position:
+      method: PUT
+      path: /people/{person_id}/positions/{id}
+      access: write
+      description: "Update a position — e.g. mark it `former: true` when someone leaves, or change the job title. Send the changed fields inside the `position` object; same schema as create_person_position."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+        position: { type: object, in: body, required: true, description: "Position object with the fields to change — same schema as create_person_position" }
+      pagination: none
+
+    delete_person_position:
+      method: DELETE
+      path: /people/{person_id}/positions/{id}
+      access: dangerous
+      description: "Remove the link between a person and a company. Irreversible — prefer update_person_position with former: true to preserve the employment history."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_person_assis:
+      method: GET
+      path: /people/{person_id}/assis
+      access: read
+      description: "The assistants (\"assis\") of a person — name, email, tel and the primary flag. Useful for gatekeeper contacts who are not full CRM records themselves."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_assi:
+      method: POST
+      path: /people/{person_id}/assis
+      access: write
+      description: "Add an assistant to a person. Wrap it under the `assi` key: name (REQUIRED), email, tel, primary (true marks the main assistant)."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        assi: { type: object, in: body, required: true, description: "{ name, email, tel, primary }" }
+      pagination: none
+
+    get_person_assi:
+      method: GET
+      path: /people/{person_id}/assis/{id}
+      access: read
+      description: "Retrieve one assistant of a person."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_person_assi:
+      method: PUT
+      path: /people/{person_id}/assis/{id}
+      access: write
+      description: "Update an assistant. Send the changed fields inside the `assi` object — same schema as create_person_assi (name, email, tel, primary)."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        assi: { type: object, in: body, required: true, description: "Assistant object with the fields to change — same schema as create_person_assi" }
+      pagination: none
+
+    delete_person_assi:
+      method: DELETE
+      path: /people/{person_id}/assis/{id}
+      access: dangerous
+      description: "Delete an assistant of a person. Irreversible."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Historic events (birthdays, anniversaries, first contact)
+    # ══════════════════════════════════════════════════════════════════
+    list_historic_events:
+      method: GET
+      path: /historic_events
+      access: read
+      description: >
+        All historic events of the account — the dated milestones attached to people:
+        birthday, anniversary, first_met, renewal or other. Narrow the range with
+        date_from AND date_to (both are required as soon as one is given) to answer
+        "whose birthday is next week?". Returns atype, name (the date), desc.
+      params:
+        date_from: { type: string, in: query, description: "YYYY-MM-DD — start of the range; date_to becomes mandatory" }
+        date_to: { type: string, in: query, description: "YYYY-MM-DD — end of the range; date_from becomes mandatory" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    list_person_historic_events:
+      method: GET
+      path: /people/{person_id}/historic_events
+      access: read
+      description: "The historic events (birthday, anniversary, first_met, renewal, other) of one person."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_historic_event:
+      method: POST
+      path: /people/{person_id}/historic_events
+      access: write
+      description: >
+        Add a dated milestone to a person. Wrap it under the `historic_event` key.
+        Writable fields: atype (REQUIRED — birthday|anniversary|first_met|renewal|other),
+        name (REQUIRED — the DATE of the event, YYYY-MM-DD), desc (an extra description,
+        used mainly with atype "other").
+      params:
+        person_id: { type: integer, in: path, required: true }
+        historic_event: { type: object, in: body, required: true, description: "{ atype, name (the date), desc }" }
+      pagination: none
+
+    get_person_historic_event:
+      method: GET
+      path: /people/{person_id}/historic_events/{id}
+      access: read
+      description: "Retrieve one historic event of a person."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    update_person_historic_event:
+      method: PUT
+      path: /people/{person_id}/historic_events/{id}
+      access: write
+      description: "Update a historic event. Send the changed fields inside the `historic_event` object — same schema as create_person_historic_event (atype, name, desc)."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        historic_event: { type: object, in: body, required: true, description: "Historic event object with the fields to change — same schema as create_person_historic_event" }
+      pagination: none
+
+    delete_person_historic_event:
+      method: DELETE
+      path: /people/{person_id}/historic_events/{id}
+      access: dangerous
+      description: "Delete a historic event of a person. Irreversible."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Custom fields and their types
+    # ══════════════════════════════════════════════════════════════════
+    list_custom_field_types:
+      method: GET
+      path: /custom_fields_types
+      access: read
+      description: >
+        The account's custom field DEFINITIONS: id, name, category (Person|Company|Deal|
+        Project), ftype (string|select|decimal|date|url), position and, for selects, the
+        allowed options. Call this first — a custom field value can only be written with
+        the custom_fields_type_id from here, and the ftype tells you the expected format.
+        The VALUES live on the records: people have their own value routes below; for
+        companies, deals and projects read them with includes=custom_fields and write
+        them as custom_fields_attributes on update_company / update_deal /
+        update_project. get_custom_field_values, set_custom_field_value and
+        find_records_by_custom_field wrap both cases.
+      params:
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_custom_field_type:
+      method: GET
+      path: /custom_fields_types/{id}
+      access: read
+      description: "Retrieve one custom field definition by id."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    create_custom_field_type:
+      method: POST
+      path: /custom_fields_types
+      access: admin
+      description: >
+        Define a new custom field for the whole account — a schema change that affects
+        every user, so confirm before calling. Wrap it under the `custom_fields_type` key.
+        Writable fields: name (REQUIRED), category (REQUIRED — Person|Company|Deal|
+        Project), ftype (REQUIRED — string|select|decimal|date|url), position (REQUIRED —
+        sort order), options (REQUIRED for ftype select — the array of allowed values).
+      params:
+        custom_fields_type: { type: object, in: body, required: true, description: "{ name, category, ftype, position, options }" }
+      pagination: none
+
+    update_custom_field_type:
+      method: PUT
+      path: /custom_fields_types/{id}
+      access: admin
+      description: "Change a custom field definition (name, category, ftype, position, options). Account-wide schema change — narrowing the options of a select can orphan existing values."
+      params:
+        id: { type: string, in: path, required: true }
+        custom_fields_type: { type: object, in: body, required: true, description: "Definition object with the fields to change — same schema as create_custom_field_type" }
+      pagination: none
+
+    delete_custom_field_type:
+      method: DELETE
+      path: /custom_fields_types/{id}
+      access: dangerous
+      description: "Delete a custom field definition. Irreversible and account-wide: every value stored in that field is lost."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_person_custom_fields:
+      method: GET
+      path: /people/{person_id}/custom_fields
+      access: read
+      description: "The custom field VALUES of one person: id, custom_fields_type_id, name (the value). Use includes=custom_fields_type to get the definition (label, ftype) in the same call instead of joining against list_custom_field_types."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: custom_fields_type" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_custom_field:
+      method: POST
+      path: /people/{person_id}/custom_fields
+      access: write
+      description: >
+        Set a custom field value on a person. Wrap it under the `custom_field` key.
+        Writable fields: custom_fields_type_id (REQUIRED — from list_custom_field_types),
+        name (REQUIRED — the VALUE, formatted according to the type's ftype: plain text,
+        one of the select options, a decimal, a YYYY-MM-DD date or a URL), api_input.
+        attachable_type / attachable_id are set from the route.
+      params:
+        person_id: { type: integer, in: path, required: true }
+        custom_field: { type: object, in: body, required: true, description: "{ custom_fields_type_id, name (the value), api_input }" }
+      pagination: none
+
+    get_person_custom_field:
+      method: GET
+      path: /people/{person_id}/custom_fields/{id}
+      access: read
+      description: "Retrieve one custom field value of a person."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: custom_fields_type" }
+      pagination: none
+
+    update_person_custom_field:
+      method: PUT
+      path: /people/{person_id}/custom_fields/{id}
+      access: write
+      description: "Change a custom field value of a person. Send the new value inside the `custom_field` object — same schema as create_person_custom_field (custom_fields_type_id, name, api_input)."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+        custom_field: { type: object, in: body, required: true, description: "Custom field object with the fields to change — same schema as create_person_custom_field" }
+      pagination: none
+
+    delete_person_custom_field:
+      method: DELETE
+      path: /people/{person_id}/custom_fields/{id}
+      access: dangerous
+      description: "Delete a custom field value of a person (the definition stays). Irreversible."
+      params:
+        person_id: { type: integer, in: path, required: true }
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Calendar — events, attendees, group calendars
+    # ══════════════════════════════════════════════════════════════════
+    list_cal_events:
+      method: GET
+      path: /cal_events
+      access: read
+      description: >
+        Calendar events of the account: id, name, location, starts_at, ends_at, all_day,
+        status, description, user_id, group_calendar_id and the attachable_type /
+        attachable_id link to a Person, Company, Deal or Project.
+        Narrow with state=upcoming|old or the before / after date bounds (YYYY-MM-DD).
+        includes: user, group_calendar, people, users, cal_event_attendees, comments.
+      params:
+        state: { type: string, in: query, description: "upcoming or old" }
+        before: { type: string, in: query, description: "YYYY-MM-DD — only events before this date" }
+        after: { type: string, in: query, description: "YYYY-MM-DD — only events after this date" }
+        includes: { type: string, in: query, description: "user, group_calendar, people, users, cal_event_attendees, comments — or 'all'" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_cal_event:
+      method: GET
+      path: /cal_events/{id}
+      access: read
+      description: "Retrieve one calendar event by id, optionally with its attendees and linked record."
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "user, group_calendar, people, users, cal_event_attendees, comments — or 'all'" }
+      pagination: none
+
+    create_cal_event:
+      method: POST
+      path: /cal_events
+      access: write
+      description: >
+        Create a calendar event. Wrap it under the `cal_event` key.
+        Writable fields: name (REQUIRED), starts_at (REQUIRED, ISO 8601), ends_at
+        (REQUIRED), user_id (REQUIRED — the owning user), group_calendar_id (REQUIRED —
+        pick one with list_group_calendars), status (REQUIRED — new|confirmed|tentative|
+        cancelled), location (free text, address or room), description (agenda details),
+        all_day (true for full-day events), email_invitations (true makes the CRM send
+        invitation mails to all attendees — a real outbound e-mail, so ask first),
+        attachable_type (Person|Company|Deal|Project) and attachable_id to link the
+        event to a record.
+        Add participants afterwards with create_cal_event_attendee.
+      params:
+        cal_event: { type: object, in: body, required: true, description: "Calendar event object — see description for writable fields" }
+        includes: { type: string, in: query }
+        no_log: { type: boolean, in: query, description: "true suppresses the activity-stream entry" }
+      pagination: none
+
+    update_cal_event:
+      method: PUT
+      path: /cal_events/{id}
+      access: write
+      description: "Update a calendar event (reschedule, cancel via status, change location). Send the changed fields inside the `cal_event` object — same schema as create_cal_event. Setting email_invitations true triggers real invitation mails."
+      params:
+        id: { type: string, in: path, required: true }
+        cal_event: { type: object, in: body, required: true, description: "Calendar event object with the fields to change — same schema as create_cal_event" }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    delete_cal_event:
+      method: DELETE
+      path: /cal_events/{id}
+      access: dangerous
+      description: "Permanently delete a calendar event and its attendees. Irreversible — prefer update_cal_event with status 'cancelled' when the appointment should stay visible."
+      params:
+        id: { type: string, in: path, required: true }
+        no_log: { type: boolean, in: query }
+      pagination: none
+
+    list_cal_event_attendees:
+      method: GET
+      path: /cal_events/{cal_event_id}/cal_event_attendees
+      access: read
+      description: "Participants of a calendar event: person_id or user_id, email and status (new, invited, no_invite, accepted, rejected, perhaps, canceled). includes: user, person, cal_event."
+      params:
+        cal_event_id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "user, person, cal_event — or 'all'" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+
+    create_cal_event_attendee:
+      method: POST
+      path: /cal_events/{cal_event_id}/cal_event_attendees
+      access: write
+      description: >
+        Add a participant to a calendar event. Wrap it under the `cal_event_attendee`
+        key. Writable fields: person_id OR user_id (one of them must reference a real
+        record — person_id for a CRM contact, user_id for a colleague), status (REQUIRED
+        — new|invited|no_invite|accepted|rejected|perhaps|canceled), email (the address
+        the invitation goes to if the event has email_invitations enabled).
+        Use status "no_invite" to add someone without sending mail.
+      params:
+        cal_event_id: { type: string, in: path, required: true }
+        cal_event_attendee: { type: object, in: body, required: true, description: "{ person_id, user_id, email, status }" }
+      pagination: none
+
+    get_cal_event_attendee:
+      method: GET
+      path: /cal_events/{cal_event_id}/cal_event_attendees/{id}
+      access: read
+      description: "Retrieve one attendee of a calendar event."
+      params:
+        cal_event_id: { type: string, in: path, required: true }
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "user, person, cal_event — or 'all'" }
+      pagination: none
+
+    update_cal_event_attendee:
+      method: PUT
+      path: /cal_events/{cal_event_id}/cal_event_attendees/{id}
+      access: write
+      description: "Update an attendee — typically to record their response via status (accepted, rejected, perhaps, canceled). Send the changed fields inside the `cal_event_attendee` object."
+      params:
+        cal_event_id: { type: string, in: path, required: true }
+        id: { type: string, in: path, required: true }
+        cal_event_attendee: { type: object, in: body, required: true, description: "Attendee object with the fields to change — same schema as create_cal_event_attendee" }
+      pagination: none
+
+    delete_cal_event_attendee:
+      method: DELETE
+      path: /cal_events/{cal_event_id}/cal_event_attendees/{id}
+      access: dangerous
+      description: "Remove a participant from a calendar event. Irreversible."
+      params:
+        cal_event_id: { type: string, in: path, required: true }
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_group_calendars:
+      method: GET
+      path: /group_calendars
+      access: read
+      description: "The shared calendars of the account (id, name, color_type, read_only). Every calendar event needs a group_calendar_id, so call this before create_cal_event. includes: cal_events."
+      params:
+        includes: { type: string, in: query, description: "Possible value: cal_events" }
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_group_calendar:
+      method: GET
+      path: /group_calendars/{id}
+      access: read
+      description: "Retrieve one shared calendar by id, optionally with its events."
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: cal_events" }
+      pagination: none
+
+    create_group_calendar:
+      method: POST
+      path: /group_calendars
+      access: admin
+      description: >
+        Create a shared calendar visible to the whole account. Wrap it under the
+        `group_calendar` key. Writable fields: name (REQUIRED), color_type (REQUIRED —
+        one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve), read_only
+        (REQUIRED — some calendars are created with the account and cannot be renamed or
+        removed).
+      params:
+        group_calendar: { type: object, in: body, required: true, description: "{ name, color_type, read_only }" }
+      pagination: none
+
+    update_group_calendar:
+      method: PUT
+      path: /group_calendars/{id}
+      access: admin
+      description: "Rename or recolor a shared calendar. Send the changed fields inside the `group_calendar` object (name, color_type, read_only)."
+      params:
+        id: { type: string, in: path, required: true }
+        group_calendar: { type: object, in: body, required: true, description: "Calendar object with the fields to change — same schema as create_group_calendar" }
+      pagination: none
+
+    delete_group_calendar:
+      method: DELETE
+      path: /group_calendars/{id}
+      access: dangerous
+      description: "Delete a shared calendar. Irreversible and account-wide — its events go with it. Read-only system calendars cannot be removed."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Avatars (profile pictures)
+    # ══════════════════════════════════════════════════════════════════
+    list_avatars:
+      method: GET
+      path: /avatars/
+      access: read
+      response:
+        transform: *avatar_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "All avatars (profile pictures) of the account with their owning record — metadata only (filename, content_type, size, attachable_type/_id); the base64 `data` field is stripped here and returned by get_avatar."
+      params:
+        order: { type: string, in: query, description: "id-asc or id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_avatar:
+      method: GET
+      path: /avatars/{id}
+      access: read
+      description: "Retrieve one avatar by id, including the image bytes in the base64 `data` field alongside filename, content_type and the owning record."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    delete_avatar:
+      method: DELETE
+      path: /avatars/{id}
+      access: dangerous
+      description: "Delete an avatar. Irreversible; the record keeps its default placeholder image."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+    count_avatars:
+      method: GET
+      path: /avatars/count
+      access: read
+      description: "Number of avatars and their combined file size (total_entries plus total_size in bytes)."
+      pagination: none
+
+    list_person_avatars:
+      method: GET
+      path: /people/{person_id}/avatars
+      access: read
+      response:
+        transform: *avatar_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "The avatar(s) of one person."
+      params:
+        person_id: { type: string, in: path, required: true }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_person_avatar:
+      method: POST
+      path: /people/{person_id}/avatars
+      access: write
+      response:
+        transform: *avatar_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "Upload a profile picture for a person. Wrap it under the `avatar` key: filename (REQUIRED), content_type (REQUIRED, e.g. image/jpg), data (base64-encoded image bytes). 507 means the storage quota is exhausted."
+      params:
+        person_id: { type: string, in: path, required: true }
+        avatar: { type: object, in: body, required: true, description: "{ filename, content_type, data (base64) }" }
+      pagination: none
+
+    list_company_avatars:
+      method: GET
+      path: /companies/{company_id}/avatars
+      access: read
+      response:
+        transform: *avatar_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "The avatar(s) / logo(s) of one company."
+      params:
+        company_id: { type: string, in: path, required: true }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    create_company_avatar:
+      method: POST
+      path: /companies/{company_id}/avatars
+      access: write
+      response:
+        transform: *avatar_meta
+        max_items: 250
+        allow_jq_override: true
+      description: "Upload a logo for a company. Wrap it under the `avatar` key: { filename, content_type, data (base64) }."
+      params:
+        company_id: { type: string, in: path, required: true }
+        avatar: { type: object, in: body, required: true, description: "{ filename, content_type, data (base64) }" }
+      pagination: none
+
+    # ══════════════════════════════════════════════════════════════════
+    # Activity stream, saved filters, webhooks
+    # ══════════════════════════════════════════════════════════════════
+    list_activities:
+      method: GET
+      path: /activities
+      access: read
+      description: >
+        The activity stream — the read-only audit log of who created, changed or deleted
+        what. Each entry has verb (create, update, ...), attachable_type / attachable_id
+        (the touched record), user_id, name, occurred_at, confidential, fav and `change`
+        (a hash of the changed values, sometimes empty).
+        LIVE: a SCOPE IS MANDATORY even though the API docs mark every parameter
+        optional — pass at least one of person_id, company_id, deal_id, project_id,
+        user_id or account_id, otherwise the API answers HTTP 400 bad-request. For the
+        whole account use account_id (it is on every record as `account_id`).
+        Activities cannot be written through the API — log customer interactions with
+        create_protocol instead.
+      params:
+        person_id: { type: integer, in: query, description: "Only activities of this person" }
+        company_id: { type: integer, in: query, description: "Only activities of this company" }
+        deal_id: { type: integer, in: query, description: "Only activities of this deal" }
+        project_id: { type: integer, in: query, description: "Only activities of this project" }
+        user_id: { type: integer, in: query, description: "Only activities caused by this user" }
+        account_id: { type: integer, in: query, description: "Only activities of this account" }
+        includes: { type: string, in: query, description: "user, activity_receivers — or 'all'" }
+        methods: { type: string, in: query, description: "attachable, responsible_user_natural_name — or 'all'" }
+        order: { type: string, in: query, description: "occurred_at-asc, occurred_at-desc, id-asc, id-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_activity:
+      method: GET
+      path: /activities/{id}
+      access: read
+      description: "Retrieve one activity-stream entry by id, including its `change` hash."
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "user, activity_receivers — or 'all'" }
+        methods: { type: string, in: query }
+      pagination: none
+
+    count_activities:
+      method: GET
+      path: /activities/count
+      access: read
+      description: "Number of activity entries. LIVE: a scope is MANDATORY — pass one of person_id, company_id, deal_id, project_id or account_id, otherwise the API answers HTTP 400 bad-request."
+      params:
+        person_id: { type: integer, in: query }
+        company_id: { type: integer, in: query }
+        deal_id: { type: integer, in: query }
+        project_id: { type: integer, in: query }
+        account_id: { type: integer, in: query }
+      pagination: none
+
+    list_filter_groups:
+      method: GET
+      path: /filter_groups
+      access: read
+      description: >
+        The saved segments ("filter groups") the account built in the UI: id, name and
+        model_type (Person, Company, Deal or Project). Since the bracket-nested filter
+        syntax is not available through this DADL, a filter group is the way to reuse a
+        complex, human-curated segment — list them here, then fetch the members with
+        get_filter_group.
+      params:
+        order: { type: string, in: query, description: "abc-asc, abc-desc, new-asc, new-desc, update-asc, update-desc, activity-asc, activity-desc" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_filter_group:
+      method: GET
+      path: /filter_groups/{id}
+      access: read
+      description: >
+        The RECORDS matching a saved filter group. The result type follows the group's
+        model_type, so `kind` is person, company, deal or project. includes and methods
+        accept the same values as the corresponding list_* tool for that model type.
+      params:
+        id: { type: integer, in: path, required: true }
+        includes: { type: string, in: query, description: "Depends on the group's model_type — same values as the matching list_* tool, or 'all'" }
+        methods: { type: string, in: query, description: "Depends on the group's model_type, or 'all'" }
+      pagination: none
+
+    list_filter_group_ids:
+      method: GET
+      path: /filter_groups/{id}/ids
+      access: read
+      description: "Only the IDs of the records matching a filter group, plus the group's name and record_type. Much cheaper than get_filter_group when you just need to iterate or intersect sets."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    count_filter_group:
+      method: GET
+      path: /filter_groups/{id}/count
+      access: read
+      description: "How many records match a saved filter group, as a total_entries object."
+      params:
+        id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_hooks:
+      method: GET
+      path: /hooks
+      access: admin
+      description: "The account's webhooks: model, event, state, target_url, object_type, includes, methods, plus failed / failed_at delivery diagnostics. includes: filter_groups."
+      params:
+        includes: { type: string, in: query, description: "Possible value: filter_groups" }
+        perpage: { type: integer, in: query, default: 100 }
+        page: { type: integer, in: query }
+
+    get_hook:
+      method: GET
+      path: /hooks/{id}
+      access: admin
+      description: "Retrieve one webhook by id, including its delivery failure counters."
+      params:
+        id: { type: string, in: path, required: true }
+        includes: { type: string, in: query, description: "Possible value: filter_groups" }
+      pagination: none
+
+    create_hook:
+      method: POST
+      path: /hooks
+      access: admin
+      description: >
+        Register a webhook. Wrap it under the `hook` key. CentralStationCRM will POST to
+        your URL whenever the chosen event happens — set this up only when the user asked
+        for an integration, and verify the target URL belongs to them.
+        Writable fields: model (REQUIRED — Person|Company|Deal|Project|Protocol), event
+        (REQUIRED — create|update|destroy), target_url (REQUIRED — where the payload is
+        delivered), object_type (REQUIRED — the payload shape: nested|api|lean|
+        hook_with_structure_and_record), hook_type (REQUIRED — currently only "url"),
+        state (active|disabled), includes (comma-separated sub-records to embed in the
+        payload, for the nested/api/hook_with_structure_and_record shapes), methods
+        (array of computed fields, e.g. salutation_official).
+        One hook covers exactly one model + event pair — register several for several
+        events.
+      params:
+        hook: { type: object, in: body, required: true, description: "{ model, event, target_url, object_type, hook_type, state, includes, methods }" }
+        includes: { type: string, in: query, description: "Possible value: filter_groups" }
+      pagination: none
+
+    delete_hook:
+      method: DELETE
+      path: /hooks/{id}
+      access: dangerous
+      description: "Delete a webhook — deliveries stop immediately. Irreversible; there is no update endpoint, so recreate the hook to change it."
+      params:
+        id: { type: string, in: path, required: true }
+      pagination: none
+
+  composites:
+    find_person_by_contact:
+      access: read
+      description: >
+        Resolve a person from an e-mail address or a phone number and return the full
+        record. Tries the dedicated people search first (email, then phone) and falls
+        back to the polymorphic contact-detail reverse lookup, which also finds numbers
+        stored in an unusual format. Returns the person object with everything embedded
+        (includes=all, methods=all), or null when nobody matches — the tool to call
+        before creating a contact, and the one to answer "who is calling?".
+      params:
+        email:
+          type: string
+        phone:
+          type: string
+      timeout: 30s
+      depends_on: [search_people, search_contact_details, get_person]
+      code: |
+        const term = params.email || params.phone;
+        if (!term) return null;
+        let hits = await api.search_people(
+          params.email ? { email: params.email } : { phone: params.phone }
+        );
+        if (!hits || hits.length === 0) {
+          hits = await api.search_contact_details({ name: term, type: "people" });
+        }
+        if (!hits || hits.length === 0) return null;
+        return await api.get_person({ id: hits[0].id, includes: "all", methods: "all" });
+
+    get_person_360:
+      access: read
+      description: >
+        Everything the CRM knows about one person in a single call: the person record
+        with all child objects embedded (positions, companies, deals, projects, tags,
+        tasks, contact details, addresses, custom fields, historic events, assistants)
+        plus the most recent protocols (notes, calls, meetings) as a separate `protocols`
+        array. Use this for briefings before a call instead of chaining get_person and
+        list_protocols yourself.
+      params:
+        id:
+          type: integer
+        protocol_limit:
+          type: integer
+          default: 20
+      timeout: 30s
+      depends_on: [get_person, list_protocols]
+      code: |
+        const person = await api.get_person({ id: params.id, includes: "all", methods: "all" });
+        const protocols = await api.list_protocols({
+          person_id: params.id,
+          order: "id-desc",
+          perpage: params.protocol_limit || 20
+        });
+        return { ...person, protocols: protocols || [] };
+
+    log_note:
+      access: write
+      description: >
+        Log an interaction on one or more records in a single call — the shortcut for
+        "note down what was discussed". Wraps create_protocol: pass the text plus any
+        combination of person_id, company_id, deal_id and project_id, and optionally a
+        badge (note, call, email, meeting, other). Returns the created protocol.
+      params:
+        content:
+          type: string
+        badge:
+          type: string
+          default: note
+        person_id:
+          type: integer
+        company_id:
+          type: integer
+        deal_id:
+          type: integer
+        project_id:
+          type: integer
+        name:
+          type: string
+      timeout: 30s
+      depends_on: [create_protocol]
+      code: |
+        const protocol = {
+          content: params.content,
+          badge: params.badge || "note",
+          type: "ProtocolObjectNote"
+        };
+        if (params.name) protocol.name = params.name;
+        if (params.person_id) protocol.person_ids = [params.person_id];
+        if (params.company_id) protocol.company_ids = [params.company_id];
+        if (params.deal_id) protocol.deal_ids = [params.deal_id];
+        if (params.project_id) protocol.project_ids = [params.project_id];
+        return await api.create_protocol({ protocol });
+
+    move_deal_to_stage:
+      access: write
+      description: >
+        Move a deal to another stage of its pipeline, optionally setting probability and
+        current_state, and log the move as a note. Reads the deal first so the returned
+        object reflects the new state and so the stage can be validated against the
+        pipeline's stages. Returns { deal, stage_name } — or throws when the stage does
+        not belong to the deal's pipeline.
+      params:
+        id:
+          type: integer
+        deal_type_stage_id:
+          type: integer
+        probability:
+          type: integer
+        current_state:
+          type: string
+        note:
+          type: string
+      timeout: 30s
+      depends_on: [get_deal, get_deal_type, update_deal, create_protocol]
+      code: |
+        const deal = await api.get_deal({ id: params.id });
+        const pipeline = await api.get_deal_type({ id: deal.deal_type_id });
+        // Verified live: stages arrive flat, but stay tolerant of a wrapped variant.
+        const stages = (pipeline.deal_type_stages || []).map(s => s.deal_type_stage || s);
+        const stage = stages.find(s => s.id === params.deal_type_stage_id);
+        if (stages.length > 0 && !stage) {
+          throw new Error(
+            "stage " + params.deal_type_stage_id + " does not belong to pipeline " +
+            deal.deal_type_id + " (" + pipeline.name + ")"
+          );
+        }
+        const patch = { deal_type_stage_id: params.deal_type_stage_id };
+        if (params.probability !== undefined && params.probability !== null) {
+          patch.probability = params.probability;
+        }
+        if (params.current_state) patch.current_state = params.current_state;
+        await api.update_deal({ id: String(params.id), deal: patch });
+        if (params.note) {
+          await api.create_protocol({
+            protocol: { content: params.note, badge: "note", deal_ids: [params.id] }
+          });
+        }
+        const updated = await api.get_deal({ id: params.id });
+        return { deal: updated, stage_name: stage ? stage.name : null };
+
+    fetch_all_people:
+      access: read
+      description: >
+        Page through list_people until the account is exhausted or max_pages is reached,
+        and return one flat array. Respects the API maximum of 250 records per page and
+        stops as soon as a short page arrives. Pass includes/methods to embed child
+        records, or stream_updated_at_after for an incremental sync. Keep max_pages
+        modest — the API allows 50 requests per 10 seconds and the composite sandbox
+        allows 50 calls in total.
+      params:
+        max_pages:
+          type: integer
+          default: 10
+        perpage:
+          type: integer
+          default: 250
+        includes:
+          type: string
+        methods:
+          type: string
+        stream_updated_at_after:
+          type: string
+        tag_name:
+          type: string
+      timeout: 120s
+      depends_on: [list_people]
+      code: |
+        const perpage = Math.min(params.perpage || 250, 250);
+        const maxPages = Math.min(params.max_pages || 10, 40);
+        const all = [];
+        for (let page = 1; page <= maxPages; page++) {
+          const args = { page, perpage };
+          if (params.includes) args.includes = params.includes;
+          if (params.methods) args.methods = params.methods;
+          if (params.stream_updated_at_after) args.stream_updated_at_after = params.stream_updated_at_after;
+          if (params.tag_name) args.tag_name = params.tag_name;
+          const batch = await api.list_people(args);
+          if (!batch || batch.length === 0) break;
+          all.push(...batch);
+          if (batch.length < perpage) break;
+        }
+        return all;
+
+    # ── Custom fields ─────────────────────────────────────────────────
+    # The three composites below share their record-type table on purpose: composite
+    # code cannot import code from another composite. Companies, deals and projects
+    # have no custom-field value routes in the API, so values are read through
+    # includes=custom_fields and written as custom_fields_attributes on update_*.
+    get_custom_field_values:
+      access: read
+      description: >
+        Read the custom field values (the account's own fields, e.g. a customer number
+        on companies) of one person, company, deal or project, joined with their
+        definitions. Returns { record_type, record_id, record_name, fields: [{
+        custom_fields_type_id, label, ftype, options, custom_field_id, value }] } in the
+        account's field order; date and decimal fields add `typed_value`. Fields the
+        record does not carry come back with value null, so the result also shows what
+        could be filled — pass include_unset: false to get only the set ones. record_type
+        is Person, Company, Deal or Project (lower case and plural work too). Costs two
+        API calls.
+      params:
+        record_type:
+          type: string
+          required: true
+          description: "Person, Company, Deal or Project"
+        record_id:
+          type: integer
+          required: true
+          description: "Numeric id of the person, company, deal or project"
+        include_unset:
+          type: boolean
+          default: true
+          description: "false drops the fields that have no value on this record"
+      timeout: 30s
+      depends_on: [list_custom_field_types, get_person, get_company, get_deal, get_project]
+      code: |
+        const KINDS = {
+          person: { category: "Person", get: "get_person" },
+          company: { category: "Company", get: "get_company" },
+          deal: { category: "Deal", get: "get_deal" },
+          project: { category: "Project", get: "get_project" }
+        };
+        const ALIASES = { people: "person", persons: "person", companies: "company", deals: "deal", projects: "project" };
+        const rt = String(params.record_type || "").trim().toLowerCase();
+        const K = KINDS[ALIASES[rt] || rt];
+        if (!K) {
+          throw new Error("record_type must be Person, Company, Deal or Project, got " + JSON.stringify(params.record_type));
+        }
+        const types = (await api.list_custom_field_types({ perpage: 250 })) || [];
+        const defs = types
+          .filter(t => t.category === K.category)
+          .sort((a, b) => (a.position || 0) - (b.position || 0));
+        const rec = await api[K.get]({ id: params.record_id, includes: "custom_fields" });
+        const values = rec.custom_fields || [];
+        const fields = defs.map(d => {
+          const v = values.find(x => x.custom_fields_type_id === d.id);
+          const f = {
+            custom_fields_type_id: d.id,
+            label: d.name,
+            ftype: d.ftype,
+            options: d.options || null,
+            custom_field_id: v ? v.id : null,
+            value: v && v.name !== "" ? v.name : null
+          };
+          if (v && d.ftype === "date") f.typed_value = v.name_date;
+          if (v && d.ftype === "decimal") f.typed_value = v.name_decimal;
+          return f;
+        });
+        return {
+          record_type: K.category,
+          record_id: rec.id,
+          record_name: rec.first_name ? rec.first_name + " " + rec.name : rec.name,
+          fields: params.include_unset === false ? fields.filter(f => f.value !== null) : fields
+        };
+
+    set_custom_field_value:
+      access: write
+      description: >
+        Set, change or clear ONE custom field value on a person, company, deal or
+        project — the write path for fields such as a customer number on companies,
+        which the API only reaches through nested attributes. Name the field by
+        custom_fields_type_id or by field_name (its label, case-insensitive; see
+        list_custom_field_types). The composite reads the record, then creates the value,
+        changes it by its value id, or removes it when value is empty or null, and reads
+        the record again — so it never trips the API's one-value-per-field rule (a
+        second value for the same field answers 422). Select fields only take one of
+        their options. Dates go in as YYYY-MM-DD (DD.MM.YYYY is converted); decimals as
+        a number string, a decimal comma is converted to a dot and any other text is
+        refused before the call (the API answers 422 for it). Returns {
+        record_type, record_id, custom_fields_type_id, label, ftype, action
+        (created|updated|removed|unchanged), previous, value, custom_field_id }. Writes
+        an entry to the record's activity stream like any update.
+      params:
+        record_type:
+          type: string
+          required: true
+          description: "Person, Company, Deal or Project"
+        record_id:
+          type: integer
+          required: true
+          description: "Numeric id of the person, company, deal or project"
+        custom_fields_type_id:
+          type: integer
+          description: "Id of the field definition (list_custom_field_types); alternative to field_name"
+        field_name:
+          type: string
+          description: "Label of the field, case-insensitive; alternative to custom_fields_type_id"
+        value:
+          type: string
+          description: "New value; empty or null removes the field from the record"
+      timeout: 30s
+      depends_on: [list_custom_field_types, get_person, get_company, get_deal, get_project, update_person, update_company, update_deal, update_project]
+      code: |
+        const KINDS = {
+          person: { category: "Person", key: "person", get: "get_person", update: "update_person" },
+          company: { category: "Company", key: "company", get: "get_company", update: "update_company" },
+          deal: { category: "Deal", key: "deal", get: "get_deal", update: "update_deal" },
+          project: { category: "Project", key: "project", get: "get_project", update: "update_project" }
+        };
+        const ALIASES = { people: "person", persons: "person", companies: "company", deals: "deal", projects: "project" };
+        const rt = String(params.record_type || "").trim().toLowerCase();
+        const K = KINDS[ALIASES[rt] || rt];
+        if (!K) {
+          throw new Error("record_type must be Person, Company, Deal or Project, got " + JSON.stringify(params.record_type));
+        }
+        const types = (await api.list_custom_field_types({ perpage: 250 })) || [];
+        const defs = types.filter(t => t.category === K.category);
+        let def = null;
+        if (params.custom_fields_type_id) {
+          def = defs.find(d => d.id === Number(params.custom_fields_type_id)) || null;
+        } else if (params.field_name) {
+          const want = String(params.field_name).trim().toLowerCase();
+          def = defs.find(d => String(d.name).trim().toLowerCase() === want) || null;
+        } else {
+          throw new Error("pass custom_fields_type_id or field_name");
+        }
+        if (!def) {
+          throw new Error("no " + K.category + " custom field " +
+            JSON.stringify(params.custom_fields_type_id || params.field_name) + "; defined: " +
+            (defs.map(d => d.id + " " + JSON.stringify(d.name)).join(", ") || "none"));
+        }
+        const input = params.value === undefined || params.value === null ? "" : String(params.value).trim();
+        let value = input;
+        if (value !== "" && def.ftype === "select" && (def.options || []).indexOf(value) === -1) {
+          throw new Error(JSON.stringify(value) + " is not an option of " + JSON.stringify(def.name) +
+            ": " + JSON.stringify(def.options || []));
+        }
+        // LIVE: a date is stored as the text sent (name) plus the parsed name_date, so
+        // DD.MM.YYYY becomes YYYY-MM-DD to keep both identical; a decimal comma answers
+        // 422 "is not a number", so it becomes a dot, and other text is refused here.
+        if (value !== "" && def.ftype === "date") {
+          const m = value.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+          if (m) value = m[3] + "-" + ("0" + m[2]).slice(-2) + "-" + ("0" + m[1]).slice(-2);
+        }
+        if (value !== "" && def.ftype === "decimal") {
+          if (/^[+-]?\d+,\d+$/.test(value)) value = value.replace(",", ".");
+          if (!/^[+-]?\d+(\.\d+)?$/.test(value)) {
+            throw new Error(JSON.stringify(input) + " is not a decimal number for " + JSON.stringify(def.name));
+          }
+        }
+        const readValue = async () => {
+          const rec = await api[K.get]({ id: params.record_id, includes: "custom_fields" });
+          return (rec.custom_fields || []).find(v => v.custom_fields_type_id === def.id) || null;
+        };
+        const current = await readValue();
+        let action = "unchanged";
+        let attr = null;
+        if (value === "") {
+          if (current) {
+            action = "removed";
+            attr = { id: current.id, _destroy: true };
+          }
+        } else if (current) {
+          const same = def.ftype === "decimal" && current.name_decimal !== null && current.name_decimal !== undefined
+            ? Number(current.name_decimal) === Number(value)
+            : current.name === value;
+          if (!same) {
+            action = "updated";
+            attr = { id: current.id, name: value };
+          }
+        } else {
+          action = "created";
+          attr = { custom_fields_type_id: def.id, name: value };
+        }
+        let now = current;
+        if (attr) {
+          const args = { id: String(params.record_id) };
+          args[K.key] = { custom_fields_attributes: [attr] };
+          await api[K.update](args);
+          now = await readValue();
+        }
+        return {
+          record_type: K.category,
+          record_id: params.record_id,
+          custom_fields_type_id: def.id,
+          label: def.name,
+          ftype: def.ftype,
+          action,
+          previous: current && current.name !== "" ? current.name : null,
+          value: now && now.name !== "" ? now.name : null,
+          custom_field_id: now ? now.id : null
+        };
+
+    find_records_by_custom_field:
+      access: read
+      description: >
+        Find the people, companies, deals or projects whose custom field matches a value
+        — e.g. "which company has customer number C-1001?" — or, without value, every
+        record that has the field set at all (an audit of one field across the
+        account). Name the field by custom_fields_type_id or field_name (its label,
+        case-insensitive). Pages the matching list_* tool with includes=custom_fields,
+        250 records per page, up to max_pages (default 10, at most 40). Matching ignores
+        case and surrounding spaces; match "contains" accepts partial values. Date fields
+        also match on the parsed date (2027-01-16 finds a value entered as 16.01.2027),
+        decimal fields compare numerically (13,75 finds 13.75). Returns {
+        record_type, custom_fields_type_id, label, scanned, complete, matches: [{ id,
+        name, value, custom_field_id }] } — complete false means max_pages ran out
+        before the last page. Fetch full records with get_person / get_company /
+        get_deal / get_project.
+      params:
+        record_type:
+          type: string
+          required: true
+          description: "Person, Company, Deal or Project"
+        custom_fields_type_id:
+          type: integer
+          description: "Id of the field definition (list_custom_field_types); alternative to field_name"
+        field_name:
+          type: string
+          description: "Label of the field, case-insensitive; alternative to custom_fields_type_id"
+        value:
+          type: string
+          description: "Value to look for; omit to list every record that has the field set"
+        match:
+          type: string
+          default: exact
+          description: "exact (default) or contains"
+        max_pages:
+          type: integer
+          default: 10
+          description: "Pages of 250 records to scan, at most 40"
+      timeout: 120s
+      depends_on: [list_custom_field_types, list_people, list_companies, list_deals, list_projects]
+      code: |
+        const KINDS = {
+          person: { category: "Person", list: "list_people" },
+          company: { category: "Company", list: "list_companies" },
+          deal: { category: "Deal", list: "list_deals" },
+          project: { category: "Project", list: "list_projects" }
+        };
+        const ALIASES = { people: "person", persons: "person", companies: "company", deals: "deal", projects: "project" };
+        const rt = String(params.record_type || "").trim().toLowerCase();
+        const K = KINDS[ALIASES[rt] || rt];
+        if (!K) {
+          throw new Error("record_type must be Person, Company, Deal or Project, got " + JSON.stringify(params.record_type));
+        }
+        const types = (await api.list_custom_field_types({ perpage: 250 })) || [];
+        const defs = types.filter(t => t.category === K.category);
+        let def = null;
+        if (params.custom_fields_type_id) {
+          def = defs.find(d => d.id === Number(params.custom_fields_type_id)) || null;
+        } else if (params.field_name) {
+          const wanted = String(params.field_name).trim().toLowerCase();
+          def = defs.find(d => String(d.name).trim().toLowerCase() === wanted) || null;
+        } else {
+          throw new Error("pass custom_fields_type_id or field_name");
+        }
+        if (!def) {
+          throw new Error("no " + K.category + " custom field " +
+            JSON.stringify(params.custom_fields_type_id || params.field_name) + "; defined: " +
+            (defs.map(d => d.id + " " + JSON.stringify(d.name)).join(", ") || "none"));
+        }
+        const raw = params.value === undefined || params.value === null ? "" : String(params.value).trim();
+        const want = raw === "" ? null : raw.toLowerCase();
+        const contains = String(params.match || "exact").toLowerCase() === "contains";
+        // Dates and decimals also match on the parsed value the API stores next to the
+        // text: 2027-01-16 finds a value entered as 16.01.2027, 13,75 finds 13.75.
+        let typed = null;
+        if (want !== null && !contains && def.ftype === "date") {
+          const m = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+          typed = m ? m[3] + "-" + ("0" + m[2]).slice(-2) + "-" + ("0" + m[1]).slice(-2) : raw;
+        }
+        if (want !== null && !contains && def.ftype === "decimal") {
+          const n = Number(raw.replace(",", "."));
+          if (!isNaN(n)) typed = n;
+        }
+        const hit = (v, s) => {
+          if (want === null) return true;
+          if (contains) return s.indexOf(want) !== -1;
+          if (s === want) return true;
+          if (typed === null) return false;
+          if (def.ftype === "date") return v.name_date === typed;
+          return v.name_decimal !== null && v.name_decimal !== undefined && Number(v.name_decimal) === typed;
+        };
+        const perpage = 250;
+        const maxPages = Math.max(1, Math.min(params.max_pages || 10, 40));
+        const matches = [];
+        let scanned = 0;
+        let complete = false;
+        for (let page = 1; page <= maxPages; page++) {
+          const batch = (await api[K.list]({ page, perpage, includes: "custom_fields" })) || [];
+          scanned += batch.length;
+          for (const r of batch) {
+            const v = (r.custom_fields || []).find(c => c.custom_fields_type_id === def.id);
+            if (!v || v.name === null || v.name === "") continue;
+            const s = String(v.name).trim().toLowerCase();
+            if (!hit(v, s)) continue;
+            matches.push({
+              id: r.id,
+              name: r.first_name ? r.first_name + " " + r.name : r.name,
+              value: v.name,
+              custom_field_id: v.id
+            });
+          }
+          if (batch.length < perpage) {
+            complete = true;
+            break;
+          }
+        }
+        return {
+          record_type: K.category,
+          custom_fields_type_id: def.id,
+          label: def.name,
+          scanned,
+          complete,
+          matches
+        };
+
+  examples:
+    - name: "Create a contact with phone, e-mail and employer in one call"
+      description: "Uses nested *_attributes so a new person, their contact details, address and tag are created in a single request, then links them to a company"
+      code: |
+        const person = await api.create_person({
+          person: {
+            name: "Mäh",
+            first_name: "Jolly",
+            gender_identity: "diverse",
+            background: "Met at the Cologne meetup",
+            emails_attributes: [{ atype: "office", name: "jolly.maeh@example.com" }],
+            tels_attributes: [{ atype: "mobile", name: "+49 170 1234567" }],
+            addrs_attributes: [{ atype: "work", street: "Ehrenstr. 1", zip: "50672", city: "Köln", country_code: "DE" }],
+            tags_attributes: [{ name: "lead" }]
+          }
+        });
+        const companies = await api.search_companies({ name: "42he" });
+        if (companies.length > 0) {
+          await api.create_person_position({
+            person_id: person.id,
+            position: { company_id: companies[0].id, name: "Head of Sales", primary_function: true }
+          });
+        }
+        return await api.get_person({ id: person.id, includes: "all" });
+
+    - name: "Log a call and schedule the follow-up"
+      description: "Finds the caller by phone number, writes a protocol on person and deal, and creates a task for the responsible user"
+      code: |
+        const person = await api.find_person_by_contact({ phone: "+49 170 1234567" });
+        if (!person) return "unknown caller";
+        const deals = await api.list_deals({ includes: "people", order: "update-desc", perpage: 10 });
+        const deal = deals.find(d => (d.people || []).some(p => (p.person || p).id === person.id));
+        await api.log_note({
+          content: "Called about the renewal — wants a revised quote by Friday.",
+          badge: "call",
+          person_id: person.id,
+          deal_id: deal ? deal.id : undefined
+        });
+        return await api.create_task({
+          task: {
+            user_id: person.user_id,
+            name: "Send revised quote to " + person.first_name + " " + person.name,
+            attachable_type: "Person",
+            attachable_id: person.id,
+            badge: "task",
+            precise_time: "2026-07-24T09:00:00Z",
+            fuzzy: true
+          }
+        });
+
+    - name: "Open a deal in the right pipeline and move it forward"
+      description: "Reads the pipelines, creates a deal in the first stage, then advances it with a note"
+      code: |
+        const pipelines = await api.list_deal_types();
+        const pipeline = pipelines[0];
+        const stages = (pipeline.deal_type_stages || []).map(s => s.deal_type_stage || s);
+        const deal = await api.create_deal({
+          deal: {
+            name: "Renewal 2027 — 42he GmbH",
+            deal_type_id: pipeline.id,
+            deal_type_stage_id: stages.length > 0 ? stages[0].id : undefined,
+            company_id: 4711,
+            user_id: 7,
+            value: "12000.00",
+            value_type: "total",
+            currency: "EUR",
+            target_date: "2026-09-30",
+            person_ids_set: "42"
+          }
+        });
+        if (stages.length > 1) {
+          return await api.move_deal_to_stage({
+            id: deal.id,
+            deal_type_stage_id: stages[1].id,
+            probability: 50,
+            note: "Quote sent, customer confirmed interest."
+          });
+        }
+        return deal;
+
+    - name: "Incremental sync of everyone touched since yesterday"
+      description: "Uses stream_updated_at_after plus count_people to sync only what changed, instead of paging the whole account"
+      code: |
+        const total = await api.count_people();
+        const changed = await api.fetch_all_people({
+          stream_updated_at_after: "2026-07-20T00:00:00Z",
+          includes: "tels emails addrs tags",
+          max_pages: 5
+        });
+        return { account_total: total.total_entries, changed: changed.length, people: changed };
+
+    - name: "Look up a company by its customer number and change the number"
+      description: "Uses the custom-field composites: find the company by a field value, show all its custom fields, then move the value — no hand-built custom_fields_attributes"
+      code: |
+        const hit = await api.find_records_by_custom_field({
+          record_type: "Company",
+          field_name: "customer number",
+          value: "C-1001"
+        });
+        if (hit.matches.length === 0) return "no company carries C-1001";
+        const company = hit.matches[0];
+        const before = await api.get_custom_field_values({
+          record_type: "Company",
+          record_id: company.id,
+          include_unset: false
+        });
+        const changed = await api.set_custom_field_value({
+          record_type: "Company",
+          record_id: company.id,
+          field_name: "customer number",
+          value: "C-2001"
+        });
+        return { company: company.name, before: before.fields, changed };
