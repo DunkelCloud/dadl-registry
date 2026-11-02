@@ -1,0 +1,418 @@
+# youtube.dadl — YouTube Data API v3 for ToolMesh
+# Read video metadata, status and statistics, and update a video's visibility and
+# snippet (title, description, tags) without losing fields the caller did not touch.
+#
+# Domain Notes for LLM consumers:
+# - SCOPE: this file is deliberately narrow. It covers what a release workflow needs:
+#   read videos by ID, switch a video between private / unlisted / public, and edit its
+#   snippet. No upload, no search, no comments, no playlists (see coverage.missing).
+# - AUTH is OAuth 2.0 with a user-delegated refresh token. There is no service-account
+#   path for YouTube channels and an API key can only read public data. The token is
+#   bound to ONE channel: the channel (personal or brand account) picked on the Google
+#   account chooser during the one-time consent. Call list_channels to see which channel
+#   the stored token belongs to. Videos of other channels can be read while they are
+#   public or unlisted, but never updated.
+# - VISIBILITY: status.privacyStatus is one of "private", "unlisted", "public". An
+#   unlisted video is reachable by link and embeddable but does not show up in search,
+#   feeds or the channel page. A scheduled video (status.publishAt set) MUST be private
+#   until the scheduled time; unlisted and scheduled cannot be combined.
+# - videos.update REPLACES whole parts. For every part named in the `part` parameter,
+#   each mutable property that is missing from the request body is reset or deleted:
+#   updating only snippet.description without sending snippet.tags deletes the tags.
+#   snippet.title and snippet.categoryId are REQUIRED whenever part contains snippet.
+#   Therefore never call the raw update directly. The update_video composite reads the
+#   video first, merges the requested changes into the current values and sends the
+#   complete parts back. Unchanged input means no write at all.
+# - READ-AFTER-WRITE: videos.list can still return the PREVIOUS privacyStatus for a few
+#   seconds after a successful videos.update (observed: still the old value 1.6 s after
+#   the PUT, correct shortly afterwards). The update response itself is authoritative.
+#   A verification read right after an update must retry with backoff (10 to 30 s)
+#   before it reports a failure. Thumbnail URLs changing form is not a field change:
+#   private videos get signed i9.ytimg.com URLs, unlisted and public videos plain
+#   i.ytimg.com URLs.
+# - Mutable snippet properties: title, description, tags[], categoryId, defaultLanguage,
+#   defaultAudioLanguage. Mutable status properties: privacyStatus, embeddable, license,
+#   publicStatsViewable, publishAt, selfDeclaredMadeForKids, containsSyntheticMedia.
+#   Everything else (publishedAt, channelId, thumbnails, uploadStatus, madeForKids, ...)
+#   is read-only.
+# - status.containsSyntheticMedia is the creator's disclosure that the video contains
+#   realistic altered or synthetic (AI-generated) content. The merge keeps it as it is
+#   unless the caller sets it.
+# - DESCRIPTION EDITS: the description is one plain-text field, max 5000 bytes, no
+#   angle brackets. To swap a single line (for example a link that changes when a page
+#   goes live) use replace_line_prefix + replace_line_with on update_video: exactly one
+#   line must start with the prefix; if none does but a line already equals the
+#   replacement, nothing changes. This makes the call safe to repeat.
+# - QUOTA: every request costs units from a per-project daily budget (default 10,000,
+#   reset at midnight Pacific Time). videos.list = 1 unit per call (regardless of the
+#   number of IDs or parts), channels.list = 1 unit, videos.update = 50 units. One
+#   update_video call that changes something costs 51 units (1 read + 1 write), an
+#   unchanged one 1 unit. Exceeding the budget returns 403 with reason quotaExceeded.
+# - IDs: a video ID is the 11-character value from the watch URL
+#   (https://www.youtube.com/watch?v=VIDEO_ID). list_videos accepts up to 50 IDs,
+#   comma-separated. Unknown IDs and private videos of other channels are silently
+#   absent from the result (empty array, not 404).
+# - `part` controls which sections of a resource are returned. Useful values for
+#   videos: snippet, status, statistics, contentDetails. Numbers in statistics arrive
+#   as strings ("viewCount": "42").
+# - Error envelope: { "error": { "code": 403, "message": "...", "errors": [ { "domain":
+#   "youtube.quota", "reason": "quotaExceeded", "message": "..." } ] } }. The reason
+#   (quotaExceeded, forbidden, videoNotFound, invalidVideoMetadata, invalidCategoryId,
+#   defaultLanguageNotSet, ...) is the stable machine-readable part.
+# - Refresh-token lifetime: an OAuth app whose consent screen is in "Testing" status
+#   gets refresh tokens that EXPIRE AFTER 7 DAYS. Publish the app to "In production"
+#   before the consent. A production token stays valid until the user revokes access,
+#   it stays unused for six months, or more than 100 tokens exist for the same client
+#   and account. A revoked token shows up as "invalid_grant" on the next call.
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+source_name: "YouTube Data API v3"
+source_url: https://developers.google.com/youtube/v3/docs
+date: "2026-10-19"
+
+backend:
+  name: youtube
+  type: rest
+  version: "1.0"
+  base_url: https://www.googleapis.com
+  description: >
+    YouTube Data API v3 — read videos (metadata, visibility, statistics) by ID and
+    update a video's visibility, title, description and tags with a read-merge-write
+    that keeps every field the caller did not change.
+
+  coverage:
+    endpoints: 3
+    total_endpoints: 52
+    percentage: 6
+    focus: "Video release workflow: videos, visibility, description, channel."
+    missing: >
+      Everything outside reading and updating existing videos: video upload, delete and
+      rating, thumbnails, captions, playlists and playlist items, search, comments and
+      comment threads, subscriptions, channel sections and branding, members, activities,
+      i18n and category lookups, live streaming (separate API).
+    last_reviewed: "2026-10-19"
+
+  setup:
+    credential_steps:
+      - "Open https://console.cloud.google.com and create or select a Google Cloud project."
+      - "Enable the API: APIs & Services → Library → 'YouTube Data API v3' → Enable. No billing account is needed; the default quota is 10,000 units per day."
+      - "Configure the OAuth consent screen (Google Auth Platform → Branding / Audience): user type 'External', add an app name and contact address. Then set the publishing status to 'In production'. CRITICAL: an app left in 'Testing' issues refresh tokens that expire after 7 days. The scope used here is a sensitive scope; an unverified production app shows a warning page during consent ('Google hasn't verified this app' → Advanced → continue), which is fine for your own account."
+      - "Create the client: Google Auth Platform → Clients → Create client → application type 'Web application', authorized redirect URI https://developers.google.com/oauthplayground. Download the client JSON right away: it holds client_id and client_secret together, and the console shows the secret in full only once. Copy the client ID in full from the client's detail page; it ends with .apps.googleusercontent.com. An ID and a secret from different clients fail later with invalid_client ('The provided client secret is invalid')."
+      - "One-time consent: open https://developers.google.com/oauthplayground, open the settings (gear icon), tick 'Use your own OAuth credentials' and enter the client ID and secret; keep 'Access type: Offline' and tick 'Force prompt: Consent Screen'. In step 1 enter the scope https://www.googleapis.com/auth/youtube.force-ssl and click 'Authorize APIs'."
+      - "On the Google account chooser pick the CHANNEL you want to manage. If the channel is a brand account it appears as its own entry below your personal account. The token is bound to exactly this channel."
+      - "In step 2 click 'Exchange authorization code for tokens' and copy the refresh token."
+      - "Store the three values as ToolMesh credentials: CREDENTIAL_YOUTUBE_CLIENT_ID, CREDENTIAL_YOUTUBE_CLIENT_SECRET, CREDENTIAL_YOUTUBE_REFRESH_TOKEN. Then recreate the ToolMesh container (docker compose up -d toolmesh): a plain docker compose restart keeps the old environment and therefore the old values."
+      - "Verify: call list_channels. It must return the channel you picked. Then call list_videos with the ID of one of its videos; a private or unlisted video of that channel must be visible."
+      - "If calls later fail with 'invalid_grant', the refresh token was revoked or expired: repeat the consent step and replace CREDENTIAL_YOUTUBE_REFRESH_TOKEN."
+    env_var: CREDENTIAL_YOUTUBE_REFRESH_TOKEN
+    backends_yaml: |
+      - name: youtube
+        transport: rest
+        dadl: youtube.dadl
+        url: "https://www.googleapis.com"
+    required_scopes:
+      - "https://www.googleapis.com/auth/youtube.force-ssl"
+    optional_scopes:
+      - "https://www.googleapis.com/auth/youtube.readonly"
+    docs_url: "https://developers.google.com/youtube/v3/guides/auth/server-side-web-apps"
+    notes: >
+      YouTube has no service-account access to channels; the refresh_token flow with a
+      one-time interactive consent is the only headless option. ToolMesh exchanges the
+      refresh token for short-lived access tokens on demand, no external refresh job is
+      needed. The scope youtube.force-ssl allows reading and editing the channel's
+      videos; youtube.readonly is enough if only list_videos and list_channels are used.
+      The consent binds the token to one channel, so one backend instance manages one
+      channel. Quota is counted per Google Cloud project: 1 unit per read, 50 units per
+      video update, 10,000 units per day by default.
+
+  auth:
+    type: oauth2
+    flow: refresh_token
+    token_url: https://oauth2.googleapis.com/token
+    client_id_credential: youtube_client_id
+    client_secret_credential: youtube_client_secret
+    refresh_token_credential: youtube_refresh_token
+    refresh_before_expiry: 60s
+    # Consent-time scope, documentational only: scopes are not sent on the
+    # refresh_token grant, they are fixed when the user consents.
+    scopes:
+      - "https://www.googleapis.com/auth/youtube.force-ssl"
+
+  defaults:
+    headers:
+      Accept: application/json
+    # No pagination block: the covered calls address resources by ID or by owner and
+    # return everything in one response.
+    errors:
+      format: json
+      message_path: "$.error.message"
+      code_path: "$.error.errors[0].reason"
+      retry_on: [500, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 409]
+      retry_strategy:
+        max_retries: 2
+        backoff: exponential
+        initial_delay: 1s
+    response:
+      result_path: "$.items"
+
+  tools:
+
+    # ──────────────────────────────────────────────────────────────
+    # Videos
+    # ──────────────────────────────────────────────────────────────
+
+    list_videos:
+      method: GET
+      path: /youtube/v3/videos
+      access: read
+      description: >
+        Read one or more videos by ID. Returns an array of video resources with the
+        requested parts: snippet (title, description, tags, categoryId, channelId,
+        publishedAt, defaultLanguage), status (privacyStatus = private | unlisted |
+        public, publishAt, embeddable, license, madeForKids, containsSyntheticMedia),
+        statistics (viewCount, likeCount, commentCount, all as strings). Unknown IDs and
+        private videos of other channels are missing from the array (no 404); an empty
+        array means "not found or not visible to the authorized channel". In the first
+        seconds after a videos.update the result can still show the previous
+        privacyStatus; when verifying an update, retry with backoff instead of trusting
+        one immediate read. Costs 1 quota unit per call regardless of the number of IDs.
+      params:
+        id:
+          type: string
+          in: query
+          required: true
+          description: "Video ID, or up to 50 IDs separated by commas. The ID is the 11-character v= value of the watch URL."
+        part:
+          type: string
+          in: query
+          default: "snippet,status,statistics"
+          description: "Comma-separated resource parts to return: snippet, status, statistics, contentDetails, localizations, topicDetails, player."
+      pagination: none
+
+    _update_video_raw:
+      method: PUT
+      path: /youtube/v3/videos
+      access: write
+      description: >
+        Internal: raw videos.update. REPLACES every part named in `part`; mutable
+        properties missing from the body are deleted, and snippet requires title and
+        categoryId. Use the update_video composite instead, which reads the video and
+        merges. Costs 50 quota units.
+      params:
+        part:
+          type: string
+          in: query
+          required: true
+          description: "Parts the body contains and the API should overwrite, for example snippet,status."
+        id:
+          type: string
+          in: body
+          required: true
+          description: "ID of the video to update. Must belong to the authorized channel."
+        snippet:
+          type: object
+          in: body
+          description: "Complete snippet: title, description, categoryId, tags, defaultLanguage, defaultAudioLanguage."
+        status:
+          type: object
+          in: body
+          description: "Complete status: privacyStatus, embeddable, license, publicStatsViewable, publishAt, selfDeclaredMadeForKids, containsSyntheticMedia."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────────────────────
+    # Channels
+    # ──────────────────────────────────────────────────────────────
+
+    list_channels:
+      method: GET
+      path: /youtube/v3/channels
+      access: read
+      description: >
+        List the channel the stored OAuth token belongs to (mine=true). Returns an array,
+        normally with one channel: id, snippet (title, customUrl, publishedAt) and
+        statistics (viewCount, subscriberCount, videoCount as strings). Use it to confirm
+        that the consent was given for the intended channel before updating videos, and
+        as a cheap credential check. Costs 1 quota unit.
+      params:
+        mine:
+          type: boolean
+          in: query
+          default: true
+          description: "Keep true: return the channel of the authorized account."
+        part:
+          type: string
+          in: query
+          default: "snippet,statistics"
+          description: "Comma-separated resource parts: id, snippet, statistics, status, contentDetails, brandingSettings."
+      pagination: none
+
+  composites:
+
+    update_video:
+      description: >
+        Update a video of the authorized channel. Pass only what should change:
+        visibility (privacy_status = private | unlisted | public), title, description,
+        tags, category or flags. The composite reads the video, merges your changes into
+        the current snippet and status and writes both parts back completely, so tags,
+        language and all other fields you did not pass stay as they are. To swap one
+        line of the description (for example a link) pass replace_line_prefix and
+        replace_line_with: exactly one line must start with the prefix; if no line does
+        but a line already equals the replacement, the description is left unchanged,
+        so the call is safe to repeat. If nothing differs from the current state no
+        write happens. Returns {id, changed, snippet, status}; `changed` lists the fields
+        that were written (empty array = already in the requested state). The returned
+        status reflects the write and is authoritative; a list_videos read in the first
+        seconds afterwards may still show the previous privacyStatus, so verify with a
+        delayed retry rather than an immediate read. Costs 1 quota unit for the read
+        plus 50 units when something is written. Changing privacy_status to public
+        publishes the video immediately.
+      access: write
+      params:
+        id:
+          type: string
+          required: true
+          description: "Video ID (11 characters). The video must belong to the authorized channel."
+        privacy_status:
+          type: string
+          description: "private, unlisted or public."
+        title:
+          type: string
+          description: "New title, max 100 characters, no angle brackets."
+        description:
+          type: string
+          description: "New complete description, max 5000 bytes, no angle brackets. Do not combine with replace_line_prefix."
+        replace_line_prefix:
+          type: string
+          description: "Replace the single description line that starts with this text. Requires replace_line_with."
+        replace_line_with:
+          type: string
+          description: "The new content of that line."
+        tags:
+          type: array
+          description: "New complete list of tags (replaces the current list)."
+        category_id:
+          type: string
+          description: "Video category ID, for example 28 = Science & Technology."
+        default_language:
+          type: string
+          description: "Language of title and description (BCP-47, for example de)."
+        embeddable:
+          type: boolean
+          description: "Whether the video can be embedded on other sites."
+        public_stats_viewable:
+          type: boolean
+          description: "Whether the extended statistics on the watch page are public."
+        self_declared_made_for_kids:
+          type: boolean
+          description: "Creator's declaration that the video is made for kids."
+        contains_synthetic_media:
+          type: boolean
+          description: "Disclosure that the video contains realistic altered or synthetic content."
+        publish_at:
+          type: string
+          description: "Scheduled publication time (ISO 8601). Only valid while privacy_status is private."
+      timeout: 30s
+      depends_on: [list_videos, _update_video_raw]
+      code: |
+        const found = await api.list_videos({ id: params.id, part: "snippet,status" });
+        const video = (found || []).filter(v => v.id === params.id)[0];
+        if (!video) {
+          throw new Error("video " + params.id + " not found or not visible to the authorized channel");
+        }
+        const cur = video.snippet || {};
+        const curStatus = video.status || {};
+        const changed = [];
+        const pick = (name, value, current) => {
+          if (value === undefined || value === null) { return current; }
+          if (JSON.stringify(value) !== JSON.stringify(current)) { changed.push(name); }
+          return value;
+        };
+
+        let description = cur.description || "";
+        if (params.replace_line_prefix !== undefined && params.replace_line_prefix !== null) {
+          if (params.description !== undefined && params.description !== null) {
+            throw new Error("pass either description or replace_line_prefix, not both");
+          }
+          if (params.replace_line_with === undefined || params.replace_line_with === null) {
+            throw new Error("replace_line_prefix requires replace_line_with");
+          }
+          const lines = description.split("\n");
+          const hits = [];
+          let already = false;
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line === params.replace_line_with) { already = true; }
+            else if (line.indexOf(params.replace_line_prefix) === 0) { hits.push(i); }
+          }
+          if (hits.length === 1) {
+            lines[hits[0]] = params.replace_line_with;
+            description = lines.join("\n");
+            changed.push("description");
+          } else if (!(hits.length === 0 && already)) {
+            throw new Error("expected exactly one description line starting with the prefix, found " + hits.length);
+          }
+        } else {
+          description = pick("description", params.description, description);
+        }
+
+        const snippet = {
+          title: pick("title", params.title, cur.title),
+          description: description,
+          categoryId: pick("categoryId", params.category_id, cur.categoryId),
+        };
+        const tags = pick("tags", params.tags, cur.tags);
+        if (tags !== undefined) { snippet.tags = tags; }
+        const lang = pick("defaultLanguage", params.default_language, cur.defaultLanguage);
+        if (lang !== undefined) { snippet.defaultLanguage = lang; }
+        if (cur.defaultAudioLanguage !== undefined) { snippet.defaultAudioLanguage = cur.defaultAudioLanguage; }
+
+        const status = { privacyStatus: pick("privacyStatus", params.privacy_status, curStatus.privacyStatus) };
+        const flags = [
+          ["embeddable", params.embeddable],
+          ["publicStatsViewable", params.public_stats_viewable],
+          ["selfDeclaredMadeForKids", params.self_declared_made_for_kids],
+          ["containsSyntheticMedia", params.contains_synthetic_media],
+          ["publishAt", params.publish_at],
+        ];
+        for (const f of flags) {
+          const v = pick(f[0], f[1], curStatus[f[0]]);
+          if (v !== undefined) { status[f[0]] = v; }
+        }
+        if (curStatus.license !== undefined) { status.license = curStatus.license; }
+
+        if (changed.length === 0) {
+          return { id: video.id, changed: changed, snippet: cur, status: curStatus };
+        }
+        const updated = await api._update_video_raw({ part: "snippet,status", id: video.id, snippet: snippet, status: status });
+        return { id: video.id, changed: changed, snippet: (updated || {}).snippet, status: (updated || {}).status };
+
+  hints:
+    list_videos:
+      empty_result: "an empty array means the ID is unknown or the video is private and belongs to another channel"
+      statistics_strings: "statistics values are strings, convert before doing arithmetic"
+    update_video:
+      publishes: "privacy_status public takes effect immediately and is visible to everyone"
+      quota: "1 unit when nothing changes, 51 units when something is written"
+      line_swap: "replace_line_prefix must match exactly one description line"
+
+  examples:
+    - name: "Publish an unlisted video and swap its link line"
+      description: "Make a video public and replace the description line that starts with a placeholder link"
+      code: |
+        const result = await api.update_video({
+          id: "VIDEO_ID_11",
+          privacy_status: "public",
+          replace_line_prefix: "https://example.com/preview/",
+          replace_line_with: "https://www.example.com/articles/launch/?utm_source=youtube",
+        });
+        return result.changed;
+    - name: "Read visibility and view count"
+      description: "Check whether a video is public and how often it was viewed"
+      code: |
+        const videos = await api.list_videos({ id: "VIDEO_ID_11", part: "status,statistics" });
+        if (videos.length === 0) { return "not found or not visible"; }
+        return { visibility: videos[0].status.privacyStatus, views: Number(videos[0].statistics.viewCount) };
