@@ -3,7 +3,7 @@
 #
 # Domain Notes for LLM consumers:
 # - Xen Orchestra (XO) is the web management UI for XCP-ng / XenServer hypervisors.
-# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added); current through XO 6.9 (September 2026).
+# - The REST API is at /rest/v0/ and stable since XO 6.4 (April 2026, RBAC v2 added); current through XO 6.10 (October 2026).
 # - Swagger docs available at /rest/v0/docs (OpenAPI spec for runtime discovery).
 # - Access control: pre-6.4 was admin-only; XO 6.4+ uses fine-grained RBAC v2 (acl-privileges/acl-roles).
 #   Endpoints with no declared privilege still require admin -- see /users/me/acl-privileges to inspect yours.
@@ -51,7 +51,7 @@
 #   sensors. Needs the xo-server-ipmi-sensors plugin (404 otherwise); 503 = host has no reachable IPMI device (not transient).
 # - VERSION SKEW: this DADL is used against several XO releases at once (floor 6.4). Routes marked 'XO 6.x+' return 404
 #   on older builds. Body fields are validated strictly by XO's REST layer (tsoa, throw-on-extras) wherever a route has a
-#   typed body -- a field the build does not know is REJECTED with HTTP 400, not ignored (e.g. bypassBackupCheck on 6.8).
+#   typed body -- a field the build does not know is REJECTED with HTTP 400 or 422, not ignored (e.g. bypassBackupCheck on 6.8).
 #   Only the pre-6.7 rolling_reboot/rolling_update routes had no body at all and ignored whatever was sent. Rule: omit
 #   fields that are newer than the target XO, and say so in every tool description that carries such a field.
 # - Rolling pool reboot/update (XO 6.9): both are refused with 409 'incorrect state' while a backup job runs on the pool
@@ -82,6 +82,32 @@
 # - Audit records (XO 6.9 Swagger): GET /plugins/audit/records and /records/{id} are xo-server-audit plugin routes,
 #   404 when the plugin is not loaded. They are the XO-side action log (who called which API method from which IP);
 #   the host-level XAPI audit log is GET /hosts/{id}/audit.txt.
+# - Plugins (XO 6.10): GET /plugins lists the xo-server plugins (id = plugin name, e.g. 'transport-email') with state,
+#   version, configuration (passwords/tokens/secrets obfuscated by XO) and JSON schemas. PATCH /plugins/{id} sets
+#   autoload, POST .../actions/{load|unload|test} act on it, DELETE .../configuration erases its settings (plugin must be
+#   unloaded, else 409). PUT /plugins/{id}/configuration is NOT exposed: its body is the free-form configuration object
+#   itself, which a DADL cannot declare as named body params.
+# - SR probing (XO 6.10): POST /hosts/{id}/actions/probe_{nfs,zfs,hba,iscsi_iqns,iscsi_luns} show what the host sees on
+#   a storage target (exports, ZFS pools, HBA LUNs, iSCSI IQNs and LUNs); probe_{nfs,iscsi,hba}_exists return the UUIDs
+#   of SRs already living there (empty = free). Nothing is created; sync=true answers 200 with the result, otherwise a
+#   task. Tool names follow this file's <action>_host convention (probe_nfs_host, ...).
+# - XO 6.10 body additions: create_acl_role takes privileges[]; migrate_vm takes bypassCpuCheck (forced migration past
+#   VM_INCOMPATIBLE_WITH_THIS_HOST -- the VM may crash); the three create_*network actions take insecureNbd (NBD without
+#   TLS, dedicated backup networks only; exclusive with nbd in the same call AND pool-wide: XAPI refuses insecure_nbd while
+#   another network of the pool has nbd, after XO has already created the network); SDN traffic rules take an optional OpenFlow priority
+#   (XAPI plugin only, unique per network incl. its VIF rules, and required to delete/update a rule that has one).
+#   6.9 and older reject privileges/bypassCpuCheck/insecureNbd with 400 (see VERSION SKEW); omit priority there too.
+# - VDI and VDI-snapshot export: vmdk added in XO 6.10 (built by XO from the allocated disk blocks only, each grain
+#   padded so content-length is known up front). VHD export refuses disks above the VHD size limit (~2 TiB) with 422.
+# - Backup repositories carry size/used/available (bytes) since XO 6.10, once XO has measured the target (at start,
+#   after backups change it); null/missing while disabled.
+# - Live restore (XO 6.10: mount a backup disk read/WRITE with a cache SR, bootable) is UI/JSON-RPC only. The REST
+#   mount_live_disk route still mounts read-only and takes only diskId + hostId.
+# - SSE (XO 6.10): new collections plugin, backup-archive, backup-log, authentication_token. Token events carry the token
+#   itself (each user only gets their own) -- do not subscribe to them from an LLM context.
+# - ACL privileges: the body is {roleId, resource, action, effect: 'allow'|'deny', selector?} -- there is no objectId;
+#   narrow to one object with selector 'id:<uuid>'. Verified against the XO source (2026-10); earlier versions of this
+#   file declared a non-existent objectId and lacked the required effect.
 # - Backup repositories ("remotes") became WRITABLE in XO 6.6: POST /backup-repositories (create),
 #   PATCH /backup-repositories/{id} (update). Pre-6.6 they were read-only. There is NO DELETE route --
 #   removal is POST /backup-repositories/{id}/actions/forget (forget_backup_repository).
@@ -116,7 +142,7 @@
 # - UUID "_" means "any/default" for collection-level actions (e.g. /pools/_/actions does not exist anymore --
 #   action discovery is now via Swagger spec at /rest/v0/docs).
 # - Backup jobs: use /backup-jobs (modern). Old /backup/jobs/vm subroutes are DEPRECATED (removal announced for
-#   2026-09-12, still present in 6.9 -- do not rely on them).
+#   2026-09-12, still present in 6.10 -- do not rely on them).
 # - Auth tokens: the authentication-token endpoints (GET/POST /users/{id}/authentication_tokens) are deliberately
 #   NOT exposed as tools -- their responses contain plaintext bearer tokens (the GET list even includes the token
 #   used to make the request). Create or revoke tokens outside ToolMesh: xo-cli --createToken or the XO web UI.
@@ -129,15 +155,15 @@ credits:
 
 source_name: "Xen Orchestra REST API"
 source_url: "https://docs.xen-orchestra.com/restapi"
-date: "2026-09-30"
+date: "2026-10-29"
 
 backend:
   name: xen-orchestra
   type: rest
-  version: "3.9"
+  version: "3.10"
   # base_url is intentionally omitted -- must be provided via backends.yaml url field,
   # because each deployment has its own Xen Orchestra instance address.
-  description: "Xen Orchestra REST API (XO 6.4+, current through 6.9) -- complete coverage: VMs (incl. PATCH update + snapshot revert), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode + PIF rescan), pools (incl. add_host, rolling reboot/update with interrupted-update recovery + finalize), storage (SR create/delete, VDI incl. PATCH update + vhd/raw/qcow2 export, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (archives incl. live mount of backup disks, jobs/logs, repositories incl. health + benchmark + space reclaim), schedules, messages, alarms, events (SSE incl. non-XAPI collections), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), proxies, servers, dashboards, SDN traffic rules (add/delete/update), IPMI sensor inventory (plugin), audit records (plugin), health check"
+  description: "Xen Orchestra REST API (XO 6.4+, current through 6.10) -- complete coverage: VMs (incl. PATCH update + snapshot revert + forced migration), VM controllers, hosts (incl. full power/lifecycle actions + maintenance mode + PIF rescan + SR probing of NFS/iSCSI/HBA/ZFS targets), pools (incl. add_host, rolling reboot/update with interrupted-update recovery + finalize), storage (SR create/delete, VDI incl. PATCH update + vhd/raw/qcow2/vmdk export, VBD), networks (VIF incl. PATCH update + PIF/PBD), VM/VDI snapshots, VM templates, hardware (PCI/PGPU/SM), tasks, backups (archives incl. live mount of backup disks, jobs/logs, repositories incl. health + benchmark + space reclaim), schedules, messages, alarms, events (SSE incl. non-XAPI collections and backup archives), RBAC v2 (users/groups/acl-roles/acl-privileges incl. assignment introspection), XO plugins (list, load/unload, autoload, self-test), proxies, servers, dashboards, SDN traffic rules (add/delete/update incl. OpenFlow priority), IPMI sensor inventory (plugin), audit records (plugin), health check"
 
   auth:
     type: bearer
@@ -173,12 +199,12 @@ backend:
       max_items: 500
 
   coverage:
-    endpoints: 275
-    total_endpoints: 277
+    endpoints: 291
+    total_endpoints: 294
     percentage: 99
-    focus: "Complete REST API coverage for XO 6.4+: all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full host power/lifecycle control (start, clean/smart reboot, clean/emergency shutdown, restart toolstack, disable/enable incl. reboot-persistent maintenance mode, detach, forget, pool join, PIF rescan), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges, plus reading role-to-user/group assignments), backups (archives incl. live mount of backup disks, jobs, logs, restore-logs, writable repositories incl. health check, throughput benchmark and space reclaim, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update incl. pinned-VM handling, interrupted-update recovery and finalize, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), IPMI sensor inventory (ipmi-sensors plugin), audit records (audit plugin), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + export_vdi_qcow2 + import_vdi_to_existing + import_vdi_to_existing_raw)."
-    missing: "Authentication-token routes (GET/POST /users/{id}/authentication_tokens) are deliberately NOT exposed: their responses contain plaintext bearer tokens -- the GET list even includes the token used to make the request (see XO PR #10233) -- which must never enter an LLM context. Create/revoke tokens via xo-cli --createToken or the XO web UI instead; do NOT re-add these routes. Backup RESTORE is not exposed over REST -- backup archives, jobs and logs can be read, but restoring a restore-point onto a target SR must be done in the XO GUI or via the JSON-RPC API; since XO 6.9 a backup disk can at least be live-mounted read-only on a host (mount_backup_live_disk) to read its content without a restore. SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed; the IPMI inventory route (/plugins/ipmi-sensors/*) likewise requires the xo-server-ipmi-sensors plugin (>= 2.1.1, XO 6.8+) and returns 503 on hosts without a reachable IPMI device; the audit-record routes (/plugins/audit/*) require the xo-server-audit plugin. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- announced for removal on 2026-09-12 / 2026-10-13 and still present in 6.9; do not rely on them. Version floor: routes marked 'XO 6.7+' return 404 on 6.6.x (create_sr, update_vdi, list_acl_role_users, list_acl_role_groups, list_group_acl_roles), 'XO 6.8+' on 6.7.x (scan_pifs_host, get_host_ipmi_sensors) and 'XO 6.9+' on 6.8.x (get_pool_rolling_update_recovery, finalize_rolling_update_pool, reclaim_space_backup_repository, mount_backup_live_disk, unmount_backup_live_disk, list_audit_records, get_audit_record; export_vdi_qcow2 answers 422 there). Body fields newer than the target build are REJECTED with HTTP 400 by XO's typed routes -- bypassBackupCheck and acceptCurrentStateAsBaseline (6.9) on 6.7/6.8 -- so omit them on older XO; only the pre-6.7 rolling_reboot/rolling_update routes had no body at all and silently ignore shutdownPinnedVms"
-    last_reviewed: "2026-09-30"
+    focus: "Complete REST API coverage for XO 6.4+: all object types (VMs, VM controllers, VM templates, VM snapshots, hosts, pools, SRs, VDIs, VDI snapshots, VBDs, networks, VIFs, PIFs, PBDs, PCIs, PGPUs, SMs), all lifecycle actions (CRUD, partial update of VMs, VIFs and VDIs, power, snapshot/clone/migrate/revert, export/import, hotplug), full host power/lifecycle control (start, clean/smart reboot, clean/emergency shutdown, restart toolstack, disable/enable incl. reboot-persistent maintenance mode, detach, forget, pool join, PIF rescan, SR probing of NFS/iSCSI/HBA/ZFS targets), full sub-resource access (alarms, messages, tasks, tags, stats per object), RBAC v2 (users, groups, acl-roles, acl-privileges, plus reading role-to-user/group assignments), backups (archives incl. live mount of backup disks, jobs, logs, restore-logs, writable repositories incl. health check, throughput benchmark and space reclaim, schedules), real-time events via SSE, host/pool maintenance ops (rolling reboot/update incl. pinned-VM handling, interrupted-update recovery and finalize, management reconfigure, audit logs, missing patches), network traffic rules (SDN controller plugin: add/delete/update), IPMI sensor inventory (ipmi-sensors plugin), audit records (audit plugin), XO plugin management (list, load/unload, autoload, self-test, configuration reset), XOA appliance (dashboard, ping, gui-routes, MCP status). Some routes with format path params are exposed as multiple typed tools (e.g. /vms/{id}.{format} -> export_vm_xva + export_vm_ova, /vdis/{id}.{format} -> export_vdi_vhd + export_vdi_raw + export_vdi_qcow2 + export_vdi_vmdk + import_vdi_to_existing + import_vdi_to_existing_raw)."
+    missing: "Authentication-token routes (GET/POST /users/{id}/authentication_tokens) are deliberately NOT exposed: their responses contain plaintext bearer tokens -- the GET list even includes the token used to make the request (see XO PR #10233) -- which must never enter an LLM context. Create/revoke tokens via xo-cli --createToken or the XO web UI instead; do NOT re-add these routes. Backup RESTORE is not exposed over REST -- backup archives, jobs and logs can be read, but restoring a restore-point onto a target SR must be done in the XO GUI or via the JSON-RPC API; since XO 6.9 a backup disk can at least be live-mounted read-only on a host (mount_backup_live_disk) to read its content without a restore; the read/write live restore of XO 6.10 (bootable, with a cache SR) is UI/JSON-RPC only. PUT /plugins/{id}/configuration (XO 6.10) is not exposed: its request body is the free-form, plugin-specific configuration object itself, which DADL cannot declare as named body params -- configure plugins in the XO UI (get_plugin, load_plugin, test_plugin and delete_plugin_configuration are exposed). SDN-controller traffic-rule routes (/plugins/sdn-controller/*) are included but only function when the xo-server-sdn-controller plugin is installed; the IPMI inventory route (/plugins/ipmi-sensors/*) likewise requires the xo-server-ipmi-sensors plugin (>= 2.1.1, XO 6.8+) and returns 503 on hosts without a reachable IPMI device; the audit-record routes (/plugins/audit/*) require the xo-server-audit plugin. Deprecated routes (POST /users/authentication_tokens, GET /backup/jobs/vm/*, GET /restore/logs/*) intentionally excluded -- announced for removal on 2026-09-12 / 2026-10-13 and still present in 6.10; do not rely on them. Version floor: routes marked 'XO 6.7+' return 404 on 6.6.x (create_sr, update_vdi, list_acl_role_users, list_acl_role_groups, list_group_acl_roles), 'XO 6.8+' on 6.7.x (scan_pifs_host, get_host_ipmi_sensors) 'XO 6.9+' on 6.8.x (get_pool_rolling_update_recovery, finalize_rolling_update_pool, reclaim_space_backup_repository, mount_backup_live_disk, unmount_backup_live_disk, list_audit_records, get_audit_record; export_vdi_qcow2 answers 422 there) and 'XO 6.10+' on 6.9.x (the eight probe_*_host tools, list_plugins, get_plugin, update_plugin, delete_plugin_configuration, load_plugin, unload_plugin, test_plugin; export_vdi_vmdk answers 422 there). Body fields newer than the target build are REJECTED with HTTP 400 by XO's typed routes -- bypassBackupCheck and acceptCurrentStateAsBaseline (6.9) on 6.7/6.8, privileges (create_acl_role), bypassCpuCheck (migrate_vm) and insecureNbd (create_*network) (6.10) on 6.9 and older -- so omit them on older XO; only the pre-6.7 rolling_reboot/rolling_update routes had no body at all and silently ignore shutdownPinnedVms"
+    last_reviewed: "2026-10-29"
 
   setup:
     credential_steps:
@@ -210,7 +236,7 @@ backend:
       required: "name_label + template UUID are minimum required params"
       memory: "Memory in bytes (e.g. 2147483648 = 2 GB)"
       cloud_config: "Cloud-init config as string for automatic guest setup"
-      note: "CPU count cannot be set at creation -- create the VM, then adjust cpus/cpusStaticMax via update_vm (PATCH /vms/{id})"
+      note: "cpus and memory can be set at creation; raise cpusStaticMax/memoryStaticMax afterwards via update_vm (PATCH /vms/{id}, VM halted). Field names are mixed-case: autoPoweron (not auto_poweron), hvmBootFirmware, high_availability, cloud_config."
     update_vm:
       note: "PATCH semantics -- only the fields you send are changed. Cold-change fields (cpusStaticMax, memoryStaticMax, secureBoot, virtualizationMode) require the VM to be halted; live fields (nameLabel, cpus within static max, tags) work while running."
       tags: "tags replaces the entire tag list. To add/remove a single tag without rewriting, use add_vm_tag / remove_vm_tag instead."
@@ -241,6 +267,7 @@ backend:
     migrate_vm:
       note: "Live-migrates a VM to another host, optionally with storage migration. For large VMs avoid sync=true to prevent timeouts; use async (default) and poll the returned taskId via get_task instead."
       cross_pool: "For cross-pool moves, use srIdByVdiId to place each disk on a specific target SR and networkIdByVifId to re-map each VIF to a target network; srId sets a single default SR for all disks."
+      cpu_check: "XO 6.10+: bypassCpuCheck=true forces a migration refused with VM_INCOMPATIBLE_WITH_THIS_HOST; the VM may crash afterwards. Older builds reject the field (400)."
     emergency_shutdown_pool:
       warning: "Shuts down ALL VMs and hosts in the pool. Use only in emergencies."
     rolling_reboot_pool:
@@ -254,7 +281,7 @@ backend:
       added: "XO 6.9 -- 404 on older builds and when there is nothing to recover."
     create_pool_network:
       modes: "Three flavors: create_network (basic with PIF), create_bonded_network (link aggregation across pifIds with bondMode), create_internal_network (host-internal, no physical PIF)"
-      body_fields: "All three share name/description/mtu/nbd -- NOT name_label/name_description. nbd=true enables Network Block Device for backup traffic (XO 6.6+)."
+      body_fields: "All three share name/description/mtu/nbd/insecureNbd -- NOT name_label/name_description. nbd=true enables Network Block Device for backup traffic (XO 6.6+); insecureNbd=true (XO 6.10+) enables it without TLS, only for a dedicated backup network. nbd and insecureNbd cannot be mixed within a pool: both in one call is 422, insecureNbd while another pool network has nbd (or the reverse) is 500 NETWORK_INCOMPATIBLE_PURPOSES and leaves the new network behind without NBD -- delete_network it. Check the pool's networks (fields nbd,insecureNbd) first."
     management_reconfigure_host:
       warning: "Moves the management interface to a different PIF. May briefly disconnect XO from the host."
     management_reconfigure_pool:
@@ -269,13 +296,14 @@ backend:
       note: "The host must already be registered in XO (add_server) and be homogeneous with the pool master. force skips the CPU/version checks but leaves the pool heterogeneous, which restricts live migration."
     create_sr:
       device_config: "Driver-specific: nfs -> {server, serverpath}; smb -> {server, username, password}; lvmoiscsi -> {target, targetIQN, SCSIid}; lvm/ext -> {device}. hostId is the pool master for shared types."
+      probe_first: "XO 6.10+: discover the values with the probe_*_host tools first (probe_nfs_host -> serverpath, probe_iscsi_iqns_host -> probe_iscsi_luns_host -> SCSIid, probe_hba_host -> SCSIid) and run the matching probe_*_exists_host -- a non-empty result means an SR already lives there."
     get_host_stats:
       granularity: "seconds (last 10min) | minutes (last 2h) | hours (last week) | days (last year)"
     get_vm_stats:
       granularity: "seconds (last 10min) | minutes (last 2h) | hours (last week) | days (last year)"
       data_sources: "Use add/delete data_source endpoints to enable/disable specific RRD metrics (e.g. cpu0, vif_0_rx)"
     open_events_stream:
-      note: "Server-Sent Events (SSE) connection. The first event is 'init' with the connection id; then use POST /events/{id}/subscriptions to add collection listeners (VM, host, pool, ... and since XO 6.9 also user, group, acl-role, acl-privilege, proxy, server, backup-repository, backup-job, schedule). Events emitted: init, ping, add, update, remove."
+      note: "Server-Sent Events (SSE) connection. The first event is 'init' with the connection id; then use POST /events/{id}/subscriptions to add collection listeners (VM, host, pool, ... and since XO 6.9 also user, group, acl-role, acl-privilege, proxy, server, backup-repository, backup-job, schedule; since XO 6.10 plugin, backup-archive, backup-log, authentication_token). Events emitted: init, ping, add, update, remove."
     run_schedule:
       note: "Manually triggers a backup-job execution outside its cron schedule. Returns a task reference."
     get_dashboard:
@@ -283,15 +311,16 @@ backend:
     create_user:
       permission_field: "Permission strings: 'admin', 'user', 'none'. Omit for default user-level access."
     create_acl_role:
-      flow: "1) Create role via POST /acl-roles. 2) Add privileges via POST /acl-privileges (with roleId). 3) Attach role to user/group via PUT /acl-roles/{id}/{users|groups}/{userId|groupId}."
+      flow: "1) Create role via POST /acl-roles -- since XO 6.10 with its privileges in the same call (privileges array). 2) Otherwise add privileges via POST /acl-privileges (roleId, resource, action, effect, selector?). 3) Attach role to user/group via PUT /acl-roles/{id}/{users|groups}/{userId|groupId}."
     add_server:
       note: "Registers a new XCP-ng/XenServer pool master to XO. body.host is the IP/hostname, body.username/password are XAPI credentials. Use connect_server afterwards to establish the connection."
     delete_sr:
       warning: "Destroys the SR AND all data on the underlying storage -- irreversible. The SR must be detached/unplugged first. To keep the data and only remove it from XO, use forget_sr instead."
     add_network_traffic_rule:
       note: "Requires the xo-server-sdn-controller plugin; returns 404 if not loaded. Applies to private (tunnel) networks managed by the SDN controller. allow=false drops matching traffic."
+      priority: "XO 6.10+, XAPI plugin only: OpenFlow priority 0-65535, unique per network incl. its VIF rules (409 if taken), highest applies first, default 32768. Leave gaps between priorities."
     delete_network_traffic_rule:
-      note: "Identify the rule to remove by allow + direction + ipRange + protocol + port (allow is required since XO 6.9; 6.9+ answers 404 when no rule matches). Requires the SDN controller plugin."
+      note: "Identify the rule to remove by allow + direction + ipRange + protocol + port (allow is required since XO 6.9; 6.9+ answers 404 when no rule matches) and, since XO 6.10, priority when the rule has one. Requires the SDN controller plugin."
     add_vif_traffic_rule:
       note: "Per-VIF variant of add_network_traffic_rule -- scopes the rule to a single VM interface. Requires the SDN controller plugin."
     get_mcp_status:
@@ -301,16 +330,16 @@ backend:
       note: "PATCH semantics. size can only grow (>= current size); shrinking is rejected by XAPI. Use add_vdi_tag/remove_vdi_tag for tags."
     update_vif:
       added: "XO 6.6 -- PATCH /vifs/{id} returns 404 on older builds."
-      note: "PATCH semantics -- only the fields you send change. lockingMode='locked' enforces the ipv4Allowed/ipv6Allowed whitelists; 'disabled' blocks all traffic; 'unlocked' allows everything; 'network_default' inherits the network setting."
+      note: "PATCH semantics -- only the fields you send change. lockingMode='locked' enforces the allowedIpv4Addresses/allowedIpv6Addresses whitelists (the body names -- not ipv4Allowed); 'disabled' blocks all traffic; 'unlocked' allows everything; 'network_default' inherits the network setting."
       rate_limit: "rateLimit is the egress cap in kbps (null/0 = unlimited)."
       tx_checksumming: "txChecksumming toggles the ethtool tx-checksumming offload (maps to other_config ethtool-tx); disable it only to work around buggy guest drivers."
     create_vif:
-      tx_checksumming: "txChecksumming (added XO 6.5, PR #9793) maps to the ethtool tx-checksumming / other_config value; omit for the host default."
+      tx_checksumming: "create_vif has no txChecksumming field (422) -- pass other_config {\"ethtool-tx\": \"false\"} or set it afterwards with update_vif."
     create_backup_repository:
       added: "XO 6.6 -- backup repositories ('remotes') became writable over REST."
       note: "url encodes the backend: 'nfs://host:/path', 'smb://user:pass@host\\\\share', 's3://key:secret@endpoint/bucket', or 'file:///srv/backups' for a local mount. Returns {id}."
     update_backup_repository:
-      note: "PATCH semantics. Set enabled=false to stop new backups writing here without deleting the target. options is a free-form per-backend settings map."
+      note: "PATCH semantics. Set enabled=false to stop new backups writing here without deleting the target. options is a single string (mount options), null clears it."
     forget_backup_repository:
       note: "Removes the repository registration from XO. Does NOT delete the backup data on the underlying storage. Fails if backup-jobs still reference it. There is no DELETE route -- this action is the removal."
     get_backup_repository_health:
@@ -329,6 +358,14 @@ backend:
       flow: "get_backup -> pick disks[].id -> mount_backup_live_disk (?sync gives {id, srUuid, vdiUuid}) -> attach the VDI to a VM (create_vbd) -> read -> unmount_backup_live_disk with the returned id."
     export_vdi_qcow2:
       added: "XO 6.9 -- older builds answer 422 Invalid format."
+    export_vdi_vmdk:
+      added: "XO 6.10 -- older builds answer 422 Invalid format."
+    probe_nfs_host:
+      added: "XO 6.10 -- like all probe_*_host tools, 404 on older builds. Nothing is created; sync=true returns the result directly."
+    list_plugins:
+      added: "XO 6.10 -- 404 on older builds. Use fields to keep the large configurationSchema/testSchema out of lists."
+    delete_plugin_configuration:
+      warning: "Erases the plugin settings irreversibly; the plugin must be unloaded first (409)."
     list_backups:
       note: "backup-repository='*' or a repository id is required in practice -- XO returns [] without it (all versions)."
     list_audit_records:
@@ -609,10 +646,11 @@ backend:
       method: POST
       path: /acl-roles
       access: admin
-      description: "Create a new RBAC role. Returns {id}. Add privileges via POST /acl-privileges (with roleId), then attach to users/groups."
+      description: "Create a new RBAC role. Returns {id}. Since XO 6.10 the privileges can be passed in the same call (privileges array; needs the acl-privilege:create privilege as well); otherwise add them afterwards via create_acl_privilege with roleId. Then attach the role to users/groups. Older builds reject the privileges field with HTTP 400."
       params:
         name: { type: string, in: body, required: true }
         description: { type: string, in: body }
+        privileges: { type: array, in: body, description: "XO 6.10+: privileges created together with the role, each {resource, action, effect, selector?} -- the create_acl_privilege body without roleId, e.g. [{\"resource\":\"vm-template\",\"action\":\"instantiate\",\"effect\":\"allow\"},{\"resource\":\"pool\",\"action\":\"create:vm\",\"effect\":\"allow\"}]. Omit on older XO (400)." }
       pagination: none
 
     update_acl_role:
@@ -753,24 +791,26 @@ backend:
       method: POST
       path: /acl-privileges
       access: admin
-      description: "Grant a new privilege (action on a resource type, optionally scoped to a specific object) to a role. Returns {id}. Body fields depend on the resource type -- see Swagger /rest/v0/docs for the privilege schema."
+      description: "Grant a new privilege (action on a resource type, optionally narrowed to matching objects by a selector) to a role. Returns {id}. effect is required ('allow' or 'deny' -- a deny wins over any allow). Valid actions depend on the resource type (e.g. vm: read, start, shutdown:clean, update:tags; pool: create:vm) -- see Swagger /rest/v0/docs. There is no objectId field: scope to one object with selector 'id:<uuid>'. Since XO 6.10 privileges can also be passed directly to create_acl_role."
       params:
         roleId: { type: string, in: body, required: true, description: "Target role UUID" }
-        resource: { type: string, in: body, required: true, description: "e.g. 'vm', 'host', 'pool', 'user', 'backup-job'" }
-        action: { type: string, in: body, required: true, description: "e.g. 'read', 'create', 'delete', 'update', 'snapshot'" }
-        objectId: { type: string, in: body, description: "Optional: scope to a specific object UUID" }
+        resource: { type: string, in: body, required: true, description: "e.g. 'vm', 'host', 'pool', 'user', 'backup-job', 'plugin'" }
+        action: { type: string, in: body, required: true, description: "e.g. 'read', 'create', 'delete', 'update:tags', 'shutdown:clean'; '*' for all actions of the resource" }
+        effect: { type: string, in: body, required: true, description: "'allow' or 'deny'" }
+        selector: { type: string, in: body, description: "Optional XO filter (complex-matcher) narrowing the objects, e.g. 'id:<uuid>' or 'tags:production'. Omit for all objects of the resource type." }
       pagination: none
 
     update_acl_privilege:
       method: PATCH
       path: /acl-privileges/{id}
       access: admin
-      description: "Update a privilege's resource/action/objectId (roleId is immutable)."
+      description: "Update a privilege's resource, action, effect and/or selector (roleId is immutable). Only the fields you send change."
       params:
         id: { type: string, in: path, required: true }
         resource: { type: string, in: body }
         action: { type: string, in: body }
-        objectId: { type: string, in: body }
+        effect: { type: string, in: body, description: "'allow' or 'deny'" }
+        selector: { type: string, in: body, description: "XO filter (complex-matcher) narrowing the objects, e.g. 'id:<uuid>'" }
       pagination: none
 
     delete_acl_privilege:
@@ -1001,11 +1041,12 @@ backend:
       method: POST
       path: /vms/{uuid}/actions/migrate
       access: write
-      description: "Live-migrate a VM to another host. Supports cross-SR storage migration and per-disk / per-VIF placement for cross-pool moves."
+      description: "Live-migrate a VM to another host. Supports cross-SR storage migration and per-disk / per-VIF placement for cross-pool moves. Networks and SRs must belong to the destination host's pool. A move refused with VM_INCOMPATIBLE_WITH_THIS_HOST (CPU feature mismatch) can be forced with bypassCpuCheck=true (XO 6.10+) -- the VM may then crash after the migration."
       params:
         uuid: { type: string, in: path, required: true }
         hostId: { type: string, in: body, required: true, description: "Target host UUID" }
         migrationNetworkId: { type: string, in: body, description: "Network UUID to use for the migration traffic" }
+        bypassCpuCheck: { type: boolean, in: body, description: "XO 6.10+: skip XAPI's CPU compatibility check (forced migration). Only to retry a migration refused with VM_INCOMPATIBLE_WITH_THIS_HOST; the VM may crash afterwards. Default false. Omit on older XO -- they reject the unknown field with HTTP 400." }
         srId: { type: string, in: body, description: "Default target SR for storage migration (all VDIs)" }
         srIdByVdiId: { type: object, in: body, description: "Per-VDI target SR map: {\"<vdi-uuid>\": \"<sr-uuid>\"} (overrides srId per disk)" }
         networkIdByVifId: { type: object, in: body, description: "Per-VIF target network map: {\"<vif-uuid>\": \"<network-uuid>\"} (cross-pool)" }
@@ -1781,6 +1822,111 @@ backend:
         sync: { type: boolean, in: query }
       pagination: none
 
+    # --- SR probing (XO 6.10+): discover what a host can see BEFORE create_sr. Nothing is created or changed;
+    # the host itself contacts the storage server. sync=true returns the result directly (HTTP 200),
+    # otherwise a task URL is returned (poll get_task, the result is in the task).
+
+    probe_nfs_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_nfs
+      access: admin
+      description: "XO 6.10+ (404 on older builds). Ask the host to list the exports of an NFS server: returns [{path, acl}]. Use it to pick device_config.serverpath for create_sr (type nfs). Read-only on the storage side, but the host opens a connection to the given server. sync=true returns the list directly, otherwise poll the returned task."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID (the pool master for a shared SR)" }
+        server: { type: string, in: body, required: true, description: "NFS server hostname or IP, e.g. nfs.example.com" }
+        nfsVersion: { type: string, in: body, description: "NFS version to use, e.g. '3' or '4'" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    probe_nfs_exists_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_nfs_exists
+      access: admin
+      description: "XO 6.10+ (404 on older builds). Check whether an NFS export already holds an SR known to XAPI: returns an array of SR UUIDs found there (empty = no SR yet, safe to create_sr; non-empty = reattach that SR instead of creating a new one). A serverPath the host cannot mount (e.g. not exported) is NOT answered with [] but with HTTP 500 SR_BACKEND_FAILURE_73 (NFS mount error) -- take the path from probe_nfs_host. sync=true returns the result directly."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
+        server: { type: string, in: body, required: true, description: "NFS server hostname or IP" }
+        serverPath: { type: string, in: body, required: true, description: "Export path on the server, e.g. /srv/nfs/xcp" }
+        nfsVersion: { type: string, in: body, description: "NFS version, e.g. '3' or '4'" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    probe_iscsi_iqns_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_iscsi_iqns
+      access: admin
+      description: "XO 6.10+ (404 on older builds). Discover the target IQNs offered by an iSCSI portal: returns [{iqn, ip}] (empty when the host cannot connect). First step of an iSCSI SR setup, followed by probe_iscsi_luns_host. XO masks chapPassword in the task record."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
+        targetIp: { type: string, in: body, required: true, description: "iSCSI portal address" }
+        port: { type: integer, in: body, description: "iSCSI port (default 3260)" }
+        chapUser: { type: string, in: body, description: "CHAP user, if the target requires authentication" }
+        chapPassword: { type: string, in: body, description: "CHAP password" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    probe_iscsi_luns_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_iscsi_luns
+      access: admin
+      description: "XO 6.10+ (404 on older builds). List the LUNs of one iSCSI target: returns [{id, vendor, serial, size, scsiId}]. The scsiId is device_config.SCSIid for create_sr (type lvmoiscsi) and the input of probe_iscsi_exists_host. XO masks chapPassword in the task record."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
+        targetIp: { type: string, in: body, required: true, description: "iSCSI portal address" }
+        targetIqn: { type: string, in: body, required: true, description: "Target IQN from probe_iscsi_iqns_host" }
+        port: { type: integer, in: body, description: "iSCSI port (default 3260)" }
+        chapUser: { type: string, in: body }
+        chapPassword: { type: string, in: body }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    probe_iscsi_exists_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_iscsi_exists
+      access: admin
+      description: "XO 6.10+ (404 on older builds). Check whether an iSCSI LUN already holds an SR known to XAPI: returns an array of SR UUIDs (empty = no SR on this LUN yet). Run it before create_sr so an existing SR is reattached instead of overwritten."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
+        targetIp: { type: string, in: body, required: true, description: "iSCSI portal address" }
+        targetIqn: { type: string, in: body, required: true, description: "Target IQN" }
+        scsiId: { type: string, in: body, required: true, description: "scsiId of the LUN from probe_iscsi_luns_host" }
+        port: { type: integer, in: body, description: "iSCSI port (default 3260)" }
+        chapUser: { type: string, in: body }
+        chapPassword: { type: string, in: body }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    probe_hba_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_hba
+      access: admin
+      description: "XO 6.10+ (404 on older builds). List the LUNs visible through the host's HBAs (Fibre Channel / SAS): returns [{hba, id, lun, path, scsiId, serial, size, vendor}]. The scsiId is device_config.SCSIid for create_sr (type lvmohba)."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    probe_hba_exists_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_hba_exists
+      access: admin
+      description: "XO 6.10+ (404 on older builds). Check whether an HBA LUN already holds an SR known to XAPI: returns an array of SR UUIDs (empty = no SR on this LUN yet)."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
+        scsiId: { type: string, in: body, required: true, description: "scsiId from probe_hba_host" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    probe_zfs_host:
+      method: POST
+      path: /hosts/{uuid}/actions/probe_zfs
+      access: admin
+      description: "XO 6.10+ (404 on older builds). List the ZFS pools of the host: returns an object {<poolname>: {<pool parameters>}} (empty when there is none). Use it to see which ZFS pools exist before creating a zfs SR with create_sr."
+      params:
+        uuid: { type: string, in: path, required: true, description: "Host UUID" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
     # =========================================================================
     # POOLS
     # =========================================================================
@@ -1910,19 +2056,30 @@ backend:
       method: POST
       path: /pools/{pool_id}/actions/create_vm
       access: write
-      description: "Create a new VM from a template"
+      description: "Create a new VM from a template. Body field names are mixed-case exactly as listed (autoPoweron, hvmBootFirmware, high_availability, cloud_config) -- XO rejects unknown fields. vCPU count and memory can be set here; cold-change fields (cpusStaticMax, memoryStaticMax) afterwards via update_vm."
       params:
         pool_id: { type: string, in: path, required: true, description: "Pool UUID" }
         name_label: { type: string, in: body, required: true }
         template: { type: string, in: body, required: true, description: "Template UUID" }
         name_description: { type: string, in: body }
+        cpus: { type: integer, in: body, description: "Number of vCPUs (template default if omitted)" }
         memory: { type: integer, in: body, description: "Memory in bytes" }
         boot: { type: boolean, in: body, description: "Start after creation" }
-        auto_poweron: { type: boolean, in: body }
-        clone: { type: boolean, in: body, description: "Full clone (default true)" }
-        cloud_config: { type: string, in: body }
-        network_config: { type: string, in: body }
-        vdis: { type: array, in: body }
+        autoPoweron: { type: boolean, in: body, description: "Start the VM automatically when the host boots" }
+        clone: { type: boolean, in: body, description: "Fast clone of the template disks (default true); false = full copy" }
+        affinity: { type: string, in: body, description: "Host UUID the VM prefers to run on" }
+        install: { type: object, in: body, description: "OS install source: {method: 'cdrom', repository: '<ISO VDI UUID>'} or {method: 'network', repository: ''} (PXE)" }
+        vifs: { type: array, in: body, description: "Network interfaces: {network: '<network UUID>', device?, mac?, mtu?, ipv4_allowed?, ipv6_allowed?} to create or update the template VIF at device, or {destroy: true, device} to drop a template VIF. Omit to keep the template VIFs." }
+        hvmBootFirmware: { type: string, in: body, description: "'uefi' or 'bios'" }
+        secureBoot: { type: boolean, in: body, description: "UEFI Secure Boot (needs hvmBootFirmware 'uefi')" }
+        createVtpm: { type: boolean, in: body, description: "Attach a virtual TPM (needed e.g. for Windows 11)" }
+        copyHostBiosStrings: { type: boolean, in: body, description: "Copy the host's BIOS strings into the VM (OEM-licensed guests)" }
+        vgpuType: { type: string, in: body, description: "vGPU type id (with gpuGroup)" }
+        gpuGroup: { type: string, in: body, description: "GPU group id for a vGPU" }
+        cloud_config: { type: string, in: body, description: "cloud-init user-data; XO creates a config drive" }
+        network_config: { type: string, in: body, description: "cloud-init network-config" }
+        destroy_cloud_config_vdi: { type: boolean, in: body, description: "Remove the cloud-init config drive after the first boot" }
+        vdis: { type: array, in: body, description: "Disks of the new VM. Each entry is one of: {name_label, size, sr?, name_description?} = add a new disk; {userdevice, name_label?, size?, sr?, name_description?} = adjust the template disk at that position; {destroy: true, userdevice} = drop that template disk (works reliably from XO 6.10 on -- earlier builds misnamed the field). size in bytes." }
         high_availability: { type: string, in: body, description: "XO 6.7+: HA restart priority -- 'restart' (guaranteed restart), 'best-effort', or '' (empty string = HA disabled, the default). Ignored by older builds." }
         sync: { type: boolean, in: query }
       pagination: none
@@ -1998,6 +2155,7 @@ backend:
         mtu: { type: integer, in: body, description: "MTU (optional, default from PIF)" }
         vlan: { type: integer, in: body, description: "VLAN ID (optional)" }
         nbd: { type: boolean, in: body, description: "XO 6.6+: enable NBD (Network Block Device) on this network, so backups can stream disk data over it. Strongly recommended for a dedicated backup network." }
+        insecureNbd: { type: boolean, in: body, description: "XO 6.10+: enable NBD WITHOUT TLS (clear text, faster) -- only for a network dedicated to backups. Not together with nbd (422). Pool-wide: while another network of the pool has nbd, XAPI refuses it with 500 NETWORK_INCOMPATIBLE_PURPOSES -- and the network has then already been created without NBD, delete it with delete_network. Omit on older XO (400)." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2014,6 +2172,7 @@ backend:
         bondMode: { type: string, in: body, description: "'balance-slb' | 'active-backup' | 'lacp'" }
         mtu: { type: integer, in: body, description: "MTU (optional)" }
         nbd: { type: boolean, in: body, description: "XO 6.6+: enable NBD (Network Block Device) on this network, so backups can stream disk data over it." }
+        insecureNbd: { type: boolean, in: body, description: "XO 6.10+: enable NBD WITHOUT TLS (clear text) -- only for a network dedicated to backups. Not together with nbd (422). Pool-wide: while another network of the pool has nbd, XAPI refuses it with 500 NETWORK_INCOMPATIBLE_PURPOSES -- and the network has then already been created without NBD, delete it with delete_network. Omit on older XO (400)." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2028,6 +2187,7 @@ backend:
         description: { type: string, in: body, description: "Network description" }
         mtu: { type: integer, in: body, description: "MTU (optional)" }
         nbd: { type: boolean, in: body, description: "XO 6.6+: enable NBD (Network Block Device) on this network." }
+        insecureNbd: { type: boolean, in: body, description: "XO 6.10+: enable NBD WITHOUT TLS (clear text) -- only for a network dedicated to backups. Not together with nbd (422). Pool-wide: while another network of the pool has nbd, XAPI refuses it with 500 NETWORK_INCOMPATIBLE_PURPOSES -- and the network has then already been created without NBD, delete it with delete_network. Omit on older XO (400)." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2210,13 +2370,19 @@ backend:
       method: POST
       path: /vdis
       access: write
-      description: "Create a new VDI"
+      description: "Create an empty VDI on an SR. Returns {id} (the new VDI UUID). The body uses XAPI names: srId and virtual_size (bytes) -- NOT sr/size (those are rejected with 422). Attach it to a VM with create_vbd."
       params:
-        sr: { type: string, in: body, required: true, description: "SR UUID" }
+        srId: { type: string, in: body, required: true, description: "Target SR UUID" }
         name_label: { type: string, in: body, required: true }
         name_description: { type: string, in: body }
-        size: { type: integer, in: body, required: true, description: "Size in bytes" }
-        other_config: { type: object, in: body, description: "Optional XAPI other_config key/value map (no longer required as of XO 6.5)" }
+        virtual_size: { type: integer, in: body, required: true, description: "Size in bytes, e.g. 10737418240 for 10 GiB" }
+        type: { type: string, in: body, description: "XAPI VDI type, default 'user'" }
+        read_only: { type: boolean, in: body }
+        sharable: { type: boolean, in: body }
+        tags: { type: array, in: body, description: "Tag strings" }
+        other_config: { type: object, in: body, description: "Optional XAPI other_config key/value map (string values)" }
+        xenstore_data: { type: object, in: body, description: "Optional xenstore key/value map" }
+        sm_config: { type: object, in: body, description: "Optional storage-manager config map (driver-specific)" }
       pagination: none
 
     update_vdi:
@@ -2314,7 +2480,7 @@ backend:
       method: GET
       path: /vdis/{uuid}.vhd
       access: read
-      description: "Export a VDI as VHD, whatever format the disk is stored in. Binary download. Since XO 6.9 the export reads the disk over NBD automatically when available and always sends content-length; the route has no NBD tuning query params."
+      description: "Export a VDI as VHD, whatever format the disk is stored in. Binary download. Since XO 6.9 the export reads the disk over NBD automatically when available and always sends content-length; the route has no NBD tuning query params. A disk larger than the VHD format limit (about 2 TiB) answers 422 -- export it as raw, qcow2 or vmdk instead."
       params:
         uuid: { type: string, in: path, required: true }
       response:
@@ -2339,6 +2505,18 @@ backend:
       path: /vdis/{uuid}.qcow2
       access: read
       description: "XO 6.9+ (older builds answer 422 'Invalid format'). Export a VDI as qcow2, whatever format the disk is stored in; reads over NBD when available and sends content-length. Binary download. Importing back is vhd/raw only (import_vdi_to_existing, import_vdi_to_sr)."
+      params:
+        uuid: { type: string, in: path, required: true }
+      response:
+        binary: true
+        content_type: application/octet-stream
+      pagination: none
+
+    export_vdi_vmdk:
+      method: GET
+      path: /vdis/{uuid}.vmdk
+      access: read
+      description: "XO 6.10+ (older builds answer 422 'Invalid format'). Export a VDI as VMDK (for VMware / other hypervisors), whatever format the disk is stored in. XO builds a sparse VMDK itself from the allocated disk blocks only (an empty 4 MiB disk gives ~15 KB), each grain padded so content-length is known up front -- the file is NOT shrunk to its compressed size. Binary download. Import back is vhd/raw only."
       params:
         uuid: { type: string, in: path, required: true }
       response:
@@ -2417,10 +2595,10 @@ backend:
       method: GET
       path: /vdi-snapshots/{uuid}.{format}
       access: read
-      description: "Export a VDI snapshot as VHD, raw or (XO 6.9+) qcow2. Format is the file extension; qcow2 on older builds answers 422 'Invalid format'. Binary download."
+      description: "Export a VDI snapshot as VHD, raw, (XO 6.9+) qcow2 or (XO 6.10+) vmdk. Format is the file extension; a format the build does not know answers 422 'Invalid format'. Binary download."
       params:
         uuid: { type: string, in: path, required: true }
-        format: { type: string, in: path, required: true, description: "'vhd', 'raw' or 'qcow2' (qcow2 requires XO 6.9+)" }
+        format: { type: string, in: path, required: true, description: "'vhd', 'raw', 'qcow2' (XO 6.9+) or 'vmdk' (XO 6.10+)" }
       response:
         binary: true
         content_type: application/octet-stream
@@ -2514,10 +2692,19 @@ backend:
       method: POST
       path: /vbds
       access: write
-      description: "Create a VBD to attach a VDI to a VM"
+      description: "Create a VBD to attach a VDI to a VM (both in the same pool). Field names are upper case: VM and VDI -- lower-case vm/vdi are rejected with 422. Returns {id}; plug it into a running VM with connect_vbd."
       params:
-        vm: { type: string, in: body, required: true, description: "VM UUID" }
-        vdi: { type: string, in: body, required: true, description: "VDI UUID" }
+        VM: { type: string, in: body, required: true, description: "VM UUID" }
+        VDI: { type: string, in: body, required: true, description: "VDI UUID" }
+        userdevice: { type: string, in: body, description: "Disk position, e.g. '1' (next free one if omitted)" }
+        bootable: { type: boolean, in: body }
+        mode: { type: string, in: body, description: "'RW' (default) or 'RO'" }
+        type: { type: string, in: body, description: "'Disk' (default), 'CD' or 'Floppy'" }
+        unpluggable: { type: boolean, in: body }
+        empty: { type: boolean, in: body }
+        other_config: { type: object, in: body }
+        qos_algorithm_type: { type: string, in: body }
+        qos_algorithm_params: { type: object, in: body }
       pagination: none
 
     delete_vbd:
@@ -2710,14 +2897,20 @@ backend:
       method: POST
       path: /vifs
       access: write
-      description: "Create a virtual network interface on a VM. The VM and network must belong to the same pool."
+      description: "Create a virtual network interface on a VM. The VM and network must belong to the same pool. Body fields use XAPI names (MTU, locking_mode, ipv4_allowed, other_config); XO rejects unknown fields with 422 -- there is no txChecksumming on create (use other_config 'ethtool-tx' or update_vif). Returns {id}."
       params:
         vmId: { type: string, in: body, required: true, description: "VM UUID" }
         networkId: { type: string, in: body, required: true, description: "Network UUID" }
         MAC: { type: string, in: body, description: "Optional MAC address (auto-generated if omitted)" }
         device: { type: string, in: body, description: "Optional device index (e.g. '0', '1')" }
         MTU: { type: integer, in: body, description: "Optional MTU override" }
-        txChecksumming: { type: boolean, in: body, description: "Toggle TX checksumming offload (added XO 6.5; maps to ethtool tx-checksumming / other_config). Omit for host default." }
+        locking_mode: { type: string, in: body, description: "'network_default' (default), 'locked', 'unlocked' or 'disabled'" }
+        ipv4_allowed: { type: array, in: body, description: "Allowed IPv4 addresses when locking_mode is 'locked'" }
+        ipv6_allowed: { type: array, in: body, description: "Allowed IPv6 addresses when locking_mode is 'locked'" }
+        currently_attached: { type: boolean, in: body }
+        other_config: { type: object, in: body, description: "String map; e.g. {\"ethtool-tx\": \"false\"} disables TX checksumming offload at creation (there is no txChecksumming field on create -- 422; use update_vif for that)" }
+        qos_algorithm_type: { type: string, in: body, description: "'ratelimit' to cap the bandwidth (with qos_algorithm_params)" }
+        qos_algorithm_params: { type: object, in: body, description: "String map, e.g. {\"kbps\": \"1000\"}" }
       pagination: none
 
     update_vif:
@@ -2727,9 +2920,9 @@ backend:
       description: "Partially update a VIF's properties (locking mode, allowed IPs, rate limit, TX checksumming). Only the fields you pass are changed. Added in XO 6.6 -- returns 404 on older builds. Does not move the VIF to another network; recreate it for that."
       params:
         uuid: { type: string, in: path, required: true }
-        lockingMode: { type: string, in: body, description: "'network_default' | 'locked' | 'unlocked' | 'disabled'. 'locked' enforces the ipv4Allowed/ipv6Allowed whitelists." }
-        ipv4Allowed: { type: array, in: body, description: "Allowed IPv4 addresses/CIDRs (array of strings) when lockingMode='locked'" }
-        ipv6Allowed: { type: array, in: body, description: "Allowed IPv6 addresses/CIDRs (array of strings) when lockingMode='locked'" }
+        lockingMode: { type: string, in: body, description: "'network_default' | 'locked' | 'unlocked' | 'disabled'. 'locked' enforces the allowedIpv4Addresses/allowedIpv6Addresses whitelists." }
+        allowedIpv4Addresses: { type: array, in: body, description: "Allowed IPv4 addresses (array of strings) when lockingMode='locked'. XO keeps its IP-pool accounting in sync." }
+        allowedIpv6Addresses: { type: array, in: body, description: "Allowed IPv6 addresses (array of strings) when lockingMode='locked'" }
         rateLimit: { type: integer, in: body, description: "Egress rate limit in kbps (null or 0 for unlimited)" }
         txChecksumming: { type: boolean, in: body, description: "Toggle the ethtool TX checksumming offload" }
       pagination: none
@@ -2803,6 +2996,84 @@ backend:
         markdown: { type: boolean, in: query }
 
     # =========================================================================
+    # XO PLUGINS -- management of xo-server plugins (XO 6.10+)
+    # Plugin ids are the plugin names, e.g. 'transport-email', 'auth-ldap', 'sdn-controller'.
+    # PUT /plugins/{id}/configuration is NOT exposed: its body is the free-form,
+    # plugin-specific configuration object itself (see coverage.missing).
+    # =========================================================================
+
+    list_plugins:
+      method: GET
+      path: /plugins
+      access: admin
+      description: "XO 6.10+ (404 on older builds). List the xo-server plugins. Returns hrefs unless fields is set, e.g. fields='id,name,version,loaded,autoload,configured,unloadable,testable' (avoid configurationSchema/testSchema in lists -- they are large JSON schemas). Secrets in configuration are obfuscated by XO. loaded is omitted (not false) for plugins that are not loaded; use filter='loaded?' for loaded plugins only."
+      params:
+        fields: { type: string, in: query }
+        filter: { type: string, in: query }
+        limit: { type: integer, in: query }
+        ndjson: { type: boolean, in: query }
+        markdown: { type: boolean, in: query }
+
+    get_plugin:
+      method: GET
+      path: /plugins/{id}
+      access: admin
+      description: "XO 6.10+ (404 on older builds or unknown plugin). One plugin with its state (loaded, autoload, configured, unloadable, testable), version, current configuration (passwords, tokens and secrets obfuscated by XO), configurationSchema and -- for testable plugins -- testSchema describing the data test_plugin expects."
+      params:
+        id: { type: string, in: path, required: true, description: "Plugin id = plugin name, e.g. 'transport-email'" }
+      pagination: none
+
+    update_plugin:
+      method: PATCH
+      path: /plugins/{id}
+      access: admin
+      description: "XO 6.10+. Set whether the plugin is loaded automatically when XO starts (autoload). Does not load or unload it now -- use load_plugin / unload_plugin for that. Returns 204."
+      params:
+        id: { type: string, in: path, required: true, description: "Plugin id, e.g. 'transport-email'" }
+        autoload: { type: boolean, in: body, required: true, description: "true = load at XO startup" }
+      pagination: none
+
+    delete_plugin_configuration:
+      method: DELETE
+      path: /plugins/{id}/configuration
+      access: dangerous
+      description: "XO 6.10+. Erase the stored configuration of a plugin (it becomes unconfigured and cannot be loaded until configured again in the XO UI). The plugin must be unloaded first -- 409 'incorrect state' while it is loaded. Irreversible: read get_plugin first if the settings must be kept."
+      params:
+        id: { type: string, in: path, required: true, description: "Plugin id" }
+      pagination: none
+
+    load_plugin:
+      method: POST
+      path: /plugins/{id}/actions/load
+      access: admin
+      description: "XO 6.10+. Load (start) a plugin. 409 'incorrect state' when it is already loaded, still loading or not configured. sync=true waits and returns 204, otherwise a task URL is returned."
+      params:
+        id: { type: string, in: path, required: true, description: "Plugin id" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    unload_plugin:
+      method: POST
+      path: /plugins/{id}/actions/unload
+      access: admin
+      description: "XO 6.10+. Unload (stop) a plugin -- its feature is gone until it is loaded again (e.g. unloading 'sdn-controller' removes the traffic-rule routes, unloading an auth plugin stops that login method). 403 when the plugin is not unloadable, 409 when it is not loaded. sync=true waits and returns 204."
+      params:
+        id: { type: string, in: path, required: true, description: "Plugin id" }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    test_plugin:
+      method: POST
+      path: /plugins/{id}/actions/test
+      access: admin
+      description: "XO 6.10+. Run the plugin's self-test with its current configuration, e.g. send a test e-mail or chat message, or check a LDAP/NetBox connection. The plugin must be loaded (409 otherwise) and testable (403 otherwise). data is checked twice: against the known test inputs of all plugins (422 'Value does not match any allowed schema', also for an empty object {}) and against this plugin's testSchema (400 for unknown properties) -- omit data for plugins without a testSchema. sync=true waits and returns 204 on success or the plugin's error."
+      params:
+        id: { type: string, in: path, required: true, description: "Plugin id" }
+        data: { type: object, in: body, description: "Test input matching testSchema, e.g. {\"to\": \"admin@example.org\"} for transport-email. Omit for plugins without a testSchema -- {} is rejected with 422." }
+        sync: { type: boolean, in: query }
+      pagination: none
+
+    # =========================================================================
     # SDN CONTROLLER -- Network traffic rules (xo-server-sdn-controller plugin)
     # These routes only exist when the SDN Controller plugin is loaded.
     # =========================================================================
@@ -2811,7 +3082,7 @@ backend:
       method: POST
       path: /plugins/sdn-controller/networks/{uuid}/actions/add_traffic_rule
       access: write
-      description: "Add a traffic (OpenFlow) rule to a private SDN network. Requires the SDN Controller plugin."
+      description: "Add a traffic (OpenFlow) rule to a private SDN network. Requires the SDN Controller plugin. (404 otherwise). XO 6.10+: an optional priority orders the rules -- of all network and VIF rules matching a packet, the highest priority applies; with the XAPI plugin only."
       params:
         uuid: { type: string, in: path, required: true, description: "Network UUID" }
         allow: { type: boolean, in: body, required: true, description: "true to allow matching traffic, false to drop it" }
@@ -2819,6 +3090,7 @@ backend:
         ipRange: { type: string, in: body, required: true, description: "IP range in CIDR notation (e.g. 10.0.0.0/24)" }
         protocol: { type: string, in: body, required: true, description: "Protocol, e.g. 'TCP', 'UDP', 'ICMP'" }
         port: { type: integer, in: body, description: "Port number (for TCP/UDP)" }
+        priority: { type: integer, in: body, description: "XO 6.10+, only with the SDN controller XAPI plugin (422 without it): OpenFlow priority 0-65535, unique per network (409 if taken by another rule of the network or of its VIFs); the highest priority applies first. Without it the rule gets the OpenFlow default 32768. Leave gaps (100, 110, 120...). Omit on older XO." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2826,7 +3098,7 @@ backend:
       method: POST
       path: /plugins/sdn-controller/networks/{uuid}/actions/delete_traffic_rule
       access: write
-      description: "Remove a traffic rule from a private SDN network. The rule is identified by allow + direction + ipRange + protocol + port exactly as it was added. Since XO 6.9 a non-matching rule returns HTTP 404 (older builds returned 204 without deleting anything and ignored allow). Requires the SDN Controller plugin (404 otherwise)."
+      description: "Remove a traffic rule from a private SDN network. The rule is identified by allow + direction + ipRange + protocol + port (+ priority since XO 6.10) exactly as it was added. Since XO 6.9 a non-matching rule returns HTTP 404 (older builds returned 204 without deleting anything and ignored allow). Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "Network UUID" }
         allow: { type: boolean, in: body, required: true, description: "true for an allow rule, false for a deny rule -- part of the rule identity. Required since XO 6.9 (400 without it); accepted and ignored by older builds." }
@@ -2834,6 +3106,7 @@ backend:
         ipRange: { type: string, in: body, required: true, description: "IP range of the rule to remove" }
         protocol: { type: string, in: body, required: true, description: "Protocol of the rule to remove" }
         port: { type: integer, in: body, description: "Port of the rule to remove (for TCP/UDP)" }
+        priority: { type: integer, in: body, description: "XO 6.10+: required when the rule has a priority -- a rule with a priority only matches when the same priority is given. Omit for rules without one and on older XO." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2841,11 +3114,11 @@ backend:
       method: POST
       path: /plugins/sdn-controller/networks/{uuid}/actions/update_traffic_rule
       access: write
-      description: "Update an existing traffic rule on a private SDN network. oldRule must contain the FULL existing rule (allow/direction/ipRange/protocol, plus port if set) to identify it; newRule is a PARTIAL update -- only the fields you send change, and a field sent as null is REMOVED from the rule (XO 6.8+; before 6.8 e.g. the old port was silently kept). Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
+      description: "Update an existing traffic rule on a private SDN network. oldRule must contain the FULL existing rule (allow/direction/ipRange/protocol, plus port and -- XO 6.10+ -- priority if set) to identify it; newRule is a PARTIAL update -- only the fields you send change, and a field sent as null is REMOVED from the rule (XO 6.8+; before 6.8 e.g. the old port was silently kept). Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "Network UUID" }
-        oldRule: { type: object, in: body, required: true, description: "Full existing rule to match: {allow: boolean, direction: 'from'|'to', ipRange: string, protocol: string, port?: integer}" }
-        newRule: { type: object, in: body, required: true, description: "Fields to change: any of {allow, direction, ipRange, protocol, port}; port: null removes the port from the rule" }
+        oldRule: { type: object, in: body, required: true, description: "Full existing rule to match: {allow: boolean, direction: 'from'|'to', ipRange: string, protocol: string, port?: integer, priority?: integer} -- priority (XO 6.10+) must be given when the rule has one" }
+        newRule: { type: object, in: body, required: true, description: "Fields to change: any of {allow, direction, ipRange, protocol, port, priority (XO 6.10+, XAPI plugin only)}; port: null removes the port from the rule. A new priority already taken on the network answers 409" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2853,7 +3126,7 @@ backend:
       method: POST
       path: /plugins/sdn-controller/vifs/{uuid}/actions/add_traffic_rule
       access: write
-      description: "Add a traffic (OpenFlow) rule to a VIF connected to a private SDN network. Requires the SDN Controller plugin."
+      description: "Add a traffic (OpenFlow) rule to a VIF connected to a private SDN network. Requires the SDN Controller plugin. (404 otherwise). XO 6.10+: an optional priority orders the rules -- of all network and VIF rules matching a packet, the highest priority applies; with the XAPI plugin only."
       params:
         uuid: { type: string, in: path, required: true, description: "VIF UUID" }
         allow: { type: boolean, in: body, required: true, description: "true to allow matching traffic, false to drop it" }
@@ -2861,6 +3134,7 @@ backend:
         ipRange: { type: string, in: body, required: true, description: "IP range in CIDR notation (e.g. 10.0.0.0/24)" }
         protocol: { type: string, in: body, required: true, description: "Protocol, e.g. 'TCP', 'UDP', 'ICMP'" }
         port: { type: integer, in: body, description: "Port number (for TCP/UDP)" }
+        priority: { type: integer, in: body, description: "XO 6.10+, only with the SDN controller XAPI plugin (422 without it): OpenFlow priority 0-65535, unique per network (409 if taken by another rule of the network or of its VIFs); the highest priority applies first. Without it the rule gets the OpenFlow default 32768. Leave gaps (100, 110, 120...). Omit on older XO." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2868,7 +3142,7 @@ backend:
       method: POST
       path: /plugins/sdn-controller/vifs/{uuid}/actions/delete_traffic_rule
       access: write
-      description: "Remove a traffic rule from a VIF connected to a private SDN network. The rule is identified by allow + direction + ipRange + protocol + port exactly as it was added. Since XO 6.9 a non-matching rule returns HTTP 404 (older builds returned 204 without deleting anything and ignored allow). Requires the SDN Controller plugin (404 otherwise)."
+      description: "Remove a traffic rule from a VIF connected to a private SDN network. The rule is identified by allow + direction + ipRange + protocol + port (+ priority since XO 6.10) exactly as it was added. Since XO 6.9 a non-matching rule returns HTTP 404 (older builds returned 204 without deleting anything and ignored allow). Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "VIF UUID" }
         allow: { type: boolean, in: body, required: true, description: "true for an allow rule, false for a deny rule -- part of the rule identity. Required since XO 6.9 (400 without it); accepted and ignored by older builds." }
@@ -2876,6 +3150,7 @@ backend:
         ipRange: { type: string, in: body, required: true, description: "IP range of the rule to remove" }
         protocol: { type: string, in: body, required: true, description: "Protocol of the rule to remove" }
         port: { type: integer, in: body, description: "Port of the rule to remove (for TCP/UDP)" }
+        priority: { type: integer, in: body, description: "XO 6.10+: required when the rule has a priority -- a rule with a priority only matches when the same priority is given. Omit for rules without one and on older XO." }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -2883,11 +3158,11 @@ backend:
       method: POST
       path: /plugins/sdn-controller/vifs/{uuid}/actions/update_traffic_rule
       access: write
-      description: "Update an existing traffic rule on a VIF connected to a private SDN network. oldRule must contain the FULL existing rule (allow/direction/ipRange/protocol, plus port if set) to identify it; newRule is a PARTIAL update -- only the fields you send change, and a field sent as null is REMOVED from the rule (XO 6.8+; before 6.8 e.g. the old port was silently kept). Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
+      description: "Update an existing traffic rule on a VIF connected to a private SDN network. oldRule must contain the FULL existing rule (allow/direction/ipRange/protocol, plus port and -- XO 6.10+ -- priority if set) to identify it; newRule is a PARTIAL update -- only the fields you send change, and a field sent as null is REMOVED from the rule (XO 6.8+; before 6.8 e.g. the old port was silently kept). Added in XO 6.6. Requires the SDN Controller plugin (404 otherwise)."
       params:
         uuid: { type: string, in: path, required: true, description: "VIF UUID" }
-        oldRule: { type: object, in: body, required: true, description: "Full existing rule to match: {allow: boolean, direction: 'from'|'to', ipRange: string, protocol: string, port?: integer}" }
-        newRule: { type: object, in: body, required: true, description: "Fields to change: any of {allow, direction, ipRange, protocol, port}; port: null removes the port from the rule" }
+        oldRule: { type: object, in: body, required: true, description: "Full existing rule to match: {allow: boolean, direction: 'from'|'to', ipRange: string, protocol: string, port?: integer, priority?: integer} -- priority (XO 6.10+) must be given when the rule has one" }
+        newRule: { type: object, in: body, required: true, description: "Fields to change: any of {allow, direction, ipRange, protocol, port, priority (XO 6.10+, XAPI plugin only)}; port: null removes the port from the rule. A new priority already taken on the network answers 409" }
         sync: { type: boolean, in: query }
       pagination: none
 
@@ -3212,7 +3487,7 @@ backend:
       method: GET
       path: /events
       access: read
-      description: "Open an SSE (Server-Sent Events) connection. The first event is 'init' and carries the connection id, i.e. the subscriber id for add_event_subscription / remove_event_subscription; afterwards ping (keepalive), add (object created), update (object changed), remove (object deleted). Since XO 6.9 subscriptions can also cover non-XAPI collections (users, groups, ACL roles/privileges, proxies, servers, backup repositories/jobs, schedules)."
+      description: "Open an SSE (Server-Sent Events) connection. The first event is 'init' and carries the connection id, i.e. the subscriber id for add_event_subscription / remove_event_subscription; afterwards ping (keepalive), add (object created), update (object changed), remove (object deleted). Since XO 6.9 subscriptions can also cover non-XAPI collections (users, groups, ACL roles/privileges, proxies, servers, backup repositories/jobs, schedules); XO 6.10 adds plugins, backup archives (backups appearing, merged or removed on a repository), backup logs and authentication tokens (each user only sees events about their own tokens and backup logs)."
       pagination: none
 
     add_event_subscription:
@@ -3222,7 +3497,7 @@ backend:
       description: "Add an object-type subscription to an open SSE connection. Returns the subscription id (= collection name)."
       params:
         id: { type: string, in: path, required: true, description: "Subscriber UUID returned by open_events_stream" }
-        collection: { type: string, in: body, required: true, description: "Collection to watch. XAPI types ('VM', 'host', 'pool', 'SR', 'VDI', 'VBD', 'VIF', 'network', 'PIF', 'PBD', 'VM-snapshot', 'VM-template', ...) plus 'alarm' and 'task'. XO 6.9+ also accepts 'user', 'group', 'acl-privilege', 'acl-role', 'proxy', 'server', 'backup-repository', 'backup-job', 'schedule' -- not accepted by older builds." }
+        collection: { type: string, in: body, required: true, description: "Collection to watch. XAPI types ('VM', 'host', 'pool', 'SR', 'VDI', 'VBD', 'VIF', 'network', 'PIF', 'PBD', 'VM-snapshot', 'VM-template', ...) plus 'alarm' and 'task'. XO 6.9+ also accepts 'user', 'group', 'acl-privilege', 'acl-role', 'proxy', 'server', 'backup-repository', 'backup-job', 'schedule'; XO 6.10+ adds 'plugin', 'backup-archive', 'backup-log' and 'authentication_token' (underscore). Not accepted by older builds. 'backup-archive' events for changes made by this XO arrive at once, others within minutes (each repository is also fully re-listed every hour). Token events carry the token itself -- avoid 'authentication_token' in an LLM context." }
         fields: { type: string, in: body, description: "Either '*' (all fields) or array of field names" }
       pagination: none
 
@@ -3352,7 +3627,7 @@ backend:
       method: GET
       path: /backup-repositories
       access: read
-      description: "List all backup repositories (NFS, S3, SMB, local targets where backups are stored)."
+      description: "List all backup repositories (NFS, S3, SMB, local targets where backups are stored). Returns hrefs unless fields is set, e.g. fields='id,name,enabled,size,used,available'. Since XO 6.10 size/used/available (bytes) are stored on the repository object -- they are null or missing for a disabled repository and until XO has read the target's free space (at startup, after a backup changed it)."
       params:
         fields: { type: string, in: query }
         filter: { type: string, in: query }
@@ -3364,7 +3639,7 @@ backend:
       method: GET
       path: /backup-repositories/{id}
       access: read
-      description: "Get details of a backup repository (capacity, type, status)."
+      description: "Get details of a backup repository: id, name, url (credentials masked by XO), enabled, options, benchmarks, error, and since XO 6.10 size/used/available in bytes (null/missing while disabled or not yet measured)."
       params:
         id: { type: string, in: path, required: true }
       pagination: none
@@ -3373,13 +3648,12 @@ backend:
       method: POST
       path: /backup-repositories
       access: write
-      description: "Register a new backup repository ('remote') where backups are written. Added in XO 6.6 (was read-only before). Returns {id}. The url encodes the backend type (nfs://, smb://, s3://, file://)."
+      description: "Register a new backup repository ('remote') where backups are written. Added in XO 6.6 (was read-only before). Returns {id}. The url encodes the backend type (nfs://, smb://, s3://, file://). Body is name, url, options (a string), proxy -- there is no enabled field on create (422); a new repository is enabled, use update_backup_repository to disable it."
       params:
         name: { type: string, in: body, required: true, description: "Friendly display name" }
         url: { type: string, in: body, required: true, description: "Backend URL: 'nfs://host:/path', 'smb://user:pass@host\\\\share', 's3://key:secret@endpoint/bucket', or 'file:///srv/backups'" }
-        options: { type: object, in: body, description: "Optional per-backend settings (e.g. mount options, S3 region/forcePathStyle)" }
+        options: { type: string, in: body, description: "Optional backend options as ONE string (e.g. NFS/SMB mount options 'vers=4.1') -- not an object" }
         proxy: { type: string, in: body, description: "Optional XO Proxy UUID to route traffic through" }
-        enabled: { type: boolean, in: body, description: "Whether the repository is active (default true)" }
       pagination: none
 
     update_backup_repository:
@@ -3391,7 +3665,7 @@ backend:
         id: { type: string, in: path, required: true }
         name: { type: string, in: body, description: "New display name" }
         url: { type: string, in: body, description: "New backend URL" }
-        options: { type: object, in: body, description: "Per-backend settings map" }
+        options: { type: string, in: body, description: "Backend options as one string (null to clear)" }
         proxy: { type: string, in: body, description: "XO Proxy UUID (null to clear)" }
         enabled: { type: boolean, in: body, description: "Enable/disable the repository" }
       pagination: none
@@ -3753,8 +4027,7 @@ backend:
       code: |
         const repo = await api.create_backup_repository({
           name: "nightly-nfs",
-          url: "nfs://192.168.100.20:/srv/backups",
-          enabled: true
+          url: "nfs://192.0.2.20:/srv/backups"
         });
         return await api.get_backup_repository({ id: repo.id });
 
@@ -3764,6 +4037,6 @@ backend:
         return await api.update_vif({
           uuid: "vif-uuid-here",
           lockingMode: "locked",
-          ipv4Allowed: ["10.0.0.42/32"],
+          allowedIpv4Addresses: ["192.0.2.42"],
           rateLimit: 100000
         });

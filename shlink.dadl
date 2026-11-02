@@ -1,0 +1,1072 @@
+# shlink.dadl — Shlink REST API v3 for ToolMesh
+# Shlink is a self-hosted URL shortener (https://shlink.io). This file covers
+# its REST API v3: short URLs, dynamic redirect rules, tags, visit tracking
+# (incl. orphan visits), domains and the health endpoint.
+#
+# Domain Notes for LLM consumers:
+# - SELF-HOSTED: there is no central Shlink service. Every instance has its own
+#   address, so base_url is omitted and comes from the backends.yaml url field:
+#   the bare instance origin (e.g. https://s.example.com), WITHOUT /rest. The
+#   tool paths carry /rest/v3/...; get_health lives at /rest/health
+#   (unversioned, works without a key). /rest/v1 and /rest/v2 still answer on
+#   Shlink 5.x, but v3 is the current version and the only one used here.
+#   Point url at the Shlink SERVER, not at the Shlink web client (the admin
+#   UI, often on a separate host): the web client is a single-page app that
+#   answers every path, /rest/... included, with its index.html and HTTP 200,
+#   so every tool then "succeeds" with an HTML page instead of JSON.
+# - AUTH: one API key in the X-Api-Key header. Keys are created on the server
+#   with the CLI (shlink api-key:generate); there is no REST endpoint and no UI
+#   for key management. Since Shlink 4.3 keys are stored hashed, so the plain
+#   key is shown exactly once. Missing header -> 401 missing-authentication;
+#   unknown, disabled or expired key -> 401 invalid-api-key.
+# - KEY ROLES: a key without roles is an ADMIN key and may do everything.
+#   Restricted keys (roles combinable): AUTHORED_SHORT_URLS (--author-only)
+#   only sees short URLs it created itself; DOMAIN_SPECIFIC
+#   (--domain-only=<domain>) is pinned to one non-default domain;
+#   NO_ORPHAN_VISITS (--no-orphan-visits) gets an empty orphan visit list and
+#   deletes 0. Non-admin keys get 403 forbidden-tag-operation on rename_tag
+#   and delete_tags, and set_domain_redirects fails for them (Shlink 5.1.8
+#   answers 500, not 403). A restricted key sees filtered lists, so "not
+#   found" can mean "not visible to this key".
+# - IDENTIFIER = short code + domain. A short code is unique per domain only.
+#   Short URLs on the default domain need no domain parameter. Short URLs on
+#   any other domain need domain=<authority> on get, update, delete, visits
+#   and redirect rules, otherwise the API answers 404 short-url-not-found. In
+#   results "domain": null means the default domain. The keyword DEFAULT
+#   stands for the default domain in the list_short_urls domain filter and the
+#   list_domain_visits path; set_domain_redirects rejects it (400) and needs
+#   the real authority.
+# - NORMALIZATION (verified against Shlink 5.1.8): customSlug is slugified
+#   (spaces and "/" become "-", case is kept in the default strict mode:
+#   "Spring Sale" -> "Spring-Sale"); tags are lowercased and slugified
+#   ("Mixed Case Tag" -> "mixed-case-tag"). Generated short codes have 5
+#   characters by default; shortCodeLength must be >= 4. A slug that is
+#   already taken on that domain is a 400 non-unique-slug. A short code
+#   cannot be renamed after creation.
+# - GET OR CREATE: create_short_url with findIfExists=true returns an existing
+#   short URL for the same long URL (and the same optional fields) instead of
+#   creating a duplicate.
+# - EDIT IS A TRUE PATCH (verified 5.1.8): omitted fields stay unchanged, null
+#   clears validSince/validUntil/maxVisits/title, and tags replaces the whole
+#   tag list (tags: [] removes all tags; it never appends).
+# - EXPIRY: validSince/validUntil/maxVisits do not hide a short URL from the
+#   API; it stays listable and gettable. Visitors get a 404 instead and the hit
+#   is tracked as an orphan visit of type invalid_short_url.
+#   excludeMaxVisitsReached/excludePastValidUntil filter such links out.
+# - DATES: ISO-8601 with offset ("2026-10-01T00:00:00+02:00"); a plain date
+#   ("2026-10-01") works too. Shlink converts input dates to its configured
+#   timezone. PHP also parses relative words such as "tomorrow"; do not rely
+#   on that.
+# - VISITS: {referer, date, userAgent, visitLocation, potentialBot,
+#   visitedUrl, redirectUrl}; orphan visits add type = base_url (the bare
+#   domain), invalid_short_url (a single path segment that is no valid short
+#   code: unknown, expired or exhausted, but also scanner probes like
+#   /wp-login.php) or regular_404 (any other path, e.g. several segments;
+#   verified 5.1.8). visitLocation is null unless the instance
+#   has a GeoLite2 license key. potentialBot is a User-Agent heuristic. Lists
+#   are newest first. Shlink has no server-side aggregation: the
+#   summarize_visits composite pages through visits and counts per day,
+#   referrer host, country, city and URL.
+# - LARGE INSTANCES (verified 2026-10 against a live instance whose visits
+#   table is large and mostly orphan visits, MySQL with a tight memory limit):
+#   get_visit_stats reads precomputed counters and is always cheap. Visits of
+#   one short URL or one tag are found through an index and stay fast.
+#   list_domain_visits (and list_non_orphan_visits WITH a domain filter) join
+#   visits to short_urls and order by visit id, which can make MySQL walk the
+#   whole visits table: itemsPerPage=5 answered in 40 ms, itemsPerPage=500
+#   exhausted the database's memory and MySQL was restarted. Keep those pages
+#   small or use the per short URL / per tag tools. Every list page also runs
+#   a COUNT over all matching rows, so list_orphan_visits counts every orphan
+#   visit on each page; its domain filter is a substring match on visitedUrl
+#   and excludeBots/type need row reads, i.e. table scans. On such instances
+#   take totals from get_visit_stats and do not page through orphan visits.
+# - excludeBots TRAP (verified 5.1.8): ANY value, even "false", excludes bots.
+#   Pass "true" to exclude them and OMIT the parameter to include them.
+#   excludeMaxVisitsReached and excludePastValidUntil on list_short_urls are
+#   real booleans.
+# - PAGINATION: page-based (page, itemsPerPage) with the envelope
+#   {data, pagination: {currentPage, pagesCount, itemsPerPage,
+#   itemsInCurrentPage, totalItems}}. ToolMesh cannot auto-follow it because
+#   the items are wrapped in an object, so pagination is exposed: the list
+#   tools keep the pagination block in their result and the caller pages.
+#   itemsPerPage=-1 returns everything. The visit lists return ALL rows when
+#   itemsPerPage is omitted, which on a busy instance means hundreds of
+#   thousands, so this file sends itemsPerPage=100 unless told otherwise.
+# - QUERY ARRAYS: Shlink only accepts PHP array keys (tags[]=x); a plain
+#   tags=x is a 400 on list_short_urls and a 500 on delete_tags. ToolMesh
+#   sends one value per query key, so the "tags[]" and "excludeTags[]"
+#   parameters take ONE tag each. For several tags call once per tag or
+#   filter the result; tagsMode/excludeTagsMode are not exposed for that
+#   reason.
+# - REDIRECT RULES (Shlink 4.0+): an ordered list of {longUrl, conditions[]}
+#   per short URL. All conditions of a rule must match (AND). Rules are tried
+#   by priority, which is the order in which they were sent (1 first); without
+#   a match the visitor goes to the short URL's own longUrl. set_redirect_rules
+#   REPLACES the whole list and an empty list removes all rules. Condition
+#   types and their fields are listed in the set_redirect_rules description.
+# - TAGS stay in list_tags after their last short URL dropped them
+#   (shortUrlsCount 0) until delete_tags removes them. delete_tags answers 204
+#   for unknown names as well.
+# - DELETING a short URL deletes its visits too. An instance may set
+#   DELETE_SHORT_URL_THRESHOLD; short URLs with more visits then answer 422.
+# - DOMAINS show up in list_domains once a short URL or a redirect config uses
+#   them; set_domain_redirects creates the entry implicitly. The "not found"
+#   redirects merge: omitted fields are kept, null clears one.
+# - ERRORS are RFC 7807 problem details {type, title, detail, status, ...};
+#   type is a URI such as https://shlink.io/api/error/short-url-not-found.
+#   Others: invalid-data (with invalidElements[]), non-unique-slug,
+#   tag-not-found, tag-conflict, domain-not-found, forbidden-tag-operation,
+#   invalid-api-key, mercure-not-configured (501). Branch on type, not detail.
+# - Shlink has no rate limiting of its own; a 429 can only come from a proxy.
+# - Not exposed: the public redirect endpoint /{shortCode} and the tracking
+#   pixel /{shortCode}/track (both create real visits), the deprecated
+#   GET /rest/v3/short-urls/shorten (API key in the query string), QR codes
+#   (removed in Shlink 5.0), and CLI-only functions (API keys, imports,
+#   GeoLite updates, short-url:delete-expired).
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+source_name: "Shlink REST API"
+source_url: https://api-spec.shlink.io/
+date: "2026-10-23"
+
+# ─── Reusable fragments (underscore keys are ignored by ToolMesh) ────────────
+_shared:
+  shortcode_param: &p-shortcode
+    type: string
+    in: path
+    required: true
+    description: "The short code (the path part of the short URL, e.g. abc12 for https://s.example.com/abc12)."
+
+  domain_param: &p-domain
+    type: string
+    in: query
+    description: "Domain (authority) the short code belongs to. Omit for the default domain; required for short URLs on any other domain, otherwise the API answers 404."
+
+  page_param: &p-page
+    type: integer
+    in: query
+    description: "Page number, starting at 1 (the API default)."
+
+  visits_items_param: &p-visit-items
+    type: integer
+    in: query
+    default: 100
+    description: "Visits per page. Defaults to 100 here; -1 returns ALL visits (the API's own default), which can be a huge response."
+
+  start_date_param: &p-start-date
+    type: string
+    in: query
+    description: "ISO-8601 date or date-time from which to include items, e.g. 2026-10-01 or 2026-10-01T00:00:00+02:00."
+
+  end_date_param: &p-end-date
+    type: string
+    in: query
+    description: "ISO-8601 date or date-time until which to include items."
+
+  exclude_bots_param: &p-exclude-bots
+    type: string
+    in: query
+    description: "Pass \"true\" to drop visits flagged as potential bots. ANY value excludes bots (even \"false\"), so omit the parameter to include them."
+
+  visit_domain_filter_param: &p-visit-domain
+    type: string
+    in: query
+    description: "Only count visits on this domain (authority, or DEFAULT for the default domain)."
+
+  pagination: &page-pagination
+    strategy: page
+    request:
+      page_param: page
+      limit_param: itemsPerPage
+      limit_default: 100
+    behavior: expose
+    max_pages: 10
+
+backend:
+  name: shlink
+  type: rest
+  version: "1.0"
+  # base_url is intentionally omitted: every Shlink instance is self-hosted.
+  # Set the backends.yaml url field to the instance origin (without /rest).
+  description: >
+    Shlink self-hosted URL shortener REST API v3 — create, edit and delete
+    short URLs with custom slugs, tags, expiry dates and visit limits, define
+    dynamic redirect rules (device, language, query parameter, IP address,
+    geolocation, date, browser), read and summarize visit tracking per short
+    URL, tag or domain including orphan visits and bot filtering, manage tags
+    and per-domain "not found" redirects, and check instance health.
+
+  coverage:
+    endpoints: 23
+    total_endpoints: 26
+    percentage: 88
+    focus: >
+      Shlink REST API v3: short URLs (custom slugs, tags, expiry, visit
+      limits, title, query forwarding), visits (per short URL, tag, domain,
+      orphan visits, bot filtering, visit summaries), tags (stats, rename),
+      redirect rules (device, language, query param, IP address, geolocation,
+      date, browser), domains (not-found redirects), health.
+    missing: >
+      The public redirect endpoint /{shortCode} and the tracking pixel
+      /{shortCode}/track (visitor-facing, both create real visits), the
+      deprecated GET /short-urls/shorten (API key in the query string), and
+      multi-tag filters with tagsMode/excludeTagsMode (one tag per call).
+      API key management, imports and GeoLite updates exist only in the
+      Shlink CLI; QR codes were removed from Shlink in 5.0.
+    last_reviewed: "2026-10-23"
+
+  setup:
+    credential_steps:
+      - "Shlink API keys are created with the Shlink CLI on the server, not in a UI. For the official Docker image run: docker exec -it <shlink-container> shlink api-key:generate --name=toolmesh"
+      - "Copy the printed key right away. Shlink stores keys hashed and cannot show the key again."
+      - "A key without roles is an admin key and works with every tool here. For least privilege add --author-only (only short URLs this key created), --domain-only=s.example.com (one non-default domain) or --no-orphan-visits; such keys cannot rename or delete tags or set domain redirects."
+      - "Optional expiry: --expiration-date=2027-12-31. Revoke a key later with shlink api-key:disable <name>."
+      - "Fresh container without shell access: start it once with INITIAL_API_KEY=<key-of-your-choice> to seed an admin key."
+      - "Put the key into the ToolMesh .env as CREDENTIAL_SHLINK_API_KEY and add the backends.yaml entry with your instance URL."
+    env_var: CREDENTIAL_SHLINK_API_KEY
+    backends_yaml: |
+      - name: shlink
+        transport: rest
+        dadl: shlink.dadl
+        url: "https://s.example.com"
+    required_scopes:
+      - "Admin API key (no roles) for the full tool set"
+    optional_scopes:
+      - "AUTHORED_SHORT_URLS role (--author-only): only short URLs created with this key"
+      - "DOMAIN_SPECIFIC role (--domain-only=<domain>): only one non-default domain"
+      - "NO_ORPHAN_VISITS role (--no-orphan-visits): orphan visits hidden"
+    docs_url: "https://shlink.io/documentation/api-docs/authentication/"
+    notes: >
+      Shlink is self-hosted: set url to the origin that serves /rest of your
+      instance (usually the short domain, e.g. https://s.example.com) without
+      a /rest suffix. Do not use the address of the Shlink web client (admin
+      UI): it answers every request with its HTML start page and HTTP 200, so
+      the tools return HTML instead of JSON. Check with
+      https://<your-host>/rest/health, which must return JSON with status
+      pass. Requires Shlink 3.0 or newer for REST API v3; redirect
+      rules need 4.0, the date conditions 5.0 and the browser condition 5.1.
+      Verified against Shlink 5.1.8. Geolocation fields and the geolocation
+      redirect conditions need a GeoLite2 license key on the Shlink server.
+      The health endpoint needs no key.
+
+  auth:
+    type: apikey
+    credential: shlink_api_key
+    inject_into: header
+    header_name: X-Api-Key
+
+  defaults:
+    headers:
+      # Shlink may answer an unexpected error with HTML unless JSON is asked for.
+      Accept: application/json
+    content_type: application/json
+    pagination: *page-pagination
+    errors:
+      format: json
+      message_path: "$.detail"
+      code_path: "$.type"
+      # Shlink itself does not rate-limit; 429/502/504 come from a proxy in
+      # front of it. 503 is also what get_health returns while the database is
+      # unreachable.
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 409, 422, 501]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+    response:
+      result_path: "$"
+
+  tools:
+    # ── Short URLs ────────────────────────────────────────────────────────
+
+    list_short_urls:
+      method: GET
+      path: /rest/v3/short-urls
+      access: read
+      description: >
+        List short URLs, newest first by default. Returns {data: ShortUrl[],
+        pagination: {currentPage, pagesCount, itemsPerPage, itemsInCurrentPage,
+        totalItems}}; page through with page. Each ShortUrl has shortCode,
+        shortUrl, longUrl, dateCreated, tags, meta {validSince, validUntil,
+        maxVisits}, domain (null = default domain), title, crawlable,
+        forwardQuery, hasRedirectRules and visitsSummary {total, nonBots,
+        bots}. Expired or exhausted links are included unless the exclude*
+        flags are set. Tag filters take ONE tag each (Shlink needs the PHP
+        array key "tags[]"; call again for another tag).
+      params:
+        page: *p-page
+        itemsPerPage:
+          type: integer
+          in: query
+          default: 50
+          description: "Short URLs per page. Defaults to 50 here (API default 10); -1 returns all."
+        searchTerm:
+          type: string
+          in: query
+          description: "Substring searched in longUrl, shortCode and title."
+        "tags[]":
+          type: string
+          in: query
+          description: "Only short URLs carrying this ONE tag (a single string, not an array). Tags are lowercase slugs."
+        "excludeTags[]":
+          type: string
+          in: query
+          description: "Only short URLs WITHOUT this ONE tag (a single string, not an array)."
+        orderBy:
+          type: string
+          in: query
+          description: "Sort order: longUrl-ASC|DESC, shortCode-ASC|DESC, dateCreated-ASC|DESC, title-ASC|DESC, visits-ASC|DESC, nonBotVisits-ASC|DESC (e.g. visits-DESC for the most clicked links)."
+        startDate:
+          type: string
+          in: query
+          description: "Only short URLs created on or after this ISO-8601 date or date-time."
+        endDate:
+          type: string
+          in: query
+          description: "Only short URLs created on or before this ISO-8601 date or date-time."
+        excludeMaxVisitsReached:
+          type: boolean
+          in: query
+          description: "true hides short URLs that already reached maxVisits."
+        excludePastValidUntil:
+          type: boolean
+          in: query
+          description: "true hides short URLs whose validUntil lies in the past."
+        domain:
+          type: string
+          in: query
+          description: "Only short URLs of this domain (authority), or DEFAULT for the default domain."
+        apiKeyName:
+          type: string
+          in: query
+          description: "Only short URLs created with the API key of this name. Admin keys only; ignored for other keys unless it is their own name."
+      response:
+        result_path: "$.shortUrls"
+
+    create_short_url:
+      method: POST
+      path: /rest/v3/short-urls
+      access: write
+      description: >
+        Create a short URL and return the ShortUrl object (its shortUrl field is
+        the link to hand out). Without customSlug Shlink generates a 5-character
+        code (shortCodeLength >= 4). customSlug is slugified: spaces and "/"
+        become "-". Tags are lowercased and slugified. A slug already used on
+        that domain fails with 400 non-unique-slug; invalid input fails with
+        400 invalid-data listing invalidElements. Set findIfExists=true to get
+        an existing short URL for the same long URL (and same optional fields)
+        back instead of creating a duplicate.
+      params:
+        longUrl:
+          type: string
+          in: body
+          required: true
+          description: "The URL to redirect to (absolute http/https URL)."
+        customSlug:
+          type: string
+          in: body
+          description: "Own short code instead of a generated one, e.g. spring-sale."
+        pathPrefix:
+          type: string
+          in: body
+          description: "Prefix prepended to the custom slug or generated code, e.g. promo."
+        findIfExists:
+          type: boolean
+          in: body
+          description: "true returns a matching existing short URL instead of creating a new one."
+        domain:
+          type: string
+          in: body
+          description: "Domain (authority) the short URL belongs to; omit for the default domain. Ignored for domain-restricted keys."
+        shortCodeLength:
+          type: integer
+          in: body
+          description: "Length of the generated code, at least 4 (default 5). Ignored when customSlug is set."
+        validSince:
+          type: string
+          in: body
+          description: "ISO-8601 date-time from which the short URL redirects; earlier visits get a 404."
+        validUntil:
+          type: string
+          in: body
+          description: "ISO-8601 date-time after which the short URL stops redirecting."
+        maxVisits:
+          type: integer
+          in: body
+          description: "Number of visits after which the short URL stops redirecting."
+        tags:
+          type: array
+          in: body
+          description: "Tag names, e.g. [\"campaign\", \"newsletter\"]. Missing tags are created."
+        title:
+          type: string
+          in: body
+          description: "Descriptive title. If omitted, the server may fetch the page title when title auto-resolution is enabled there."
+        crawlable:
+          type: boolean
+          in: body
+          description: "true lists the short URL as Allow in Shlink's robots.txt (default false)."
+        forwardQuery:
+          type: boolean
+          in: body
+          description: "Forward query parameters of the short URL to the long URL (default true)."
+      pagination: none
+
+    get_short_url:
+      method: GET
+      path: /rest/v3/short-urls/{shortCode}
+      access: read
+      description: >
+        Get one short URL by short code: longUrl, tags, meta {validSince,
+        validUntil, maxVisits}, title, crawlable, forwardQuery,
+        hasRedirectRules and visitsSummary {total, nonBots, bots}. Short URLs on
+        a non-default domain need the domain parameter, otherwise 404
+        short-url-not-found.
+      params:
+        shortCode: *p-shortcode
+        domain: *p-domain
+      pagination: none
+
+    update_short_url:
+      method: PATCH
+      path: /rest/v3/short-urls/{shortCode}
+      access: write
+      description: >
+        Edit a short URL. True partial update: only the fields sent change,
+        omitted fields stay as they are. null clears validSince, validUntil,
+        maxVisits or title. tags REPLACES the whole tag list (send the full
+        list; [] removes all tags). The short code and domain cannot be changed.
+        Returns the updated ShortUrl. Short URLs on a non-default domain need the
+        domain parameter.
+      params:
+        shortCode: *p-shortcode
+        domain: *p-domain
+        longUrl:
+          type: string
+          in: body
+          description: "New target URL."
+        validSince:
+          type: string
+          in: body
+          description: "ISO-8601 date-time from which the short URL redirects; null clears it."
+        validUntil:
+          type: string
+          in: body
+          description: "ISO-8601 date-time after which the short URL stops redirecting; null clears it."
+        maxVisits:
+          type: integer
+          in: body
+          description: "Visit limit; null removes it."
+        tags:
+          type: array
+          in: body
+          description: "Complete new tag list (replaces the existing tags)."
+        title:
+          type: string
+          in: body
+          description: "New title; null clears it."
+        crawlable:
+          type: boolean
+          in: body
+          description: "true lists the short URL as Allow in robots.txt."
+        forwardQuery:
+          type: boolean
+          in: body
+          description: "Forward query parameters of the short URL to the long URL."
+      pagination: none
+
+    delete_short_url:
+      method: DELETE
+      path: /rest/v3/short-urls/{shortCode}
+      access: dangerous
+      description: >
+        Delete a short URL together with all of its visits. Irreversible; later
+        hits on the code become orphan visits. Returns nothing (204). Fails with
+        422 when the server has DELETE_SHORT_URL_THRESHOLD set and the short URL
+        has more visits than that. Short URLs on a non-default domain need the
+        domain parameter.
+      params:
+        shortCode: *p-shortcode
+        domain: *p-domain
+      pagination: none
+
+    # ── Redirect rules ────────────────────────────────────────────────────
+
+    list_redirect_rules:
+      method: GET
+      path: /rest/v3/short-urls/{shortCode}/redirect-rules
+      access: read
+      description: >
+        List the dynamic redirect rules of one short URL. Returns
+        {defaultLongUrl, redirectRules: [{longUrl, priority, conditions:
+        [{type, matchKey, matchValue}]}]}; priority 1 is checked first and
+        defaultLongUrl is used when no rule matches. Read this before
+        set_redirect_rules when rules should be added rather than replaced.
+      params:
+        shortCode: *p-shortcode
+        domain: *p-domain
+      pagination: none
+
+    set_redirect_rules:
+      method: POST
+      path: /rest/v3/short-urls/{shortCode}/redirect-rules
+      access: write
+      description: >
+        Replace ALL redirect rules of a short URL (an empty array removes every
+        rule). Priorities follow the array order. Each rule is {longUrl,
+        conditions: [{type, matchKey, matchValue}]}; all conditions of a rule
+        must match. Condition types: device (matchValue android, ios, mobile,
+        windows, macos, linux, chromeos or desktop); language (matchValue such
+        as en or en-US, from Accept-Language); query-param (matchKey = param
+        name, matchValue = exact value); any-value-query-param (matchKey =
+        param name, present with or without value); valueless-query-param
+        (matchKey = param name, present without value); ip-address (matchValue
+        exact IP, CIDR like 192.0.2.0/24 or wildcard like 192.0.2.*);
+        geolocation-country-code (matchValue ISO 3166-1 alpha-2, e.g. DE);
+        geolocation-city-name (matchValue city name); before-date and
+        after-date (matchValue ISO-8601 date-time, Shlink 5.0+); browser
+        (matchValue chrome, firefox, edge, safari, opera or android_browser,
+        Shlink 5.1+). matchKey may be omitted or null where unused. Geolocation
+        conditions need GeoLite2 on the server. Returns the resulting rule list
+        like list_redirect_rules; an unknown value fails with 400 invalid-data
+        whose invalidElements holds the index of the bad rule.
+      params:
+        shortCode: *p-shortcode
+        domain: *p-domain
+        redirectRules:
+          type: array
+          in: body
+          required: true
+          description: "Ordered rules, e.g. [{\"longUrl\": \"https://example.com/app\", \"conditions\": [{\"type\": \"device\", \"matchValue\": \"mobile\", \"matchKey\": null}]}]."
+      pagination: none
+
+    # ── Tags ──────────────────────────────────────────────────────────────
+
+    list_tags:
+      method: GET
+      path: /rest/v3/tags
+      access: read
+      description: >
+        List tag names, alphabetically by default. Returns {data: string[],
+        pagination}. Without itemsPerPage all tags come back in one page.
+        Tags stay listed after their last short URL dropped them until
+        delete_tags removes them; use list_tag_stats for usage counts.
+      params:
+        page: *p-page
+        itemsPerPage:
+          type: integer
+          in: query
+          description: "Tags per page; omit to get all tags."
+        searchTerm:
+          type: string
+          in: query
+          description: "Substring searched in the tag name."
+        orderBy:
+          type: string
+          in: query
+          description: "tag-ASC or tag-DESC."
+      response:
+        result_path: "$.tags"
+
+    list_tag_stats:
+      method: GET
+      path: /rest/v3/tags/stats
+      access: read
+      description: >
+        List tags with usage statistics. Returns {data: [{tag, shortUrlsCount,
+        visitsSummary: {total, nonBots, bots}}], pagination}. Ordering by
+        shortUrlsCount or visits is as slow as loading the whole list, so omit
+        itemsPerPage when sorting by those.
+      params:
+        page: *p-page
+        itemsPerPage:
+          type: integer
+          in: query
+          description: "Tags per page; omit to get all tags."
+        searchTerm:
+          type: string
+          in: query
+          description: "Substring searched in the tag name."
+        orderBy:
+          type: string
+          in: query
+          description: "tag-ASC|DESC, shortUrlsCount-ASC|DESC, visits-ASC|DESC or nonBotVisits-ASC|DESC."
+      response:
+        result_path: "$.tags"
+
+    rename_tag:
+      method: PUT
+      path: /rest/v3/tags
+      access: admin
+      description: >
+        Rename a tag on every short URL that carries it. Returns nothing (204).
+        404 tag-not-found when oldName does not exist, 409 tag-conflict when
+        newName is taken (tags cannot be merged this way), 403
+        forbidden-tag-operation for non-admin API keys.
+      params:
+        oldName:
+          type: string
+          in: body
+          required: true
+          description: "Current tag name."
+        newName:
+          type: string
+          in: body
+          required: true
+          description: "New tag name (stored as a lowercase slug)."
+      pagination: none
+
+    delete_tags:
+      method: DELETE
+      path: /rest/v3/tags
+      access: dangerous
+      description: >
+        Delete ONE tag (removes it from every short URL; the short URLs stay).
+        Returns nothing (204), also for unknown names. Call once per tag.
+        Non-admin API keys get 403 forbidden-tag-operation.
+      params:
+        "tags[]":
+          type: string
+          in: query
+          required: true
+          description: "Name of the tag to delete (a single string, not an array)."
+      pagination: none
+
+    # ── Visits ────────────────────────────────────────────────────────────
+
+    get_visit_stats:
+      method: GET
+      path: /rest/v3/visits
+      access: read
+      description: >
+        Instance-wide visit counters: {nonOrphanVisits: {total, nonBots, bots},
+        orphanVisits: {total, nonBots, bots}}. Non-orphan visits hit an existing
+        short URL; orphan visits hit the bare domain, an unknown or expired
+        short code, or any other path. Cheap; use it before pulling visit lists.
+      pagination: none
+      response:
+        result_path: "$.visits"
+
+    list_short_url_visits:
+      method: GET
+      path: /rest/v3/short-urls/{shortCode}/visits
+      access: read
+      description: >
+        List the visits of one short URL, newest first. Returns {data: Visit[],
+        pagination}; a Visit is {referer, date, userAgent, visitLocation
+        {countryCode, countryName, regionName, cityName, latitude, longitude,
+        timezone} or null, potentialBot, visitedUrl, redirectUrl}. 100 per page
+        unless itemsPerPage says otherwise. For counts per day, referrer or
+        country use the summarize_visits composite instead of paging raw visits.
+      params:
+        shortCode: *p-shortcode
+        domain: *p-domain
+        startDate: *p-start-date
+        endDate: *p-end-date
+        excludeBots: *p-exclude-bots
+        page: *p-page
+        itemsPerPage: *p-visit-items
+      response:
+        result_path: "$.visits"
+
+    list_tag_visits:
+      method: GET
+      path: /rest/v3/tags/{tag}/visits
+      access: read
+      description: >
+        List the visits of all short URLs carrying a tag, newest first. Returns
+        {data: Visit[], pagination}, 100 per page by default. 404 tag-not-found
+        for an unknown tag.
+      params:
+        tag:
+          type: string
+          in: path
+          required: true
+          description: "Tag name (lowercase slug)."
+        domain: *p-visit-domain
+        startDate: *p-start-date
+        endDate: *p-end-date
+        excludeBots: *p-exclude-bots
+        page: *p-page
+        itemsPerPage: *p-visit-items
+      response:
+        result_path: "$.visits"
+
+    list_domain_visits:
+      method: GET
+      path: /rest/v3/domains/{domain}/visits
+      access: read
+      description: >
+        List the visits of all short URLs on one domain, newest first. Returns
+        {data: Visit[], pagination}, 20 per page by default. Use DEFAULT as
+        domain for the default domain. 404 domain-not-found for an unknown
+        domain. EXPENSIVE on instances with a large visits table: MySQL may walk
+        the whole table to fill a page, and a 500-item page has exhausted a
+        memory-limited database. Keep itemsPerPage small (<= 20) and prefer
+        list_short_url_visits or list_tag_visits for analysis.
+      params:
+        domain:
+          type: string
+          in: path
+          required: true
+          description: "Domain authority (e.g. s.example.com) or DEFAULT."
+        startDate: *p-start-date
+        endDate: *p-end-date
+        excludeBots: *p-exclude-bots
+        page: *p-page
+        itemsPerPage:
+          type: integer
+          in: query
+          default: 20
+          description: "Visits per page. Defaults to 20 here; large pages and -1 can overload the database on big instances."
+      response:
+        result_path: "$.visits"
+
+    list_non_orphan_visits:
+      method: GET
+      path: /rest/v3/visits/non-orphan
+      access: read
+      description: >
+        List visits to any existing short URL across the instance, newest
+        first. Returns {data: Visit[], pagination}, 100 per page by default.
+        Fast without the domain filter (index on the short URL reference). The
+        domain filter adds the same join as list_domain_visits and can make
+        MySQL walk the whole visits table; use small pages with it.
+      params:
+        domain: *p-visit-domain
+        startDate: *p-start-date
+        endDate: *p-end-date
+        excludeBots: *p-exclude-bots
+        page: *p-page
+        itemsPerPage: *p-visit-items
+      response:
+        result_path: "$.visits"
+
+    list_orphan_visits:
+      method: GET
+      path: /rest/v3/visits/orphan
+      access: read
+      description: >
+        List orphan visits (requests that matched no valid short URL), newest
+        first. Returns {data: OrphanVisit[], pagination}, 100 per page by
+        default; each item is a Visit plus type: base_url (the bare domain),
+        invalid_short_url (a single path segment that is no valid short code,
+        i.e. unknown, expired or exhausted codes and scanner probes such as
+        /wp-login.php) or regular_404 (any other path, e.g. several segments).
+        Scanners and bots usually dominate here. API keys with the
+        NO_ORPHAN_VISITS role always get an empty list. Every page runs a COUNT
+        over all matching orphan visits; the domain filter (a substring match on
+        visitedUrl), excludeBots and type turn that into a table scan. On
+        instances with many orphan visits take totals from get_visit_stats.
+      params:
+        type:
+          type: string
+          in: query
+          description: "Only this orphan type: base_url, invalid_short_url or regular_404."
+        domain: *p-visit-domain
+        startDate: *p-start-date
+        endDate: *p-end-date
+        excludeBots: *p-exclude-bots
+        page: *p-page
+        itemsPerPage: *p-visit-items
+      response:
+        result_path: "$.visits"
+
+    delete_short_url_visits:
+      method: DELETE
+      path: /rest/v3/short-urls/{shortCode}/visits
+      access: dangerous
+      description: >
+        Delete ALL visits of one short URL (the short URL itself stays and its
+        counters restart at 0). Irreversible. Returns {deletedVisits: number}.
+      params:
+        shortCode: *p-shortcode
+        domain: *p-domain
+      pagination: none
+
+    delete_orphan_visits:
+      method: DELETE
+      path: /rest/v3/visits/orphan
+      access: dangerous
+      description: >
+        Delete ALL orphan visits of the instance (bot and scanner noise on
+        unknown paths). Irreversible; there is no date or type filter. Returns
+        {deletedVisits: number}; keys with the NO_ORPHAN_VISITS role get 0.
+      pagination: none
+
+    # ── Domains ───────────────────────────────────────────────────────────
+
+    list_domains:
+      method: GET
+      path: /rest/v3/domains
+      access: read
+      description: >
+        List the domains in use: {data: [{domain, isDefault, redirects:
+        {baseUrlRedirect, regular404Redirect, invalidShortUrlRedirect}}],
+        defaultRedirects}. defaultRedirects apply to every domain without its
+        own setting; null means Shlink shows its 404 page. A domain appears once
+        a short URL or a redirect setting uses it.
+      pagination: none
+      response:
+        result_path: "$.domains"
+
+    set_domain_redirects:
+      method: PATCH
+      path: /rest/v3/domains/redirects
+      access: admin
+      description: >
+        Set where visitors of a domain go when nothing matches: the bare domain
+        (baseUrlRedirect), a single path segment that is no valid short code,
+        e.g. an unknown or expired one (invalidShortUrlRedirect), or any other
+        path (regular404Redirect).
+        Merges with the current values: omitted fields stay, null clears one.
+        Creates the domain entry if needed. Needs the real authority (DEFAULT
+        is rejected) and an admin API key. Returns the resulting redirects.
+      params:
+        domain:
+          type: string
+          in: body
+          required: true
+          description: "Domain authority, e.g. s.example.com (the default domain too, by its name)."
+        baseUrlRedirect:
+          type: string
+          in: body
+          description: "URL for visits to the bare domain; null clears it."
+        regular404Redirect:
+          type: string
+          in: body
+          description: "URL for visits to any other unmatched path (e.g. several segments); null clears it."
+        invalidShortUrlRedirect:
+          type: string
+          in: body
+          description: "URL for visits to a single path segment that is no valid short code (unknown, expired or exhausted); null clears it."
+      pagination: none
+
+    # ── Integrations and monitoring ──────────────────────────────────────
+
+    get_mercure_info:
+      method: GET
+      path: /rest/v3/mercure-info
+      access: admin
+      description: >
+        Get the Mercure hub URL and a short-lived subscriber JWT for real-time
+        updates (new visits, new short URLs): {mercureHubUrl, jwt,
+        jwtExpiration}. The JWT is a credential; do not log or share it. 501
+        mercure-not-configured when the instance has no Mercure hub.
+      pagination: none
+
+    get_health:
+      method: GET
+      path: /rest/health
+      access: read
+      description: >
+        Health check of the instance including its database connection:
+        {status: pass|fail, version, links}. HTTP 503 with status fail when
+        Shlink cannot reach its database. Needs no API key; version shows the
+        Shlink release. An HTML page instead of JSON (here and from every other
+        tool) means the backend url points at the Shlink web client, not at the
+        Shlink server.
+      pagination: none
+
+  composites:
+    summarize_visits:
+      description: >
+        Aggregate visits instead of paging raw rows: counts per day, top
+        referrer hosts, countries, cities, visited and redirect URLs, bots and
+        orphan types. scope selects the source: short_url (needs shortCode,
+        plus domain for a non-default domain), tag (needs tag, optional domain),
+        non_orphan (all short URLs) or orphan. Reads newest first in pages of
+        500, at most maxVisits rows (default 5000, max 20000); truncated=true
+        means the counts cover only the newest analyzed visits of
+        total_matching. There is deliberately no per-domain scope: that query
+        can make MySQL walk the whole visits table. On instances with many
+        orphan visits every orphan page counts all of them, so keep maxVisits
+        low there and take totals from get_visit_stats.
+      access: read
+      timeout: 90s
+      depends_on: [list_short_url_visits, list_tag_visits, list_orphan_visits, list_non_orphan_visits]
+      params:
+        scope:
+          type: string
+          required: true
+          description: "short_url, tag, non_orphan or orphan."
+        shortCode:
+          type: string
+          description: "Short code (scope short_url)."
+        tag:
+          type: string
+          description: "Tag name (scope tag)."
+        domain:
+          type: string
+          description: "Domain authority of the short URL (scope short_url, needed for a non-default domain) or domain filter (scope tag, DEFAULT allowed). Ignored for the other scopes."
+        orphanType:
+          type: string
+          description: "Scope orphan only: base_url, invalid_short_url or regular_404. Needs a table scan per page on large instances."
+        startDate:
+          type: string
+          description: "ISO-8601 date or date-time from which to count."
+        endDate:
+          type: string
+          description: "ISO-8601 date or date-time until which to count."
+        excludeBots:
+          type: boolean
+          default: false
+          description: "true drops visits flagged as potential bots."
+        maxVisits:
+          type: integer
+          default: 5000
+          description: "Maximum number of visits to read (1 to 20000)."
+        top:
+          type: integer
+          default: 10
+          description: "Entries per top list."
+      code: |
+        const scope = params.scope;
+        const pageSize = 500;
+        const limit = Math.min(Math.max(params.maxVisits || 5000, 1), 20000);
+        const topN = Math.min(Math.max(params.top || 10, 1), 100);
+        const q = {};
+        if (params.startDate) q.startDate = params.startDate;
+        if (params.endDate) q.endDate = params.endDate;
+        if (params.excludeBots) q.excludeBots = "true";
+        let call;
+        if (scope === "short_url") {
+          if (!params.shortCode) throw new Error("scope short_url needs shortCode");
+          q.shortCode = params.shortCode;
+          if (params.domain) q.domain = params.domain;
+          call = (p) => api.list_short_url_visits(p);
+        } else if (scope === "tag") {
+          if (!params.tag) throw new Error("scope tag needs tag");
+          q.tag = params.tag;
+          if (params.domain) q.domain = params.domain;
+          call = (p) => api.list_tag_visits(p);
+        } else if (scope === "orphan") {
+          if (params.orphanType) q.type = params.orphanType;
+          call = (p) => api.list_orphan_visits(p);
+        } else if (scope === "non_orphan") {
+          call = (p) => api.list_non_orphan_visits(p);
+        } else {
+          throw new Error("scope must be short_url, tag, non_orphan or orphan (there is no per-domain scope: that query can scan the whole visits table)");
+        }
+
+        const visits = [];
+        let total = 0;
+        let page = 1;
+        while (visits.length < limit) {
+          const res = await call(Object.assign({}, q, { page: page, itemsPerPage: pageSize }));
+          const data = (res && res.data) || [];
+          const pg = (res && res.pagination) || {};
+          total = pg.totalItems || 0;
+          for (const v of data) {
+            if (visits.length >= limit) break;
+            visits.push(v);
+          }
+          if (data.length === 0 || page >= (pg.pagesCount || 1)) break;
+          page++;
+        }
+
+        const count = (m, k) => {
+          const key = (k === null || k === undefined || k === "") ? "(none)" : String(k);
+          m[key] = (m[key] || 0) + 1;
+        };
+        const host = (u) => {
+          if (!u) return null;
+          const m = /^[a-z][a-z0-9+.-]*:\/\/([^\/?#]+)/i.exec(u);
+          return m ? m[1].toLowerCase() : u;
+        };
+        const topOf = (m) => Object.keys(m)
+          .map((k) => ({ value: k, count: m[k] }))
+          .sort((a, b) => b.count - a.count)
+          .slice(0, topN);
+
+        const byDay = {}, referrers = {}, countries = {}, cities = {};
+        const visited = {}, redirects = {}, types = {};
+        let bots = 0, located = 0;
+        for (const v of visits) {
+          count(byDay, (v.date || "").slice(0, 10));
+          count(referrers, host(v.referer));
+          count(visited, v.visitedUrl);
+          count(redirects, v.redirectUrl);
+          if (v.potentialBot) bots++;
+          if (v.type) count(types, v.type);
+          const loc = v.visitLocation;
+          if (loc && loc.countryCode) {
+            located++;
+            count(countries, loc.countryCode);
+            count(cities, (loc.cityName || "(unknown)") + ", " + loc.countryCode);
+          } else {
+            count(countries, "(unknown)");
+          }
+        }
+
+        const result = {
+          scope: scope,
+          total_matching: total,
+          analyzed: visits.length,
+          truncated: visits.length < total,
+          newest: visits.length ? visits[0].date : null,
+          oldest: visits.length ? visits[visits.length - 1].date : null,
+          potential_bots: bots,
+          with_location: located,
+          by_day: Object.keys(byDay).sort().map((d) => ({ date: d, visits: byDay[d] })),
+          top_referrer_hosts: topOf(referrers),
+          top_countries: topOf(countries),
+          top_cities: topOf(cities),
+          top_visited_urls: topOf(visited),
+          top_redirect_urls: topOf(redirects)
+        };
+        if (scope === "orphan") result.orphan_types = topOf(types);
+        return result;
+
+  examples:
+    - name: "Campaign link"
+      description: "Get or create a tagged short URL that stops working at the end of the year"
+      code: |
+        const link = await api.create_short_url({
+          longUrl: "https://example.com/landing?utm_source=newsletter",
+          customSlug: "newsletter-2026",
+          tags: ["newsletter", "campaign-2026"],
+          title: "Newsletter landing page",
+          validUntil: "2026-12-31T23:59:59+00:00",
+          findIfExists: true
+        });
+        return { shortUrl: link.shortUrl, shortCode: link.shortCode };
+
+    - name: "Add a mobile redirect without losing existing rules"
+      description: "set_redirect_rules replaces the whole list, so read, append and write back"
+      code: |
+        const current = await api.list_redirect_rules({ shortCode: "newsletter-2026" });
+        const rules = current.redirectRules.map((r) => ({ longUrl: r.longUrl, conditions: r.conditions }));
+        rules.push({
+          longUrl: "https://example.com/app",
+          conditions: [{ type: "device", matchValue: "mobile", matchKey: null }]
+        });
+        return await api.set_redirect_rules({ shortCode: "newsletter-2026", redirectRules: rules });
+
+    - name: "Click report for one link"
+      description: "Daily clicks, top referrers and countries of a short URL in October, without bots"
+      code: |
+        return await api.summarize_visits({
+          scope: "short_url",
+          shortCode: "newsletter-2026",
+          startDate: "2026-10-01",
+          endDate: "2026-10-31T23:59:59+00:00",
+          excludeBots: true,
+          top: 5
+        });
+
+    - name: "Most clicked links of a tag"
+      description: "Rank all short URLs carrying one tag by human (non-bot) visits"
+      code: |
+        const res = await api.list_short_urls({ "tags[]": "campaign-2026", orderBy: "nonBotVisits-DESC", itemsPerPage: 20 });
+        return res.data.map((u) => ({ shortUrl: u.shortUrl, longUrl: u.longUrl, visits: u.visitsSummary.nonBots }));
+
+    - name: "Orphan visit triage"
+      description: "Compare orphan and regular traffic, then see which unknown paths are hit most"
+      code: |
+        const stats = await api.get_visit_stats();
+        const orphans = await api.summarize_visits({ scope: "orphan", maxVisits: 500, top: 15 });
+        return { stats: stats, orphan_types: orphans.orphan_types, top_paths: orphans.top_visited_urls, truncated: orphans.truncated };

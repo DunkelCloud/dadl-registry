@@ -4,7 +4,7 @@ credits:
   - "Dunkel Cloud GmbH"
 source_name: "Vikunja REST API"
 source_url: "https://vikunja.io/docs/api/"
-date: "2026-10-10"
+date: "2026-10-16"
 
 backend:
   name: vikunja
@@ -14,12 +14,12 @@ backend:
   description: "Vikunja open-source task management — project planning, kanban boards, and task tracking"
 
   coverage:
-    endpoints: 29
+    endpoints: 31
     total_endpoints: 80
-    percentage: 36
+    percentage: 39
     focus: "projects, tasks, views, buckets, labels, comments, positions, filters, attachments"
-    missing: "teams, users, shares, assignees, task relations, reactions, notifications, webhooks, subscriptions, saved filters"
-    last_reviewed: "2026-10-10"
+    missing: "teams, users, shares, assignees, reactions, notifications, webhooks, subscriptions, saved filters"
+    last_reviewed: "2026-10-16"
 
   setup:
     credential_steps:
@@ -41,6 +41,7 @@ backend:
       - "Task Comments: read & write"
     optional_scopes:
       - "Project Views: read (kanban buckets, positions)"
+      - "Task Relations: create & delete (create_task_relation, delete_task_relation)"
     docs_url: "https://vikunja.io/docs/api-tokens"
     notes: "Vikunja is self-hosted — replace the URL with your instance address, including the /api/v1 suffix. API tokens are shown only once at creation and their granted permissions cap what these tools can do (a read-only token returns 403 on create/update/delete)."
 
@@ -193,6 +194,20 @@ backend:
   #   (e.g. DADL-26) are project-local and are REASSIGNED on move; the source
   #   project even recycles the freed index. Cross-reference tasks by their global
   #   numeric id, never by identifier, whenever they might be moved.
+  #
+  # Task relations (blockers, subtasks, ...):
+  #   Vikunja stores a relation once per direction and creates the inverse itself:
+  #   create_task_relation(task_id A, other_task_id B, "blocking") also gives B a
+  #   "blocked" relation to A, and delete_task_relation removes both directions.
+  #   Every task read returns related_tasks, a map from relation kind to the related
+  #   tasks, read from the task's own side: related_tasks.blocked on X = the tasks that
+  #   block X, .blocking = the tasks X blocks, .subtask = X's subtasks. Vikunja returns
+  #   full task objects there; list_tasks and list_project_tasks project each one to
+  #   {id, title, done, project_id} so relation-aware ordering (e.g. "blocked tasks after
+  #   their blocker") needs no get_task per task. get_task keeps the full objects.
+  #   Relations are not removed when a task is completed: a done blocker stays listed,
+  #   so filter on its done flag. Related tasks in projects the caller cannot read are
+  #   omitted.
   # ──────────────────────────────────────────────────────────────
 
   tools:
@@ -219,7 +234,11 @@ backend:
         field in list_views before concluding a project has no done tasks. For done or all
         tasks of a project use list_tasks with filter "project = N" or
         "done = true && project = N". Supports sorting by position, due_date, created, etc.
-        Kanban views return buckets with nested tasks, not a flat list.
+        Kanban views return buckets with nested tasks, not a flat list. Each task carries
+        related_tasks, a map from relation kind to compact related tasks
+        {id, title, done, project_id}: related_tasks.blocked lists the tasks that block this
+        one, related_tasks.blocking the tasks it blocks; {} when it has no relations. A done
+        blocker stays in the map, so check its done flag.
       params:
         project_id: { type: integer, in: path, required: true }
         view_id: { type: integer, in: path, required: true }
@@ -234,7 +253,8 @@ backend:
         s: { type: string, in: query }
       response:
         transform: |
-          [.[] | if (has("done") | not) then {bucket_id: .id, title: .title, tasks: [.tasks[]? | {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title]}]} else {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title]} end]
+          def rel: (.related_tasks // {}) | map_values([.[]? | {id, title, done, project_id}]);
+          [.[] | if (has("done") | not) then {bucket_id: .id, title: .title, tasks: [.tasks[]? | {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title], related_tasks: rel}]} else {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title], related_tasks: rel} end]
         allow_jq_override: true
       pagination: none
 
@@ -250,6 +270,10 @@ backend:
         filter "project = N"; "done = true && project = N" returns a project's completed
         tasks, which list_project_tasks hides on views with a "done = false" filter (the
         default List view). Returns a flat task array; no view filter is applied here.
+        Each task carries related_tasks, a map from relation kind to compact related tasks
+        {id, title, done, project_id}: related_tasks.blocked lists the tasks that block this
+        one, related_tasks.blocking the tasks it blocks; {} when it has no relations. A done
+        blocker stays in the map, so check its done flag.
       params:
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 50 }
@@ -262,14 +286,14 @@ backend:
         expand: { type: string, in: query }
       response:
         transform: |
-          [.[] | {id, identifier, title, done, done_at, due_date, priority, percent_done, project_id, bucket_id, position, created, updated, labels: [.labels[]?.title], assignees: [.assignees[]?.username]}]
+          [.[] | {id, identifier, title, done, done_at, due_date, priority, percent_done, project_id, bucket_id, position, created, updated, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks: ((.related_tasks // {}) | map_values([.[]? | {id, title, done, project_id}]))}]
         allow_jq_override: true
 
     get_task:
       method: GET
       path: /tasks/{id}
       access: read
-      description: "Get a single task by its ID, including all details, assignees, labels, and relations."
+      description: "Get a single task by its ID, including all details, assignees, labels, and relations. related_tasks maps each relation kind (blocked, blocking, subtask, parenttask, related, ...) to the full related task objects."
       params:
         id: { type: integer, in: path, required: true }
       response:
@@ -331,6 +355,37 @@ backend:
       description: "Permanently delete a task."
       params:
         id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ─────────────── Relations ───────────────
+    create_task_relation:
+      method: PUT
+      path: /tasks/{task_id}/relations
+      access: write
+      description: >
+        Relate two tasks. relation_kind is read from task_id towards other_task_id:
+        "blocking" = task_id blocks other_task_id, "blocked" = task_id is blocked by
+        other_task_id, "subtask" = other_task_id is a subtask of task_id, "parenttask" =
+        other_task_id is the parent of task_id. Further kinds: related, duplicateof,
+        duplicates, precedes, follows, copiedfrom, copiedto. Vikunja creates the inverse
+        relation on the other task automatically (blocking on one side, blocked on the
+        other), so create each relation once. Fails if the relation already exists or both
+        ids are the same task.
+      params:
+        task_id: { type: integer, in: path, required: true }
+        other_task_id: { type: integer, in: body, required: true }
+        relation_kind: { type: string, in: body, required: true, description: "subtask | parenttask | related | duplicateof | duplicates | blocking | blocked | precedes | follows | copiedfrom | copiedto" }
+      pagination: none
+
+    delete_task_relation:
+      method: DELETE
+      path: /tasks/{task_id}/relations/{relation_kind}/{other_task_id}
+      access: write
+      description: "Remove a relation between two tasks, addressed exactly as it was created (task_id, relation_kind, other_task_id). Vikunja removes the inverse relation on the other task as well. The tasks themselves are not changed."
+      params:
+        task_id: { type: integer, in: path, required: true }
+        relation_kind: { type: string, in: path, required: true, description: "subtask | parenttask | related | duplicateof | duplicates | blocking | blocked | precedes | follows | copiedfrom | copiedto" }
+        other_task_id: { type: integer, in: path, required: true }
       pagination: none
 
     # ─────────────── Attachments ───────────────
