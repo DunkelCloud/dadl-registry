@@ -31,13 +31,17 @@
 #     PUT    -> /add    (create a new record)
 #     DELETE -> /remove (delete by ID)
 #     POST   -> any console command (ping, reboot, run-script, monitor, etc.)
+#   Through ToolMesh, a record in the URL path must be given by NAME -- see
+#   'Addressing records in the URL path' at the end of these notes.
 # - Resource IDs: every record has a ".id" field in the form "*1", "*A", "*1F"
 #   (asterisk followed by hex). IDs are NOT stable across reboots/exports --
 #   ID *3 on Monday may be a different rule after a config reload. For stable
 #   references, use the "name" field (interfaces, queues, scripts) or "comment"
 #   field (firewall rules often tagged with comments for cross-reference).
-# - For tools where a named resource exists, you can also reference it by name
-#   in the URL: GET /interface/ether1 works as well as GET /interface/*1.
+# - For tables whose records have a 'name' field, RouterOS also accepts the
+#   name in place of the .id in the URL: GET /interface/ether1 and
+#   GET /interface/*1 address the same record. Through ToolMesh only the
+#   name form works -- see 'Addressing records in the URL path' below.
 # - Response format: GETs always return a JSON ARRAY of objects (even when only
 #   one record matches). Single-record GETs by ID return one object. ALL field
 #   values are encoded as strings, even numbers and booleans -- "1500" not 1500,
@@ -62,7 +66,9 @@
 #   hex (leading 0x) are accepted. Exponent notation (1e5) is NOT supported.
 # - "Disabled" semantics: many resources have a "disabled" field. To toggle a
 #   firewall rule or interface off, PATCH with {"disabled":"yes"} (the canonical
-#   value); "true" also works. To enable, send {"disabled":"no"}.
+#   value); "true" also works. To enable, send {"disabled":"no"}. Through
+#   ToolMesh this works for records addressed by name (interfaces); for
+#   firewall rules see 'Addressing records in the URL path' below.
 # - /ip/service is a SPECIAL endpoint: PATCH is NOT supported (returns HTTP 400
 #   on any field). Use POST /ip/service/set with 'numbers' instead (mirrors the
 #   CLI '/ip/service set telnet disabled=yes'). Verified empirically on
@@ -70,7 +76,9 @@
 #   enable_ip_service in this DADL. The dynamic www entries that appear in the
 #   list represent active inbound connections (connection=true, dynamic=true),
 #   NOT separate service slots — filter dynamic!=true to see only configurable
-#   service definitions.
+#   service definitions. (Whether PATCH by service name, e.g.
+#   /ip/service/telnet, also works has not been tested; a test with a .id
+#   would have hit the path-encoding limitation described below.)
 # - RouterOS has TWO update worlds and the DADL exposes both:
 #     1. Collections with full CRUD (PUT/PATCH/DELETE): /ip/address, /ip/route,
 #        /ip/firewall/{filter,nat,mangle,raw}, /ip/dhcp-server/{,lease,network},
@@ -80,11 +88,13 @@
 #        /system/scheduler, /system/logging, /system/logging/action,
 #        /tool/netwatch, /ipv6/{address,route}, /ipv6/firewall/filter,
 #        /ip/ipsec/{peer,identity,policy,profile,proposal}.
+#        Through ToolMesh, PATCH/DELETE on these need the record's name in
+#        the path; records without a name are blocked (see below).
 #     2. Singletons and slave-controlled resources updated via POST /xxx/set:
 #        /ip/service (lockout-warning above), /ipv6/settings, /ip/cloud,
 #        /ip/dns, /system/{identity,clock,note}, /system/ntp/{client,server},
 #        /snmp, /tool/e-mail (SMTP), /interface/{l2tp,sstp,pptp,ovpn}-server/server,
-#        /interface/ethernet (slave ports reject PATCH on mtu/l2mtu — use
+#        /interface/ethernet (PATCH by port name works as well; use
 #        /interface/ethernet/set with numbers for atomic mtu+l2mtu),
 #        /interface/ethernet/switch (CRS3xx switch-chip global), /interface/lte
 #        (operator-side fields like apn, network-mode).
@@ -122,21 +132,42 @@
 #   devices). /interface/wifi is the newer stack on cAP ax, hAP ax, Audience,
 #   etc. They are NOT interchangeable -- pick the one that matches the device.
 #
-# Known ToolMesh wrapper bugs (as of 2026-05-25) — workarounds wired into
-# this DADL; remove the workarounds once the wrapper is fixed:
-# - PATCH/DELETE on /xxx/{*N-id} routes return HTTP 400. The wrapper does
-#   not percent-encode the leading asterisk in RouterOS .ids (e.g. '*6'
-#   should be '%2A6' in the URL path). Affects every update_*/delete_*
-#   tool in this DADL whose path uses {id}. Verified empirically on
-#   bridge-vlan (update_bridge_vlan, delete_bridge_vlan) — both fail
-#   on a freshly-added empty test record. Workaround: prefer the POST
-#   /xxx/set and POST /xxx/remove twins (set_bridge_vlan, remove_bridge_vlan,
-#   set_dhcp_server, set_bridge_port, set_ethernet_interface, set_interface,
-#   ...) which take 'numbers' in the body instead of an .id in the URL path.
-#   These have been added/marked WORKING throughout. Until the wrapper is
-#   fixed, fall back to /xxx/set + 'numbers' for edits, and to /xxx/remove
-#   + 'numbers' (or the CLI) for deletes. ToolMesh issue tracked in the
-#   DADL/Wrapper Befund 2026-05-25.
+# Known ToolMesh limitations (verified 2026-11 on RouterOS 7.22) -- the
+# workarounds are wired into this DADL; drop them once ToolMesh is fixed:
+# - Addressing records in the URL path: ToolMesh percent-encodes every path
+#   parameter, so the asterisk of a RouterOS .id is sent as '%2A' ('*1A'
+#   becomes /interface/ethernet/%2A1A). RouterOS does not match the encoded
+#   form to the record and answers HTTP 400 (RouterOS uses 400, not 404, for
+#   an unknown record in the path); nothing is changed. Pre-encoding does not
+#   help: '%2A1A' is sent as '%252A1A'. This affects every tool with an {id}
+#   path -- 38 update_* (PATCH), 45 delete_* (DELETE) and get_interface,
+#   get_user, get_system_script (GET) -- whenever it is given a .id.
+#   Workarounds, in order of preference:
+#     1. Address the record by NAME. Tables with a 'name' field accept it in
+#        place of the .id (RouterOS REST docs), and a plain name such as
+#        'ether1' or 'bridge1' passes the encoding unchanged. Verified for
+#        GET /interface/{id} and for a comment-only PATCH
+#        /interface/ethernet/{id} on a bridge-member port. Applies to all
+#        interface types (ethernet, bridge, vlan, bonding, wireguard),
+#        interface lists, DHCP servers, PPP secrets and profiles, simple
+#        queues, IPsec peers, profiles and proposals, BGP connections, OSPF
+#        instances and areas, logging actions, scripts, schedulers, users,
+#        user groups and files. Names with characters other than letters,
+#        digits and - _ . ~ (e.g. the '/' of a file in a subdirectory) are
+#        encoded as well and will most likely fail the same way.
+#     2. Use a body-addressed twin: POST /xxx/set and POST /xxx/remove take
+#        the .id or name in 'numbers' in the JSON body and are not affected
+#        (set_ethernet_interface, set_interface, set_bridge, set_bridge_port,
+#        set_bridge_vlan, remove_bridge_vlan, set_dhcp_server,
+#        set_logging_action, enable_interface, disable_interface, ...).
+#     3. Records addressed only by .id and without a twin -- IPv4/IPv6
+#        addresses and routes, firewall filter/NAT/mangle/raw rules,
+#        address-list entries, DHCP leases, networks and clients, DNS static
+#        entries, ARP entries, bridge ports (delete), interface-list members,
+#        WireGuard peers, IPsec identities and policies, routing-filter
+#        rules, logging rules and netwatch entries -- cannot be updated or
+#        deleted through ToolMesh until the encoding is fixed. Their tool
+#        descriptions say so.
 # - POST /interface/bridge/port/set REQUIRES the bridge-port record's .id
 #   in 'numbers'. The interface name (e.g. 'ether47') returns HTTP 404 —
 #   verified on RouterOS 7.x. Lookup pattern: call list_bridge_ports first,
@@ -153,19 +184,19 @@
 #   for backends where the field is genuinely nullable (NetBox FKs etc.) —
 #   on RouterOS this rarely applies.
 
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH -- maintainer"
 
 source_name: "MikroTik RouterOS REST API"
 source_url: "https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST+API"
-date: "2026-05-25"
+date: "2026-11-06"
 
 backend:
   name: mikrotik
   type: rest
-  version: "1.1"
+  version: "1.2"
   # base_url intentionally omitted -- self-hosted, provided via backends.yaml.
   # Each MikroTik device has its own URL (e.g. https://10.0.0.1/rest).
   description: "MikroTik RouterOS REST API -- manage interfaces, IP addresses, routing, firewall, DHCP, DNS, PPP, queues, wireless, system configuration, users, certificates, files, logs, and diagnostics on RouterOS v7.1+ devices"
@@ -174,6 +205,16 @@ backend:
     type: basic
     username_credential: mikrotik_username
     password_credential: mikrotik_password
+
+  # Health check (spec v0.2, section 4.6): GET /system/identity is the
+  # cheapest authenticated call -- one tiny object ({"name":"..."}), no
+  # side effects, readable by any API user with the 'read' policy. Every
+  # REST request needs valid Basic Auth, so a passing check proves both
+  # reachability and the credential. Local RouterOS users do not expire,
+  # so there is no auth_expires_path.
+  health:
+    tool: get_system_identity
+    expect_path: "$.name"
 
   defaults:
     headers:
@@ -205,8 +246,8 @@ backend:
     total_endpoints: 450
     percentage: 65
     focus: "system (resource, identity, clock, health, license, package, script, scheduler, reboot/shutdown, backup, note, logging rules + actions with /set twin), interfaces (generic set, list/CRUD, ethernet + atomic /set + switch chip + switch port, bridge + /set + port /set + VLAN CRUD + /set + /remove + host/FDB table, vlan, bonding CRUD, wireless legacy, wifi, lte + /set, wireguard + interface CRUD + peers, list/member + list CRUD), IP (address, route, ARP, neighbor, service set/enable/disable, pool, cloud + /set), DNS (settings, static, cache), DHCP server (CRUD + /set + delete, lease, network CRUD, make-static, client CRUD + release/renew), firewall (filter, NAT, mangle full CRUD + move, raw full CRUD + move, address-list update, connection tracking), IPv6 (address full CRUD, route CRUD, firewall filter CRUD + move, ND, settings /set), PPP (secret, active, profile CRUD), routing (BGP connection CRUD, BGP templates/sessions, OSPF instance + area CRUD, interface-templates, neighbors, routing-filter rules CRUD), queues (simple full, tree, type), tools (ping, traceroute, bandwidth-test, netwatch CRUD, email SMTP settings get/set + send), users (user, group CRUD, ssh-keys, active sessions), logs, certificates, files, SNMP, VPN servers (L2TP/SSTP/PPTP/OVPN singleton get/set), IPsec (peer, identity, policy, profile, proposal full CRUD; active-peers, installed-sa, flush, settings), container (RouterOS 7), MPLS basics"
-    missing: "CAPsMAN controller endpoints (out of scope: CRS354 is Ethernet-only), RADIUS server config, hotspot user profiles/walled garden, /interface/wireless deep config (legacy stack; tooling focuses on the modern /interface/wifi stack), BGP VPN/VPLS, OSPFv3 (instance.version=3 supported but no separate tooling), MPLS LDP detail, RIPv2, traffic-flow exporter, traffic monitor, GPS, ROMON, dude integration, dot1x, w60g, modem deep config, /tool/fetch (file upload/download via REST), file repository sync, certificate ACME plugin, /caps-man for new wifi stack (intentional: per-device wifi-config exposes set already). Also broken until ToolMesh wrapper fix (2026-05-25): every update_*/delete_* using PATCH/DELETE /xxx/{*N-id} returns HTTP 400 due to missing percent-encoding of the .id asterisk — see top-of-file 'Known ToolMesh wrapper bugs' note. Workarounds via POST /xxx/set + 'numbers' (and POST /xxx/remove + 'numbers' where exposed, e.g. remove_bridge_vlan) are unaffected."
-    last_reviewed: "2026-05-25"
+    missing: "CAPsMAN controller endpoints (out of scope: CRS354 is Ethernet-only), RADIUS server config, hotspot user profiles/walled garden, /interface/wireless deep config (legacy stack; tooling focuses on the modern /interface/wifi stack), BGP VPN/VPLS, OSPFv3 (instance.version=3 supported but no separate tooling), MPLS LDP detail, RIPv2, traffic-flow exporter, traffic monitor, GPS, ROMON, dude integration, dot1x, w60g, modem deep config, /tool/fetch (file upload/download via REST), file repository sync, certificate ACME plugin, /caps-man for new wifi stack (intentional: per-device wifi-config exposes set already). Limited until ToolMesh stops percent-encoding the asterisk of RouterOS .ids in URL paths (2026-11): update_*/delete_* tools for records without a name (addresses, routes, firewall rules, address lists, DHCP leases/networks/clients, DNS static entries, bridge ports and VLANs, WireGuard peers, IPsec identities/policies, routing filters, logging rules, netwatch) return HTTP 400; named records work when addressed by name, and POST /xxx/set + /xxx/remove twins with 'numbers' are unaffected -- see the top-of-file note."
+    last_reviewed: "2026-11-06"
 
   setup:
     credential_steps:
@@ -236,14 +277,18 @@ backend:
       - "reboot -- system reboot and shutdown"
       - "ftp -- file management"
     docs_url: "https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST+API"
-    notes: "RouterOS v7.1+ required (v7.9+ recommended). Most MikroTik devices ship with self-signed certificates -- ToolMesh must skip TLS verification or you must install a trusted certificate via /certificate/import. The 'api' policy is REQUIRED on the user's group for any REST access. For read-only monitoring, use group with policy=api,read,test,winbox; for full management add write,policy,reboot,ftp,sensitive. Known ToolMesh wrapper bugs (2026-05-25): (1) PATCH/DELETE /xxx/{*N-id} return HTTP 400 — use POST /xxx/set + 'numbers' (e.g. set_bridge_vlan) and POST /xxx/remove + 'numbers' (e.g. remove_bridge_vlan) instead. (2) set_bridge_port 'numbers' must be the bridge-port .id, not interface name. (3) JSON null is dropped by the wrapper — use empty string '' to clear fields. Full detail in the comment block at the top of this file."
+    notes: "RouterOS v7.1+ required (v7.9+ recommended). Most MikroTik devices ship with self-signed certificates -- ToolMesh must skip TLS verification or you must install a trusted certificate via /certificate/import. The 'api' policy is REQUIRED on the user's group for any REST access. For read-only monitoring, use group with policy=api,read,test,winbox; for full management add write,policy,reboot,ftp,sensitive. Known ToolMesh limitations (2026-11): (1) tools with an {id} path (update_*, delete_*, get_interface, get_user, get_system_script) fail with HTTP 400 when given a .id such as '*1', because ToolMesh percent-encodes the asterisk -- pass the record's name instead (interfaces, users, scripts, ...) or use a POST /xxx/set or /xxx/remove twin with 'numbers' (e.g. set_ethernet_interface, set_bridge_vlan, remove_bridge_vlan). (2) set_bridge_port 'numbers' must be the bridge-port .id, not interface name. (3) JSON null is dropped by the wrapper — use empty string '' to clear fields. Full detail in the comment block at the top of this file."
 
   hints:
     list_interfaces:
       filter_by_type: "GET /interface?type=ether -- filter by interface type (ether, vlan, bridge, wifi, wireguard, lte, ppp-client, ...)"
-      stable_id: "Use 'name' (e.g. ether1) as the stable identifier; .id (*1) changes after config reload"
+      stable_id: "Use 'name' (e.g. ether1) as the stable identifier; .id (*1) changes after config reload. The name is also the only form that works in {id} URL paths through ToolMesh."
     update_interface:
       common_fields: "name, comment, disabled (yes/no), mtu, mac-address (ether only), arp"
+      address_by_name: "Pass the interface name as id, e.g. update_interface({id:'bridge1', comment:'core'}). A .id such as '*1' fails with HTTP 400 through ToolMesh."
+    update_ethernet_interface:
+      address_by_name: "Pass the port name as id: update_ethernet_interface({id:'ether1', comment:'uplink'}). A .id such as '*1A' fails with HTTP 400 because ToolMesh percent-encodes the asterisk."
+      clear_field: "Send an empty string to clear a field: update_ethernet_interface({id:'ether1', comment:''}) removes the comment. JSON null is dropped before the request is sent."
     list_firewall_filter:
       chain_filter: "Filter by chain: ?chain=input | forward | output | <custom-chain>"
       order_matters: "Rules are evaluated top-to-bottom -- use move_firewall_filter to reorder"
@@ -256,7 +301,7 @@ backend:
       required: "address (CIDR like 192.168.1.1/24) and interface name; e.g. {address:'192.168.10.1/24',interface:'bridge1'}"
     list_dhcp_leases:
       status_field: "status: bound, waiting, offered, expired, busy"
-      make_static: "Use make_dhcp_lease_static({id:'*5'}) to convert dynamic lease to static reservation"
+      make_static: "Use make_dhcp_lease_static({numbers:'*5'}) to convert dynamic lease to static reservation"
     add_dns_static:
       required: "name (hostname) and address (IP) OR cname (target FQDN); type defaults to A"
       regexp_support: "use 'regexp' instead of 'name' for wildcard/regex matches"
@@ -305,23 +350,23 @@ backend:
       atomic_bulk: "Generic /interface/set lets you change name/comment/mtu/disabled across MIXED interface types in one transaction. Reference targets via 'numbers' (comma-separated names or .ids). Prefer set_ethernet_interface for ether-specific fields (l2mtu, speed, duplex), set_lte_interface for cellular fields, etc."
       jumbo_jumbo: "For atomic jumbo enable, prefer set_ethernet_interface({numbers:'ether1,...', mtu:'9000', l2mtu:'9014'}) — the ethernet endpoint validates the combo at once. The generic set_interface only changes l3 mtu and can be silently clamped by an unchanged l2mtu."
     set_bridge:
-      atomic_bridge: "Use POST /interface/bridge/set with 'numbers' when toggling multiple bridges or to keep mtu/admin-mac/vlan-filtering changes atomic. PATCH update_bridge works for single-record edits."
+      atomic_bridge: "Use POST /interface/bridge/set with 'numbers' when toggling multiple bridges or to keep mtu/admin-mac/vlan-filtering changes atomic. PATCH update_bridge works for single-record edits when the bridge is addressed by name (id:'bridge1')."
     set_bridge_port:
-      slave_safety: "Bridge ports are slave-controlled — PATCH update on the (id) endpoint can reject mtu/l2mtu changes. POST /interface/bridge/port/set with numbers lets you change pvid/frame-types/ingress-filtering/hw on one or many ports atomically without the slave-validation gotcha."
+      slave_safety: "Bridge-port records have no name, so any /interface/bridge/port/{id} path would need the .id, which fails through ToolMesh (percent-encoded asterisk, HTTP 400). POST /interface/bridge/port/set with numbers changes pvid/frame-types/ingress-filtering/hw on one or many ports atomically."
       numbers_must_be_id: "EMPIRICAL (RouterOS 7.x, verified 2026-05-25): 'numbers' MUST be the bridge-port record's .id (e.g. '*2E'). The interface name (e.g. 'ether47') returns HTTP 404 even though the CLI '/interface/bridge/port set [find interface=ether47]' accepts the resolver. Lookup pattern: call list_bridge_ports first, find the row where .interface matches, take .id, then pass that string as 'numbers'. Composite-friendly."
       lookup_example: "const ports = await api.list_bridge_ports(); const row = ports.find(p => p.interface === 'ether47'); await api.set_bridge_port({numbers: row['.id'], pvid: '20'});"
     update_bridge_vlan:
-      known_broken: "BROKEN as of 2026-05-25 — ToolMesh wrapper does not percent-encode the asterisk in RouterOS .ids when substituting into PATCH /xxx/{id} URLs, so the request returns HTTP 400. Use set_bridge_vlan instead (POST /interface/bridge/vlan/set with numbers in the body)."
+      known_broken: "BROKEN through ToolMesh (2026-11): bridge-vlan records have no name, and ToolMesh percent-encodes the asterisk of the .id in the URL path ('*6' is sent as '%2A6'), which RouterOS answers with HTTP 400. Use set_bridge_vlan instead (POST /interface/bridge/vlan/set with numbers in the body)."
       workaround: "set_bridge_vlan({numbers: '<id>', comment: 'new'})"
     delete_bridge_vlan:
-      known_broken: "BROKEN as of 2026-05-25 — same .id URL-encoding bug as update_bridge_vlan. Use remove_bridge_vlan instead (POST /interface/bridge/vlan/remove with numbers in the body)."
+      known_broken: "BROKEN through ToolMesh (2026-11) — same .id path-encoding limitation as update_bridge_vlan. Use remove_bridge_vlan instead (POST /interface/bridge/vlan/remove with numbers in the body)."
       workaround: "remove_bridge_vlan({numbers: '<id>'})"
     set_bridge_vlan:
-      preferred_until_fix: "Use this in place of update_bridge_vlan until the wrapper's PATCH /xxx/{*N-id} encoding bug is fixed. Identical semantics, but the .id travels in the request body instead of the URL path."
+      preferred_until_fix: "Use this in place of update_bridge_vlan until ToolMesh stops percent-encoding the .id in URL paths. Identical semantics, but the .id travels in the request body instead of the URL path."
       clearing_ports: "To remove ports from tagged/untagged lists, pass an empty string '' rather than JSON null — the wrapper drops keys with null values before sending."
       lookup_example: "const vlans = await api.list_bridge_vlans(); const row = vlans.find(v => v['vlan-ids'] === '99'); await api.set_bridge_vlan({numbers: row['.id'], comment: 'updated'});"
     remove_bridge_vlan:
-      preferred_until_fix: "Use this in place of delete_bridge_vlan until the wrapper's DELETE /xxx/{*N-id} encoding bug is fixed."
+      preferred_until_fix: "Use this in place of delete_bridge_vlan until ToolMesh stops percent-encoding the .id in URL paths."
       lookup_example: "const vlans = await api.list_bridge_vlans(); const row = vlans.find(v => v['vlan-ids'] === '99'); await api.remove_bridge_vlan({numbers: row['.id']});"
     add_logging_action:
       target_values: "memory | disk | echo | remote | email. Cannot create another 'remote' or 'email' — the 5 defaults are reserved names; new actions must use distinct names (e.g. 'graylog', 'siem-tcp')."
@@ -654,9 +699,9 @@ backend:
       method: GET
       path: /system/script/{id}
       access: read
-      description: "Get a single script by .id or name. Returns the full source field."
+      description: "Get a single script by name. Returns the full source field. A .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true, description: "Script .id (e.g. *1) or name" }
+        id: &named-record-id { type: string, in: path, required: true, description: "Record name, e.g. 'ether1', 'bridge1' or 'alice'. Pass the name, not the .id: ToolMesh percent-encodes path parameters, so '*1' is sent as '%2A1' and RouterOS answers HTTP 400. Plain names (letters, digits, - _ .) pass unchanged." }
       response:
         result_path: "$"
       pagination: none
@@ -680,9 +725,9 @@ backend:
       method: PATCH
       path: /system/script/{id}
       access: admin
-      description: "Update an existing script's source, policies, or comment."
+      description: "Update an existing script's source, policies, or comment. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         source: { type: string, in: body }
         policy: { type: string, in: body }
@@ -695,9 +740,9 @@ backend:
       method: DELETE
       path: /system/script/{id}
       access: dangerous
-      description: "Delete a script by .id or name."
+      description: "Delete a script by name. A .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     run_system_script:
@@ -739,9 +784,9 @@ backend:
       method: PATCH
       path: /system/scheduler/{id}
       access: admin
-      description: "Update a scheduled task (name, on-event, start-date/time, interval, policy, comment, disabled)."
+      description: "Update a scheduled task (name, on-event, start-date/time, interval, policy, comment, disabled). Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         on-event: { type: string, in: body }
         start-date: { type: string, in: body }
@@ -758,9 +803,9 @@ backend:
       method: DELETE
       path: /system/scheduler/{id}
       access: admin
-      description: "Delete a scheduled task by .id or name."
+      description: "Delete a scheduled task by name. A .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     reboot_system:
@@ -874,9 +919,9 @@ backend:
       method: GET
       path: /interface/{id}
       access: read
-      description: "Get a single interface by name (e.g. 'ether1', 'bridge1') or .id (e.g. '*1')."
+      description: "Get a single interface by name (e.g. 'ether1', 'bridge1'). A .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       response:
         result_path: "$"
       pagination: none
@@ -892,8 +937,10 @@ backend:
         least 9014 (or use the max-l2mtu the hardware reports). On CRS3xx
         switch-chips the per-port l2mtu IS writable and changes the chip's
         accepted frame size on that port.
+        Pass the record's name as id; a .id such as '*1' fails with HTTP 400
+        through ToolMesh (percent-encoded asterisk).
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         comment: { type: string, in: body }
         mtu: { type: string, in: body, description: "L3 MTU (IP payload). Must be <= l2mtu - 14." }
@@ -974,12 +1021,14 @@ backend:
       access: admin
       description: >
         Atomically update one or more Ethernet ports via the CLI-style
-        '/interface/ethernet set' command. PREFERRED for jumbo-frame setup on
-        switches: PATCH /interface/ethernet/{id} returns HTTP 400 when a port
-        is a bridge slave (slave='true') OR when mtu would exceed current
-        l2mtu - 14. This POST endpoint sets l2mtu and mtu in a single atomic
-        transaction so the validator sees both new values together. Reference
-        ports via 'numbers' (comma-separated names or .ids).
+        '/interface/ethernet set' command. Reference ports via 'numbers'
+        (comma-separated names or .ids); 'numbers' travels in the JSON body,
+        so .ids work here, unlike in URL paths through ToolMesh. PREFERRED for
+        jumbo-frame setup on switches: it sets l2mtu and mtu in one
+        transaction, so RouterOS validates the new pair together
+        (mtu <= l2mtu - 14). For a single-port change of other fields,
+        update_ethernet_interface with the port name works as well; bridge
+        membership (slave='true') does not block it.
       params:
         numbers: { type: string, in: body, required: true, description: "Port name(s) or .id(s), e.g. 'ether1,ether2,...' or '*E,*F,*10'" }
         l2mtu: { type: string, in: body, description: "L2 frame size cap; set together with mtu for jumbo" }
@@ -1001,15 +1050,19 @@ backend:
       path: /interface/ethernet/{id}
       access: write
       description: >
-        Update an Ethernet port's properties (name, speed, advertise, full-duplex,
-        auto-negotiation, comment, disabled, MTU/l2mtu, MAC override).
-        Jumbo-frame note: raise l2mtu (e.g. to 9014 or up to max-l2mtu) BEFORE
-        setting mtu=9000, otherwise RouterOS silently clamps mtu to l2mtu - 14.
-        For slave (bridge-member) ports this PATCH frequently returns HTTP 400
-        when changing mtu/l2mtu -- use set_ethernet_interface instead, which
-        sets both values atomically via the /set endpoint.
+        Update one Ethernet port (name, comment, disabled, speed, advertise,
+        full-duplex, auto-negotiation, mtu, l2mtu, mac-address). Pass the
+        port NAME as id (e.g. 'ether1'): RouterOS accepts the name in the URL
+        path, while a .id such as '*1A' fails with HTTP 400 because ToolMesh
+        percent-encodes the asterisk. Verified 2026-11 with a comment-only
+        change on a bridge-member port (slave='true'): bridge membership does
+        not block this PATCH. Send '' to clear a field (comment:''). Returns
+        the updated port record. Jumbo frames: RouterOS requires
+        mtu <= l2mtu - 14, so raise l2mtu before mtu, or use
+        set_ethernet_interface, which sets both in one atomic call and can
+        change several ports at once (mtu/l2mtu via this PATCH not re-tested).
       params:
-        id: { type: string, in: path, required: true }
+        id: { type: string, in: path, required: true, description: "Port name as listed by list_ethernet_interfaces, e.g. 'ether1' or 'sfp-sfpplus1'. Not the .id: '*1A' is sent percent-encoded ('%2A1A') and RouterOS answers HTTP 400." }
         name: { type: string, in: body }
         comment: { type: string, in: body }
         disabled: { type: string, in: body }
@@ -1116,9 +1169,9 @@ backend:
       method: PATCH
       path: /interface/bridge/{id}
       access: write
-      description: "Update bridge properties (name, protocol-mode, vlan-filtering, igmp-snooping, fast-forward, mtu, admin-mac, comment)."
+      description: "Update bridge properties (name, protocol-mode, vlan-filtering, igmp-snooping, fast-forward, mtu, admin-mac, comment). Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         comment: { type: string, in: body }
         protocol-mode: { type: string, in: body }
@@ -1159,9 +1212,9 @@ backend:
       method: DELETE
       path: /interface/bridge/{id}
       access: dangerous
-      description: "Delete a bridge by .id or name. Removes all port memberships."
+      description: "Delete a bridge by name. Removes all port memberships. A .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_bridge_ports:
@@ -1191,9 +1244,9 @@ backend:
       method: DELETE
       path: /interface/bridge/port/{id}
       access: write
-      description: "Remove a port from a bridge."
+      description: "Remove a port from a bridge. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: &unnamed-record-id { type: string, in: path, required: true, description: "RouterOS .id of the record, e.g. '*1'. KNOWN BROKEN through ToolMesh (2026-11): path parameters are percent-encoded, '*1' is sent as '%2A1' and RouterOS answers HTTP 400. Prefer a POST /xxx/set or /xxx/remove tool with 'numbers' where this DADL has one. Only if the record has a unique 'name' on your RouterOS version may passing that name work (untested)." }
       pagination: none
 
     set_bridge_port:
@@ -1267,16 +1320,15 @@ backend:
         Update an existing bridge-vlan record (tagged/untagged port lists,
         comment, disabled).
 
-        KNOWN BROKEN (ToolMesh wrapper bug, 2026-05-25): this PATCH returns
-        HTTP 400 on RouterOS because the wrapper does not percent-encode
-        the leading asterisk in the .id URL segment (e.g. '*6' should be
-        '%2A6'). Reproduced empirically on a freshly-added empty test VLAN
-        with a trivial comment change. WORKAROUND: use set_bridge_vlan
+        KNOWN BROKEN through ToolMesh (2026-11): bridge-vlan records have no
+        name, so the URL path needs the .id, and ToolMesh percent-encodes its
+        asterisk ('*6' is sent as '%2A6'), which RouterOS answers with
+        HTTP 400. Reproduced on a freshly-added empty test VLAN with a
+        trivial comment change. WORKAROUND: use set_bridge_vlan
         (POST /interface/bridge/vlan/set with 'numbers') instead — it
-        passes the .id in the body and is not affected by the bug.
-        See top-of-file 'Known ToolMesh wrapper bugs' note.
+        passes the .id in the body and is not affected.
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         bridge: { type: string, in: body }
         vlan-ids: { type: string, in: body }
         tagged: { type: string, in: body }
@@ -1294,12 +1346,12 @@ backend:
       description: >
         Remove a bridge-vlan record.
 
-        KNOWN BROKEN (ToolMesh wrapper bug, 2026-05-25): this DELETE returns
-        HTTP 400 — same .id URL-encoding bug as update_bridge_vlan.
+        KNOWN BROKEN through ToolMesh (2026-11): this DELETE returns
+        HTTP 400 — same .id path-encoding limitation as update_bridge_vlan.
         WORKAROUND: use remove_bridge_vlan (POST /interface/bridge/vlan/remove
         with 'numbers') instead.
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     set_bridge_vlan:
@@ -1309,10 +1361,9 @@ backend:
       description: >
         Update a bridge-vlan record via CLI-style '/interface/bridge/vlan set'.
         Reference via 'numbers' = the .id of the bridge-vlan record (e.g. '*6').
-        PREFERRED over update_bridge_vlan until the ToolMesh wrapper bug
-        for PATCH /xxx/{*N-id} URL encoding is fixed — see the top-of-file
-        'Known ToolMesh wrapper bugs' note. Lookup the .id with
-        list_bridge_vlans first.
+        PREFERRED over update_bridge_vlan, which fails through ToolMesh
+        because the .id in its URL path is sent percent-encoded. Lookup the
+        .id with list_bridge_vlans first.
 
         Note: although the CLI accepts multi-record selectors (e.g.
         `[find vlan-ids=10,20]`), the REST docs only show single-.id
@@ -1337,10 +1388,10 @@ backend:
       description: >
         Remove a bridge-vlan record via CLI-style
         '/interface/bridge/vlan remove'. Reference via 'numbers' = the .id
-        of the bridge-vlan record. PREFERRED over delete_bridge_vlan until
-        the ToolMesh wrapper bug for DELETE /xxx/{*N-id} URL encoding is
-        fixed. Lookup the .id with list_bridge_vlans first. Single .id
-        per call (see set_bridge_vlan note).
+        of the bridge-vlan record. PREFERRED over delete_bridge_vlan, which
+        fails through ToolMesh because the .id in its URL path is sent
+        percent-encoded. Lookup the .id with list_bridge_vlans first.
+        Single .id per call (see set_bridge_vlan note).
       params:
         numbers: { type: string, in: body, required: true, description: "Bridge-vlan record .id, e.g. '*6'. Single .id only." }
       response:
@@ -1373,9 +1424,9 @@ backend:
       method: DELETE
       path: /interface/vlan/{id}
       access: dangerous
-      description: "Delete a VLAN interface."
+      description: "Delete a VLAN interface. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_bonding_interfaces:
@@ -1407,9 +1458,9 @@ backend:
       method: PATCH
       path: /interface/bonding/{id}
       access: write
-      description: "Update a bonding interface (slaves, mode, lacp-rate, hash policy, comment)."
+      description: "Update a bonding interface (slaves, mode, lacp-rate, hash policy, comment). Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         slaves: { type: string, in: body }
         mode: { type: string, in: body }
@@ -1427,9 +1478,9 @@ backend:
       method: DELETE
       path: /interface/bonding/{id}
       access: dangerous
-      description: "Delete a bonding interface. Member ports return to individual L2 state."
+      description: "Delete a bonding interface. Member ports return to individual L2 state. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_interface_lists:
@@ -1456,9 +1507,9 @@ backend:
       method: DELETE
       path: /interface/list/{id}
       access: dangerous
-      description: "Delete an interface list. Firewall rules referencing it will break — audit first."
+      description: "Delete an interface list. Firewall rules referencing it will break — audit first. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_interface_list_members:
@@ -1484,9 +1535,9 @@ backend:
       method: DELETE
       path: /interface/list/member/{id}
       access: write
-      description: "Remove an interface from an interface list."
+      description: "Remove an interface from an interface list. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     # =========================================================================
@@ -1610,8 +1661,10 @@ backend:
         Update a WireGuard interface (listen-port, private-key, mtu, comment,
         disabled). Rotating private-key requires re-distributing the resulting
         public-key to every peer — handle with care.
+        Pass the record's name as id; a .id such as '*1' fails with HTTP 400
+        through ToolMesh (percent-encoded asterisk).
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         listen-port: { type: string, in: body }
         private-key: { type: string, in: body }
@@ -1626,9 +1679,9 @@ backend:
       method: DELETE
       path: /interface/wireguard/{id}
       access: dangerous
-      description: "Delete a WireGuard interface. ALL associated peers are removed implicitly."
+      description: "Delete a WireGuard interface. ALL associated peers are removed implicitly. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_wireguard_peers:
@@ -1659,9 +1712,9 @@ backend:
       method: PATCH
       path: /interface/wireguard/peers/{id}
       access: write
-      description: "Update a WireGuard peer (allowed-address, endpoint, keepalive, comment, disabled)."
+      description: "Update a WireGuard peer (allowed-address, endpoint, keepalive, comment, disabled). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         allowed-address: { type: string, in: body }
         endpoint-address: { type: string, in: body }
         endpoint-port: { type: string, in: body }
@@ -1677,9 +1730,9 @@ backend:
       method: DELETE
       path: /interface/wireguard/peers/{id}
       access: write
-      description: "Remove a WireGuard peer."
+      description: "Remove a WireGuard peer. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     # =========================================================================
@@ -1714,9 +1767,9 @@ backend:
       method: PATCH
       path: /ip/address/{id}
       access: write
-      description: "Update an IP address record (address, interface, comment, disabled)."
+      description: "Update an IP address record (address, interface, comment, disabled). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         address: { type: string, in: body }
         interface: { type: string, in: body }
         comment: { type: string, in: body }
@@ -1729,9 +1782,9 @@ backend:
       method: DELETE
       path: /ip/address/{id}
       access: dangerous
-      description: "Remove an IPv4 address. May disconnect remote sessions if the deleted address is the management IP."
+      description: "Remove an IPv4 address. May disconnect remote sessions if the deleted address is the management IP. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_ip_routes:
@@ -1770,9 +1823,9 @@ backend:
       method: PATCH
       path: /ip/route/{id}
       access: write
-      description: "Update a static route."
+      description: "Update a static route. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         dst-address: { type: string, in: body }
         gateway: { type: string, in: body }
         distance: { type: string, in: body }
@@ -1787,9 +1840,9 @@ backend:
       method: DELETE
       path: /ip/route/{id}
       access: dangerous
-      description: "Delete a static route."
+      description: "Delete a static route. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_ip_arp:
@@ -1816,9 +1869,9 @@ backend:
       method: DELETE
       path: /ip/arp/{id}
       access: write
-      description: "Remove an ARP entry."
+      description: "Remove an ARP entry. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_ip_neighbors:
@@ -1971,9 +2024,9 @@ backend:
       method: PATCH
       path: /ip/dns/static/{id}
       access: write
-      description: "Update a static DNS entry."
+      description: "Update a static DNS entry. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         name: { type: string, in: body }
         address: { type: string, in: body }
         cname: { type: string, in: body }
@@ -1988,9 +2041,9 @@ backend:
       method: DELETE
       path: /ip/dns/static/{id}
       access: write
-      description: "Remove a static DNS entry."
+      description: "Remove a static DNS entry. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_dns_cache:
@@ -2039,9 +2092,9 @@ backend:
       method: PATCH
       path: /ip/dhcp-server/{id}
       access: write
-      description: "Update a DHCP server."
+      description: "Update a DHCP server. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         interface: { type: string, in: body }
         address-pool: { type: string, in: body }
@@ -2077,9 +2130,9 @@ backend:
       method: DELETE
       path: /ip/dhcp-server/{id}
       access: dangerous
-      description: "Delete a DHCP server instance. Clients will fail to renew leases."
+      description: "Delete a DHCP server instance. Clients will fail to renew leases. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_dhcp_leases:
@@ -2114,9 +2167,9 @@ backend:
       method: DELETE
       path: /ip/dhcp-server/lease/{id}
       access: write
-      description: "Delete a DHCP lease/reservation."
+      description: "Delete a DHCP lease/reservation. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     make_dhcp_lease_static:
@@ -2157,9 +2210,9 @@ backend:
       method: PATCH
       path: /ip/dhcp-server/network/{id}
       access: write
-      description: "Update a DHCP server network (gateway, dns, ntp, domain, comment)."
+      description: "Update a DHCP server network (gateway, dns, ntp, domain, comment). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         address: { type: string, in: body }
         gateway: { type: string, in: body }
         dns-server: { type: string, in: body }
@@ -2175,9 +2228,9 @@ backend:
       method: DELETE
       path: /ip/dhcp-server/network/{id}
       access: write
-      description: "Remove a DHCP server network. Existing leases remain but new clients will get no options."
+      description: "Remove a DHCP server network. Existing leases remain but new clients will get no options. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_dhcp_clients:
@@ -2208,9 +2261,9 @@ backend:
       method: PATCH
       path: /ip/dhcp-client/{id}
       access: write
-      description: "Update a DHCP client (interface, add-default-route, use-peer-dns, etc.)."
+      description: "Update a DHCP client (interface, add-default-route, use-peer-dns, etc.). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         interface: { type: string, in: body }
         add-default-route: { type: string, in: body }
         use-peer-dns: { type: string, in: body }
@@ -2226,9 +2279,9 @@ backend:
       method: DELETE
       path: /ip/dhcp-client/{id}
       access: dangerous
-      description: "Delete a DHCP client. WAN-side delete may sever connectivity — confirm before invoking."
+      description: "Delete a DHCP client. WAN-side delete may sever connectivity — confirm before invoking. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     release_dhcp_client:
@@ -2309,9 +2362,9 @@ backend:
       method: PATCH
       path: /ip/firewall/filter/{id}
       access: admin
-      description: "Update an existing filter rule (any field)."
+      description: "Update an existing filter rule (any field). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         chain: { type: string, in: body }
         action: { type: string, in: body }
         protocol: { type: string, in: body }
@@ -2332,9 +2385,9 @@ backend:
       method: DELETE
       path: /ip/firewall/filter/{id}
       access: dangerous
-      description: "Delete a filter rule. Removing an accept rule can lock you out -- check before deleting."
+      description: "Delete a filter rule. Removing an accept rule can lock you out -- check before deleting. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     move_firewall_filter:
@@ -2390,9 +2443,9 @@ backend:
       method: PATCH
       path: /ip/firewall/nat/{id}
       access: admin
-      description: "Update a NAT rule."
+      description: "Update a NAT rule. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         chain: { type: string, in: body }
         action: { type: string, in: body }
         protocol: { type: string, in: body }
@@ -2414,9 +2467,9 @@ backend:
       method: DELETE
       path: /ip/firewall/nat/{id}
       access: dangerous
-      description: "Delete a NAT rule. Removing masquerade can break LAN-to-WAN traffic."
+      description: "Delete a NAT rule. Removing masquerade can break LAN-to-WAN traffic. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     move_firewall_nat:
@@ -2478,9 +2531,9 @@ backend:
       method: PATCH
       path: /ip/firewall/mangle/{id}
       access: admin
-      description: "Update a mangle rule (any field)."
+      description: "Update a mangle rule (any field). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         chain: { type: string, in: body }
         action: { type: string, in: body }
         new-packet-mark: { type: string, in: body }
@@ -2509,9 +2562,9 @@ backend:
       method: DELETE
       path: /ip/firewall/mangle/{id}
       access: dangerous
-      description: "Delete a mangle rule. Removing mark-routing rules can break policy routing."
+      description: "Delete a mangle rule. Removing mark-routing rules can break policy routing. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     move_firewall_mangle:
@@ -2566,9 +2619,9 @@ backend:
       method: PATCH
       path: /ip/firewall/raw/{id}
       access: admin
-      description: "Update a raw firewall rule."
+      description: "Update a raw firewall rule. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         chain: { type: string, in: body }
         action: { type: string, in: body }
         protocol: { type: string, in: body }
@@ -2587,9 +2640,9 @@ backend:
       method: DELETE
       path: /ip/firewall/raw/{id}
       access: dangerous
-      description: "Delete a raw firewall rule."
+      description: "Delete a raw firewall rule. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     move_firewall_raw:
@@ -2630,9 +2683,9 @@ backend:
       method: PATCH
       path: /ip/firewall/address-list/{id}
       access: admin
-      description: "Update an existing address-list entry (address, list, timeout, comment)."
+      description: "Update an existing address-list entry (address, list, timeout, comment). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         list: { type: string, in: body }
         address: { type: string, in: body }
         timeout: { type: string, in: body }
@@ -2646,9 +2699,9 @@ backend:
       method: DELETE
       path: /ip/firewall/address-list/{id}
       access: admin
-      description: "Remove an entry from an address-list."
+      description: "Remove an entry from an address-list. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_firewall_connections:
@@ -2693,9 +2746,9 @@ backend:
       method: PATCH
       path: /ipv6/address/{id}
       access: write
-      description: "Update an IPv6 address record."
+      description: "Update an IPv6 address record. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         address: { type: string, in: body }
         interface: { type: string, in: body }
         advertise: { type: string, in: body }
@@ -2709,9 +2762,9 @@ backend:
       method: DELETE
       path: /ipv6/address/{id}
       access: dangerous
-      description: "Remove an IPv6 address."
+      description: "Remove an IPv6 address. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_ipv6_routes:
@@ -2746,9 +2799,9 @@ backend:
       method: PATCH
       path: /ipv6/route/{id}
       access: write
-      description: "Update a static IPv6 route."
+      description: "Update a static IPv6 route. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         dst-address: { type: string, in: body }
         gateway: { type: string, in: body }
         distance: { type: string, in: body }
@@ -2762,9 +2815,9 @@ backend:
       method: DELETE
       path: /ipv6/route/{id}
       access: dangerous
-      description: "Delete a static IPv6 route."
+      description: "Delete a static IPv6 route. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_ipv6_firewall_filter:
@@ -2810,9 +2863,9 @@ backend:
       method: PATCH
       path: /ipv6/firewall/filter/{id}
       access: admin
-      description: "Update an IPv6 firewall filter rule."
+      description: "Update an IPv6 firewall filter rule. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         chain: { type: string, in: body }
         action: { type: string, in: body }
         protocol: { type: string, in: body }
@@ -2833,9 +2886,9 @@ backend:
       method: DELETE
       path: /ipv6/firewall/filter/{id}
       access: dangerous
-      description: "Delete an IPv6 firewall filter rule."
+      description: "Delete an IPv6 firewall filter rule. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     move_ipv6_firewall_filter:
@@ -2943,9 +2996,9 @@ backend:
       method: PATCH
       path: /ppp/secret/{id}
       access: admin
-      description: "Update a PPP user (password, profile, service, addresses, comment, disabled)."
+      description: "Update a PPP user (password, profile, service, addresses, comment, disabled). Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         password: { type: string, in: body }
         profile: { type: string, in: body }
         service: { type: string, in: body }
@@ -2961,9 +3014,9 @@ backend:
       method: DELETE
       path: /ppp/secret/{id}
       access: admin
-      description: "Delete a PPP user account."
+      description: "Delete a PPP user account. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_ppp_active:
@@ -3002,9 +3055,9 @@ backend:
       method: PATCH
       path: /ppp/profile/{id}
       access: admin
-      description: "Update a PPP profile."
+      description: "Update a PPP profile. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         local-address: { type: string, in: body }
         remote-address: { type: string, in: body }
@@ -3023,9 +3076,9 @@ backend:
       method: DELETE
       path: /ppp/profile/{id}
       access: dangerous
-      description: "Delete a PPP profile. Cannot delete 'default' or 'default-encryption' built-in profiles."
+      description: "Delete a PPP profile. Cannot delete 'default' or 'default-encryption' built-in profiles. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     # =========================================================================
@@ -3074,9 +3127,9 @@ backend:
       method: PATCH
       path: /routing/bgp/connection/{id}
       access: admin
-      description: "Update a BGP peer connection."
+      description: "Update a BGP peer connection. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         remote.address: { type: string, in: body }
         remote.as: { type: string, in: body }
@@ -3095,9 +3148,9 @@ backend:
       method: DELETE
       path: /routing/bgp/connection/{id}
       access: dangerous
-      description: "Delete a BGP peer connection. Will tear down the BGP session immediately."
+      description: "Delete a BGP peer connection. Will tear down the BGP session immediately. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_bgp_sessions:
@@ -3142,9 +3195,9 @@ backend:
       method: DELETE
       path: /routing/ospf/instance/{id}
       access: dangerous
-      description: "Delete an OSPF instance. All adjacencies in this instance go down."
+      description: "Delete an OSPF instance. All adjacencies in this instance go down. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_ospf_areas:
@@ -3175,9 +3228,9 @@ backend:
       method: DELETE
       path: /routing/ospf/area/{id}
       access: dangerous
-      description: "Delete an OSPF area."
+      description: "Delete an OSPF area. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_ospf_interface_templates:
@@ -3222,9 +3275,9 @@ backend:
       method: PATCH
       path: /routing/filter/rule/{id}
       access: admin
-      description: "Update a routing-filter rule."
+      description: "Update a routing-filter rule. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         chain: { type: string, in: body }
         rule: { type: string, in: body }
         comment: { type: string, in: body }
@@ -3237,9 +3290,9 @@ backend:
       method: DELETE
       path: /routing/filter/rule/{id}
       access: dangerous
-      description: "Delete a routing-filter rule. Removing a deny-all leaf can flood the route table — audit first."
+      description: "Delete a routing-filter rule. Removing a deny-all leaf can flood the route table — audit first. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     # =========================================================================
@@ -3277,9 +3330,9 @@ backend:
       method: PATCH
       path: /queue/simple/{id}
       access: write
-      description: "Update a simple queue."
+      description: "Update a simple queue. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         target: { type: string, in: body }
         max-limit: { type: string, in: body }
@@ -3295,9 +3348,9 @@ backend:
       method: DELETE
       path: /queue/simple/{id}
       access: write
-      description: "Remove a simple queue."
+      description: "Remove a simple queue. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_queue_tree:
@@ -3401,9 +3454,9 @@ backend:
       method: PATCH
       path: /tool/netwatch/{id}
       access: write
-      description: "Update a netwatch monitor (host, type, interval, scripts, port, http-codes, comment, disabled)."
+      description: "Update a netwatch monitor (host, type, interval, scripts, port, http-codes, comment, disabled). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         host: { type: string, in: body }
         type: { type: string, in: body }
         interval: { type: string, in: body }
@@ -3422,9 +3475,9 @@ backend:
       method: DELETE
       path: /tool/netwatch/{id}
       access: write
-      description: "Remove a netwatch monitor."
+      description: "Remove a netwatch monitor. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     get_email_settings:
@@ -3494,9 +3547,9 @@ backend:
       method: GET
       path: /user/{id}
       access: admin
-      description: "Get a single user by name or .id."
+      description: "Get a single user by name. A .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       response:
         result_path: "$"
       pagination: none
@@ -3521,9 +3574,9 @@ backend:
       method: PATCH
       path: /user/{id}
       access: admin
-      description: "Update a user (password, group, source restriction, comment, disabled)."
+      description: "Update a user (password, group, source restriction, comment, disabled). Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         password: { type: string, in: body }
         group: { type: string, in: body }
         address: { type: string, in: body }
@@ -3537,9 +3590,9 @@ backend:
       method: DELETE
       path: /user/{id}
       access: dangerous
-      description: "Delete a user. Cannot delete the user you're authenticated as."
+      description: "Delete a user. Cannot delete the user you're authenticated as. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_user_groups:
@@ -3566,9 +3619,9 @@ backend:
       method: PATCH
       path: /user/group/{id}
       access: admin
-      description: "Update an existing user group's policies, skin, or comment. Cannot rename built-in 'read', 'write', 'full' groups."
+      description: "Update an existing user group's policies, skin, or comment. Cannot rename built-in 'read', 'write', 'full' groups. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         policy: { type: string, in: body }
         skin: { type: string, in: body }
@@ -3581,9 +3634,9 @@ backend:
       method: DELETE
       path: /user/group/{id}
       access: dangerous
-      description: "Delete a custom user group. Built-in groups (read/write/full) cannot be deleted. Users assigned to a deleted group are orphaned — re-assign first."
+      description: "Delete a custom user group. Built-in groups (read/write/full) cannot be deleted. Users assigned to a deleted group are orphaned — re-assign first. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_active_users:
@@ -3660,9 +3713,9 @@ backend:
       method: DELETE
       path: /file/{id}
       access: admin
-      description: "Delete a file from device flash. Cannot delete in-use files."
+      description: "Delete a file from device flash. Cannot delete in-use files. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true, description: "File .id or full filename" }
+        id: { type: string, in: path, required: true, description: "File name as listed by list_files. Not the .id: '*1' is sent percent-encoded ('%2A1') and RouterOS answers HTTP 400. Names containing '/' (files in subdirectories) are percent-encoded too and will most likely fail the same way (untested)." }
       pagination: none
 
     list_logs:
@@ -3719,9 +3772,9 @@ backend:
       method: PATCH
       path: /system/logging/{id}
       access: admin
-      description: "Update a logging rule (topics, action, prefix, regex, comment, disabled)."
+      description: "Update a logging rule (topics, action, prefix, regex, comment, disabled). KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         topics: { type: string, in: body }
         action: { type: string, in: body }
         prefix: { type: string, in: body }
@@ -3736,9 +3789,9 @@ backend:
       method: DELETE
       path: /system/logging/{id}
       access: admin
-      description: "Delete a logging rule. The 5 default actions remain available; only your custom rules are removed."
+      description: "Delete a logging rule. The 5 default actions remain available; only your custom rules are removed. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_logging_actions:
@@ -3798,8 +3851,10 @@ backend:
         Update a custom logging action. NOTE: for the 5 built-in actions
         (memory, disk, echo, remote, email) PATCH on the path is unreliable —
         use set_logging_action with numbers='remote' (etc.) instead.
+        Pass the record's name as id; a .id such as '*1' fails with HTTP 400
+        through ToolMesh (percent-encoded asterisk).
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         target: { type: string, in: body }
         remote: { type: string, in: body }
@@ -3864,9 +3919,9 @@ backend:
       method: DELETE
       path: /system/logging/action/{id}
       access: dangerous
-      description: "Delete a custom logging action. The 5 default actions (memory/disk/echo/remote/email) cannot be deleted."
+      description: "Delete a custom logging action. The 5 default actions (memory/disk/echo/remote/email) cannot be deleted. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     get_snmp_settings:
@@ -4073,9 +4128,9 @@ backend:
       method: PATCH
       path: /ip/ipsec/peer/{id}
       access: admin
-      description: "Update an IPsec peer."
+      description: "Update an IPsec peer. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         address: { type: string, in: body }
         profile: { type: string, in: body }
@@ -4091,9 +4146,9 @@ backend:
       method: DELETE
       path: /ip/ipsec/peer/{id}
       access: dangerous
-      description: "Delete an IPsec peer. Tears down all SAs to that peer."
+      description: "Delete an IPsec peer. Tears down all SAs to that peer. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_ipsec_identities:
@@ -4133,9 +4188,9 @@ backend:
       method: PATCH
       path: /ip/ipsec/identity/{id}
       access: admin
-      description: "Update an IPsec identity."
+      description: "Update an IPsec identity. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         peer: { type: string, in: body }
         auth-method: { type: string, in: body }
         secret: { type: string, in: body }
@@ -4155,9 +4210,9 @@ backend:
       method: DELETE
       path: /ip/ipsec/identity/{id}
       access: dangerous
-      description: "Delete an IPsec identity."
+      description: "Delete an IPsec identity. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_ipsec_profiles:
@@ -4191,9 +4246,9 @@ backend:
       method: PATCH
       path: /ip/ipsec/profile/{id}
       access: admin
-      description: "Update an IPsec profile."
+      description: "Update an IPsec profile. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         hash-algorithm: { type: string, in: body }
         enc-algorithm: { type: string, in: body }
@@ -4211,9 +4266,9 @@ backend:
       method: DELETE
       path: /ip/ipsec/profile/{id}
       access: dangerous
-      description: "Delete an IPsec profile. Cannot delete 'default'."
+      description: "Delete an IPsec profile. Cannot delete 'default'. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_ipsec_proposals:
@@ -4243,9 +4298,9 @@ backend:
       method: PATCH
       path: /ip/ipsec/proposal/{id}
       access: admin
-      description: "Update an IPsec proposal."
+      description: "Update an IPsec proposal. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
         name: { type: string, in: body }
         auth-algorithms: { type: string, in: body }
         enc-algorithms: { type: string, in: body }
@@ -4261,9 +4316,9 @@ backend:
       method: DELETE
       path: /ip/ipsec/proposal/{id}
       access: dangerous
-      description: "Delete an IPsec proposal. Cannot delete 'default'."
+      description: "Delete an IPsec proposal. Cannot delete 'default'. Pass the record's name as id; a .id such as '*1' fails with HTTP 400 through ToolMesh (percent-encoded asterisk)."
       params:
-        id: { type: string, in: path, required: true }
+        id: *named-record-id
       pagination: none
 
     list_ipsec_policies:
@@ -4308,9 +4363,9 @@ backend:
       method: PATCH
       path: /ip/ipsec/policy/{id}
       access: admin
-      description: "Update an IPsec policy."
+      description: "Update an IPsec policy. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
         peer: { type: string, in: body }
         src-address: { type: string, in: body }
         dst-address: { type: string, in: body }
@@ -4329,9 +4384,9 @@ backend:
       method: DELETE
       path: /ip/ipsec/policy/{id}
       access: dangerous
-      description: "Delete an IPsec policy. Active SAs are torn down."
+      description: "Delete an IPsec policy. Active SAs are torn down. KNOWN BROKEN through ToolMesh (2026-11): the URL path needs the record's .id, and the percent-encoded .id is answered with HTTP 400."
       params:
-        id: { type: string, in: path, required: true }
+        id: *unnamed-record-id
       pagination: none
 
     list_ipsec_active_peers:
