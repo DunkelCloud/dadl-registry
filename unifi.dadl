@@ -1,0 +1,1694 @@
+# unifi.dadl -- Ubiquiti UniFi Network Controller REST API
+# DADL backend for ToolMesh
+#
+# Domain Notes for LLM consumers:
+# - UniFi is Ubiquiti's network management platform for APs, switches, gateways, and cameras.
+# - This covers the self-hosted UniFi Network Application (not the cloud Site Manager API).
+#   Verified against a self-hosted Network Application 10.6 (2026-11).
+# - Authentication is session-based: POST /api/login sets session cookies that ToolMesh keeps in
+#   a cookie jar and sends with every request. No header is injected (auth.inject is empty).
+# - UniFi OS consoles (UDM, UCG, Cloud Key Gen2+) serve the Network API under /proxy/network and
+#   log in at /api/auth/login on the console root. This file logs in at <base_url>/api/login,
+#   which is the self-hosted path; UniFi OS consoles are untested with it.
+# - Self-hosted controllers listen on port 8443 by default.
+# - All endpoints under /api/s/{site}/ require a site name. "name" from list_sites is the site
+#   name (the first site is "default"); "desc" is only the display label.
+# - The "_id" field is the internal 24-char MongoDB ObjectId used for PUT/DELETE operations.
+# - MAC addresses are lowercase with colons: "00:00:5e:00:53:01".
+# - Standard response envelope: {"meta":{"rc":"ok"},"data":[...]}. Errors: {"meta":{"rc":"error","msg":"..."}}.
+# - v2 API endpoints (/v2/api/site/{site}/..., same session cookie) return bare JSON without
+#   the meta/data envelope, as documented by common third-party API clients: system log,
+#   AP groups, traffic rules.
+# - EVENTS MOVED: Network 10.x (verified on 10.6) no longer serves the legacy event and alarm endpoints.
+#   GET /api/s/{site}/stat/event and stat/alarm answer HTTP 404 api.err.NotFound, rest/alarm
+#   answers HTTP 400 api.err.InvalidObject. The event history now lives in the v2 system log:
+#   POST /v2/api/site/{site}/system-log/{class} with a body of timestampFrom/timestampTo (ms),
+#   pageNumber and pageSize (list_system_log). The POST is a query and changes nothing.
+#   list_events, list_alarms and list_alarms_unarchived stay for older controllers, deprecated.
+# - DEVICE DETAIL: list_devices returns a compact projection (radio settings and radio stats
+#   included, but no port_table, lldp_table, uplink, vap_table). For the full raw document use
+#   get_device (GET stat/device/{mac}, one device) or get_device_detail (POST stat/device with
+#   {"macs": [...]}). get_device_detail takes an ARRAY named macs; without it the controller
+#   returns every device of the site (about 30 kB per access point).
+# - RADIO SETTINGS: radio_table on a device is an array with one entry per radio, keyed by
+#   "radio" (ng = 2.4 GHz, na = 5 GHz, 6e = 6 GHz). PUT /api/s/{site}/rest/device/{_id} with
+#   radio_table REPLACES the whole array, so a partial array would drop the other radios'
+#   settings. The update_device composite reads the device, merges per radio and sends the
+#   complete array. Writable radio fields (controller field schema): channel ("auto" or a
+#   number), ht (channel width 20/40/80/160/320), tx_power_mode (auto, high, medium, low,
+#   custom, disabled), tx_power (with custom), min_rssi_enabled + min_rssi (-90..-67 dBm),
+#   sens_level_enabled + sens_level, antenna_gain, antenna_id, vwire_enabled,
+#   hard_noise_floor_enabled, loadbalance_enabled + maxsta, dfs. Other radio_table fields
+#   (radio_caps, nss, max_txpower, has_dfs, is_11ax, ...) are capabilities reported by the
+#   device and are not sent back. Every device PUT re-provisions that device (clients drop briefly).
+# - WLAN SETTINGS: PUT /api/s/{site}/rest/wlanconf/{_id} takes partial bodies (common API
+#   clients send only the fields to change); fields not sent stay as they are. Array fields
+#   (wlan_bands, ap_group_ids) are replaced as a whole. A WLAN PUT re-provisions every AP that
+#   broadcasts the SSID.
+# - Raw device and WLAN documents carry secret x_* fields (device keys x_authkey/x_vwirekey,
+#   WLAN x_passphrase/x_iapp_key). Do not copy them into output.
+# - Device commands go through /cmd/devmgr with {"cmd":"...", "mac":"..."} bodies.
+# - Client commands go through /cmd/stamgr with {"cmd":"...", "mac":"..."} bodies.
+# - Site management commands go through /cmd/sitemgr with {"cmd":"...", ...} bodies.
+# - Stats endpoints accept POST with {"attrs":["bytes","num_sta"], "start":..., "end":...} for time ranges.
+# - start/end timestamps are Unix epoch in milliseconds.
+# - The "within" parameter on some endpoints specifies hours (integer).
+# - Self-signed TLS certificates are common; ToolMesh should skip TLS verification if configured.
+# - No official rate limiting, but avoid aggressive polling of login endpoints.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "Ubiquiti UniFi Network Controller API"
+source_url: "https://ubntwiki.com/products/software/unifi-controller/api"
+date: "2026-11-07"
+
+backend:
+  name: unifi
+  type: rest
+  version: "1.1"
+  # base_url is intentionally omitted -- must be provided via backends.yaml url field,
+  # because each deployment has its own controller address and port.
+  # Self-hosted controller: https://unifi.example.com:8443
+  description: "Ubiquiti UniFi Network Controller API -- manage sites, APs, switches, gateways, clients, networks, WLANs, firewall rules, DPI stats, guests, vouchers, and backups"
+
+  auth:
+    type: session
+    login:
+      method: POST
+      path: /api/login
+      body:
+        username: "credential:unifi_username"
+        password: "credential:unifi_password"
+        remember: "true"
+    # The login answer sets session cookies, which the runtime's cookie jar sends with every
+    # request. Nothing is extracted from the body and no header is injected.
+    inject: []
+    refresh:
+      trigger: status_code_401
+      action: re_login
+
+  # Health check: GET /api/self needs a valid session, so it exercises the login with the stored
+  # credential and fails on a revoked account or a wrong password. Raw response:
+  # {"meta":{"rc":"ok"},"data":[{"admin_id":...,"name":...}]}; an empty data array fails the check.
+  health:
+    tool: get_self
+    expect_path: "$.data[0]"
+
+  defaults:
+    headers:
+      Content-Type: application/json
+    pagination:
+      strategy: offset
+      request:
+        limit_param: _limit
+        limit_default: 100
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      message_path: "$.meta.msg"
+      code_path: "$.meta.rc"
+      retry_on: [429, 502, 503, 504]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+      terminal: [400, 401, 403, 404]
+    response:
+      result_path: "$.data"
+      max_items: 500
+
+  coverage:
+    endpoints: 98
+    total_endpoints: 160
+    percentage: 61
+    focus: "Self-hosted UniFi Network Application API: devices (access points, switches, gateways, radio settings, adoption, restarts, firmware), WLANs (SSIDs, roaming, PMF, minimum data rates, AP groups), clients (active, known, blocking), firewall (rules, groups, NAT port forwarding, static routes), networks (LANs, VLANs, WAN), system log (client events, device alerts, admin activity), statistics (DPI, traffic reports, site health), hotspot (vouchers, authorizations), RADIUS, backups."
+    missing: "WebSocket events, v2 traffic rules and firewall policies, v2 client connection timeline, IPS/IDS management, hotspot portal config, VoIP extensions, spectrum scan results, switch port overrides, UniFi OS console login (/api/auth/login)"
+    last_reviewed: "2026-11-07"
+
+  setup:
+    credential_steps:
+      - "Install or access your UniFi Network Controller (self-hosted or UDM/UDM Pro)"
+      - "Create a local admin account or use an existing one (Settings -> Admins)"
+      - "For dedicated API access, create a limited-admin account with read-only or site-admin role"
+      - "Note: UniFi uses session-based auth (username + password), not API keys"
+      - "Store the username and password in your ToolMesh credential store"
+    env_var: CREDENTIAL_UNIFI_USERNAME / CREDENTIAL_UNIFI_PASSWORD
+    backends_yaml: |
+      - name: unifi
+        transport: rest
+        dadl: unifi.dadl
+        url: "https://unifi.example.com:8443"
+    required_scopes:
+      - "Local admin account on the UniFi controller"
+    optional_scopes:
+      - "Super admin for cross-site operations"
+    docs_url: "https://ubntwiki.com/products/software/unifi-controller/api"
+    notes: "Written for the self-hosted UniFi Network Application: set url to https://<host>:8443. The file logs in at <url>/api/login. UniFi OS consoles (UDM, UCG, Cloud Key Gen2+) serve the Network API under https://<console>/proxy/network but log in at /api/auth/login on the console root, which this file does not configure; they are untested. Self-signed TLS certs are common -- configure TLS skip if needed. The health check calls GET /api/self and so tests the login with the stored credential."
+
+  hints:
+    list_devices:
+      mac_filter: "POST with {\"macs\":[\"00:00:5e:00:53:01\"]} to filter by MAC"
+      key_fields: "_id (for PUT/DELETE), mac, name, model, type, state (1=connected, 0=disconnected)"
+    get_device_detail:
+      macs: "macs is an array, also for one device; without it every device of the site is returned"
+    update_device:
+      radio_table: "pass only the changes per radio, keyed by radio (ng, na, 6e); the composite merges them into the full array"
+      dry_run: "dry_run true returns the PUT body without writing"
+    list_system_log:
+      timestamps: "timestampFrom and timestampTo are Unix epoch milliseconds"
+      paging: "pageNumber starts at 0; total_element_count and total_page_count come with every page"
+    device_command:
+      adopt: "Use cmd=adopt with the MAC of a discovered device"
+      restart: "cmd=restart, optional reboot_type=soft for graceful restart"
+      locate: "cmd=set-locate starts LED blinking, cmd=unset-locate stops it"
+    list_active_clients:
+      note: "Returns only currently connected clients. Use list_all_users for historical."
+      key_fields: "mac, hostname, ip, oui (vendor), rx_bytes, tx_bytes, uptime, last_seen"
+    client_command:
+      block: "Blocks MAC at controller level across all APs/switches"
+      kick: "Disconnects client; it may reconnect automatically"
+      forget: "Removes from known clients list; takes array of MACs"
+    create_voucher:
+      quota: "0=unlimited uses, 1=single-use, 2+=multi-use"
+      expire: "Minutes until voucher expires after first use"
+      n: "Number of vouchers to generate in batch"
+    list_events:
+      legacy: "Network 10.6 answers HTTP 404; use list_system_log there"
+      limit: "Hard limit of 3000 results per request on older controllers"
+    stat_report:
+      attrs: "Common: bytes, rx_bytes, tx_bytes, num_sta, wan-tx_bytes, wan-rx_bytes"
+      timestamps: "start and end are Unix epoch in milliseconds"
+      intervals: "5minutes, hourly, daily, monthly"
+
+  tools:
+
+    # =========================================================================
+    # SYSTEM -- Server Status & Info
+    # =========================================================================
+
+    get_server_status:
+      method: GET
+      path: /status
+      access: read
+      description: "Get controller server status (unauthenticated). Returns server version, UUID, up status."
+      response:
+        result_path: "$"
+      pagination: none
+
+    get_self:
+      method: GET
+      path: /api/self
+      access: read
+      description: "Get currently logged-in admin user info"
+      pagination: none
+
+    get_sysinfo:
+      method: GET
+      path: /api/s/{site}/stat/sysinfo
+      access: read
+      description: "Get controller system info: version, hostname, uptime, memory"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+      pagination: none
+
+    get_health:
+      method: GET
+      path: /api/s/{site}/stat/health
+      access: read
+      description: "Get site health status for all subsystems (wan, wlan, lan, vpn)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+      pagination: none
+
+    get_dashboard:
+      method: GET
+      path: /api/s/{site}/stat/dashboard
+      access: read
+      description: "Get dashboard metrics. Optional scale param for time granularity."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        scale: { type: string, in: query, description: "Time scale: 5minutes, hourly, daily" }
+      pagination: none
+
+    # =========================================================================
+    # SITES -- Management
+    # =========================================================================
+
+    list_sites:
+      method: GET
+      path: /api/self/sites
+      access: read
+      description: "List all sites accessible to current admin (basic info)"
+      pagination: none
+
+    list_sites_stats:
+      method: GET
+      path: /api/stat/sites
+      access: read
+      description: "List all sites with health data, device counts, and alerts"
+      pagination: none
+
+    site_command:
+      method: POST
+      path: /api/s/{site}/cmd/sitemgr
+      access: admin
+      description: "Site management commands: add-site, delete-site, update-site, get-admins, move-device, delete-device"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, description: "Command: add-site, delete-site, update-site, get-admins, move-device, delete-device" }
+        desc: { type: string, in: body, description: "Site description (for add-site, update-site)" }
+        name: { type: string, in: body, description: "Site short name" }
+        mac: { type: string, in: body, description: "Device MAC (for move-device, delete-device)" }
+        site_id: { type: string, in: body, description: "Target site 24-char ID (for move-device)" }
+      pagination: none
+
+    # =========================================================================
+    # ADMINS -- User Management
+    # =========================================================================
+
+    list_admins:
+      method: GET
+      path: /api/stat/admin
+      access: admin
+      description: "List all administrators across all sites with permissions"
+      pagination: none
+
+    admin_command:
+      method: POST
+      path: /api/s/{site}/cmd/sitemgr
+      access: admin
+      description: "Admin commands: invite-admin, assign-existing-admin, update-admin, revoke-admin, delete-admin"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, description: "Command: invite-admin, assign-existing-admin, update-admin, revoke-admin, delete-admin" }
+        admin: { type: string, in: body, description: "Admin ID (for assign, update, revoke, delete)" }
+        name: { type: string, in: body }
+        email: { type: string, in: body }
+        role: { type: string, in: body, description: "Role: admin, readonly" }
+        permissions: { type: array, in: body }
+        for_sso: { type: boolean, in: body }
+      pagination: none
+
+    # =========================================================================
+    # DEVICES -- APs, Switches, Gateways
+    # =========================================================================
+
+    list_devices_basic:
+      method: GET
+      path: /api/s/{site}/stat/device-basic
+      access: read
+      description: "List all adopted devices with limited fields (fast)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    list_devices:
+      method: POST
+      path: /api/s/{site}/stat/device
+      access: read
+      description: >
+        List adopted devices (APs, switches, gateways) as a compact projection: _id, mac, name,
+        type (uap, usw, ugw, udm), model, state (1 = connected), version, ip, uptime, traffic
+        rates, num_sta, satisfaction, plus per radio the settings (radio_table: radio, name,
+        channel, ht, tx_power_mode, tx_power, min_rssi_enabled, min_rssi) and the live radio
+        stats (radio_table_stats: radio, channel, tx_power, num_sta, satisfaction, cu_total,
+        cu_self_rx, cu_self_tx, tx_retries_pct). Switches have empty radio arrays. Port tables,
+        LLDP, uplink and the remaining radio fields are not included: use get_device (one MAC)
+        or get_device_detail for the full raw document. Optional macs (array) filters by MAC.
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        macs: { type: array, in: body, description: "Array of device MACs to return, e.g. [\"00:00:5e:00:53:01\"]. Omit for all devices." }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, type, model, state, adopted, disabled, version: .version, ip, uptime, last_seen, "rx_bytes-r": .["rx_bytes-r"], "tx_bytes-r": .["tx_bytes-r"], num_sta, satisfaction, radio_table: [.radio_table[]? | {radio, name, channel, ht, tx_power_mode, tx_power, min_rssi_enabled, min_rssi}], radio_table_stats: [.radio_table_stats[]? | {radio, name, channel, tx_power, num_sta, satisfaction, cu_total, cu_self_rx, cu_self_tx, tx_retries_pct}]}]
+        allow_jq_override: true
+
+    get_device_detail:
+      method: POST
+      path: /api/s/{site}/stat/device
+      access: read
+      description: >
+        Full raw device documents, no projection: port_table, lldp_table, uplink, vap_table,
+        radio_table (all fields), radio_table_stats, config_network and more, about 30 kB per
+        access point. Pass macs as an ARRAY, also for a single device:
+        {macs: ["00:00:5e:00:53:01"]} returns exactly that device. There is no singular mac
+        parameter; without macs the controller returns every device of the site. For one device
+        get_device (GET by MAC) returns the same document. Returns an array of devices. The
+        documents contain device keys (x_authkey, x_vwirekey): do not copy them into output.
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        macs: { type: array, in: body, description: "Array of device MACs (lowercase, colons), e.g. [\"00:00:5e:00:53:01\"]. Omit to get all devices." }
+      response:
+        result_path: "$.data"
+
+    get_device:
+      method: GET
+      path: /api/s/{site}/stat/device/{mac}
+      access: read
+      description: >
+        Get one device by MAC address: the full raw document (same content as get_device_detail
+        with one MAC), including radio_table and radio_table_stats for access points and
+        port_table for switches. Returns an array with one element. Works on self-hosted
+        controllers (verified on Network 10.6). The document contains device keys
+        (x_authkey, x_vwirekey): do not copy them into output.
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        mac: { type: string, in: path, required: true, description: "Device MAC, e.g. 00:00:5e:00:53:01" }
+      pagination: none
+
+    _update_device_raw:
+      method: PUT
+      path: /api/s/{site}/rest/device/{_id}
+      access: write
+      description: >
+        Internal: raw device update. Sends only the fields given. radio_table REPLACES the whole
+        radio array: a partial array loses the settings of the radios left out. Use the
+        update_device composite instead, which reads the current radio_table and merges.
+        Every call re-provisions the device (its clients drop briefly).
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true, description: "Device _id (24-char)" }
+        name: { type: string, in: body }
+        led_override: { type: string, in: body, description: "LED mode: default, on, off" }
+        disabled: { type: boolean, in: body }
+        radio_table: { type: array, in: body, description: "Complete radio_table, one entry per radio of the device" }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, led_override, disabled, radio_table: [.radio_table[]? | {radio, name, channel, ht, tx_power_mode, tx_power, min_rssi_enabled, min_rssi}]}]
+      pagination: none
+
+    device_command:
+      method: POST
+      path: /api/s/{site}/cmd/devmgr
+      access: write
+      description: "Device management commands: adopt, restart, force-provision, power-cycle, upgrade, set-locate, unset-locate, speedtest, speedtest-status, migrate, cancel-migrate, spectrum-scan"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, description: "Command name" }
+        mac: { type: string, in: body, required: true, description: "Device MAC address" }
+        reboot_type: { type: string, in: body, description: "For restart: 'soft' for graceful" }
+        port_idx: { type: integer, in: body, description: "For power-cycle: PoE port index" }
+        url: { type: string, in: body, description: "For upgrade-external: firmware URL" }
+        inform_url: { type: string, in: body, description: "For migrate: new controller inform URL" }
+      pagination: none
+
+    # =========================================================================
+    # CLIENTS -- Connected Stations & Known Users
+    # =========================================================================
+
+    list_active_clients:
+      method: GET
+      path: /api/s/{site}/stat/sta
+      access: read
+      description: "List all currently connected clients"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, hostname, ip, oui, is_wired, is_guest, network: .last_connection_network_name, essid, ap_mac, last_uplink_name, rssi, signal, satisfaction, channel, rx_bytes, tx_bytes, "rx_bytes-r": .["rx_bytes-r"], "tx_bytes-r": .["tx_bytes-r"], uptime, last_seen, vlan}]
+        allow_jq_override: true
+
+    get_client:
+      method: GET
+      path: /api/s/{site}/stat/sta/{mac}
+      access: read
+      description: "Get details of a single connected client by MAC"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        mac: { type: string, in: path, required: true }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, hostname, ip, oui, is_wired, is_guest, network: .last_connection_network_name, essid, ap_mac, last_uplink_name, rssi, signal, satisfaction, channel, rx_bytes, tx_bytes, "rx_bytes-r": .["rx_bytes-r"], "tx_bytes-r": .["tx_bytes-r"], uptime, last_seen, vlan, note, fixed_ip, use_fixedip}]
+        allow_jq_override: true
+      pagination: none
+
+    get_user:
+      method: GET
+      path: /api/s/{site}/stat/user/{mac}
+      access: read
+      description: "Get client/user details including offline clients"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        mac: { type: string, in: path, required: true }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, hostname, ip, oui, is_wired, is_guest, network: .last_connection_network_name, first_seen, last_seen, rx_bytes, tx_bytes, note, noted, use_fixedip, fixed_ip, usergroup_id, blocked}]
+        allow_jq_override: true
+      pagination: none
+
+    list_known_clients:
+      method: GET
+      path: /api/s/{site}/rest/user
+      access: read
+      description: "List all known/configured clients (including offline)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, hostname, oui, is_wired, is_guest, first_seen, last_seen, last_ip: .last_ip, note, noted, blocked, use_fixedip, fixed_ip, network_id, usergroup_id}]
+        allow_jq_override: true
+
+    list_all_users:
+      method: POST
+      path: /api/s/{site}/stat/alluser
+      access: read
+      description: "List all users (active and historical). Filter by type and time range."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        type: { type: string, in: body, default: "all", description: "Filter type: all, guest, noted, blocked" }
+        conn: { type: string, in: body, default: "all", description: "Connection filter: all, connected" }
+        within: { type: integer, in: body, description: "Hours to look back" }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, hostname, oui, is_wired, is_guest, first_seen, last_seen, last_ip: .last_ip, rx_bytes, tx_bytes, note, noted, blocked}]
+        allow_jq_override: true
+
+    list_guests:
+      method: POST
+      path: /api/s/{site}/stat/guest
+      access: read
+      description: "List guest clients within a time range"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        within: { type: integer, in: body, default: 24, description: "Hours to look back" }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, mac, name, hostname, ip, oui, essid, ap_mac, authorized, start: .start, end: .end, duration, rx_bytes, tx_bytes}]
+        allow_jq_override: true
+
+    client_command:
+      method: POST
+      path: /api/s/{site}/cmd/stamgr
+      access: write
+      description: "Client management commands: block-sta, unblock-sta, kick-sta, forget-sta"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, description: "Command: block-sta, unblock-sta, kick-sta, forget-sta" }
+        mac: { type: string, in: body, description: "Client MAC (for block/unblock/kick)" }
+        macs: { type: array, in: body, description: "Array of MACs (for forget-sta)" }
+      pagination: none
+
+    update_client:
+      method: PUT
+      path: /api/s/{site}/rest/user/{_id}
+      access: write
+      description: "Update client: name, note, fixed IP, network_id, usergroup_id"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true, description: "User _id (24-char)" }
+        name: { type: string, in: body }
+        note: { type: string, in: body }
+        noted: { type: boolean, in: body }
+        use_fixedip: { type: boolean, in: body }
+        fixed_ip: { type: string, in: body }
+        network_id: { type: string, in: body }
+        usergroup_id: { type: string, in: body }
+      pagination: none
+
+    # =========================================================================
+    # NETWORKS -- LAN/VLAN Configuration
+    # =========================================================================
+
+    list_networks:
+      method: GET
+      path: /api/s/{site}/rest/networkconf
+      access: read
+      description: "List all networks (LANs, VLANs, WAN)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_network:
+      method: POST
+      path: /api/s/{site}/rest/networkconf
+      access: write
+      description: "Create a new network"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        purpose: { type: string, in: body, required: true, description: "Purpose: corporate, guest, wan, vlan-only" }
+        vlan_enabled: { type: boolean, in: body }
+        vlan: { type: string, in: body, description: "VLAN ID" }
+        ip_subnet: { type: string, in: body, description: "Gateway address and prefix length, e.g. 192.0.2.1/24" }
+        dhcpd_enabled: { type: boolean, in: body }
+        dhcpd_start: { type: string, in: body }
+        dhcpd_stop: { type: string, in: body }
+        domain_name: { type: string, in: body }
+      pagination: none
+
+    update_network:
+      method: PUT
+      path: /api/s/{site}/rest/networkconf/{_id}
+      access: write
+      description: "Update network configuration"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        vlan_enabled: { type: boolean, in: body }
+        vlan: { type: string, in: body }
+        ip_subnet: { type: string, in: body }
+        dhcpd_enabled: { type: boolean, in: body }
+      pagination: none
+
+    delete_network:
+      method: DELETE
+      path: /api/s/{site}/rest/networkconf/{_id}
+      access: dangerous
+      description: "Delete a network. WARNING: may disconnect clients on this network."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # WLANs -- Wireless Networks
+    # =========================================================================
+
+    list_wlans:
+      method: GET
+      path: /api/s/{site}/rest/wlanconf
+      access: read
+      description: "List all WLAN configurations (SSIDs)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_wlan:
+      method: POST
+      path: /api/s/{site}/rest/wlanconf
+      access: write
+      description: "Create a new WLAN (SSID)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true, description: "SSID name" }
+        x_passphrase: { type: string, in: body, required: true, description: "WiFi password (min 8 chars)" }
+        enabled: { type: boolean, in: body, default: true }
+        security: { type: string, in: body, default: "wpapsk", description: "Security: wpapsk, wpaeap, open" }
+        wpa_mode: { type: string, in: body, default: "wpa2", description: "WPA mode: auto, wpa1, wpa2. WPA3 is switched on with wpa3_support, not here." }
+        hide_ssid: { type: boolean, in: body, default: false }
+        is_guest: { type: boolean, in: body, default: false }
+        vlan_enabled: { type: boolean, in: body }
+        vlan: { type: string, in: body, description: "VLAN ID for this WLAN" }
+        wlangroup_id: { type: string, in: body, description: "WLAN group ID" }
+        networkconf_id: { type: string, in: body, description: "Network ID to associate" }
+      pagination: none
+
+    update_wlan:
+      method: PUT
+      path: /api/s/{site}/rest/wlanconf/{_id}
+      access: write
+      description: >
+        Update a WLAN (SSID): pass only the fields to change; top-level fields not sent stay
+        as they are. Array fields (wlan_bands, ap_group_ids) are replaced as a whole, so pass the
+        complete list. Read the current values with list_wlans first. Every update
+        re-provisions all APs that broadcast this SSID (clients drop briefly). Roaming:
+        bss_transition (802.11v), fast_roaming_enabled (802.11r). Security: pmf_mode, wpa_mode,
+        wpa3_support, wpa3_transition. Bands: wlan_bands. AP selection: ap_group_mode +
+        ap_group_ids (list_ap_groups). The minrate_* values are used when
+        minrate_setting_preference is manual. Returns the updated WLAN document, which includes
+        x_passphrase: do not copy it into output.
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true, description: "WLAN _id from list_wlans" }
+        name: { type: string, in: body, description: "SSID name" }
+        x_passphrase: { type: string, in: body, description: "WiFi password (min 8 chars)" }
+        enabled: { type: boolean, in: body }
+        security: { type: string, in: body, description: "Security: wpapsk, wpaeap, open" }
+        hide_ssid: { type: boolean, in: body }
+        is_guest: { type: boolean, in: body, description: "Treat the WLAN as a guest network" }
+        networkconf_id: { type: string, in: body, description: "_id of the network (list_networks) the WLAN bridges into" }
+        wpa_mode: { type: string, in: body, description: "WPA mode: auto, wpa1, wpa2" }
+        wpa3_support: { type: boolean, in: body, description: "Enable WPA3 (SAE). Requires pmf_mode optional or required." }
+        wpa3_transition: { type: boolean, in: body, description: "WPA2/WPA3 transition mode, so WPA2-only clients can still join" }
+        pmf_mode: { type: string, in: body, description: "Protected Management Frames: disabled, optional, required" }
+        bss_transition: { type: boolean, in: body, description: "802.11v BSS transition management (lets the AP steer clients to a better AP)" }
+        fast_roaming_enabled: { type: boolean, in: body, description: "802.11r fast roaming" }
+        wlan_bands: { type: array, in: body, description: "Bands the SSID is broadcast on, complete list of 2g, 5g, 6g, e.g. [\"2g\", \"5g\"]" }
+        wlan_band: { type: string, in: body, description: "Legacy single band field: 2g, 5g, both. Current controllers use wlan_bands; keep both consistent." }
+        ap_group_mode: { type: string, in: body, description: "Which APs broadcast the SSID: all, groups (the AP groups in ap_group_ids), devices" }
+        ap_group_ids: { type: array, in: body, description: "Complete list of AP group _id values (list_ap_groups)" }
+        minrate_setting_preference: { type: string, in: body, description: "auto or manual. The minrate_* values below apply only with manual." }
+        minrate_ng_enabled: { type: boolean, in: body, description: "Enforce a minimum data rate on 2.4 GHz" }
+        minrate_ng_data_rate_kbps: { type: integer, in: body, description: "2.4 GHz minimum data rate in kbps, e.g. 1000, 6000, 12000" }
+        minrate_ng_advertising_rates: { type: boolean, in: body, description: "Also apply the 2.4 GHz minimum to the advertised (beacon) rates" }
+        minrate_na_enabled: { type: boolean, in: body, description: "Enforce a minimum data rate on 5 GHz" }
+        minrate_na_data_rate_kbps: { type: integer, in: body, description: "5 GHz minimum data rate in kbps, e.g. 6000, 9000, 12000" }
+        minrate_na_advertising_rates: { type: boolean, in: body, description: "Also apply the 5 GHz minimum to the advertised (beacon) rates" }
+      pagination: none
+
+    delete_wlan:
+      method: DELETE
+      path: /api/s/{site}/rest/wlanconf/{_id}
+      access: dangerous
+      description: "Delete a WLAN. All clients on this SSID will be disconnected."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_wlan_groups:
+      method: GET
+      path: /api/s/{site}/list/wlangroup
+      access: read
+      description: "List WLAN groups (radio profiles)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    list_ap_groups:
+      method: GET
+      path: /v2/api/site/{site}/apgroups
+      access: read
+      description: >
+        List AP groups (v2 API): each entry has _id, name and device_macs (the member APs).
+        A WLAN with ap_group_mode groups is broadcast only by the APs in the groups listed in its
+        ap_group_ids (see update_wlan). Returns a bare array.
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    # =========================================================================
+    # FIREWALL -- Rules & Groups
+    # =========================================================================
+
+    list_firewall_rules:
+      method: GET
+      path: /api/s/{site}/rest/firewallrule
+      access: read
+      description: "List all user-defined firewall rules"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_firewall_rule:
+      method: POST
+      path: /api/s/{site}/rest/firewallrule
+      access: write
+      description: "Create a new firewall rule"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        enabled: { type: boolean, in: body, default: true }
+        ruleset: { type: string, in: body, required: true, description: "Ruleset: WAN_IN, WAN_OUT, WAN_LOCAL, LAN_IN, LAN_OUT, LAN_LOCAL, GUEST_IN, GUEST_OUT, GUEST_LOCAL" }
+        rule_index: { type: integer, in: body, required: true, description: "Rule priority order" }
+        action: { type: string, in: body, required: true, description: "Action: accept, drop, reject" }
+        protocol: { type: string, in: body, default: "all", description: "Protocol: all, tcp, udp, tcp_udp, icmp" }
+        src_firewallgroup_ids: { type: array, in: body }
+        dst_firewallgroup_ids: { type: array, in: body }
+        dst_address: { type: string, in: body }
+        src_address: { type: string, in: body }
+        dst_port: { type: string, in: body }
+      pagination: none
+
+    update_firewall_rule:
+      method: PUT
+      path: /api/s/{site}/rest/firewallrule/{_id}
+      access: write
+      description: "Update a firewall rule"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        enabled: { type: boolean, in: body }
+        action: { type: string, in: body }
+        rule_index: { type: integer, in: body }
+      pagination: none
+
+    delete_firewall_rule:
+      method: DELETE
+      path: /api/s/{site}/rest/firewallrule/{_id}
+      access: dangerous
+      description: "Delete a firewall rule"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_firewall_groups:
+      method: GET
+      path: /api/s/{site}/rest/firewallgroup
+      access: read
+      description: "List firewall groups (address groups, port groups)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_firewall_group:
+      method: POST
+      path: /api/s/{site}/rest/firewallgroup
+      access: write
+      description: "Create a firewall group (address-group, port-group, ipv6-address-group)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        group_type: { type: string, in: body, required: true, description: "Type: address-group, port-group, ipv6-address-group" }
+        group_members: { type: array, in: body, required: true, description: "Array of IPs, CIDRs, or port numbers" }
+      pagination: none
+
+    update_firewall_group:
+      method: PUT
+      path: /api/s/{site}/rest/firewallgroup/{_id}
+      access: write
+      description: "Update firewall group members"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        group_members: { type: array, in: body }
+      pagination: none
+
+    delete_firewall_group:
+      method: DELETE
+      path: /api/s/{site}/rest/firewallgroup/{_id}
+      access: dangerous
+      description: "Delete a firewall group"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # PORT FORWARDING
+    # =========================================================================
+
+    list_port_forwards:
+      method: GET
+      path: /api/s/{site}/list/portforward
+      access: read
+      description: "List all port forwarding rules"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_port_forward:
+      method: POST
+      path: /api/s/{site}/rest/portforward
+      access: write
+      description: "Create a port forwarding rule"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        enabled: { type: boolean, in: body, default: true }
+        proto: { type: string, in: body, required: true, description: "Protocol: tcp, udp, tcp_udp" }
+        src: { type: string, in: body, description: "Source restriction: any or IP/CIDR" }
+        dst_port: { type: string, in: body, required: true, description: "External port or range (e.g. 8080 or 8080-8090)" }
+        fwd: { type: string, in: body, required: true, description: "Internal destination IP" }
+        fwd_port: { type: string, in: body, required: true, description: "Internal destination port" }
+      pagination: none
+
+    update_port_forward:
+      method: PUT
+      path: /api/s/{site}/rest/portforward/{_id}
+      access: write
+      description: "Update a port forwarding rule (enable/disable, change ports)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        enabled: { type: boolean, in: body }
+        dst_port: { type: string, in: body }
+        fwd: { type: string, in: body }
+        fwd_port: { type: string, in: body }
+      pagination: none
+
+    delete_port_forward:
+      method: DELETE
+      path: /api/s/{site}/rest/portforward/{_id}
+      access: dangerous
+      description: "Delete a port forwarding rule"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ROUTING -- Static Routes
+    # =========================================================================
+
+    list_routes:
+      method: GET
+      path: /api/s/{site}/rest/routing
+      access: read
+      description: "List user-defined static routes"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    get_active_routes:
+      method: GET
+      path: /api/s/{site}/stat/routing
+      access: read
+      description: "Get active routing table from gateway device"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_route:
+      method: POST
+      path: /api/s/{site}/rest/routing
+      access: write
+      description: "Create a static route"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        enabled: { type: boolean, in: body, default: true }
+        type: { type: string, in: body, required: true, description: "Route type: nexthop-route, interface-route, blackhole" }
+        network: { type: string, in: body, required: true, description: "Destination CIDR, e.g. 198.51.100.0/24" }
+        gateway: { type: string, in: body, description: "Next hop IP (for nexthop-route)" }
+        interface: { type: string, in: body, description: "Interface name (for interface-route)" }
+      pagination: none
+
+    update_route:
+      method: PUT
+      path: /api/s/{site}/rest/routing/{_id}
+      access: write
+      description: "Update a static route"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        enabled: { type: boolean, in: body }
+        network: { type: string, in: body }
+        gateway: { type: string, in: body }
+      pagination: none
+
+    delete_route:
+      method: DELETE
+      path: /api/s/{site}/rest/routing/{_id}
+      access: dangerous
+      description: "Delete a static route"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # DPI / TRAFFIC STATS
+    # =========================================================================
+
+    get_dpi_stats:
+      method: GET
+      path: /api/s/{site}/stat/dpi
+      access: read
+      description: "Get site-wide Deep Packet Inspection stats"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    get_site_dpi:
+      method: POST
+      path: /api/s/{site}/stat/sitedpi
+      access: read
+      description: "Get filtered site DPI stats by application or category"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        type: { type: string, in: body, required: true, description: "Breakdown: by_app or by_cat" }
+
+    get_client_dpi:
+      method: POST
+      path: /api/s/{site}/stat/stadpi
+      access: read
+      description: "Get per-client DPI stats. Filter by MAC addresses."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        macs: { type: array, in: body, description: "Array of client MACs to filter" }
+        type: { type: string, in: body, default: "by_app", description: "Breakdown: by_app or by_cat" }
+
+    stat_report_site:
+      method: POST
+      path: /api/s/{site}/stat/report/{interval}.site
+      access: read
+      description: "Get site-level traffic report for a time interval"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        interval: { type: string, in: path, required: true, description: "Interval: 5minutes, hourly, daily, monthly" }
+        attrs: { type: array, in: body, required: true, description: "Attributes: bytes, rx_bytes, tx_bytes, num_sta, wan-tx_bytes, wan-rx_bytes" }
+        start: { type: integer, in: body, description: "Start timestamp (Unix ms)" }
+        end: { type: integer, in: body, description: "End timestamp (Unix ms)" }
+
+    stat_report_device:
+      method: POST
+      path: /api/s/{site}/stat/report/{interval}.ap
+      access: read
+      description: "Get per-AP traffic report for a time interval"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        interval: { type: string, in: path, required: true, description: "Interval: 5minutes, hourly, daily, monthly" }
+        attrs: { type: array, in: body, required: true }
+        start: { type: integer, in: body }
+        end: { type: integer, in: body }
+
+    stat_report_user:
+      method: POST
+      path: /api/s/{site}/stat/report/{interval}.user
+      access: read
+      description: "Get per-user traffic report for a time interval"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        interval: { type: string, in: path, required: true, description: "Interval: 5minutes, hourly, daily, monthly" }
+        attrs: { type: array, in: body, required: true }
+        start: { type: integer, in: body }
+        end: { type: integer, in: body }
+
+    stat_report_gateway:
+      method: POST
+      path: /api/s/{site}/stat/report/{interval}.gw
+      access: read
+      description: "Get gateway/WAN traffic report for a time interval"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        interval: { type: string, in: path, required: true, description: "Interval: 5minutes, hourly, daily, monthly" }
+        attrs: { type: array, in: body, required: true }
+        start: { type: integer, in: body }
+        end: { type: integer, in: body }
+
+    clear_dpi:
+      method: POST
+      path: /api/s/{site}/cmd/stat
+      access: admin
+      description: "Clear/reset DPI counters"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "clear-dpi" }
+      pagination: none
+
+    # =========================================================================
+    # EVENTS & ALARMS -- v2 system log (Network 10.x) and legacy endpoints
+    # =========================================================================
+
+    list_system_log:
+      method: POST
+      path: /v2/api/site/{site}/system-log/{class}
+      access: read
+      description: >
+        Read the controller's system log (v2 API), where Network 10.x keeps the event history:
+        client connects, disconnects and roams, device alerts and state changes, WAN and update
+        events, admin activity, threat alerts. Replaces list_events and list_alarms, which
+        Network 10.6 no longer serves. The POST is a query and changes nothing.
+        timestampFrom and timestampTo are Unix epoch MILLISECONDS and are required, for the last
+        24 hours e.g. timestampFrom: Date.now() - 86400000, timestampTo: Date.now(). Results are
+        paged and newest first: pageNumber starts at 0, pageSize sets the entries per page.
+        Returns the raw page object {data: [...], page_number, total_element_count,
+        total_page_count}. Entries carry key (e.g. a client-connected key), category, severity,
+        timestamp (ms), a message template (message_raw, e.g. "{CLIENT} connected to {WLAN}") and
+        parameters with the referenced CLIENT, DEVICE, WLAN etc. Class all returns every entry
+        and can be narrowed with categories; the UniFi UI sends class-specific filter arrays
+        for the other classes (see the params).
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        class:
+          type: string
+          in: path
+          required: true
+          description: >
+            Log class: all (everything, narrow with categories), device-alert, client-alert
+            (with clientType and guestAuthorizationMethod), admin-activity (with activity_keys and
+            change_keys), update-alert (with systemLogDeviceTypes), threat-alert (with
+            threatTypes), critical, vpn-alert, next-ai-alert (with nextAiCategory), triggers
+            (older controllers, with triggerTypes)
+        timestampFrom: { type: integer, in: body, required: true, description: "Start of the window, Unix epoch milliseconds" }
+        timestampTo: { type: integer, in: body, required: true, description: "End of the window, Unix epoch milliseconds" }
+        pageNumber: { type: integer, in: body, default: 0, description: "Page to return, starting at 0" }
+        pageSize: { type: integer, in: body, default: 100, description: "Entries per page" }
+        categories: { type: array, in: body, description: "Class all: categories to include, e.g. [\"CLIENT_DEVICES\"], [\"INTERNET_AND_WAN\"], [\"AUDIT\"], [\"SOFTWARE_UPDATES\"], [\"SECURITY\"]" }
+        severities: { type: array, in: body, description: "Severities to include: LOW, MEDIUM, HIGH, VERY_HIGH" }
+        clientType: { type: array, in: body, description: "Class client-alert: GUEST, TELEPORT, VPN, WIRELESS, RADIUS, WIRED" }
+        guestAuthorizationMethod: { type: array, in: body, description: "Class client-alert: FACEBOOK_SOCIAL_GATEWAY, FREE_TRIAL, GOOGLE_SOCIAL_GATEWAY, NONE, PASSWORD, PAYMENT, RADIUS, VOUCHER" }
+        activity_keys: { type: array, in: body, description: "Class admin-activity: ACCESSED_NETWORK_WEB, ACCESSED_NETWORK_IOS, ACCESSED_NETWORK_ANDROID" }
+        change_keys: { type: array, in: body, description: "Class admin-activity: CLIENT, DEVICE, HOTSPOT, INTERNET, NETWORK, PROFILE, ROUTING, SECURITY, SYSTEM, VPN, WIFI" }
+        systemLogDeviceTypes: { type: array, in: body, description: "Class update-alert: GATEWAYS, SWITCHES, ACCESS_POINT, SMART_POWER, BUILDING_TO_BUILDING_BRIDGES, UNIFI_LTE" }
+        threatTypes: { type: array, in: body, description: "Class threat-alert: HONEYPOT, THREAT" }
+        triggerTypes: { type: array, in: body, description: "Class triggers: TRAFFIC_RULE, TRAFFIC_ROUTE, FIREWALL_RULE" }
+        nextAiCategory: { type: array, in: body, description: "Class next-ai-alert: CLIENT, DEVICE, INTERNET, VPN" }
+      response:
+        result_path: "$"
+      pagination: none
+
+    list_events:
+      method: GET
+      path: /api/s/{site}/stat/event
+      access: read
+      deprecated: "legacy stat/event endpoint; Network 10.6 answers HTTP 404 api.err.NotFound"
+      replaced_by: list_system_log
+      description: "Legacy: list events from stat/event (newest first, max 3000) on older controllers. Network 10.6 answers HTTP 404; use list_system_log there. Use _limit and _start for paging."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _limit: { type: integer, in: query, description: "Max results (hard cap 3000)" }
+        _start: { type: integer, in: query, description: "Offset for pagination" }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, key, msg, time, datetime, subsystem, ap: .ap, ap_name, client: .client, hostname, ssid, channel, duration}]
+        max_items: 100
+        allow_jq_override: true
+
+    list_alarms:
+      method: GET
+      path: /api/s/{site}/stat/alarm
+      access: read
+      deprecated: "legacy stat/alarm endpoint; Network 10.6 answers HTTP 404 api.err.NotFound"
+      replaced_by: list_system_log
+      description: "Legacy: list alarms from stat/alarm (newest first, max 3000) on older controllers. Network 10.6 answers HTTP 404; use list_system_log (class device-alert or critical) there."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, key, msg, time, datetime, subsystem, ap: .ap, ap_name, archived, handled_admin_id}]
+        max_items: 100
+        allow_jq_override: true
+
+    list_alarms_unarchived:
+      method: GET
+      path: /api/s/{site}/rest/alarm
+      access: read
+      deprecated: "legacy rest/alarm endpoint; Network 10.6 answers HTTP 400 api.err.InvalidObject"
+      replaced_by: list_system_log
+      description: "Legacy: list unarchived alarms from rest/alarm (oldest first) on older controllers. Network 10.6 answers HTTP 400 api.err.InvalidObject; use list_system_log there."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        archived: { type: boolean, in: query, default: false }
+      response:
+        result_path: "$.data"
+        transform: |
+          [.[] | {_id, key, msg, time, datetime, subsystem, ap: .ap, ap_name, archived}]
+        allow_jq_override: true
+
+    archive_all_alarms:
+      method: POST
+      path: /api/s/{site}/cmd/evtmgt
+      access: write
+      description: "Archive all active alarms of the legacy alarm store (older controllers, where list_alarms works). Untested on Network 10.6, which no longer serves the alarm list."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "archive-all-alarms" }
+      pagination: none
+
+    # =========================================================================
+    # BACKUPS
+    # =========================================================================
+
+    create_backup:
+      method: POST
+      path: /api/s/{site}/cmd/backup
+      access: admin
+      description: "Generate a controller backup"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "backup" }
+      pagination: none
+
+    list_backups:
+      method: POST
+      path: /api/s/{site}/cmd/backup
+      access: read
+      description: "List available auto-backups"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "list-backups" }
+      pagination: none
+
+    delete_backup:
+      method: POST
+      path: /api/s/{site}/cmd/backup
+      access: dangerous
+      description: "Delete a backup file by filename"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "delete-backup" }
+        filename: { type: string, in: body, required: true, description: "Backup filename to delete" }
+      pagination: none
+
+    # =========================================================================
+    # GUEST / HOTSPOT / VOUCHERS
+    # =========================================================================
+
+    authorize_guest:
+      method: POST
+      path: /api/s/{site}/cmd/stamgr
+      access: write
+      description: "Authorize a guest client for network access"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "authorize-guest" }
+        mac: { type: string, in: body, required: true, description: "Guest MAC address" }
+        minutes: { type: integer, in: body, required: true, description: "Authorization duration in minutes" }
+        up: { type: integer, in: body, description: "Upload speed limit in kbps" }
+        down: { type: integer, in: body, description: "Download speed limit in kbps" }
+        bytes: { type: integer, in: body, description: "Data transfer limit in MB" }
+        ap_mac: { type: string, in: body, description: "AP MAC to restrict authorization to" }
+      pagination: none
+
+    unauthorize_guest:
+      method: POST
+      path: /api/s/{site}/cmd/stamgr
+      access: write
+      description: "Revoke guest authorization"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "unauthorize-guest" }
+        mac: { type: string, in: body, required: true }
+      pagination: none
+
+    create_voucher:
+      method: POST
+      path: /api/s/{site}/cmd/hotspot
+      access: write
+      description: "Create hotspot voucher(s) for guest access"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "create-voucher" }
+        n: { type: integer, in: body, required: true, description: "Number of vouchers to create" }
+        expire: { type: integer, in: body, required: true, description: "Voucher validity in minutes" }
+        quota: { type: integer, in: body, default: 0, description: "Max uses per voucher (0=unlimited)" }
+        note: { type: string, in: body, description: "Voucher note/label" }
+        up: { type: integer, in: body, description: "Upload limit in kbps" }
+        down: { type: integer, in: body, description: "Download limit in kbps" }
+        bytes: { type: integer, in: body, description: "Data limit in MB" }
+      pagination: none
+
+    revoke_voucher:
+      method: POST
+      path: /api/s/{site}/cmd/hotspot
+      access: write
+      description: "Revoke a voucher by its _id"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        cmd: { type: string, in: body, required: true, default: "revoke-voucher" }
+        _id: { type: string, in: body, required: true, description: "Voucher _id" }
+      pagination: none
+
+    list_vouchers:
+      method: POST
+      path: /api/s/{site}/stat/voucher
+      access: read
+      description: "List all vouchers. Optionally filter by creation timestamp."
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        create_time: { type: integer, in: body, description: "Filter by creation Unix timestamp" }
+
+    list_payments:
+      method: GET
+      path: /api/s/{site}/stat/payment
+      access: read
+      description: "List hotspot payment history"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        within: { type: integer, in: query, description: "Hours to look back" }
+
+    list_sessions:
+      method: POST
+      path: /api/s/{site}/stat/session
+      access: read
+      description: "List client sessions with time range and optional MAC filter"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        type: { type: string, in: body, default: "all" }
+        start: { type: integer, in: body, description: "Start Unix timestamp (ms)" }
+        end: { type: integer, in: body, description: "End Unix timestamp (ms)" }
+        mac: { type: string, in: body, description: "Filter by client MAC" }
+
+    # =========================================================================
+    # USER GROUPS -- Bandwidth Profiles
+    # =========================================================================
+
+    list_user_groups:
+      method: GET
+      path: /api/s/{site}/list/usergroup
+      access: read
+      description: "List user groups (bandwidth profiles)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_user_group:
+      method: POST
+      path: /api/s/{site}/rest/usergroup
+      access: write
+      description: "Create a user group with bandwidth limits"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        qos_rate_max_down: { type: integer, in: body, description: "Max download rate in kbps (-1 = unlimited)" }
+        qos_rate_max_up: { type: integer, in: body, description: "Max upload rate in kbps (-1 = unlimited)" }
+      pagination: none
+
+    update_user_group:
+      method: PUT
+      path: /api/s/{site}/rest/usergroup/{_id}
+      access: write
+      description: "Update user group bandwidth limits"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        qos_rate_max_down: { type: integer, in: body }
+        qos_rate_max_up: { type: integer, in: body }
+      pagination: none
+
+    delete_user_group:
+      method: DELETE
+      path: /api/s/{site}/rest/usergroup/{_id}
+      access: dangerous
+      description: "Delete a user group"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SETTINGS
+    # =========================================================================
+
+    get_settings:
+      method: GET
+      path: /api/s/{site}/get/setting
+      access: read
+      description: "Get all site settings (country, locale, mgmt, guest_access, etc.)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    update_setting:
+      method: PUT
+      path: /api/s/{site}/rest/setting/{key}/{_id}
+      access: admin
+      description: "Update a specific site setting by key (country, locale, snmp, mgmt, guest_access, ntp, connectivity)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        key: { type: string, in: path, required: true, description: "Setting key: country, locale, snmp, mgmt, guest_access, ntp, connectivity" }
+        _id: { type: string, in: path, required: true, description: "Setting _id" }
+      pagination: none
+
+    set_led:
+      method: POST
+      path: /api/s/{site}/set/setting/mgmt
+      access: write
+      description: "Toggle site-wide device LED on/off"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        led_enabled: { type: boolean, in: body, required: true }
+      pagination: none
+
+    # =========================================================================
+    # RADIUS
+    # =========================================================================
+
+    list_radius_profiles:
+      method: GET
+      path: /api/s/{site}/rest/radiusprofile
+      access: read
+      description: "List RADIUS profiles"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_radius_profile:
+      method: POST
+      path: /api/s/{site}/rest/radiusprofile
+      access: write
+      description: "Create a RADIUS profile"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        auth_servers: { type: array, in: body, description: "Array of auth server objects" }
+        acct_servers: { type: array, in: body, description: "Array of accounting server objects" }
+      pagination: none
+
+    list_radius_accounts:
+      method: GET
+      path: /api/s/{site}/rest/account
+      access: read
+      description: "List RADIUS user accounts"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_radius_account:
+      method: POST
+      path: /api/s/{site}/rest/account
+      access: write
+      description: "Create a RADIUS user account"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true, description: "RADIUS username" }
+        x_password: { type: string, in: body, required: true, description: "RADIUS password" }
+        tunnel_type: { type: integer, in: body }
+        tunnel_medium_type: { type: integer, in: body }
+        vlan: { type: string, in: body, description: "VLAN to assign" }
+      pagination: none
+
+    # =========================================================================
+    # TAGS -- MAC Grouping
+    # =========================================================================
+
+    list_tags:
+      method: GET
+      path: /api/s/{site}/rest/tag
+      access: read
+      description: "List all tags (MAC address groups)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    create_tag:
+      method: POST
+      path: /api/s/{site}/rest/tag
+      access: write
+      description: "Create a tag to group MAC addresses"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        name: { type: string, in: body, required: true }
+        member_table: { type: array, in: body, required: true, description: "Array of MAC addresses" }
+      pagination: none
+
+    update_tag:
+      method: PUT
+      path: /api/s/{site}/rest/tag/{_id}
+      access: write
+      description: "Update tag members"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+        name: { type: string, in: body }
+        member_table: { type: array, in: body }
+      pagination: none
+
+    delete_tag:
+      method: DELETE
+      path: /api/s/{site}/rest/tag/{_id}
+      access: write
+      description: "Delete a tag"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # ROGUE AP DETECTION
+    # =========================================================================
+
+    list_rogue_aps:
+      method: POST
+      path: /api/s/{site}/stat/rogueap
+      access: read
+      description: "List neighboring/rogue APs detected within a time range"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        within: { type: integer, in: body, default: 24, description: "Hours to look back" }
+
+    list_known_rogues:
+      method: GET
+      path: /api/s/{site}/rest/rogueknown
+      access: read
+      description: "List known/acknowledged rogue APs"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    # =========================================================================
+    # DYNAMIC DNS
+    # =========================================================================
+
+    get_ddns_status:
+      method: GET
+      path: /api/s/{site}/stat/dynamicdns
+      access: read
+      description: "Get Dynamic DNS status (current IP, last change)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    get_ddns_config:
+      method: GET
+      path: /api/s/{site}/rest/dynamicdns
+      access: read
+      description: "Get Dynamic DNS configuration"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    update_ddns_config:
+      method: PUT
+      path: /api/s/{site}/rest/dynamicdns/{_id}
+      access: write
+      description: "Update Dynamic DNS configuration"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+        _id: { type: string, in: path, required: true }
+      pagination: none
+
+    # =========================================================================
+    # SWITCH PORT PROFILES
+    # =========================================================================
+
+    list_port_profiles:
+      method: GET
+      path: /api/s/{site}/rest/portconf
+      access: read
+      description: "List switch port profiles (native VLAN, tagged VLANs, PoE mode)"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    # =========================================================================
+    # MISCELLANEOUS
+    # =========================================================================
+
+    get_country_codes:
+      method: GET
+      path: /api/s/{site}/stat/ccode
+      access: read
+      description: "List available country codes"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    get_wifi_channels:
+      method: GET
+      path: /api/s/{site}/stat/current-channel
+      access: read
+      description: "List available WiFi channels for the site's country setting"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+    get_sdn_status:
+      method: GET
+      path: /api/s/{site}/stat/sdn
+      access: read
+      description: "Get UniFi SDN/Cloud connection status"
+      params:
+        site: { type: string, in: path, required: true, default: "default" }
+
+  composites:
+
+    update_device:
+      description: >
+        Update a device (AP, switch, gateway): name, led_override, disabled, and per-radio
+        settings of an access point. Pass only what should change. For radio_table pass one
+        entry per radio you want to change, keyed by radio (ng = 2.4 GHz, na = 5 GHz,
+        6e = 6 GHz), with only the fields to change, e.g.
+        [{radio: "ng", channel: 11, ht: 20}, {radio: "na", min_rssi_enabled: true, min_rssi: -80}].
+        The controller replaces the whole radio_table on every write, so the composite reads the
+        device (get_device), merges the changes into the current entries and sends the complete
+        array; other radios and fields keep their values. Settable radio fields: channel
+        ("auto" or a channel number), ht (20, 40, 80, 160, 240, 320), tx_power_mode (auto, high,
+        medium, low, custom, disabled; disabled switches the radio off), tx_power (dBm, with
+        custom), min_rssi_enabled, min_rssi (-90 to -67 dBm), sens_level_enabled, sens_level
+        (-90 to -50), antenna_gain, antenna_id, vwire_enabled, hard_noise_floor_enabled,
+        loadbalance_enabled, maxsta, dfs. Unknown fields are rejected before anything is sent.
+        If nothing differs from the current state, no write happens. dry_run true returns the
+        PUT body without writing. Every write re-provisions the device: its clients drop for a
+        few seconds. Returns {_id, written, changed, radio_table (settings after the merge),
+        result} or, with dry_run, {_id, written: false, dry_run: true, changed, body}.
+      access: write
+      params:
+        site:
+          type: string
+          default: "default"
+          description: "Site name (name from list_sites)"
+        _id:
+          type: string
+          required: true
+          description: "Device _id (24-char), from list_devices"
+        mac:
+          type: string
+          description: "Device MAC. Optional: saves a lookup when radio_table is passed."
+        name:
+          type: string
+          description: "New device name"
+        led_override:
+          type: string
+          description: "LED mode: default, on, off"
+        disabled:
+          type: boolean
+          description: "Disable (true) or enable (false) the device"
+        radio_table:
+          type: array
+          description: "Changes per radio: [{radio: \"ng\"|\"na\"|\"6e\", <field>: <value>, ...}]"
+        dry_run:
+          type: boolean
+          default: false
+          description: "Return the PUT body without writing"
+      timeout: 30s
+      depends_on: [list_devices, get_device, _update_device_raw]
+      code: |
+        const site = params.site || "default";
+        const id = params._id;
+        const KEEP = ["name", "radio", "radio_identifiers", "channel", "ht", "tx_power_mode",
+          "tx_power", "min_rssi_enabled", "min_rssi", "sens_level_enabled", "sens_level",
+          "antenna_gain", "antenna_id", "vwire_enabled", "hard_noise_floor_enabled",
+          "loadbalance_enabled", "maxsta", "dfs"];
+        const SETTABLE = KEEP.filter(k => k !== "name" && k !== "radio" && k !== "radio_identifiers");
+        const MODES = ["auto", "high", "medium", "low", "custom", "disabled"];
+        const WIDTHS = [20, 40, 80, 160, 240, 320];
+        const isNum = v => typeof v === "number" && isFinite(v);
+        const same = (a, b) => (a === undefined || a === null)
+          ? (b === undefined || b === null)
+          : (b !== undefined && b !== null && String(a) === String(b));
+        const check = (k, v) => {
+          if (k === "channel" && !(v === "auto" || isNum(v))) { return "channel must be \"auto\" or a channel number"; }
+          if (k === "ht" && WIDTHS.indexOf(Number(v)) < 0) { return "ht must be one of " + WIDTHS.join(", "); }
+          if (k === "tx_power_mode" && MODES.indexOf(v) < 0) { return "tx_power_mode must be one of " + MODES.join(", "); }
+          if (k === "tx_power" && !(v === "auto" || isNum(v))) { return "tx_power must be a number (dBm) or \"auto\""; }
+          if (k === "min_rssi" && !(isNum(v) && v >= -90 && v <= -67)) { return "min_rssi must be a number from -90 to -67 (dBm)"; }
+          if (k === "sens_level" && !(isNum(v) && v >= -90 && v <= -50)) { return "sens_level must be a number from -90 to -50"; }
+          if (/_enabled$/.test(k) && typeof v !== "boolean") { return k + " must be true or false"; }
+          return null;
+        };
+
+        const body = { site: site, _id: id };
+        const changed = [];
+        for (const k of ["name", "led_override", "disabled"]) {
+          if (params[k] !== undefined && params[k] !== null) { body[k] = params[k]; changed.push(k); }
+        }
+
+        let radios = null;
+        if (params.radio_table !== undefined && params.radio_table !== null) {
+          if (!Array.isArray(params.radio_table) || params.radio_table.length === 0) {
+            throw new Error("radio_table must be a non-empty array of changes per radio, e.g. [{radio: \"na\", channel: 36}]");
+          }
+          let mac = params.mac;
+          if (!mac) {
+            const all = await api.list_devices({ site: site });
+            const hit = (all || []).filter(d => d._id === id)[0];
+            if (!hit) { throw new Error("no device with _id " + id + " in site " + site); }
+            mac = hit.mac;
+          }
+          const found = await api.get_device({ site: site, mac: mac });
+          const dev = (found || [])[0];
+          if (!dev || dev._id !== id) { throw new Error("device " + mac + " does not have _id " + id); }
+          if (!Array.isArray(dev.radio_table) || dev.radio_table.length === 0) {
+            throw new Error("device " + mac + " has no radio_table (not an access point?)");
+          }
+          radios = dev.radio_table.map(r => {
+            const out = {};
+            for (const k of KEEP) { if (r[k] !== undefined) { out[k] = r[k]; } }
+            return out;
+          });
+          let radioChanged = false;
+          for (const ch of params.radio_table) {
+            if (!ch || typeof ch.radio !== "string") {
+              throw new Error("every radio_table entry needs radio: ng (2.4 GHz), na (5 GHz) or 6e (6 GHz)");
+            }
+            const target = radios.filter(r => r.radio === ch.radio)[0];
+            if (!target) {
+              throw new Error("device has no radio " + ch.radio + "; it has " + radios.map(r => r.radio).join(", "));
+            }
+            for (const k of Object.keys(ch)) {
+              if (k === "radio") { continue; }
+              if (SETTABLE.indexOf(k) < 0) {
+                throw new Error("radio field " + k + " cannot be set; settable: " + SETTABLE.join(", "));
+              }
+              const problem = check(k, ch[k]);
+              if (problem) { throw new Error(problem); }
+              if (!same(target[k], ch[k])) {
+                target[k] = ch[k];
+                changed.push("radio_table." + ch.radio + "." + k);
+                radioChanged = true;
+              }
+            }
+          }
+          if (radioChanged) { body.radio_table = radios; }
+        }
+
+        const summary = radios === null ? undefined : radios.map(r => ({
+          radio: r.radio, name: r.name, channel: r.channel, ht: r.ht, tx_power_mode: r.tx_power_mode,
+          tx_power: r.tx_power, min_rssi_enabled: r.min_rssi_enabled, min_rssi: r.min_rssi
+        }));
+        if (changed.length === 0) {
+          return { _id: id, written: false, changed: changed, radio_table: summary };
+        }
+        if (params.dry_run === true) {
+          return { _id: id, written: false, dry_run: true, changed: changed, body: body };
+        }
+        const result = await api._update_device_raw(body);
+        return { _id: id, written: true, changed: changed, radio_table: summary, result: result };
+
+  examples:
+    - name: "Site health check"
+      description: "Get site health and list all connected clients"
+      code: |
+        const health = await api.get_health({ site: "default" });
+        const clients = await api.list_active_clients({ site: "default" });
+        return { health, client_count: clients.length, clients };
+
+    - name: "Block a client"
+      description: "Block a client by MAC address across all APs"
+      code: |
+        await api.client_command({
+          site: "default",
+          cmd: "block-sta",
+          mac: "00:00:5e:00:53:01"
+        });
+
+    - name: "Client events of the last 24 hours"
+      description: "Read connect, disconnect and roaming entries from the v2 system log (Network 10.x)"
+      code: |
+        const now = Date.now();
+        const page = await api.list_system_log({
+          site: "default",
+          class: "all",
+          categories: ["CLIENT_DEVICES"],
+          timestampFrom: now - 86400000,
+          timestampTo: now,
+          pageNumber: 0,
+          pageSize: 200
+        });
+        return {
+          total: page.total_element_count,
+          events: page.data.map(e => ({ time: new Date(e.timestamp).toISOString(), key: e.key, message: e.message_raw }))
+        };
+
+    - name: "Set the 2.4 GHz channel of an AP"
+      description: "Preview, then write a radio change; the other radio keeps its settings"
+      code: |
+        const ap = (await api.list_devices({ site: "default", macs: ["00:00:5e:00:53:01"] }))[0];
+        const change = { site: "default", _id: ap._id, mac: ap.mac, radio_table: [{ radio: "ng", channel: 11, ht: 20 }] };
+        const preview = await api.update_device(Object.assign({ dry_run: true }, change));
+        if (preview.changed.length === 0) { return preview; }
+        return await api.update_device(change);
+
+    - name: "Create guest vouchers"
+      description: "Create 10 single-use vouchers valid for 24 hours with 10 Mbps download limit"
+      code: |
+        const result = await api.create_voucher({
+          site: "default",
+          cmd: "create-voucher",
+          n: 10,
+          expire: 1440,
+          quota: 1,
+          down: 10000,
+          note: "Event guests"
+        });
+        const vouchers = await api.list_vouchers({ site: "default" });
+        return vouchers;
+
+    - name: "Daily traffic report"
+      description: "Get yesterday's traffic stats for the site"
+      code: |
+        const now = Date.now();
+        const yesterday = now - 86400000;
+        const report = await api.stat_report_site({
+          site: "default",
+          interval: "daily",
+          attrs: ["bytes", "rx_bytes", "tx_bytes", "num_sta"],
+          start: yesterday,
+          end: now
+        });
+        return report;
