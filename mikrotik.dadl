@@ -372,7 +372,7 @@ backend:
       target_values: "memory | disk | echo | remote | email. Cannot create another 'remote' or 'email' — the 5 defaults are reserved names; new actions must use distinct names (e.g. 'graylog', 'siem-tcp')."
       remote_protocol_default: "remote-protocol defaults to 'udp'. Most syslog daemons (rsyslog, FluentD, syslog-ng) listen on UDP/514 by default. TCP/514 requires the receiver to be explicitly configured for TCP — confirm before using."
       remote_format_choice: "remote-log-format is empirically constrained to {default, cef} on RouterOS 7.22.3 -- 'bsd-syslog'/'iso8601'/'local7' return HTTP 400. To send proper RFC 3164 (with PRI header so severity routes correctly downstream), set BOTH remote-log-format='default' AND bsd-syslog='yes'. Without bsd-syslog='yes', the default format has no PRI header and syslog daemons cannot infer severity (everything ends up at level=1/alert in Graylog)."
-      remote_example: "Sane Graylog/FluentD setup (UDP/514, RFC 3164 with ISO timestamps): {name:'syslog', target:'remote', remote:'192.168.100.15', remote-port:'514', remote-protocol:'udp', remote-log-format:'default', bsd-syslog:'yes', syslog-time-format:'iso8601'}. CEF over TCP only if receiver explicitly parses CEF for this source IP."
+      remote_example: "Sane Graylog/FluentD setup (UDP/514, RFC 3164 with ISO timestamps): {name:'syslog', target:'remote', remote:'192.0.2.15', remote-port:'514', remote-protocol:'udp', remote-log-format:'default', bsd-syslog:'yes', syslog-time-format:'iso8601'}. CEF over TCP only if receiver explicitly parses CEF for this source IP."
       state_transition: "RouterOS keeps stale fields when changing format: switching FROM cef leaves cef-event-delimiter set, which then blocks subsequent format changes with HTTP 400. Workaround: set remote-log-format='default' FIRST (clears cef-event-delimiter), then apply other fields in a separate call."
     set_logging_action:
       defaults_repurpose: "Use {numbers:'remote', remote:'10.0.0.5', remote-protocol:'udp'} to re-aim the built-in 'remote' action without creating a new one. Same for 'email' (email-to/email-cc/email-start-tls)."
@@ -3810,7 +3810,7 @@ backend:
       access: admin
       description: >
         Add a logging action (destination). Common pattern for Graylog (CEF
-        over TCP): {name:'graylog', target:'remote', remote:'192.168.100.15',
+        over TCP): {name:'graylog', target:'remote', remote:'192.0.2.15',
         remote-port:'514', remote-protocol:'tcp', remote-log-format:'cef',
         syslog-time-format:'iso8601'}. For a second memory ring buffer:
         {name:'audit', target:'memory', memory-lines:'5000'}.
