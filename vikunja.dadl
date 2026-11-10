@@ -1,14 +1,15 @@
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "Vikunja REST API"
 source_url: "https://vikunja.io/docs/api/"
-date: "2026-10-16"
+date: "2026-11-10"
 
 backend:
   name: vikunja
   type: rest
+  version: "1.1"
   # base_url is intentionally omitted — must be provided via backends.yaml url field,
   # because each deployment has its own Vikunja instance URL.
   description: "Vikunja open-source task management — project planning, kanban boards, and task tracking"
@@ -19,7 +20,7 @@ backend:
     percentage: 39
     focus: "projects, tasks, views, buckets, labels, comments, positions, filters, attachments"
     missing: "teams, users, shares, assignees, reactions, notifications, webhooks, subscriptions, saved filters"
-    last_reviewed: "2026-10-16"
+    last_reviewed: "2026-11-10"
 
   setup:
     credential_steps:
@@ -51,6 +52,15 @@ backend:
     inject_into: header
     header_name: Authorization
     prefix: "Bearer "
+
+  # Reachability + credential check (DADL spec v0.2): GET /user returns the account the
+  # API token belongs to, so a passing check proves both the URL and the token. Vikunja
+  # API tokens can carry an expiry date, but /user does not report it, so there is no
+  # auth_expires_path.
+  health:
+    method: GET
+    path: /user
+    expect_path: $.id
 
   defaults:
     headers:
@@ -117,10 +127,35 @@ backend:
   #
   # Update semantics:
   #   update_task is a composite that does GET → merge → POST.
-  #   Vikunja's raw POST /tasks/{id} resets missing fields to zero,
-  #   so the composite reads the current state first and only overwrites
-  #   fields that were explicitly provided. Safe for partial updates.
+  #   Vikunja's raw POST /tasks/{id} resets every omitted field: start_date, end_date,
+  #   hex_color, percent_done, repeat_after, repeat_mode, is_favorite and the cover image
+  #   fall back to zero, and the task's reminders and assignees are removed (labels are
+  #   kept). The composite therefore reads the task first (get_task returns all of these,
+  #   assignees also as assignee_ids) and sends every field back, changing only the ones
+  #   that were explicitly provided. Safe for partial updates.
   #   update_project works the same way (GET → merge → POST via get_project).
+  #
+  # Repeating tasks:
+  #   repeat_after is the interval in seconds (0 = no repeat, 604800 = weekly).
+  #   repeat_mode 0 adds repeat_after to the task's dates, 1 repeats monthly (repeat_after
+  #   is ignored), 2 counts repeat_after from the moment the task is marked done. Marking a
+  #   repeating task done does not close it: Vikunja moves its dates forward by whole
+  #   intervals until the due date lies in the future and leaves done = false.
+  #
+  # Empty results:
+  #   Vikunja answers an empty list with JSON null, not []. list_tasks, list_project_tasks,
+  #   list_projects, list_labels, list_task_comments and list_task_attachments turn that
+  #   into [], so an empty result is always an empty array.
+  #
+  # Automatic paging (list_tasks, list_projects, list_labels, list_task_comments,
+  # list_task_attachments):
+  #   These tools read pages on their own: page is the FIRST page to read (default 1), and
+  #   the call keeps reading the following pages, up to 20, and returns them as one array.
+  #   Vikunja caps per_page at its maxitemsperpage setting (50 by default). One call thus
+  #   returns at most 20 × per_page items, as a plain array without a truncation marker.
+  #   A result of exactly that size may be cut off: continue with page + 20, or narrow the
+  #   filter. Paging by page 1, 2, 3 … returns heavily overlapping results.
+  #   list_tasks does not return descriptions; read them with get_task.
   #
   # Timestamps & dates:
   #   created, updated, done_at, due_date, start_date, end_date are RFC 3339 strings.
@@ -254,7 +289,7 @@ backend:
       response:
         transform: |
           def rel: (.related_tasks // {}) | map_values([.[]? | {id, title, done, project_id}]);
-          [.[] | if (has("done") | not) then {bucket_id: .id, title: .title, tasks: [.tasks[]? | {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title], related_tasks: rel}]} else {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title], related_tasks: rel} end]
+          [.[]? | if (has("done") | not) then {bucket_id: .id, title: .title, tasks: [.tasks[]? | {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title], related_tasks: rel}]} else {id: .id, identifier: .identifier, title: .title, priority: .priority, done: .done, due_date: .due_date, done_at: .done_at, created: .created, updated: .updated, position: .position, labels: [.labels[]?.title], related_tasks: rel} end]
         allow_jq_override: true
       pagination: none
 
@@ -269,14 +304,19 @@ backend:
         sort by done_at, created, updated, due_date, percent_done. Scope to one project with
         filter "project = N"; "done = true && project = N" returns a project's completed
         tasks, which list_project_tasks hides on views with a "done = false" filter (the
-        default List view). Returns a flat task array; no view filter is applied here.
+        default List view). Returns a flat task array ([] when nothing matches); no view
+        filter is applied here. Descriptions are not included; read them with get_task.
+        Pages automatically: page is the FIRST page to read, and the call appends the
+        following pages, up to 20, into one array. Vikunja caps per_page at 50 by default,
+        so one call returns at most 20 × per_page tasks without a truncation marker; if
+        you get exactly that many, continue with page + 20 or narrow the filter.
         Each task carries related_tasks, a map from relation kind to compact related tasks
         {id, title, done, project_id}: related_tasks.blocked lists the tasks that block this
         one, related_tasks.blocking the tasks it blocks; {} when it has no relations. A done
         blocker stays in the map, so check its done flag.
       params:
-        page: { type: integer, in: query }
-        per_page: { type: integer, in: query, default: 50 }
+        page: { type: integer, in: query, description: "First page to read (default 1); the following pages, up to 20 in total, are appended automatically." }
+        per_page: { type: integer, in: query, default: 50, description: "Tasks per page. Vikunja caps it at its maxitemsperpage setting (50 by default); higher values act like the cap." }
         s: { type: string, in: query }
         sort_by: { type: string, in: query, default: "id" }
         order_by: { type: string, in: query, default: "asc" }
@@ -286,19 +326,19 @@ backend:
         expand: { type: string, in: query }
       response:
         transform: |
-          [.[] | {id, identifier, title, done, done_at, due_date, priority, percent_done, project_id, bucket_id, position, created, updated, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks: ((.related_tasks // {}) | map_values([.[]? | {id, title, done, project_id}]))}]
+          [.[]? | {id, identifier, title, done, done_at, due_date, priority, percent_done, project_id, bucket_id, position, created, updated, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks: ((.related_tasks // {}) | map_values([.[]? | {id, title, done, project_id}]))}]
         allow_jq_override: true
 
     get_task:
       method: GET
       path: /tasks/{id}
       access: read
-      description: "Get a single task by its ID, including all details, assignees, labels, and relations. related_tasks maps each relation kind (blocked, blocking, subtask, parenttask, related, ...) to the full related task objects."
+      description: "Get a single task by its ID, including all details (dates, color, progress, repeat settings, reminders), assignees (usernames, plus their user ids in assignee_ids), labels, and relations. related_tasks maps each relation kind (blocked, blocking, subtask, parenttask, related, ...) to the full related task objects."
       params:
         id: { type: integer, in: path, required: true }
       response:
         transform: |
-          {id, identifier, title, description, done, priority, due_date, done_at, created, updated, project_id, bucket_id, position, percent_done, labels: [.labels[]?.title], assignees: [.assignees[]?.username], related_tasks}
+          {id, identifier, title, description, done, priority, due_date, start_date, end_date, done_at, created, updated, project_id, bucket_id, position, percent_done, hex_color, repeat_after, repeat_mode, is_favorite, cover_image_attachment_id, reminders, labels: [.labels[]?.title], assignees: [.assignees[]?.username], assignee_ids: [.assignees[]?.id], related_tasks}
         allow_jq_override: true
       pagination: none
 
@@ -314,8 +354,13 @@ backend:
         done: { type: boolean, in: body }
         priority: { type: integer, in: body }
         due_date: { type: string, in: body }
-        labels: { type: array, in: body }
-        assignees: { type: array, in: body }
+        start_date: { type: string, in: body }
+        end_date: { type: string, in: body }
+        hex_color: { type: string, in: body }
+        percent_done: { type: number, in: body }
+        repeat_after: { type: integer, in: body }
+        repeat_mode: { type: integer, in: body }
+        assignees: { type: array, in: body, description: "User objects, e.g. [{\"id\": 1}]." }
         bucket_id: { type: integer, in: body }
         position: { type: number, in: body }
       pagination: none
@@ -324,7 +369,7 @@ backend:
       method: POST
       path: /tasks/{id}
       access: write
-      description: "Internal: raw task update (sends full object). Use the update_task composite instead."
+      description: "Internal: raw task update (sends a full object; omitted fields are reset, and omitted reminders and assignees are removed). Use the update_task composite instead."
       params:
         id: { type: integer, in: path, required: true }
         project_id: { type: integer, in: body, description: "Move the task to this project. Vikunja accepts project_id in the task-update body; identifiers are reassigned on move (reference by global id)." }
@@ -333,6 +378,16 @@ backend:
         done: { type: boolean, in: body }
         priority: { type: integer, in: body }
         due_date: { type: string, in: body }
+        start_date: { type: string, in: body }
+        end_date: { type: string, in: body }
+        hex_color: { type: string, in: body }
+        percent_done: { type: number, in: body }
+        repeat_after: { type: integer, in: body }
+        repeat_mode: { type: integer, in: body }
+        is_favorite: { type: boolean, in: body }
+        cover_image_attachment_id: { type: integer, in: body }
+        reminders: { type: array, in: body, description: "Reminder objects as returned by get_task; omitted = all reminders removed." }
+        assignees: { type: array, in: body, description: "User objects, e.g. [{\"id\": 1}]; omitted = all assignees removed." }
         position: { type: number, in: body }
       pagination: none
 
@@ -400,7 +455,7 @@ backend:
         per_page: { type: integer, in: query, default: 50 }
       response:
         transform: |
-          [.[] | {id, task_id, created, created_by: (.created_by.username? // null), file: {id: .file.id?, name: .file.name?, mime: .file.mime?, size: .file.size?}}]
+          [.[]? | {id, task_id, created, created_by: (.created_by.username? // null), file: {id: .file.id?, name: .file.name?, mime: .file.mime?, size: .file.size?}}]
         allow_jq_override: true
 
     upload_task_attachment:
@@ -457,7 +512,7 @@ backend:
         is_archived: { type: boolean, in: query }
       response:
         transform: |
-          [.[] | {id: .id, title: .title, description: .description, is_archived: .is_archived, parent_project_id: .parent_project_id, position: .position, hex_color: .hex_color, owner: (.owner.username? // null), views: [.views[]? | {id: .id, title: .title, view_kind: .view_kind}]}]
+          [.[]? | {id: .id, title: .title, description: .description, is_archived: .is_archived, parent_project_id: .parent_project_id, position: .position, hex_color: .hex_color, owner: (.owner.username? // null), views: [.views[]? | {id: .id, title: .title, view_kind: .view_kind}]}]
 
     get_project:
       method: GET
@@ -600,11 +655,14 @@ backend:
       method: GET
       path: /labels
       access: read
-      description: "List all labels the user has access to. Returns id, title, description, hex_color."
+      description: "List all labels the user has access to. Returns id, title, description, hex_color ([] when there are none)."
       params:
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 50 }
         s: { type: string, in: query }
+      response:
+        # Vikunja sends null instead of [] for an empty list.
+        transform: ". // []"
 
     create_label:
       method: PUT
@@ -645,9 +703,12 @@ backend:
       method: GET
       path: /tasks/{task_id}/comments
       access: read
-      description: "List all comments on a task."
+      description: "List all comments on a task ([] when it has none)."
       params:
         task_id: { type: integer, in: path, required: true }
+      response:
+        # Vikunja sends null instead of [] for an empty list.
+        transform: ". // []"
 
     create_task_comment:
       method: PUT
@@ -684,11 +745,13 @@ backend:
 
   composites:
     update_task:
+      access: write
       description: >
         Update an existing task. Only include the fields you want to change —
-        unchanged fields are preserved (GET → merge → POST). Set project_id to MOVE
-        the task to another project (its identifier is reassigned on move — reference
-        by global id afterwards). To move between kanban buckets, use
+        everything else is preserved, including dates, color, progress, repeat
+        settings, reminders, assignees and labels (GET → merge → POST). Set project_id
+        to MOVE the task to another project (its identifier is reassigned on move —
+        reference by global id afterwards). To move between kanban buckets, use
         move_task_to_bucket instead.
       params:
         id:
@@ -710,6 +773,24 @@ backend:
         due_date:
           type: string
           description: "Due date (ISO 8601)"
+        start_date:
+          type: string
+          description: "Start date (ISO 8601)"
+        end_date:
+          type: string
+          description: "End date (ISO 8601)"
+        hex_color:
+          type: string
+          description: "Task color (6 hex digits, no leading #; empty string clears it)"
+        percent_done:
+          type: number
+          description: "Progress from 0 to 1 (0.5 = 50 %)"
+        repeat_after:
+          type: number
+          description: "Repeat interval in seconds (0 = no repeat, 604800 = weekly)"
+        repeat_mode:
+          type: number
+          description: "0 = add repeat_after to the dates, 1 = monthly, 2 = from the moment the task is marked done"
         position:
           type: number
           description: "Sort position (float64)"
@@ -720,26 +801,42 @@ backend:
       depends_on: [get_task, _update_task_raw]
       code: |
         const current = await api.get_task({ id: params.id });
+        const pick = (k) => (params[k] !== undefined ? params[k] : current[k]);
+        // Vikunja's task update resets every field it is not sent and removes
+        // reminders and assignees that are missing, so every field goes back.
         const merged = {
           id: params.id,
-          title: params.title !== undefined ? params.title : current.title,
-          description: params.description !== undefined ? params.description : current.description,
-          done: params.done !== undefined ? params.done : current.done,
-          priority: params.priority !== undefined ? params.priority : current.priority,
-          due_date: params.due_date !== undefined ? params.due_date : current.due_date,
-          position: params.position !== undefined ? params.position : current.position,
-          project_id: params.project_id !== undefined ? params.project_id : current.project_id,
+          title: pick("title"),
+          description: pick("description"),
+          done: pick("done"),
+          priority: pick("priority"),
+          due_date: pick("due_date"),
+          start_date: pick("start_date"),
+          end_date: pick("end_date"),
+          hex_color: pick("hex_color"),
+          percent_done: pick("percent_done"),
+          repeat_after: pick("repeat_after"),
+          repeat_mode: pick("repeat_mode"),
+          position: pick("position"),
+          project_id: pick("project_id"),
+          is_favorite: current.is_favorite,
+          cover_image_attachment_id: current.cover_image_attachment_id,
+          reminders: current.reminders || [],
+          assignees: (current.assignee_ids || []).map((id) => ({ id: id })),
         };
         return await api._update_task_raw(merged);
 
     create_task:
+      access: write
       description: >
         Create a task in a project and append it to the END of its kanban bucket
         (max position + step), server-side, so API-created tasks do not jump to the
         top of the board and disturb the priority order (board order = priority).
         Pass bucket_id to place it into a specific kanban bucket; omit to use the
         view's default bucket. Priority: 0=unset, 1=low, 2=medium, 3=high, 4=urgent,
-        5=critical.
+        5=critical. Labels are attached after the task is created; the returned task
+        lists the attached ids in label_ids, and a label that could not be attached in
+        label_errors (the task exists either way, so do not create it again).
       params:
         project_id:
           type: number
@@ -761,12 +858,30 @@ backend:
         due_date:
           type: string
           description: "Due date (ISO 8601)"
+        start_date:
+          type: string
+          description: "Start date (ISO 8601)"
+        end_date:
+          type: string
+          description: "End date (ISO 8601)"
+        hex_color:
+          type: string
+          description: "Task color (6 hex digits, no leading #)"
+        percent_done:
+          type: number
+          description: "Progress from 0 to 1 (0.5 = 50 %)"
+        repeat_after:
+          type: number
+          description: "Repeat interval in seconds (0 = no repeat, 604800 = weekly)"
+        repeat_mode:
+          type: number
+          description: "0 = add repeat_after to the dates, 1 = monthly, 2 = from the moment the task is marked done"
         labels:
           type: array
-          description: "Label IDs to attach"
+          description: "Label IDs to attach (numbers, from list_labels)"
         assignees:
           type: array
-          description: "User IDs to assign"
+          description: "User IDs to assign (numbers)"
         bucket_id:
           type: number
           description: "Kanban bucket to place the task in (default: the view's default bucket)"
@@ -774,8 +889,11 @@ backend:
           type: number
           description: "Explicit list-view position; the kanban position is set automatically to the bucket end"
       timeout: 20s
-      depends_on: [_create_task_raw, list_views, list_project_tasks, move_task_to_bucket, set_task_position]
+      depends_on: [_create_task_raw, add_label_to_task, list_views, list_project_tasks, move_task_to_bucket, set_task_position]
       code: |
+        // Vikunja expects assignees as user objects and does not attach labels on
+        // create (label ids even fail with HTTP 400), so assignees are sent as {id}
+        // and labels are attached afterwards.
         const task = await api._create_task_raw({
           project_id: params.project_id,
           title: params.title,
@@ -783,11 +901,32 @@ backend:
           done: params.done,
           priority: params.priority,
           due_date: params.due_date,
-          labels: params.labels,
-          assignees: params.assignees,
+          start_date: params.start_date,
+          end_date: params.end_date,
+          hex_color: params.hex_color,
+          percent_done: params.percent_done,
+          repeat_after: params.repeat_after,
+          repeat_mode: params.repeat_mode,
+          assignees: Array.isArray(params.assignees) ? params.assignees.map((id) => ({ id: id })) : undefined,
           bucket_id: params.bucket_id,
           position: params.position,
         });
+        if (Array.isArray(params.labels) && params.labels.length) {
+          // collect locally and assign once: task is a host object, so a push on
+          // task.label_ids would only change a copy
+          const attached = [];
+          const labelErrors = [];
+          for (const labelId of params.labels) {
+            try {
+              await api.add_label_to_task({ task_id: task.id, label_id: labelId });
+              attached.push(labelId);
+            } catch (e) {
+              labelErrors.push({ label_id: labelId, error: String(e) });
+            }
+          }
+          task.label_ids = attached;
+          if (labelErrors.length) task.label_errors = labelErrors;
+        }
         try {
           const views = await api.list_views({ project_id: params.project_id });
           const kanban = (views || []).find(v => v.view_kind === "kanban");
@@ -816,6 +955,7 @@ backend:
         return task;
 
     set_default_bucket:
+      access: write
       description: >
         Set which kanban bucket is the DEFAULT (where new tasks land) and, optionally,
         the DONE bucket (moving a task there marks it done) for a project view. Reads
@@ -858,6 +998,7 @@ backend:
         });
 
     set_bucket_position:
+      access: write
       description: >
         Reorder a kanban bucket (column) within its view. Pass an explicit position
         (float64, lower = further left), or place 'first' / 'last' to compute one from
@@ -909,6 +1050,7 @@ backend:
         });
 
     update_project:
+      access: write
       description: >
         Update an existing project. Only include the fields you want to change — unchanged
         fields are preserved (this composite does GET → merge → POST, because Vikunja's raw
