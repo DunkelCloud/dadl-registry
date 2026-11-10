@@ -1,0 +1,2264 @@
+# placetel.dadl — Placetel REST API v2 for ToolMesh
+# Placetel is a German cloud telephone system (hosted PBX). Its REST API v2
+# covers the call log, click-to-dial, call detail records, recordings,
+# contacts, SMS, fax, numbers, call routing (forwards, groups, IVR, queues,
+# routing plans), SIP users, users, prompts, the call center, CTI call
+# control of desk phones, phone provisioning, call event webhooks, and the
+# Microsoft Teams and Webex integrations.
+#
+# Domain Notes for LLM consumers:
+# - SOURCE: written from the official OpenAPI 2.0 document
+#   (https://api.placetel.de/v2/swagger_doc, "Placetel API" 2.0.0, read
+#   2026-11-07). The read tools were verified against a live account on
+#   2026-11-09 (response shapes, filters, number formats, paging, error
+#   codes, redaction); contacts, prompts, routing objects, routing plans,
+#   groups and number profiles were also created, updated and deleted.
+#   Calls, SMS, fax, SIP users, users, short codes (only the validation was
+#   seen), CTI, call center, recordings, Teams, Webex and the partner
+#   customer endpoints were not exercised live; where the document leaves
+#   their behavior open (partial PUT updates, array query parameters) the
+#   tool descriptions say so. Verified for contacts, routings, routing plans
+#   and groups: PUT changes only the fields sent.
+# - AUTH: one API key from the web portal (Integrations > Web API,
+#   https://web.placetel.de/integrations/web_api), sent as
+#   "Authorization: Bearer <key>". An existing API v1 key also works for v2.
+#   Tokens carry scopes: a regular account token reached every endpoint of
+#   the booked products, while the partner customer endpoints answered 403
+#   'Access to this resource requires scope "read:customers"'. Missing
+#   header -> 401 {"error":"missing_bearer_token"}, unknown or revoked key
+#   -> 401 {"error":"inactive_token"}.
+# - BASE URL: https://api.placetel.de/v2 (SaaS, one global endpoint). Request
+#   and response bodies are JSON.
+# - PAGINATION: page (starting at 1) and per_page (API default 25, max 100;
+#   list_call_detail_records allows 500). Lists return a plain JSON array
+#   without envelope, total or has_more flag: a page with fewer items than
+#   per_page is the last one. The API notes that not every endpoint honors
+#   per_page; a value above the maximum is rejected with 400 "per_page does
+#   not have a valid value". This file sends per_page=100 and exposes paging
+#   to the caller (behavior expose), because ToolMesh cannot detect the last
+#   page of a bare array in auto mode. The call log, call detail records and
+#   call center calls are per day: one request series per date.
+# - RATE LIMIT: token bucket with a burst allowance. Every response carries
+#   RateLimit-Remaining (requests left right now) and RateLimit-Reset (seconds
+#   until the next token). Over the limit -> 429 with Retry-After (seconds).
+#   Prefer server-side filters over paging through everything.
+# - ERRORS: {"error": "<code or message>", "status": <http status>,
+#   "request_id": "<uuid>"}. Seen: missing_bearer_token and inactive_token
+#   (401), route_not_found (404), "404 not found" for unknown IDs and
+#   unbooked products, validation failures as 400 with a readable message.
+#   Some product errors are German text.
+# - EMPTY OR UNKNOWN FILTERS (verified): an empty string is sent as a real
+#   filter value and returns an empty list (filter[type]="",
+#   filter[from_number]="", filter[number]=""), and an unknown enum value
+#   such as filter[type]="outgoing" also returns an empty list instead of
+#   400. Only some parameters are validated (order -> 400). Omit filters
+#   you do not use, and do not read an empty result after a filter as proof
+#   that nothing exists.
+# - NO IDEMPOTENCY KEYS: POST and PATCH calls (initiate_call, send_sms,
+#   send_fax, dial_cti_number, ...) are never retried automatically. After a
+#   timeout the call may still have been placed or the SMS sent: check
+#   (list_calls, list_call_detail_records, list_faxes) before sending again.
+#   create_subscription (a PUT) is excluded from retries for the same reason.
+# - PHONE NUMBERS (verified live): number fields and filters use German
+#   national format without spaces, exactly as in Number.number
+#   ("02211234567"). filter[number], filter[from_number], filter[to_number]
+#   and the number form of number_or_id only match that format: the E.164
+#   form ("+492211234567") and numonly find nothing or answer 404. Number
+#   objects also carry e164, prefix (area code, "0221") and numonly.
+#   CONTACTS ARE DIFFERENT: they store valid German numbers in E.164
+#   ("+492211234567") whatever format was sent, so their exact filters
+#   (filter[phone], filter[mobile], ...) need E.164, while search[number]
+#   normalizes and finds any complete form of a valid number.
+# - SIPUID: a SIP user (phone extension) is addressed as
+#   "<username>@<sip domain>", e.g. "7771234567@fpbx.de". Forward targets and
+#   initiate_call accept a sipuid or an external phone number.
+# - IDS: numeric IDs, except subscriptions ("sub-..."). Routings are
+#   addressed by phone number OR routing ID (number_or_id). A Number links to
+#   its routing via routing_id; a SIP user has routing_plan_id (fallback when
+#   busy or unanswered).
+# - TIMESTAMPS: ISO 8601 with offset in German local time
+#   ("2026-11-07T11:42:47.000+01:00"). Date filters are YYYY-MM-DD.
+# - CALL DATA: list_calls is the log of INCOMING calls (type accepted, missed,
+#   voicemail or blocked; voicemails carry file_url; to_number is the full
+#   Number object of the dialed number). Outgoing calls only show up in
+#   list_call_detail_records (billing records with amount, length, from, to,
+#   oldest first). Recordings exist only with call recording booked.
+# - ROUTING MODEL: incoming call -> Number -> routing object (one per number)
+#   with exactly one behavior: forward (ordered destination steps, each
+#   {targets[], ringing_time}), group (ring a group), plan (a routing plan),
+#   ivr (voice menu: prompt plus items 1-9 pointing at other routing
+#   objects), queue (call center queue), api (ask an external API, with retry
+#   count and backup plan) or ai (Placetel AI; returned, not writable here).
+#   Every routing object also has mailbox (voicemail), notification (e-mail),
+#   time_settings (active weekdays, hours, holidays), a custom caller ID and
+#   music on hold. Routing plans order several routing objects by priority;
+#   simulate_routing_plan shows which one answers at a given time. A routing
+#   object added to a plan belongs to it: deleting the plan deleted that
+#   routing object too (verified). Number profiles are saved alternative
+#   configurations of a number; one is active. The active profile "Standard"
+#   is the number's own routing object (profile id = Number.routing_id), so
+#   deleting it would remove the number's routing.
+# - PUT ON ROUTINGS (verified): update_routing changes only the objects sent;
+#   name, forward, time_settings and mailbox stay as they are when omitted.
+#   ringing_time accepts only the listed values (33 -> 400).
+# - USERS vs SIP USERS: a user ("webuser": web portal login, main account or
+#   subuser) owns SIP users (phone extensions with sipuid, did = internal
+#   extension number, callerid). Groups contain SIP users (member_ids).
+#   Provisionings bind a physical phone (MAC address, model from
+#   list_devices) to SIP users (lines) and function keys.
+# - SECRETS: SIP user objects carry the SIP password (single GET and create)
+#   and the hotdesk PIN; Webex fax settings carry the fax PIN. This file masks
+#   them with response.redact wherever they appear, because SIP credentials
+#   enable toll fraud. Read them in the web portal. Setting hotdesk_pin or
+#   faxpin still works.
+# - FILES IN: send_fax (PDF), create_prompt/update_prompt (audio) and
+#   update_user (avatar) take a base64 data URI ("data:application/pdf;
+#   base64,..."). In ToolMesh pass a blob handle with the #dataurl fragment
+#   (tm-blob://<id>#dataurl after upload_file) so the bytes never pass
+#   through the model. FILES OUT: voicemail file_url, recording file, fax
+#   file and report, and prompt file are URLs. Prompt file URLs are signed
+#   and expire after about 5 minutes (verified); fetch the record again for
+#   a fresh one.
+# - QUERY ARRAYS: array filters (call center queue_ids, recordings direction,
+#   CTI params) are declared with the "[]" key suffix and take ONE value per
+#   call, because ToolMesh sends one value per query key.
+# - CTI: call control of a desk phone provisioned through Placetel, addressed
+#   by its MAC address (mac of list_provisionings). line is the account line
+#   on the phone, call_id the phone-side integer call ID. These are not the
+#   sha256 call_id values of webhook events.
+# - WEBHOOKS: create_subscription registers a URL for call events (incoming,
+#   outgoing, accepted, hungup, phone = CTI). Per Placetel's Notify API
+#   documentation the events arrive as form-encoded POSTs with event
+#   (IncomingCall, OutgoingCall, CallAccepted, HungUp), call_id (sha256 hex),
+#   from, to and direction, signed in X-PLACETEL-SIGNATURE (HMAC-SHA256) once
+#   a shared secret is set in the portal's external API settings.
+# - PRODUCT-DEPENDENT AREAS: call center, Microsoft Teams direct routing,
+#   Webex (Webex Calling wholesale), Placetel AI, SIM cards (Placetel Mobile)
+#   and customers (partner accounts) only work when booked. Observed without
+#   the product: call center and recordings answer 404 "404 not found",
+#   Webex answers 403 "Not available for your product", Microsoft Teams
+#   answers 403 until the Teams integration is enabled for API access, and
+#   the customer endpoints need the read:customers scope. Number activation
+#   can be charged. Placetel AI Pro (voice agents, their tools and
+#   conversation transcripts) is a separate product with its own API and
+#   its own MCP server; it is not covered here.
+# - VOCABULARY: "routing" = routing object of a number; "sip user" = phone
+#   extension; "webuser" = user; "did" = INTERNAL extension number, not an
+#   external number; "prompt" = announcement audio; "short code" = star code
+#   dialed on the phone that triggers an action. Spellings such as "dail_in",
+#   "dail_out" and "behaviour" are the API's own.
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+requires:
+  features: [redact]
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+source_name: "Placetel REST API v2"
+source_url: https://api.placetel.de/v2/docs/
+date: "2026-11-09"
+
+# ─── Reusable fragments (underscore keys are ignored by ToolMesh) ────────────
+_shared:
+  page_param: &p-page
+    type: integer
+    in: query
+    default: 1
+    description: "Page number, starting at 1. The result is a plain array; a page shorter than per_page is the last one."
+  per_page_param: &p-per-page
+    type: integer
+    in: query
+    default: 100
+    description: "Items per page, 1-100 (API default 25); larger values are rejected with 400."
+  updated_gte_param: &p-updated-gte
+    type: string
+    in: query
+    description: "Only records updated at or after this ISO 8601 date-time (incremental sync)."
+  updated_lte_param: &p-updated-lte
+    type: string
+    in: query
+    description: "Only records updated at or before this ISO 8601 date-time."
+  order_param: &p-order
+    type: string
+    in: query
+    description: "Sort order by time: desc (newest first, API default) or asc."
+  # SIP credentials in responses (toll-fraud risk) are masked everywhere.
+  redact_sip_user: &redact-sip-user
+    - "$.password"
+    - "$.hotdesk_pin"
+  redact_sip_user_list: &redact-sip-user-list
+    - "$[*].password"
+    - "$[*].hotdesk_pin"
+  redact_group: &redact-group
+    - "$.members[*].password"
+    - "$.members[*].hotdesk_pin"
+  redact_group_list: &redact-group-list
+    - "$[*].members[*].password"
+    - "$[*].members[*].hotdesk_pin"
+  redact_sim_card: &redact-sim-card
+    - "$.sip_user.password"
+    - "$.sip_user.hotdesk_pin"
+  redact_sim_card_list: &redact-sim-card-list
+    - "$[*].sip_user.password"
+    - "$[*].sip_user.hotdesk_pin"
+  redact_fax_settings: &redact-fax-settings
+    - "$.faxpin"
+  # Shared body params of create_routing and update_routing.
+  routing_forward: &p-routing-forward
+    type: object
+    in: body
+    description: "Forward behavior: {destinations: [{targets: [sipuid or external number, ...], ringing_time: 10-120 s (default 60)}], behaviour: ringing|mailbox|prompt_and_disconnect|prompt_and_ringing, prompt_id}. Destinations are tried in order; all targets of one step ring at once. behaviour is what happens when nobody answers (or before ringing, for the prompt_* values)."
+  routing_group: &p-routing-group
+    type: object
+    in: body
+    description: "Group behavior: {id: group ID (required), group_ringing_time: 10|15|20|25|30|40|60|90|120 (default 40), backup_behaviour: ringing|mailbox|prompt_and_disconnect|prompt_and_ringing, backup_routing_object_id}."
+  routing_ivr: &p-routing-ivr
+    type: object
+    in: body
+    description: "IVR (voice menu) behavior: {prompt_id: menu announcement, item_1_id ... item_9_id: routing object ID per key, catchall_routing_object_id: routing object for no or invalid input}."
+  routing_queue: &p-routing-queue
+    type: object
+    in: body
+    description: "Call center queue behavior: {id: queue ID from list_call_center_queues}."
+  routing_api: &p-routing-api
+    type: object
+    in: body
+    description: "External API behavior (Placetel asks your API how to route): {max_retries (required), backup_routing_plan_id, prompt_id}."
+  routing_mailbox: &p-routing-mailbox
+    type: object
+    in: body
+    description: "Voicemail: {active: boolean, greeting_id: prompt ID of the greeting, mp3: boolean (send recordings as MP3)}."
+  routing_notification: &p-routing-notification
+    type: object
+    in: body
+    description: "E-mail notification: {salutation, email, type: none|all|voicemail|missed, receiver: global|local}."
+  routing_time_settings: &p-routing-time-settings
+    type: object
+    in: body
+    description: "When this routing object is active: {enabled, mon, tue, wed, thu, fri, sat, sun (booleans), nationwide_holidays (active on nationwide German holidays), extended_time_settings}. With extended_time_settings=false use time_from/time_to ('08:00:00', '19:59:59'); with true use time_ranges ('08:30:00-13:29:59,14:30:00-17:59:59'), additional_dates (day.month list without year, '24.12,31.12') and additional_holidays (new_year, good_friday, easter, easter_monday, labor_day, ascension_day, whitmonday, day_of_german_unity, christmas, epiphany, corpus_christi, assumption_day, reformation_day, all_saints_day, repentance_day). Setting additional_dates or additional_holidays makes nationwide_holidays ignored."
+  routing_callerid: &p-routing-callerid
+    type: object
+    in: body
+    description: "Caller ID shown on forwarded calls: {callerid_enabled, callerid_name, callerid_number}. Note: responses name this object custom_caller_id with fields enabled, name, number."
+  routing_moh: &p-routing-moh
+    type: boolean
+    in: body
+    description: "Play music on hold while the caller waits."
+  routing_notify_api: &p-routing-notify-api
+    type: boolean
+    in: body
+    description: "Send call events of this routing to the external API (webhook) configuration."
+
+backend:
+  name: placetel
+  type: rest
+  version: "1.0"
+  base_url: https://api.placetel.de/v2
+  description: >
+    Placetel REST API v2 — German cloud telephone system (hosted PBX): call
+    log and voicemails, click-to-dial, call detail records, call recordings,
+    contacts and caller lookup, SMS and fax, phone numbers and number
+    profiles, call routing (forwards, ring groups, IVR menus, call center
+    queues, routing plans, time settings), SIP users and short codes, users
+    and permissions, announcements (text-to-speech prompts), call center
+    agents and queues, CTI call control of desk phones, phone provisioning,
+    call event webhooks, Microsoft Teams direct routing and Webex Calling.
+
+  coverage:
+    endpoints: 127
+    total_endpoints: 127
+    percentage: 100
+    focus: >
+      Placetel REST API v2: calls (call log, voicemails, click-to-dial, call
+      detail records, recordings), CTI call control (answer, hold, transfer,
+      conference, DTMF), routing (forwards, ring groups, IVR menus, queues,
+      routing plans, time settings, number profiles), SIP users (extensions,
+      short codes, hotdesking), contacts, numbers, SMS, fax, prompts, call
+      center, users, phone provisioning, webhooks, Microsoft Teams, Webex.
+    missing: >
+      Every endpoint of the published document is declared. Limits: array
+      query filters take one value per call (call center queue_ids,
+      recordings direction, CTI config params); the ai routing behavior is
+      returned but cannot be written; webhook callbacks themselves are
+      delivered outside the REST API; SIP passwords, hotdesk PINs and fax
+      PINs are masked in responses. Read tools and the write tools for
+      contacts, prompts, routings, routing plans, groups and number profiles
+      verified against a live account on 2026-11-09; calls, SMS, fax, SIP
+      users, users, short codes, CTI, call center, recordings, Teams, Webex
+      and customers not yet tested live. The allowed short code values are
+      not documented.
+    last_reviewed: "2026-11-09"
+
+  setup:
+    credential_steps:
+      - "Sign in to the Placetel web portal at https://web.placetel.de."
+      - "Open Integrations > Web API (https://web.placetel.de/integrations/web_api)."
+      - "Create a new API token there, or copy the existing one (an API v1 key also works for v2). Store it right away."
+      - "Partner accounts only: the customer endpoints need a token with the read:customers scope."
+      - "Put the key into the ToolMesh .env as CREDENTIAL_PLACETEL_API_KEY and add the backends.yaml entry below."
+      - "Restart ToolMesh and call placetel_health (or get_me): it must return your account with id and name."
+    env_var: CREDENTIAL_PLACETEL_API_KEY
+    backends_yaml: |
+      - name: placetel
+        transport: rest
+        dadl: placetel.dadl
+        url: "https://api.placetel.de/v2"
+    required_scopes:
+      - "A regular account token: it reaches every endpoint of the booked products"
+    optional_scopes:
+      - "read:customers (partner accounts: list_customers, get_customer; create_customer presumably needs a write scope, not verified)"
+    docs_url: "https://api.placetel.de/v2/docs/"
+    notes: >
+      The key has full access to the account: it can place calls, send SMS
+      and faxes, change routings, delete data and manage users. Restrict what
+      agents may do with ToolMesh authorization on the access classes (read,
+      write, admin, dangerous). Call center, Microsoft Teams, Webex, Placetel
+      AI, SIM cards and the partner customer endpoints only answer when the
+      product is booked; Microsoft Teams additionally has to be enabled for
+      API access. The API is rate limited (token bucket; 429 with
+      Retry-After).
+
+  auth:
+    type: bearer
+    credential: placetel_api_key
+    inject_into: header
+    header_name: Authorization
+    prefix: "Bearer "
+
+  health:
+    tool: get_me
+    expect_path: "$.id"
+
+  defaults:
+    headers:
+      Accept: application/json
+    content_type: application/json
+    pagination:
+      strategy: page
+      request:
+        page_param: page
+        limit_param: per_page
+        limit_default: 100
+      behavior: expose
+      max_pages: 10
+    errors:
+      format: json
+      message_path: "$.error"
+      retry_on: [429, 502, 503, 504]
+      terminal: [400, 401, 403, 404, 409, 422]
+      rate_limit:
+        header: RateLimit-Remaining
+        retry_after_header: Retry-After
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 2s
+    response:
+      result_path: "$"
+
+  tools:
+    # ── Account ────────────────────────────────────────────────────────────
+
+    get_me:
+      method: GET
+      path: /me
+      access: read
+      description: >
+        The account behind the API key: {id, name, email, company,
+        primary_sip_user_id, platform (product line, e.g. PROFI),
+        rights_numbers (numbers this login may see), main_account_id,
+        created_at, updated_at}. Cheapest call to check that the key works;
+        used as the health check.
+      pagination: none
+
+    get_ai_status:
+      method: GET
+      path: /ai/status
+      access: read
+      description: >
+        Status and usage of the account's Placetel AI integration: {status
+        (e.g. active), minute_package, remaining_minutes, remaining_budget,
+        total_cost (net AI cost of the last 7 days), currency, refreshed_at}.
+        The budget figures are only present while the integration is active;
+        otherwise only status is returned.
+      pagination: none
+
+    # ── Calls (call log, click-to-dial) ────────────────────────────────────
+
+    list_calls:
+      method: GET
+      path: /calls
+      access: read
+      description: >
+        Call log of INCOMING calls for ONE day (default today), newest first.
+        For a period, call once per date. Each Call: {id, type (accepted |
+        missed | voicemail | blocked), from_number (national format),
+        to_number (the full Number object of the dialed number: id, number,
+        e164, prefix, numonly, routing_id, site_id, ...), duration
+        (seconds), file_url (audio of a voicemail, else null), contact (the
+        matching contact or null), received_at, unread}. Number filters take
+        the national format (02211234567); E.164 finds nothing. Omit unused
+        filters: an empty or unknown filter value (e.g. filter[type]="" or
+        "outgoing") silently returns an empty list. Outgoing calls are not in this log: use
+        list_call_detail_records. Paged: plain array, increment page until a
+        page has fewer than per_page items.
+      params:
+        "filter[date]":
+          type: string
+          in: query
+          description: "Day as YYYY-MM-DD. Defaults to today."
+        "filter[type]":
+          type: string
+          in: query
+          description: "accepted, missed, voicemail or blocked. The combinations 'voicemail,missed' and 'missed,blocked,accepted' are accepted too."
+        "filter[from_number]": { type: string, in: query, description: "Only calls from this caller number, national format as in from_number (e.g. 02211234567)." }
+        "filter[to_number]": { type: string, in: query, description: "Only calls to this Placetel number, national format as in to_number.number; the E.164 form finds nothing." }
+        order: *p-order
+        page: *p-page
+        per_page: *p-per-page
+
+    get_call:
+      method: GET
+      path: /calls/{id}
+      access: read
+      description: "One call of the incoming call log by ID (same fields as list_calls)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Call ID from list_calls." }
+      pagination: none
+
+    initiate_call:
+      method: POST
+      path: /calls
+      access: write
+      description: >
+        Click-to-dial: Placetel rings the phone(s) registered for sipuid and,
+        once answered there, connects to target. Returns the created Call.
+        Not retried automatically (no idempotency key): after a timeout check
+        before dialing again.
+      params:
+        sipuid: { type: string, in: body, required: true, description: "SIP user that places the call, e.g. 7771234567@fpbx.de (sipuid from list_sip_users)." }
+        target: { type: string, in: body, required: true, description: "Number to call, e.g. 02211234567 or +492211234567." }
+        from_name: { type: string, in: body, description: "Optional display name for the call." }
+      pagination: none
+
+    delete_call:
+      method: DELETE
+      path: /calls/{id}
+      access: dangerous
+      description: "Delete an entry of the incoming call log, e.g. a voicemail. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Call ID." }
+      pagination: none
+
+    # ── Call detail records ────────────────────────────────────────────────
+
+    list_call_detail_records:
+      method: GET
+      path: /call_detail_records
+      access: read
+      description: >
+        Billing records (itemized call records) of ONE day, including
+        outgoing calls and forwards: {amount (charge in the account
+        currency), description (connection type label), from, to, length
+        (seconds), answer_uri (who answered, null if nobody), received_at},
+        oldest first. date is required; for a period call once per day. per_page goes up to 500
+        here. Paged: plain array.
+      params:
+        date: { type: string, in: query, required: true, description: "Day as YYYY-MM-DD." }
+        page: *p-page
+        per_page:
+          type: integer
+          in: query
+          default: 100
+          description: "Items per page, 1-500 (API default 25)."
+
+    # ── Recordings ─────────────────────────────────────────────────────────
+
+    list_recordings:
+      method: GET
+      path: /recordings
+      access: read
+      description: >
+        Call recordings, newest first; without booked call recording the API
+        answers 404 "404 not found". Each:
+        {id, direction (e.g. in), from, to, duration (seconds), time, file
+        (URL of the audio file), created_at, updated_at}. Paged: plain array.
+      params:
+        "filter[date]": { type: string, in: query, description: "Day as YYYY-MM-DD." }
+        "filter[from]": { type: string, in: query, description: "Caller number." }
+        "filter[to]": { type: string, in: query, description: "Called number." }
+        "filter[direction][]": { type: string, in: query, description: "ONE direction as in the direction field, e.g. in or out (array filter, one value per call)." }
+        order: *p-order
+        page: *p-page
+        per_page: *p-per-page
+
+    get_recording:
+      method: GET
+      path: /recordings/{id}
+      access: read
+      description: "One call recording by ID, with the file URL of the audio."
+      params:
+        id: { type: integer, in: path, required: true, description: "Recording ID." }
+      pagination: none
+
+    delete_recording:
+      method: DELETE
+      path: /recordings/{id}
+      access: dangerous
+      description: "Delete a call recording and its audio. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Recording ID." }
+      pagination: none
+
+    # ── Contacts (phone book, caller lookup, blocklist) ────────────────────
+
+    list_contacts:
+      method: GET
+      path: /contacts
+      access: read
+      description: >
+        Phone book contacts: {id, user_id, speeddial, first_name, last_name,
+        email, email_work, company, address, address_work, phone, phone_work,
+        mobile, mobile_work, fax, fax_work, facebook_url, linkedin_url,
+        xing_url, twitter_account, blocked, color, tags, created_at,
+        updated_at}. For caller lookup use search[number]: it normalizes, so
+        02211234567, +492211234567 and 2211234567 all find the contact
+        (partial numbers do not). Valid German numbers are stored in E.164,
+        so the exact filters filter[phone], filter[mobile] etc. need the
+        +49 form. All filters are exact matches (no prefix search).
+        Contacts with blocked=true form the account's blocklist. Paged:
+        plain array.
+      params:
+        "search[number]": { type: string, in: query, description: "Find contacts by a complete phone number in any format (national, +49, without leading 0); searches all number fields." }
+        "filter[first_name]": { type: string, in: query }
+        "filter[last_name]": { type: string, in: query }
+        "filter[company]": { type: string, in: query }
+        "filter[email]": { type: string, in: query }
+        "filter[email_work]": { type: string, in: query }
+        "filter[phone]": { type: string, in: query, description: "Exact match on the stored value: E.164 for valid numbers, e.g. +492211234567." }
+        "filter[phone_work]": { type: string, in: query, description: "Exact match on the stored value: E.164 for valid numbers, e.g. +492211234567." }
+        "filter[mobile]": { type: string, in: query, description: "Exact match on the stored value: E.164 for valid numbers, e.g. +492211234567." }
+        "filter[mobile_work]": { type: string, in: query, description: "Exact match on the stored value: E.164 for valid numbers, e.g. +492211234567." }
+        "filter[speeddial]": { type: integer, in: query, description: "Speed dial number." }
+        "filter[blocked]": { type: boolean, in: query, description: "Filter on the blocked flag (true = blocklisted contacts)." }
+        "filter[updated_at_gte]": *p-updated-gte
+        "filter[updated_at_lte]": *p-updated-lte
+        page: *p-page
+        per_page: *p-per-page
+
+    get_contact:
+      method: GET
+      path: /contacts/{id}
+      access: read
+      description: "One contact by ID (same fields as list_contacts)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Contact ID." }
+      pagination: none
+
+    create_contact:
+      method: POST
+      path: /contacts
+      access: write
+      description: >
+        Create a phone book contact. All fields are optional. Valid German
+        numbers are stored in E.164 (+49...) whatever format is sent. Set
+        blocked=true to block calls from the contact's numbers. Returns the
+        Contact. Not retried automatically.
+      params:
+        first_name: { type: string, in: body }
+        last_name: { type: string, in: body }
+        company: { type: string, in: body }
+        email: { type: string, in: body }
+        email_work: { type: string, in: body }
+        phone: { type: string, in: body, description: "Private landline number." }
+        phone_work: { type: string, in: body, description: "Business landline number." }
+        mobile: { type: string, in: body }
+        mobile_work: { type: string, in: body }
+        fax: { type: string, in: body }
+        fax_work: { type: string, in: body }
+        address: { type: string, in: body }
+        address_work: { type: string, in: body }
+        speeddial: { type: string, in: body, description: "Speed dial number." }
+        facebook_url: { type: string, in: body }
+        linkedin_url: { type: string, in: body }
+        xing_url: { type: string, in: body }
+        twitter_account: { type: string, in: body }
+        color: { type: string, in: body, description: "Display color, e.g. #d8d9da." }
+        tags: { type: array, in: body, description: "List of tag strings." }
+        user_id: { type: integer, in: body, description: "User the contact belongs to." }
+        blocked: { type: boolean, in: body, description: "Block calls from this contact." }
+      pagination: none
+
+    update_contact:
+      method: PUT
+      path: /contacts/{id}
+      access: write
+      description: >
+        Update a contact. Only the fields sent are changed; an empty string
+        clears a field; tags replaces the whole tag list. Returns the
+        Contact.
+      params:
+        id: { type: integer, in: path, required: true, description: "Contact ID." }
+        first_name: { type: string, in: body }
+        last_name: { type: string, in: body }
+        company: { type: string, in: body }
+        email: { type: string, in: body }
+        email_work: { type: string, in: body }
+        phone: { type: string, in: body }
+        phone_work: { type: string, in: body }
+        mobile: { type: string, in: body }
+        mobile_work: { type: string, in: body }
+        fax: { type: string, in: body }
+        fax_work: { type: string, in: body }
+        address: { type: string, in: body }
+        address_work: { type: string, in: body }
+        speeddial: { type: string, in: body }
+        facebook_url: { type: string, in: body }
+        linkedin_url: { type: string, in: body }
+        xing_url: { type: string, in: body }
+        twitter_account: { type: string, in: body }
+        color: { type: string, in: body }
+        tags: { type: array, in: body, description: "Complete new list of tag strings." }
+        user_id: { type: integer, in: body }
+        blocked: { type: boolean, in: body }
+      pagination: none
+
+    delete_contact:
+      method: DELETE
+      path: /contacts/{id}
+      access: dangerous
+      description: "Delete a contact. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Contact ID." }
+      pagination: none
+
+    # ── SMS ────────────────────────────────────────────────────────────────
+
+    send_sms:
+      method: POST
+      path: /sms
+      access: write
+      description: >
+        Send a text message (SMS) to a mobile number; SMS are billed by
+        Placetel. Returns no body on success (201). Not retried automatically, so a
+        timeout never causes a duplicate SMS.
+      params:
+        recipient: { type: string, in: body, required: true, description: "Mobile number, e.g. 01701234567 or +491701234567." }
+        message: { type: string, in: body, required: true, description: "Message text." }
+      pagination: none
+
+    # ── Faxes ──────────────────────────────────────────────────────────────
+
+    list_faxes:
+      method: GET
+      path: /faxes
+      access: read
+      description: >
+        Inbound and outbound faxes, newest first: {id, type (inbound |
+        outbound), from_number, to_number, pages, retries, status (queued |
+        working | success | failed | busy | conversion_error), status_info
+        (outbound only, e.g. a T.38 error), email, header, duration, file
+        (URL of the PDF), report (URL of the transmission report PDF),
+        created_at}. Paged: plain array.
+      params:
+        "filter[type]": { type: string, in: query, description: "inbound, outbound or 'inbound,outbound' (API default: both)." }
+        "filter[from_number]": { type: string, in: query }
+        "filter[to_number]": { type: string, in: query }
+        order: *p-order
+        page: *p-page
+        per_page: *p-per-page
+
+    get_fax:
+      method: GET
+      path: /faxes/{id}
+      access: read
+      description: "One fax by ID, e.g. to poll the status of an outbound fax (queued -> working -> success or failed/busy/conversion_error)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Fax ID." }
+      pagination: none
+
+    send_fax:
+      method: POST
+      path: /faxes
+      access: write
+      description: >
+        Send a PDF as fax. file must be a base64 data URI
+        ("data:application/pdf;base64,..."); in ToolMesh pass
+        "tm-blob://<id>#dataurl" after upload_file instead of inline base64.
+        Returns the Fax (status queued); poll get_fax for the result. A
+        status mail goes to email. Not retried automatically.
+      params:
+        from_number: { type: string, in: body, required: true, description: "Your fax-capable Placetel number." }
+        to_number: { type: string, in: body, required: true, description: "Recipient fax number." }
+        email: { type: string, in: body, required: true, description: "Address for the send report." }
+        file: { type: string, in: body, required: true, description: "PDF as base64 data URI or tm-blob://<id>#dataurl." }
+        header: { type: string, in: body, description: "Fax header line." }
+      pagination: none
+
+    delete_fax:
+      method: DELETE
+      path: /faxes/{id}
+      access: dangerous
+      description: "Delete a fax and its documents. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Fax ID." }
+      pagination: none
+
+    # ── Numbers and number profiles ────────────────────────────────────────
+
+    list_numbers:
+      method: GET
+      path: /numbers
+      access: read
+      description: >
+        Phone numbers of the account: {id, routing_id (routing object, see
+        get_routing), site_id, prefix (area code), numonly, number (national
+        format), e164, activated, test_number, name, description, carrier,
+        created_at, updated_at}. Paged: plain array.
+      params:
+        "filter[number]": { type: string, in: query, description: "Phone number in national format exactly as in number (e.g. 02211234567); E.164 and numonly find nothing." }
+        "filter[prefix]": { type: string, in: query, description: "Area code, e.g. 0221." }
+        "filter[name]": { type: string, in: query }
+        "filter[description]": { type: string, in: query }
+        "filter[site_id]": { type: integer, in: query, description: "Site (location) ID from list_sites." }
+        "filter[activated]": { type: boolean, in: query, description: "Only activated (true) or inactive (false) numbers; relevant for PROFI accounts." }
+        page: *p-page
+        per_page: *p-per-page
+
+    get_number:
+      method: GET
+      path: /numbers/{id}
+      access: read
+      description: "One phone number by ID (same fields as list_numbers). Follow routing_id with get_routing to see how its calls are handled."
+      params:
+        id: { type: integer, in: path, required: true, description: "Number ID." }
+      pagination: none
+
+    activate_number:
+      method: POST
+      path: /numbers/{id}/activation
+      access: admin
+      description: "Activate a number of the account so it takes calls. Activation may be charged. Returns the Number. Not retried automatically."
+      params:
+        id: { type: integer, in: path, required: true, description: "Number ID." }
+      pagination: none
+
+    deactivate_number:
+      method: DELETE
+      path: /numbers/{id}/activation
+      access: dangerous
+      description: "Deactivate a number: it stops taking calls. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Number ID." }
+      pagination: none
+
+    list_number_profiles:
+      method: GET
+      path: /numbers/{number_id}/profiles
+      access: read
+      description: >
+        Profiles of a number: saved alternative configurations (e.g. office
+        hours vs. holidays), exactly one active. Each {id, name, number_id,
+        active}. Switch with activate_number_profile. Empty while a number
+        has only its routing; once a profile was created, the number's own
+        routing object shows up as active profile "Standard" (its id equals
+        Number.routing_id).
+      params:
+        number_id: { type: integer, in: path, required: true, description: "Number ID." }
+      pagination: none
+
+    create_number_profile:
+      method: POST
+      path: /numbers/{number_id}/profiles
+      access: write
+      description: "Create a new, inactive profile for a number. On a number without profiles Placetel also turns the number's routing object into the active profile 'Standard' and sets that routing's name to 'Standard'; deleting the new profile later does not undo this. Returns the Profile {id, name, number_id, active}. Not retried automatically."
+      params:
+        number_id: { type: integer, in: path, required: true, description: "Number ID." }
+        name: { type: string, in: body, required: true, description: "Profile name." }
+      pagination: none
+
+    activate_number_profile:
+      method: PUT
+      path: /numbers/{number_id}/profiles
+      access: write
+      description: "Make a profile the active one for a number, which changes how the number handles calls. Returns the Profile."
+      params:
+        number_id: { type: integer, in: path, required: true, description: "Number ID." }
+        id: { type: integer, in: body, required: true, description: "Profile ID from list_number_profiles." }
+      pagination: none
+
+    delete_number_profile:
+      method: DELETE
+      path: /numbers/{number_id}/profiles/{id}
+      access: dangerous
+      description: "Delete a profile of a number. Never delete the active profile 'Standard': its id is the number's routing object (Number.routing_id). Irreversible. Returns no body (204)."
+      params:
+        number_id: { type: integer, in: path, required: true, description: "Number ID." }
+        id: { type: integer, in: path, required: true, description: "Profile ID." }
+      pagination: none
+
+    # ── Routings (how a number handles incoming calls) ─────────────────────
+
+    list_routings:
+      method: GET
+      path: /routings
+      access: read
+      description: >
+        Routing objects: {id, name, one behavior object (forward, group,
+        plan, ivr, queue, api or ai), mailbox, notification, time_settings
+        (only {enabled} while disabled), custom_caller_id ({enabled: 0 or 1,
+        name, number}), music_on_hold, notify_external_api, priority,
+        created_at, updated_at}. name may be null. Paged: plain array.
+      params:
+        "filter[updated_at_gte]": *p-updated-gte
+        "filter[updated_at_lte]": *p-updated-lte
+        page: *p-page
+        per_page: *p-per-page
+
+    get_routing:
+      method: GET
+      path: /routings/{number_or_id}
+      access: read
+      description: >
+        The routing object of a phone number, or a routing object by ID
+        (same fields as list_routings). Answers "where do calls to this
+        number go?".
+      params:
+        number_or_id: { type: string, in: path, required: true, description: "Phone number in national format as in Number.number (e.g. 02211234567; the E.164 form answers 404) or routing object ID." }
+      pagination: none
+
+    create_routing:
+      method: POST
+      path: /routings
+      access: write
+      description: >
+        Create a routing object. Set exactly ONE behavior: forward, group,
+        ivr, queue or api (plan only exists on update_routing). Optional
+        extras: mailbox, notification, time_settings, custom_callerid,
+        music_on_hold. Standalone routing objects serve as IVR menu items,
+        routing plan entries or backup targets; to change what a number does,
+        call update_routing with the number instead. Defaults when omitted:
+        mailbox active, notification type all with receiver global, priority
+        99, time_settings disabled. Returns the RoutingObject. Not retried
+        automatically.
+      params:
+        name: { type: string, in: body, required: true, description: "Name of the routing object." }
+        forward: *p-routing-forward
+        group: *p-routing-group
+        ivr: *p-routing-ivr
+        queue: *p-routing-queue
+        api: *p-routing-api
+        mailbox: *p-routing-mailbox
+        notification: *p-routing-notification
+        time_settings: *p-routing-time-settings
+        custom_callerid: *p-routing-callerid
+        music_on_hold: *p-routing-moh
+        notify_external_api: *p-routing-notify-api
+      pagination: none
+
+    update_routing:
+      method: PUT
+      path: /routings/{number_or_id}
+      access: write
+      description: >
+        Change how a number (or routing object) handles calls. Set ONE
+        behavior: forward, group, plan, ivr, queue or api. Example: forward a
+        number to a mobile phone after 20 s on the office phone with
+        forward={destinations: [{targets: ['7771234567@fpbx.de'],
+        ringing_time: 20}, {targets: ['+491701234567'], ringing_time: 30}],
+        behaviour: 'mailbox'}. Only the objects sent change; omitted name,
+        forward, time_settings or mailbox stay as they are (verified). A
+        ringing_time outside the listed values is rejected with 400. Returns
+        the RoutingObject.
+      params:
+        number_or_id: { type: string, in: path, required: true, description: "Phone number in national format (e.g. 02211234567, not E.164) or routing object ID." }
+        name: { type: string, in: body, description: "Name of the routing object." }
+        forward: *p-routing-forward
+        group: *p-routing-group
+        plan:
+          type: object
+          in: body
+          description: "Routing plan behavior: {id: routing plan ID (required), destinations: [{targets: [...], ringing_time}]}."
+        ivr: *p-routing-ivr
+        queue: *p-routing-queue
+        api: *p-routing-api
+        mailbox: *p-routing-mailbox
+        notification: *p-routing-notification
+        time_settings: *p-routing-time-settings
+        custom_callerid: *p-routing-callerid
+        music_on_hold: *p-routing-moh
+        notify_external_api: *p-routing-notify-api
+      pagination: none
+
+    delete_routing:
+      method: DELETE
+      path: /routings/{number_or_id}
+      access: dangerous
+      description: "Delete a routing object (by ID or by the number it belongs to). Calls to an affected number lose their routing. Irreversible. Returns no body (204)."
+      params:
+        number_or_id: { type: string, in: path, required: true, description: "Phone number in national format (e.g. 02211234567, not E.164) or routing object ID." }
+      pagination: none
+
+    # ── Routing plans ──────────────────────────────────────────────────────
+
+    list_routing_plans:
+      method: GET
+      path: /routing_plans
+      access: read
+      description: >
+        Routing plans: ordered sets of routing objects, each with its own
+        time settings; the first active one answers. Each {id, name,
+        description, did (internal extension of the plan),
+        routing_object_counts, rings_for (numbers that use the plan, national
+        format), created_at, updated_at}. Paged: plain array.
+      params:
+        page: *p-page
+        per_page: *p-per-page
+
+    get_routing_plan:
+      method: GET
+      path: /routing_plans/{id}
+      access: read
+      description: "One routing plan by ID. Its routing objects come from list_routing_plan_objects."
+      params:
+        id: { type: integer, in: path, required: true, description: "Routing plan ID." }
+      pagination: none
+
+    list_routing_plan_objects:
+      method: GET
+      path: /routing_plans/{id}/routings
+      access: read
+      description: "The routing objects of a routing plan, in priority order (same fields as list_routings)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Routing plan ID." }
+      pagination: none
+
+    simulate_routing_plan:
+      method: GET
+      path: /routing_plans/{id}/simulate
+      access: read
+      description: "Which routing object of a plan would answer a call at a given time (checks time settings and holidays). Returns that RoutingObject (same fields as list_routings), or an empty result when no routing object of the plan is active at that time. Read-only."
+      params:
+        id: { type: integer, in: path, required: true, description: "Routing plan ID." }
+        time: { type: string, in: query, description: "ISO 8601 date-time of the simulated call. Defaults to now." }
+      pagination: none
+
+    create_routing_plan:
+      method: POST
+      path: /routing_plans
+      access: write
+      description: "Create a routing plan from existing routing objects. The routing objects then belong to the plan: delete_routing_plan deletes them too. did stays null when omitted. Returns the RoutingPlan. Not retried automatically."
+      params:
+        name: { type: string, in: body, description: "Plan name." }
+        description: { type: string, in: body }
+        did: { type: string, in: body, description: "Internal extension of the plan." }
+        routing_objects: { type: array, in: body, description: "Routing objects in priority order: [{id: routing object ID}]." }
+      pagination: none
+
+    update_routing_plan:
+      method: PUT
+      path: /routing_plans/{id}
+      access: write
+      description: "Update a routing plan. Without routing_objects the plan keeps its objects (verified); when sent, send the complete list in the wanted order. Returns the RoutingPlan."
+      params:
+        id: { type: integer, in: path, required: true, description: "Routing plan ID." }
+        name: { type: string, in: body, required: true, description: "Plan name (required by the API on update)." }
+        description: { type: string, in: body }
+        did: { type: string, in: body, description: "Internal extension of the plan." }
+        routing_objects: { type: array, in: body, description: "[{id: routing object ID, priority: integer}]." }
+      pagination: none
+
+    delete_routing_plan:
+      method: DELETE
+      path: /routing_plans/{id}
+      access: dangerous
+      description: "Delete a routing plan AND the routing objects in it (verified: a routing object of the plan was gone afterwards). Check list_routing_plan_objects, SIP users (routing_plan_id) and routings with plan behavior first. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Routing plan ID." }
+      pagination: none
+
+    # ── SIP users (extensions) and short codes ─────────────────────────────
+
+    list_sip_users:
+      method: GET
+      path: /sip_users
+      access: read
+      description: >
+        SIP users (phone extensions): {id, sipuid, username, domain, name,
+        description, did (internal extension), callerid (outbound caller
+        ID), type (standard | blf | fax | trunk | legacy_standard),
+        webuser_id and webuser (owning user), automatic_prefix,
+        blocked_prefixes, routing_plan_id (fallback when busy or
+        unanswered), online, registrations (active SIP registrations with
+        user_agent, received address, expires, ...), busy_on_busy,
+        contact_speeddialing, p_asserted_identity, hotdesk_login,
+        hotdesk_type, cost_center, created_at, updated_at}. hotdesk_pin is
+        masked ([REDACTED]); password only appears in get_sip_user and
+        create_sip_user, masked as well. Paged: plain array.
+      params:
+        "filter[did]": { type: integer, in: query, description: "Internal extension number." }
+        "filter[username]": { type: string, in: query, description: "SIP username (the part before @ of the sipuid)." }
+        "filter[name]": { type: string, in: query }
+        "filter[description]": { type: string, in: query }
+        page: *p-page
+        per_page: *p-per-page
+      response:
+        result_path: "$"
+        redact: *redact-sip-user-list
+
+    get_sip_user:
+      method: GET
+      path: /sip_users/{id}
+      access: read
+      description: "One SIP user by ID (same fields as list_sip_users; online shows the current registration state). The SIP password and hotdesk PIN are masked."
+      params:
+        id: { type: integer, in: path, required: true, description: "SIP user ID." }
+      response:
+        result_path: "$"
+        redact: *redact-sip-user
+      pagination: none
+
+    create_sip_user:
+      method: POST
+      path: /sip_users
+      access: write
+      description: >
+        Create a SIP user (phone extension). Returns the SipUser; the
+        generated SIP password is masked here, read it in the web portal.
+        Not retried automatically.
+      params:
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "standard, blf, fax, trunk or legacy_standard." }
+        description: { type: string, in: body }
+        did: { type: integer, in: body, description: "Internal extension number." }
+        callerid: { type: string, in: body, description: "Outbound caller ID (one of the account's numbers)." }
+        webuser_id: { type: integer, in: body, description: "Owning user ID (list_users)." }
+        contact_speeddialing: { type: boolean, in: body }
+        automatic_prefix: { type: string, in: body, description: "Prefix prepended to outbound calls, e.g. an area code 0221." }
+        blocked_prefixes: { type: string, in: body, description: "Comma-separated list of blocked destination prefixes." }
+        busy_on_busy: { type: boolean, in: body, description: "Signal busy to further callers while on a call." }
+        routing_plan_id: { type: integer, in: body, description: "Fallback routing plan when busy or unanswered." }
+        hotdesk_login: { type: string, in: body }
+        hotdesk_pin: { type: string, in: body }
+        hotdesk_type: { type: string, in: body, description: "standard, custom or global_did." }
+        hotdesk_provisioning_id: { type: integer, in: body, description: "Provisioned phone used for hotdesking." }
+      response:
+        result_path: "$"
+        redact: *redact-sip-user
+      pagination: none
+
+    update_sip_user:
+      method: PUT
+      path: /sip_users/{id}
+      access: write
+      description: >
+        Update a SIP user; send the fields to change (the type cannot be
+        changed). Returns the SipUser with masked secrets.
+      params:
+        id: { type: integer, in: path, required: true, description: "SIP user ID." }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        did: { type: integer, in: body, description: "Internal extension number." }
+        callerid: { type: string, in: body, description: "Outbound caller ID." }
+        p_asserted_identity: { type: string, in: body, description: "P-Asserted-Identity number for outbound calls." }
+        webuser_id: { type: integer, in: body }
+        contact_speeddialing: { type: boolean, in: body }
+        automatic_prefix: { type: string, in: body }
+        blocked_prefixes: { type: string, in: body, description: "Comma-separated list of blocked destination prefixes." }
+        busy_on_busy: { type: boolean, in: body }
+        routing_plan_id: { type: integer, in: body }
+        hotdesk_login: { type: string, in: body }
+        hotdesk_pin: { type: string, in: body }
+        hotdesk_type: { type: string, in: body, description: "standard, custom or global_did." }
+        hotdesk_provisioning_id: { type: integer, in: body }
+      response:
+        result_path: "$"
+        redact: *redact-sip-user
+      pagination: none
+
+    delete_sip_user:
+      method: DELETE
+      path: /sip_users/{id}
+      access: dangerous
+      description: "Delete a SIP user; phones registered with it stop working. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "SIP user ID." }
+      pagination: none
+
+    list_sip_user_short_codes:
+      method: GET
+      path: /sip_users/{id}/short_codes
+      access: read
+      description: "Short codes (star codes dialed on the phone) of a SIP user: {id, code, action, number, group_id, description, created_at, updated_at}."
+      params:
+        id: { type: integer, in: path, required: true, description: "SIP user ID." }
+      pagination: none
+
+    create_sip_user_short_code:
+      method: POST
+      path: /sip_users/{id}/short_codes
+      access: write
+      description: >
+        Create a short code for a SIP user. action: set_out_anonymous,
+        set_forward, clear_forward, login_group (needs group_id), mailbox,
+        profile, set_out_number (needs number), addto_routing. code must be
+        one of Placetel's predefined codes: a free code such as *987 is
+        rejected with 400 "Validation failed: Code is not included in the
+        list". The API reference does not list the allowed codes; the
+        short code dialog of the web portal shows them. Returns the
+        ShortCode. Not retried automatically.
+      params:
+        id: { type: integer, in: path, required: true, description: "SIP user ID." }
+        code: { type: string, in: body, required: true, description: "Digits to dial." }
+        action: { type: string, in: body, required: true, description: "One of the actions listed above." }
+        number: { type: string, in: body, description: "Number for actions that need one (e.g. set_forward, set_out_number)." }
+        group_id: { type: integer, in: body, description: "Group for login_group." }
+        description: { type: string, in: body }
+      pagination: none
+
+    delete_sip_user_short_code:
+      method: DELETE
+      path: /sip_users/{id}/short_codes/{code_id}
+      access: dangerous
+      description: "Delete a short code of a SIP user. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "SIP user ID." }
+        code_id: { type: integer, in: path, required: true, description: "Short code ID." }
+      pagination: none
+
+    # ── Groups (ring groups) ───────────────────────────────────────────────
+
+    list_groups:
+      method: GET
+      path: /groups
+      access: read
+      description: >
+        Groups of SIP users: {id, name, description, type (ring_all | hunt |
+        monitoring), members (SipUser objects, secrets masked), created_at,
+        updated_at}. Paged: plain array.
+      params:
+        "filter[name]": { type: string, in: query }
+        "filter[description]": { type: string, in: query }
+        "filter[type]": { type: string, in: query, description: "ring_all, hunt or monitoring." }
+        page: *p-page
+        per_page: *p-per-page
+      response:
+        result_path: "$"
+        redact: *redact-group-list
+
+    get_group:
+      method: GET
+      path: /groups/{id}
+      access: read
+      description: "One group by ID with its members."
+      params:
+        id: { type: integer, in: path, required: true, description: "Group ID." }
+      response:
+        result_path: "$"
+        redact: *redact-group
+      pagination: none
+
+    create_group:
+      method: POST
+      path: /groups
+      access: write
+      description: "Create a group of SIP users. Use it as a routing target (group behavior). Returns the Group. Not retried automatically."
+      params:
+        name: { type: string, in: body, required: true }
+        type: { type: string, in: body, required: true, description: "ring_all (all members ring at once), hunt or monitoring." }
+        description: { type: string, in: body }
+        member_ids: { type: array, in: body, description: "SIP user IDs (integers)." }
+      response:
+        result_path: "$"
+        redact: *redact-group
+      pagination: none
+
+    update_group:
+      method: PUT
+      path: /groups/{id}
+      access: write
+      description: "Update a group (the type cannot be changed). member_ids replaces the whole member list; omit it to keep the members (both verified). Returns the Group."
+      params:
+        id: { type: integer, in: path, required: true, description: "Group ID." }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        member_ids: { type: array, in: body, description: "Complete list of member SIP user IDs." }
+      response:
+        result_path: "$"
+        redact: *redact-group
+      pagination: none
+
+    delete_group:
+      method: DELETE
+      path: /groups/{id}
+      access: dangerous
+      description: "Delete a group. Check routings that ring it (group behavior) first. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Group ID." }
+      pagination: none
+
+    # ── Prompts (announcements) ────────────────────────────────────────────
+
+    list_prompts:
+      method: GET
+      path: /prompts
+      access: read
+      description: "Announcements used by IVRs, queues, mailboxes and forwards: {id, name, description, text, file (signed URL of the audio, valid for about 5 minutes; fetch a fresh one with get_prompt), created_at, updated_at}. filter[name] is an exact match. Paged: plain array."
+      params:
+        "filter[name]": { type: string, in: query }
+        "filter[description]": { type: string, in: query }
+        page: *p-page
+        per_page: *p-per-page
+
+    get_prompt:
+      method: GET
+      path: /prompts/{id}
+      access: read
+      description: "One prompt by ID. file is a freshly signed audio URL, valid for about 5 minutes: download right away."
+      params:
+        id: { type: integer, in: path, required: true, description: "Prompt ID." }
+      pagination: none
+
+    create_prompt:
+      method: POST
+      path: /prompts
+      access: write
+      description: >
+        Create an announcement, either synthesized from text with a voice or
+        from an uploaded audio file (base64 data URI; in ToolMesh
+        tm-blob://<id>#dataurl). voice is required by the API in both cases
+        but not returned. Synthesis runs asynchronously: the file URL in this
+        response can answer 404 for a few seconds; call get_prompt shortly
+        after for the final audio (synthesized text came back as WAV, 8 kHz
+        mono, telephone quality). Returns the Prompt. Not retried
+        automatically.
+      params:
+        name: { type: string, in: body, required: true }
+        voice:
+          type: string
+          in: body
+          required: true
+          description: "Text-to-speech voice. Language-prefixed voices: de-DE-Wavenet-G, de-DE-Wavenet-H, de-DE-Chirp3-HD-Erinome, de-DE-Chirp3-HD-Enceladus, de-DE-Chirp3-HD-Sadachbia, de-DE-Chirp3-HD-Sulafat, en-GB-Neural2-A/B/C/D/F, en-GB-Standard-A/B, en-US-Neural2-A/C/D/E/F/G/H/I/J, en-US-Wavenet-A/C/F, es-ES-Neural2-A/B/C/D/E/F, es-ES-Standard-A, fr-FR-Neural2-A/B/C/D/E, fr-FR-Wavenet-A/B, it-IT-Neural2-A/C, it-IT-Wavenet-A/C, ja-JP-Wavenet-A, ko-KR-Standard-A, nl-NL-Wavenet-A/C/D, pt-BR-Standard-A, pt-PT-Wavenet-A/B, sv-SE-Standard-A, sv-SE-Wavenet-A/C, tr-TR-Standard-A, tr-TR-Wavenet-A/B (write the full name, e.g. en-GB-Neural2-A). The API also accepts a set of 20-character voice IDs listed in its reference."
+        text: { type: string, in: body, description: "Text to synthesize." }
+        file: { type: string, in: body, description: "Audio file as base64 data URI or tm-blob://<id>#dataurl (instead of text)." }
+        description: { type: string, in: body }
+      pagination: none
+
+    update_prompt:
+      method: PUT
+      path: /prompts/{id}
+      access: write
+      description: "Update a prompt (new text, voice or audio file). name and voice are required by the API. A new text is synthesized again, asynchronously, and gets a new file URL (see create_prompt). Returns the Prompt."
+      params:
+        id: { type: integer, in: path, required: true, description: "Prompt ID." }
+        name: { type: string, in: body, required: true }
+        voice: { type: string, in: body, required: true, description: "Text-to-speech voice, see create_prompt." }
+        text: { type: string, in: body }
+        file: { type: string, in: body, description: "Audio file as base64 data URI or tm-blob://<id>#dataurl." }
+        description: { type: string, in: body }
+      pagination: none
+
+    delete_prompt:
+      method: DELETE
+      path: /prompts/{id}
+      access: dangerous
+      description: "Delete a prompt. Check IVRs, queues, forwards and mailboxes that play it first. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Prompt ID." }
+      pagination: none
+
+    # ── Call center (agents, queues, queue calls) ──────────────────────────
+
+    list_call_center_agents:
+      method: GET
+      path: /call_center_agents
+      access: read
+      description: >
+        Call center agents: {id, name, description, extension_type (SIP |
+        PSTN), extension_sip, extension_pstn, agent_type (Agent |
+        Supervisor), status (offline | online | dail_out | working | pause),
+        priority, last_call_at, created_at, updated_at}. Needs the call
+        center product; without it the API answers 404. Paged: plain array.
+      params:
+        page: *p-page
+        per_page: *p-per-page
+
+    create_call_center_agent:
+      method: POST
+      path: /call_center_agents
+      access: write
+      description: >
+        Create a call center agent that is reached either on a SIP extension
+        or on an external (PSTN) number, chosen by extension_type. The API
+        requires both extension fields. Returns the CallCenterAgent. Not
+        retried automatically.
+      params:
+        name: { type: string, in: body, required: true }
+        extension_type: { type: string, in: body, required: true, description: "SIP or PSTN." }
+        extension_sip: { type: string, in: body, required: true, description: "sipuid of the agent, e.g. 7771234567@fpbx.de." }
+        extension_pstn: { type: string, in: body, required: true, description: "External number of the agent, e.g. +492211234567." }
+        agent_type: { type: string, in: body, description: "Agent (default) or Supervisor." }
+        description: { type: string, in: body }
+        priority: { type: integer, in: body, description: "Agent priority in the queues." }
+      pagination: none
+
+    update_call_center_agent:
+      method: PUT
+      path: /call_center_agents/{id}
+      access: write
+      description: >
+        Update an agent, e.g. set status to online, pause or offline. The
+        API requires extension_sip and extension_pstn on every update: send
+        the current values from list_call_center_agents. Returns the
+        CallCenterAgent.
+      params:
+        id: { type: integer, in: path, required: true, description: "Agent ID." }
+        extension_sip: { type: string, in: body, required: true, description: "Current or new sipuid of the agent." }
+        extension_pstn: { type: string, in: body, required: true, description: "Current or new external number of the agent." }
+        extension_type: { type: string, in: body, description: "SIP or PSTN." }
+        status: { type: string, in: body, description: "offline, online, dail_out, working or pause (API spelling)." }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        priority: { type: integer, in: body }
+      pagination: none
+
+    list_call_center_queues:
+      method: GET
+      path: /call_center_queues
+      access: read
+      description: >
+        Call center queues: {id, name, description, num_loops, priority,
+        ringing_time, max_iterations, mail_notification, play_prompt and
+        prompt (greeting), play_prompt_waiting and prompt_waiting,
+        play_prompt_end and prompt_end, play_mailbox and prompt_mailbox,
+        created_at, updated_at}. Paged: plain array.
+      params:
+        page: *p-page
+        per_page: *p-per-page
+
+    create_call_center_queue:
+      method: POST
+      path: /call_center_queues
+      access: write
+      description: "Create a call center queue; route a number to it with update_routing (queue behavior). Returns the CallCenterQueue. Not retried automatically."
+      params:
+        name: { type: string, in: body, required: true, description: "Queue name." }
+        description: { type: string, in: body }
+        priority: { type: integer, in: body, description: "Queue priority (API default 0)." }
+        num_loops: { type: integer, in: body, description: "API default 3." }
+        ringing_time: { type: integer, in: body, description: "Seconds an agent rings (API default 30)." }
+        max_iterations: { type: integer, in: body, description: "API default 10." }
+        mail_notification: { type: string, in: body, description: "E-mail address for notifications." }
+        play_prompt: { type: boolean, in: body, description: "Play a greeting (prompt_id)." }
+        prompt_id: { type: integer, in: body }
+        play_prompt_waiting: { type: boolean, in: body, description: "Play a waiting announcement (prompt_waiting_id)." }
+        prompt_waiting_id: { type: integer, in: body }
+        play_prompt_end: { type: boolean, in: body, description: "Play an end announcement (prompt_end_id)." }
+        prompt_end_id: { type: integer, in: body }
+        play_mailbox: { type: boolean, in: body, description: "Offer the mailbox (prompt_mailbox_id)." }
+        prompt_mailbox_id: { type: integer, in: body }
+      pagination: none
+
+    update_call_center_queue:
+      method: PUT
+      path: /call_center_queues/{id}
+      access: write
+      description: "Update a call center queue; send the fields to change. Returns the CallCenterQueue."
+      params:
+        id: { type: integer, in: path, required: true, description: "Queue ID." }
+        name: { type: string, in: body }
+        description: { type: string, in: body }
+        priority: { type: integer, in: body }
+        num_loops: { type: integer, in: body }
+        ringing_time: { type: integer, in: body, description: "Seconds an agent rings." }
+        max_iterations: { type: integer, in: body }
+        mail_notification: { type: string, in: body }
+        play_prompt: { type: boolean, in: body }
+        prompt_id: { type: integer, in: body }
+        play_prompt_waiting: { type: boolean, in: body }
+        prompt_waiting_id: { type: integer, in: body }
+        play_prompt_end: { type: boolean, in: body }
+        prompt_end_id: { type: integer, in: body }
+        play_mailbox: { type: boolean, in: body }
+        prompt_mailbox_id: { type: integer, in: body }
+      pagination: none
+
+    list_call_center_calls:
+      method: GET
+      path: /call_center_calls
+      access: read
+      description: >
+        Queue calls of ONE day: {id, call_type (dail_in | dail_out),
+        call_status (unassigned | assigned | ended | not_answered |
+        cancelled | dail_out), answer_status, started_at, left_queue_at,
+        ended_at, last_updated_at, iteration, from, to, queue_name,
+        agent_name}. unassigned calls are waiting and can be picked with
+        pick_call_center_call. Needs the call center product (404
+        otherwise). Paged: plain array.
+      params:
+        date: { type: string, in: query, required: true, description: "Day as YYYY-MM-DD." }
+        "queue_ids[]": { type: integer, in: query, description: "Only calls of this ONE queue (array filter, one value per call)." }
+        page: *p-page
+        per_page: *p-per-page
+
+    pick_call_center_call:
+      method: POST
+      path: /call_center_calls/{id}/pick
+      access: write
+      description: "Hand a waiting queue call to a given agent. Returns the CallCenterCall. Not retried automatically."
+      params:
+        id: { type: integer, in: path, required: true, description: "Call center call ID." }
+        sipuid: { type: string, in: body, required: true, description: "sipuid of the agent who takes the call." }
+      pagination: none
+
+    # ── CTI call control (desk phones provisioned through Placetel) ────────
+
+    dial_cti_number:
+      method: POST
+      path: /cti/{mac}/dial
+      access: write
+      description: "Start a new call from a provisioned desk phone. Not retried automatically. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone (mac from list_provisionings)." }
+        line: { type: integer, in: body, required: true, description: "Line (account) on the phone." }
+        number: { type: string, in: body, required: true, description: "Number or extension to dial." }
+      pagination: none
+
+    answer_cti_call:
+      method: POST
+      path: /cti/{mac}/answer
+      access: write
+      description: "Answer a ringing call on a provisioned desk phone. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true, description: "Line on the phone." }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID (integer)." }
+      pagination: none
+
+    decline_cti_call:
+      method: POST
+      path: /cti/{mac}/decline
+      access: write
+      description: "Decline a ringing call on a provisioned desk phone. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    hangup_cti_call:
+      method: POST
+      path: /cti/{mac}/hangup
+      access: write
+      description: "End a call on a provisioned desk phone. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    hold_cti_call:
+      method: POST
+      path: /cti/{mac}/hold
+      access: write
+      description: "Put a call on hold on a provisioned desk phone. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    resume_cti_call:
+      method: POST
+      path: /cti/{mac}/resume
+      access: write
+      description: "Resume a held call on a provisioned desk phone. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    transfer_cti_call:
+      method: POST
+      path: /cti/{mac}/blind_transfer
+      access: write
+      description: "Blind transfer: hand a call on a provisioned desk phone to another number without consultation. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+        number: { type: string, in: body, required: true, description: "Transfer target number or extension." }
+      pagination: none
+
+    start_cti_transfer:
+      method: POST
+      path: /cti/{mac}/start_transfer
+      access: write
+      description: "Attended transfer, step 1: start the transfer of a call on a provisioned desk phone; finish with complete_cti_transfer. The API reference does not say how the target is chosen, so for a known target prefer transfer_cti_call. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    complete_cti_transfer:
+      method: POST
+      path: /cti/{mac}/complete_transfer
+      access: write
+      description: "Attended transfer, last step: connect the parties of a transfer started with start_cti_transfer. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    start_cti_conference:
+      method: POST
+      path: /cti/{mac}/start_conference
+      access: write
+      description: "Start a conference from a call on a provisioned desk phone. Finish with complete_cti_conference. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    complete_cti_conference:
+      method: POST
+      path: /cti/{mac}/complete_conference
+      access: write
+      description: "Join the parties of a conference started with start_cti_conference. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+      pagination: none
+
+    dial_cti_digit:
+      method: POST
+      path: /cti/{mac}/dial_digit
+      access: write
+      description: "Send a single digit on a call of a provisioned desk phone. For tone sequences on the active call use send_cti_dtmf_digits. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        line: { type: integer, in: body, required: true }
+        call_id: { type: integer, in: body, required: true, description: "Phone-side call ID." }
+        digit: { type: string, in: body, required: true, description: "One digit, 0-9, * or #." }
+      pagination: none
+
+    send_cti_dtmf_digits:
+      method: POST
+      path: /cti/{mac}/send_dtmf_digits
+      access: write
+      description: "Send DTMF tones on the currently active call of a provisioned desk phone, e.g. to navigate a remote voice menu. Returns no body (201)."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        digits: { type: string, in: body, required: true, description: "Digits to send, e.g. 1#." }
+      pagination: none
+
+    get_cti_config:
+      method: GET
+      path: /cti/{mac}
+      access: read
+      description: "Read a configuration parameter of a provisioned desk phone. Parameter names depend on the phone model."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        "params[]": { type: string, in: query, required: true, description: "ONE parameter name per call (array parameter)." }
+      pagination: none
+
+    set_cti_config:
+      method: PUT
+      path: /cti/{mac}
+      access: admin
+      description: "Set configuration parameters on a provisioned desk phone. Wrong values can make the phone unusable."
+      params:
+        mac: { type: string, in: path, required: true, description: "MAC address of the phone." }
+        params: { type: object, in: body, required: true, description: "Map of parameter name to value; names depend on the phone model." }
+      pagination: none
+
+    # ── Users (web portal logins, permissions) ─────────────────────────────
+
+    list_users:
+      method: GET
+      path: /users
+      access: read
+      description: >
+        Users (web portal logins) of the account: {id, login, email,
+        first_name, last_name, type (main_account | subuser), did and
+        callerid of the primary SIP user, primary_sip_user_id, locale,
+        admin_user, rights_numbers, permissions {enabled, blocks},
+        obfuscate_billing_records, obfuscate_others,
+        two_factor_authentication_enabled, numbers, created_at, updated_at}.
+        Paged: plain array.
+      params:
+        "filter[first_name]": { type: string, in: query }
+        "filter[last_name]": { type: string, in: query }
+        "filter[email]": { type: string, in: query }
+        "filter[login]": { type: string, in: query }
+        "filter[type]": { type: string, in: query, description: "main_account or subuser." }
+        page: *p-page
+        per_page: *p-per-page
+
+    get_user:
+      method: GET
+      path: /users/{id}
+      access: read
+      description: "One user by ID (same fields as list_users)."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+      pagination: none
+
+    create_user:
+      method: POST
+      path: /users
+      access: admin
+      description: >
+        Create a subuser, optionally with an extension and a phone. A
+        subuser without email cannot log in to the web portal. Returns the
+        User. Not retried automatically.
+      params:
+        first_name: { type: string, in: body, required: true }
+        last_name: { type: string, in: body, required: true }
+        email: { type: string, in: body, description: "Login e-mail; without it the subuser cannot use the web portal." }
+        did: { type: integer, in: body, description: "Internal extension number." }
+        assign_did: { type: boolean, in: body, description: "Assign a free extension automatically (API default false)." }
+        callerid: { type: string, in: body, description: "Number shown on outgoing calls." }
+        phone_model: { type: string, in: body, description: "Phone model name as listed by list_devices." }
+        phone_mac: { type: string, in: body, description: "MAC address of the phone to provision." }
+        sip_user_type: { type: string, in: body, description: "standard (default) or blf." }
+      pagination: none
+
+    update_user:
+      method: PUT
+      path: /users/{id}
+      access: admin
+      description: >
+        Update a subuser: name, e-mail, extension, caller ID, admin rights,
+        visible numbers, privacy and portal permissions. permissions.blocks
+        lists portal areas the user may NOT open: billing_record/index,
+        invoice/index, addresses/edit, order, simple/numbers, /fax,
+        /sip_users, simple/index, routing_plans/index, details/robjectlist,
+        simple/groups, groups/edit, provisioning/index, prompts/index,
+        contacts, /cc, :cc_reporting. Returns the User.
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+        first_name: { type: string, in: body }
+        last_name: { type: string, in: body }
+        email: { type: string, in: body }
+        did: { type: integer, in: body, description: "Internal extension number." }
+        callerid: { type: string, in: body, description: "Outgoing caller ID." }
+        primary_sip_user_id: { type: integer, in: body }
+        admin_user: { type: boolean, in: body, description: "Grant admin rights." }
+        rights_numbers: { type: array, in: body, description: "Numbers (strings) this user may see." }
+        locale: { type: string, in: body, description: "de or en." }
+        obfuscate_billing_records: { type: boolean, in: body, description: "Mask billing records for this user." }
+        obfuscate_others: { type: boolean, in: body, description: "Mask numbers outside rights_numbers." }
+        permissions: { type: object, in: body, description: "{enabled: boolean (default true), blocks: [blocked portal areas, see above]}." }
+        avatar: { type: string, in: body, description: "Image as base64 data URI or tm-blob://<id>#dataurl." }
+      pagination: none
+
+    delete_user:
+      method: DELETE
+      path: /users/{id}
+      access: dangerous
+      description: "Delete a subuser. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Subuser ID." }
+      pagination: none
+
+    reset_user_password:
+      method: POST
+      path: /users/{id}/password_reset
+      access: admin
+      description: "Start a password reset for a user (answers 202 without body; 400 when not possible). Not retried automatically."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+      pagination: none
+
+    reset_user_two_factor_authentication:
+      method: DELETE
+      path: /users/{id}/two_factor_authentication
+      access: dangerous
+      description: "Remove a user's two-factor authentication so it must be set up again. Lowers account security until then. Answers 202 without body; 400 when not possible."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+      pagination: none
+
+    # ── Sites (locations) ──────────────────────────────────────────────────
+
+    list_sites:
+      method: GET
+      path: /sites
+      access: read
+      description: "Sites (locations) of the account: {id, name, street, street_no, zip, city, country, prefix (area code)}. Numbers refer to them via site_id. Paged: plain array."
+      params:
+        page: *p-page
+        per_page: *p-per-page
+
+    get_site:
+      method: GET
+      path: /sites/{id}
+      access: read
+      description: "One site by ID."
+      params:
+        id: { type: integer, in: path, required: true, description: "Site ID." }
+      pagination: none
+
+    # ── Devices and phone provisioning ─────────────────────────────────────
+
+    list_devices:
+      method: GET
+      path: /devices
+      access: read
+      description: "Catalog of phone models Placetel can provision: {id, name, display_name, manufacturer, lines, blf_keys, expansion_keys, max_expansion_modules, dect_lines, multicell, encryptable}. Use id as phone_model in create_provisioning. Paged: plain array."
+      params:
+        page: *p-page
+        per_page: *p-per-page
+
+    list_provisionings:
+      method: GET
+      path: /provisionings
+      access: read
+      description: >
+        Phones provisioned through Placetel: {id, name, mac, webuser,
+        device (model), lines [{sipuid, position}], keys [{type, label,
+        value, position}], codec, call_waiting, locale, encryption,
+        custom_configurations}. The mac is the address for the CTI tools.
+        Paged: plain array.
+      params:
+        search: { type: string, in: query, description: "Free text search, e.g. name or MAC address." }
+        webuser_id: { type: integer, in: query, description: "Only phones of this user." }
+        page: *p-page
+        per_page: *p-per-page
+
+    get_provisioning:
+      method: GET
+      path: /provisionings/{id}
+      access: read
+      description: "One provisioned phone by ID."
+      params:
+        id: { type: integer, in: path, required: true, description: "Provisioning ID." }
+      pagination: none
+
+    create_provisioning:
+      method: POST
+      path: /provisionings
+      access: write
+      description: >
+        Register a phone for auto-provisioning. lines lists sipuids in line
+        order; keys sets function keys [{type: blf | line | none | dtmf |
+        speeddial | manual | redirect | keyevent | url, value, label}].
+        Returns the Provisioning. Not retried automatically.
+      params:
+        name: { type: string, in: body, required: true }
+        mac: { type: string, in: body, required: true, description: "MAC address of the phone." }
+        phone_model: { type: integer, in: body, required: true, description: "Device ID from list_devices." }
+        webuser_id: { type: integer, in: body, description: "User the phone belongs to." }
+        lines: { type: array, in: body, description: "sipuids (strings) in line order." }
+        keys: { type: array, in: body, description: "Function keys, see description." }
+        codec: { type: string, in: body, description: "G711a, G729a, G722 or OPUS." }
+        call_waiting: { type: boolean, in: body }
+        encryption: { type: string, in: body, description: "disabled, enabled or template." }
+        locale: { type: string, in: body, description: "de, en, fr or en-GB." }
+      pagination: none
+
+    update_provisioning:
+      method: PUT
+      path: /provisionings/{id}
+      access: write
+      description: "Update a provisioned phone (name, owner, lines, keys, codec, ...). The phone fetches changes on its next configuration update or after reconfigure_provisioning. Returns the Provisioning."
+      params:
+        id: { type: integer, in: path, required: true, description: "Provisioning ID." }
+        name: { type: string, in: body }
+        webuser_id: { type: integer, in: body }
+        lines: { type: array, in: body, description: "sipuids (strings) in line order." }
+        keys: { type: array, in: body, description: "Function keys [{type, value, label}], see create_provisioning." }
+        codec: { type: string, in: body, description: "G711a, G729a, G722 or OPUS." }
+        call_waiting: { type: boolean, in: body }
+        encryption: { type: string, in: body, description: "disabled, enabled or template." }
+        locale: { type: string, in: body, description: "de, en, fr or en-GB." }
+      pagination: none
+
+    delete_provisioning:
+      method: DELETE
+      path: /provisionings/{id}
+      access: dangerous
+      description: "Remove a phone from provisioning. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Provisioning ID." }
+      pagination: none
+
+    reconfigure_provisioning:
+      method: POST
+      path: /provisionings/{id}/reconfigure
+      access: write
+      description: "Tell the phone to fetch its configuration now (SIP command to the user on line 1). Returns the Provisioning."
+      params:
+        id: { type: integer, in: path, required: true, description: "Provisioning ID." }
+      pagination: none
+
+    get_provisioning_custom_configurations:
+      method: GET
+      path: /provisionings/{id}/custom_configurations
+      access: read
+      description: "Custom configuration keys of a provisioned phone: {id, key, value, attributes}."
+      params:
+        id: { type: integer, in: path, required: true, description: "Provisioning ID." }
+      pagination: none
+
+    set_provisioning_custom_configuration:
+      method: PUT
+      path: /provisionings/{id}/custom_configurations
+      access: admin
+      description: "Create or update a raw configuration key of a provisioned phone (model-specific; wrong values can break the phone). Returns the Provisioning."
+      params:
+        id: { type: integer, in: path, required: true, description: "Provisioning ID." }
+        configurations: { type: object, in: body, required: true, description: "{key (required), value (required), attributes}." }
+      pagination: none
+
+    delete_provisioning_custom_configuration:
+      method: DELETE
+      path: /provisionings/{id}/custom_configurations/{custom_configuration_id}
+      access: dangerous
+      description: "Delete a custom configuration key of a provisioned phone. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "Provisioning ID." }
+        custom_configuration_id: { type: integer, in: path, required: true, description: "Custom configuration ID." }
+      pagination: none
+
+    # ── SIM cards (Placetel Mobile) ────────────────────────────────────────
+
+    list_sim_cards:
+      method: GET
+      path: /sim_cards
+      access: read
+      description: "Mobile SIM cards: {id, card_type, iccid (after activation), contract, number, status, sip_user (secrets masked), created_at, updated_at}. Paged: plain array."
+      params:
+        "filter[status]": { type: string, in: query, description: "ordered, sent, in_activation, activated, port_in_progress, pending_cancellation, terminated, activation_canceled or order_canceled." }
+        page: *p-page
+        per_page: *p-per-page
+      response:
+        result_path: "$"
+        redact: *redact-sim-card-list
+
+    get_sim_card:
+      method: GET
+      path: /sim_cards/{id}
+      access: read
+      description: "One SIM card by ID."
+      params:
+        id: { type: integer, in: path, required: true, description: "SIM card ID." }
+      response:
+        result_path: "$"
+        redact: *redact-sim-card
+      pagination: none
+
+    # ── Subscriptions (call event webhooks) ────────────────────────────────
+
+    list_subscriptions:
+      method: GET
+      path: /subscriptions
+      access: read
+      description: "Registered webhook subscriptions: {id (e.g. sub-...), url, incoming, outgoing, hungup, accepted, phone, numbers}."
+      pagination: none
+
+    create_subscription:
+      method: PUT
+      path: /subscriptions
+      access: admin
+      description: >
+        Register a URL that receives call events: incoming and outgoing
+        calls, accepted calls, hang-ups and CTI phone events, optionally only
+        for some numbers. Per Placetel's Notify API documentation events
+        arrive as form-encoded POSTs (event, call_id, from, to, direction).
+        Call data leaves Placetel, so only register endpoints you control. Returns the Subscription. Not retried
+        automatically.
+      params:
+        service: { type: string, in: body, required: true, description: "Free label naming your integration." }
+        url: { type: string, in: body, required: true, description: "HTTPS endpoint that receives the events." }
+        incoming: { type: boolean, in: body, description: "Incoming calls (API default false)." }
+        outgoing: { type: boolean, in: body, description: "Outgoing calls." }
+        accepted: { type: boolean, in: body, description: "Answered calls." }
+        hungup: { type: boolean, in: body, description: "Ended calls." }
+        phone: { type: boolean, in: body, description: "CTI events of provisioned phones." }
+        numbers: { type: array, in: body, description: "Only events of these numbers (strings)." }
+      # No retry_on: a retried PUT could register the webhook twice.
+      errors:
+        format: json
+        message_path: "$.error"
+        terminal: [400, 401, 403, 404, 409, 422, 429, 502, 503, 504]
+      pagination: none
+
+    delete_subscription:
+      method: DELETE
+      path: /subscriptions/{id}
+      access: dangerous
+      description: "Remove a webhook subscription. Returns no body (204)."
+      params:
+        id: { type: string, in: path, required: true, description: "Subscription ID, e.g. sub-112ba1." }
+      pagination: none
+
+    # ── Microsoft Teams (direct routing) ───────────────────────────────────
+
+    get_teams_integration:
+      method: GET
+      path: /microsoft_teams/integration
+      access: read
+      description: "The account's Microsoft Teams integration: {tenant_id, sbc_voice_routes, sync_status, available_ms_teams_seats, created_at}. Answers 403 until the Teams integration is enabled for API access."
+      pagination: none
+
+    list_teams_users:
+      method: GET
+      path: /microsoft_teams/users
+      access: read
+      description: "Microsoft Teams users imported to Placetel: {sip_user_id, ms_uuid, callerid, name, email, phone_system_enabled, resource_account (true = call queue account), account_enabled, sync_status, error_message}. Paged: plain array."
+      params:
+        "filter[sync_status]": { type: string, in: query, description: "not_synced, synced, syncing, sync_failed or disconnect_failed." }
+        page: *p-page
+        per_page: *p-per-page
+
+    import_teams_user:
+      method: POST
+      path: /microsoft_teams/users
+      access: write
+      description: "Link a Microsoft Teams user to a Placetel SIP user (uses one booked Teams seat). The user needs a Microsoft 365 Phone System license. Returns the MsUser. Not retried automatically."
+      params:
+        sip_user_id: { type: integer, in: body, required: true, description: "SIP user ID." }
+        ms_uuid: { type: string, in: body, required: true, description: "Microsoft user object ID (UUID)." }
+      pagination: none
+
+    sync_teams_user:
+      method: PATCH
+      path: /microsoft_teams/sync/{sip_user_id}
+      access: write
+      description: "Push the calling configuration of an imported user to Microsoft again. Returns the MsUser."
+      params:
+        sip_user_id: { type: integer, in: path, required: true, description: "SIP user ID." }
+      pagination: none
+
+    disconnect_teams_user:
+      method: DELETE
+      path: /microsoft_teams/users/{sip_user_id}
+      access: dangerous
+      description: "Disconnect an imported Teams user and sync that to Microsoft; the user loses Placetel calling in Teams. Returns no body (204)."
+      params:
+        sip_user_id: { type: integer, in: path, required: true, description: "SIP user ID." }
+      pagination: none
+
+    # ── Webex (Webex Calling wholesale) ────────────────────────────────────
+
+    list_webex_users:
+      method: GET
+      path: /webex/users
+      access: read
+      description: "Users of the account for Webex: {id, login, first_name, last_name, webex_person_id, webex_subscriber_id, webex_subscriber_status, package, created_at, updated_at}. Without Webex the API answers 403 'Not available for your product'. Paged: plain array."
+      params:
+        "filter[first_name]": { type: string, in: query }
+        "filter[last_name]": { type: string, in: query }
+        "filter[login]": { type: string, in: query }
+        page: *p-page
+        per_page: *p-per-page
+
+    create_webex_user:
+      method: POST
+      path: /webex/users
+      access: admin
+      description: "Create a user, optionally with a Webex license (package); licenses may be billed. Returns the WebexUser. Not retried automatically."
+      params:
+        first_name: { type: string, in: body, required: true }
+        last_name: { type: string, in: body, required: true }
+        email: { type: string, in: body, required: true, description: "E-mail address, used as login." }
+        package: { type: string, in: body, description: "voice, meetings, calling, suite or cx_essentials." }
+        location_id: { type: string, in: body, description: "Webex location ID." }
+        phone_number: { type: string, in: body, description: "Primary phone number (E.164)." }
+        extension: { type: string, in: body, description: "Calling extension." }
+      pagination: none
+
+    delete_webex_user:
+      method: DELETE
+      path: /webex/users/{id}
+      access: dangerous
+      description: "Delete a user and its Webex person. Irreversible. Returns no body (204)."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID from list_webex_users." }
+      pagination: none
+
+    get_webex_user_license:
+      method: GET
+      path: /webex/users/{id}/license
+      access: read
+      description: "The Webex license of a user: {package, change_package_to, change_package_at (scheduled change), canceled_at}."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+      pagination: none
+
+    assign_webex_user_license:
+      method: POST
+      path: /webex/users/{id}/license
+      access: admin
+      description: "Assign a Webex license to a user (may be billed). location_id, phone_number and extension only apply when the user has no license yet. Returns the License. Not retried automatically."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+        package: { type: string, in: body, required: true, description: "voice, meetings, calling, suite or cx_essentials." }
+        location_id: { type: string, in: body }
+        phone_number: { type: string, in: body, description: "Primary phone number (E.164)." }
+        extension: { type: string, in: body }
+      pagination: none
+
+    update_webex_user_license:
+      method: PATCH
+      path: /webex/users/{id}/license
+      access: admin
+      description: "Change the package of a user's Webex license; the change may be scheduled (see change_package_to and change_package_at in the result). Returns the License."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+        package: { type: string, in: body, required: true, description: "voice, meetings, calling, suite or cx_essentials." }
+      pagination: none
+
+    list_webex_user_numbers:
+      method: GET
+      path: /webex/users/{id}/numbers
+      access: read
+      description: "Numbers configured for a Webex user (Number objects). Paged: plain array."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+        page: *p-page
+        per_page: *p-per-page
+
+    update_webex_user_numbers:
+      method: PATCH
+      path: /webex/users/{id}/numbers
+      access: write
+      description: "Change the numbers of a Webex user. Returns the resulting numbers {primary, external, extension}."
+      params:
+        id: { type: integer, in: path, required: true, description: "User ID." }
+        numbers: { type: array, in: body, description: "[{action (e.g. ADD, required), external (E.164), extension, primary (boolean, required), ring_pattern}]." }
+      pagination: none
+
+    list_webex_workspaces:
+      method: GET
+      path: /webex/workspaces
+      access: read
+      description: "Webex workspaces (rooms and shared devices): {id, display_name, supported_devices, capacity, type, calling}."
+      params:
+        display_name: { type: string, in: query, description: "Filter by display name." }
+      pagination: none
+
+    get_webex_workspace:
+      method: GET
+      path: /webex/workspaces/{id}
+      access: read
+      description: "One Webex workspace by ID."
+      params:
+        id: { type: integer, in: path, required: true, description: "Workspace ID." }
+      pagination: none
+
+    create_webex_workspace:
+      method: POST
+      path: /webex/workspaces
+      access: write
+      description: "Create a Webex workspace. Returns the Workspace. Not retried automatically."
+      params:
+        display_name: { type: string, in: body, required: true }
+        supported_devices: { type: string, in: body, required: true, description: "phones or collaborationDevices." }
+        calling: { type: string, in: body, required: true, description: "webexCalling, freeCalling or none." }
+        location_id: { type: string, in: body, required: true, description: "Webex location ID." }
+        phone_number: { type: string, in: body, description: "Phone number (E.164)." }
+        extension: { type: string, in: body }
+      pagination: none
+
+    get_webex_fax_settings:
+      method: GET
+      path: /webex/numbers/{number_or_id}/fax_settings
+      access: read
+      description: "Fax settings of a Webex number: {routing_id, number, e164, faxheader, faxwhitelist, email, faxsettings, fax_attachment, webex_room_ids, license_id, license_package}. faxpin is masked."
+      params:
+        number_or_id: { type: string, in: path, required: true, description: "Phone number or number ID." }
+      response:
+        result_path: "$"
+        redact: *redact-fax-settings
+      pagination: none
+
+    set_webex_fax_settings:
+      method: PUT
+      path: /webex/numbers/{number_or_id}/fax_settings
+      access: admin
+      description: "Turn a Webex number into a fax number or change its fax settings; provisions a fax license on the fly when none is free (may be billed). Returns the settings with faxpin masked."
+      params:
+        number_or_id: { type: string, in: path, required: true, description: "Phone number or number ID." }
+        faxpin: { type: string, in: body, required: true, description: "Fax PIN, at least 4 digits." }
+        faxheader: { type: string, in: body, required: true, description: "Fax header line." }
+        faxwhitelist: { type: string, in: body, description: "Allowed sender addresses, comma or newline separated. Required unless the account has a verified customer domain linked to this number." }
+        email: { type: string, in: body, description: "Recipient address for incoming faxes." }
+        faxsettings: { type: integer, in: body, description: "E-mail routing setting (global vs. local)." }
+        fax_attachment: { type: boolean, in: body, description: "Attach the fax as PDF." }
+        webex_room_ids: { type: array, in: body, description: "Webex bot room IDs (integers) to notify." }
+      response:
+        result_path: "$"
+        redact: *redact-fax-settings
+      pagination: none
+
+    delete_webex_fax_settings:
+      method: DELETE
+      path: /webex/numbers/{number_or_id}/fax_settings
+      access: dangerous
+      description: "Turn a fax number back into a regular number and free its fax license. Returns no body (204)."
+      params:
+        number_or_id: { type: string, in: path, required: true, description: "Phone number or number ID." }
+      pagination: none
+
+    # ── Customers (partner accounts only) ──────────────────────────────────
+
+    list_customers:
+      method: GET
+      path: /customers
+      access: read
+      description: "Customers of a partner account, newest first: {id, customer_ref, login, first_name, last_name, company, country, product, status (test_phase | active | locked), created_at}. Only for partner accounts with a token that has the read:customers scope (403 otherwise). Paged: plain array."
+      params:
+        page: *p-page
+        per_page: *p-per-page
+
+    get_customer:
+      method: GET
+      path: /customers/{id}
+      access: read
+      description: "One customer of the partner account by ID (needs the read:customers scope)."
+      params:
+        id: { type: string, in: path, required: true, description: "Customer ID." }
+      pagination: none
+
+    create_customer:
+      method: POST
+      path: /customers
+      access: admin
+      description: >
+        Create a customer account under the partner account. product must
+        be one the partner may sell (the partner's default product when
+        omitted); the address country must be one the partner may create
+        customers in. Needs a partner token with customer scopes. Returns
+        the new account. Not retried automatically.
+      params:
+        login: { type: string, in: body, required: true, description: "E-mail address the customer signs in with." }
+        first_name: { type: string, in: body, required: true }
+        last_name: { type: string, in: body, required: true }
+        address_attributes: { type: object, in: body, required: true, description: "{first_name, last_name, company, street, streetno, zip, city, country, phonenumber (all required), street2, state, vat_number}." }
+        locale: { type: string, in: body, description: "UI language: de, en, en-GB, en-US, fr, es or it." }
+        product: { type: string, in: body, description: "Technical product name." }
+        client_attributes: { type: object, in: body, description: "{source_country, current_num_extensions}." }
+      pagination: none
+
+  composites:
+    summarize_calls:
+      description: >
+        Summarize the incoming call log of one day: totals per type
+        (accepted, missed, voicemail, blocked), unread count, calls per
+        dialed number, and the list of missed calls and voicemails with
+        caller, matched contact name and time. Pages through list_calls (100
+        per page, at most max_pages pages); truncated=true means the day had
+        more calls than were read.
+      access: read
+      timeout: 60s
+      depends_on: [list_calls]
+      params:
+        date:
+          type: string
+          description: "Day as YYYY-MM-DD. Defaults to today."
+        max_pages:
+          type: integer
+          default: 10
+          description: "Upper bound of pages read (100 calls each), at most 40."
+      code: |
+        const maxPages = Math.min(Math.max(params.max_pages || 10, 1), 40);
+        const query = { per_page: 100 };
+        if (params.date) query["filter[date]"] = params.date;
+        const calls = [];
+        let truncated = false;
+        for (let page = 1; page <= maxPages; page++) {
+          const batch = await api.list_calls(Object.assign({}, query, { page }));
+          const items = Array.isArray(batch) ? batch : [];
+          calls.push(...items);
+          if (items.length < 100) break;
+          if (page === maxPages) truncated = true;
+        }
+        const dialed = (c) => {
+          const t = c.to_number;
+          if (t == null) return "unknown";
+          if (typeof t === "string") return t;
+          const n = t.number;
+          if (typeof n === "string") return n;
+          if (n && typeof n === "object") return n.number || n.e164 || String(n.id);
+          return t.e164 || "unknown";
+        };
+        const contactName = (c) => {
+          const k = c.contact;
+          if (!k) return null;
+          const name = [k.first_name, k.last_name].filter(Boolean).join(" ");
+          return name || k.company || null;
+        };
+        const byType = {};
+        const byNumber = {};
+        let unread = 0;
+        const missed = [];
+        for (const c of calls) {
+          byType[c.type] = (byType[c.type] || 0) + 1;
+          const d = dialed(c);
+          byNumber[d] = (byNumber[d] || 0) + 1;
+          if (c.unread) unread++;
+          if (c.type === "missed" || c.type === "voicemail") {
+            missed.push({
+              id: c.id,
+              type: c.type,
+              from: c.from_number,
+              contact: contactName(c),
+              to: d,
+              received_at: c.received_at,
+              voicemail_url: c.type === "voicemail" ? c.file_url : undefined,
+            });
+          }
+        }
+        return {
+          date: params.date || "today",
+          total: calls.length,
+          truncated,
+          by_type: byType,
+          unread,
+          by_dialed_number: byNumber,
+          missed_and_voicemail: missed,
+        };
+
+  examples:
+    - name: "Missed calls today with caller names"
+      description: "List today's missed calls and voicemails with the matched contact."
+      code: |
+        const calls = await api.list_calls({ "filter[type]": "voicemail,missed", per_page: 100 });
+        return calls.map(c => ({
+          from: c.from_number,
+          who: c.contact ? [c.contact.first_name, c.contact.last_name].filter(Boolean).join(" ") || c.contact.company : null,
+          type: c.type,
+          at: c.received_at,
+        }));
+    - name: "Caller lookup"
+      description: "Find the contact behind a phone number."
+      code: |
+        const hits = await api.list_contacts({ "search[number]": "02211234567" });
+        return hits.map(c => ({ id: c.id, name: `${c.first_name || ""} ${c.last_name || ""}`.trim(), company: c.company }));
+    - name: "Click-to-dial"
+      description: "Ring the extension of a SIP user, then connect it to an external number."
+      code: |
+        const users = await api.list_sip_users({ "filter[did]": 23 });
+        if (users.length === 0) return "no SIP user with extension 23";
+        return await api.initiate_call({ sipuid: users[0].sipuid, target: "+492211234567" });
+    - name: "Forward a number to a mobile phone"
+      description: "Ring the office extension for 20 seconds, then a mobile phone, then the mailbox."
+      code: |
+        const office = (await api.list_sip_users({ "filter[did]": 23 }))[0];
+        return await api.update_routing({
+          number_or_id: "02211234567",
+          forward: {
+            destinations: [
+              { targets: [office.sipuid], ringing_time: 20 },
+              { targets: ["+491701234567"], ringing_time: 30 },
+            ],
+            behaviour: "mailbox",
+          },
+        });
