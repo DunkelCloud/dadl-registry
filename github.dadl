@@ -133,9 +133,9 @@ backend:
   #   The /stats/* endpoints are computed asynchronously. On a cold
   #   cache the first call returns 202 Accepted with an empty body
   #   while GitHub builds the data; the request must be retried until
-  #   it returns 200. These tools add 202 to retry_on so ToolMesh
-  #   re-requests automatically. Stat timestamps are Unix epoch
-  #   SECONDS; weekly buckets start on Sunday.
+  #   it returns 200. These tools list 202 in not_ready_on, so
+  #   ToolMesh re-requests automatically. Stat timestamps are Unix
+  #   epoch SECONDS; weekly buckets start on Sunday.
   #
   # Traffic:
   #   Traffic endpoints cover a rolling 14-day window and require
@@ -3404,9 +3404,10 @@ backend:
     # Expensive aggregates GitHub computes asynchronously. On a cold
     # cache the first request returns 202 Accepted (empty body) while
     # a background job runs; it must be retried until it returns 200.
-    # The errors override below adds 202 to retry_on so ToolMesh
-    # re-requests automatically. All timestamps are Unix epoch
-    # SECONDS; weekly buckets start on Sunday.
+    # Each tool lists 202 in not_ready_on, so ToolMesh re-requests
+    # automatically; the errors override below gives these tools a
+    # longer retry strategy. All timestamps are Unix epoch SECONDS;
+    # weekly buckets start on Sunday.
 
     get_stats_contributors:
       method: GET
@@ -3417,10 +3418,11 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
+      not_ready_on: [202]
       errors: &stats-errors
         format: json
         message_path: "$.message"
-        retry_on: [202, 429, 502, 503]
+        retry_on: [429, 502, 503]
         terminal: [400, 401, 403, 404, 409, 422]
         retry_strategy:
           max_retries: 5
@@ -3436,6 +3438,7 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
+      not_ready_on: [202]
       errors: *stats-errors
 
     get_stats_code_frequency:
@@ -3447,6 +3450,7 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
+      not_ready_on: [202]
       errors: *stats-errors
 
     get_stats_participation:
@@ -3458,6 +3462,7 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
+      not_ready_on: [202]
       errors: *stats-errors
 
     get_stats_punch_card:
@@ -3469,4 +3474,5 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
+      not_ready_on: [202]
       errors: *stats-errors
