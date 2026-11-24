@@ -1,4 +1,4 @@
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH"
@@ -140,6 +140,12 @@ backend:
   #   items, call the per-item tool (get_merge_request / get_project_issue)
   #   or filter client-side after a list call.
   # ──────────────────────────────────────────────────────────────
+
+  health:
+    method: GET
+    path: /personal_access_tokens/self
+    expect_path: $.active
+    auth_expires_path: $.expires_at
 
   tools:
 

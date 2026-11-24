@@ -1,4 +1,4 @@
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH"
@@ -184,6 +184,10 @@ backend:
   #   Found although both exist; a repeated call succeeds, so those
   #   two tools retry on 404.
   # ──────────────────────────────────────────────────────────────
+
+  health:
+    tool: get_authenticated_user
+    expect_path: $.login
 
   tools:
 

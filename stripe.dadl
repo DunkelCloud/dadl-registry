@@ -27,7 +27,7 @@
 # - Webhook endpoints are for registering YOUR server URLs, not for reading events
 # - Events are read-only and retained for 30 days
 # - Charges are mostly legacy — prefer PaymentIntents for new integrations
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "Stripe REST API"
@@ -127,6 +127,10 @@ backend:
       lifecycle: "draft → open (finalize) → paid/void/uncollectible"
     create_refund:
       partial_refund: "set amount for partial refund, omit for full refund of the PaymentIntent"
+
+  health:
+    tool: get_balance
+    expect_path: $.object
 
   tools:
     # ──────────────────────────────────────────────
