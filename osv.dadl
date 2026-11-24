@@ -1,0 +1,864 @@
+# osv.dadl -- OSV.dev vulnerability database REST API for ToolMesh
+# OSV.dev is Google's open, distributed vulnerability database for open source.
+# It aggregates advisories in the OSV schema (https://ossf.github.io/osv-schema/)
+# from many "home databases" (GitHub Security Advisories, PyPA, Go, RustSec,
+# OSS-Fuzz, Debian, Ubuntu, Alpine, AlmaLinux, Rocky Linux, SUSE, Chainguard,
+# NVD-derived CVE records, ...) and answers one question precisely: which known
+# vulnerabilities affect this package at this version (or this git commit)?
+#
+# Domain Notes for LLM consumers:
+# - PUBLIC, KEY-FREE API. No account, API key or token. The auth block below is
+#   the ToolMesh placeholder for APIs without authentication (credential "none").
+#   No rate limit is documented ("currently there are no limits on the API").
+# - SIX ENDPOINTS, all covered: POST /v1/query, POST /v1/querybatch,
+#   GET /v1/vulns/{id}, and three EXPERIMENTAL ones under /v1experimental/
+#   (determineversion, importfindings/{source}, ubuntu/binary-to-source).
+#   Queries are POSTs with a JSON body but have no side effects: every tool is
+#   access: read, and the POST tools set retry_unsafe: true because repeating a
+#   query is harmless (without it ToolMesh would never retry a POST).
+# - IDENTIFIERS: record ids are "<DB>-<ENTRYID>", case-sensitive (GHSA-...,
+#   PYSEC-..., GO-..., RUSTSEC-..., OSV-... for OSS-Fuzz, CVE-... for records
+#   converted from NVD with GIT commit ranges, DEBIAN-CVE-/DSA-/DLA-,
+#   UBUNTU-CVE-/USN-, MAL-... for malicious packages, ...). A lowercase id
+#   ("ghsa-...") returns HTTP 404.
+# - DUPLICATES ARE NORMAL. One vulnerability usually appears under several ids:
+#   GHSA-x lists PYSEC-y and CVE-z in "aliases" (= same vulnerability), and
+#   distro records point to the CVE via "upstream" (UBUNTU-CVE-2024-1 ->
+#   CVE-2024-1). Count distinct vulnerabilities by merging alias-linked ids.
+#   Distro advisories (DSA, DLA, USN) bundle several CVEs, so do not merge them
+#   via "upstream" or one advisory swallows unrelated findings.
+# - ECOSYSTEM NAMES ARE CASE-SENSITIVE and validated: "PyPI", "npm", "Maven",
+#   "Go", "crates.io", "RubyGems", "NuGet", "Packagist", "Pub", "Hex", "Hackage",
+#   "CRAN", "SwiftURL", "GitHub Actions", "Linux", "OSS-Fuzz", "GIT", ... A wrong
+#   spelling ("pypi") is HTTP 400 "invalid ecosystem", not an empty result.
+#   Distro ecosystems take a release suffix: "Debian:12", "Ubuntu:24.04:LTS"
+#   (or "Ubuntu:24.04"), "Alpine:v3.20", "AlmaLinux:9", "Rocky Linux:9".
+#   Without the suffix ("Debian") OSV matches EVERY release of that distro and
+#   the result mixes them (verified: openssl in "Debian" = 102 records,
+#   in "Debian:12" = 61). Full list:
+#   https://osv-vulnerabilities.storage.googleapis.com/ecosystems.txt
+# - PACKAGE NAMES are matched exactly, except PyPI (PEP 503 normalization:
+#   "Jinja2" == "jinja2"), NuGet (case-insensitive) and crates.io
+#   (case-insensitive, "-" == "_"). Maven names are "groupId:artifactId";
+#   the Go standard library is name "stdlib" in ecosystem "Go"; the Linux kernel
+#   is name "Kernel" in ecosystem "Linux". Distro queries use the SOURCE package
+#   name (Debian/Ubuntu "openssl", not "libssl3"); map Ubuntu binary names with
+#   map_ubuntu_binary_packages first.
+# - VERSIONS must be the ecosystem's exact version string. Distro packages need
+#   the full package version incl. epoch and revision ("1:2.3.4-1+deb12u1",
+#   "3.3.1-r0" on Alpine). Omitting the version returns every vulnerability
+#   ever recorded for the package (all versions).
+# - PURL: a package may be given as {"purl": "pkg:pypi/jinja2@3.1.4"} instead of
+#   {name, ecosystem}. Put the version EITHER in the purl OR in "version",
+#   never both (HTTP 400 "version specified in params and PURL query").
+# - COMMIT queries take a full git commit hash and match GIT ranges (mostly
+#   C/C++ projects from OSS-Fuzz and NVD-converted CVE records). "package" is
+#   optional then; do not combine "commit" with "version".
+# - AN EMPTY RESULT IS NOT PROOF OF "CLEAN". Coverage depends on the upstream
+#   feeds OSV imports: ecosystems or distros without a feed, private or vendored
+#   code, packages renamed upstream, version strings in a different format than
+#   the advisory and advisories not yet imported all come back empty. The API
+#   answers a version that no record covers with {} (no "vulns" key); the
+#   tools here normalize that to vulns: [].
+# - SEVERITY: "severity" holds CVSS VECTOR STRINGS (CVSS_V2/V3/V4, e.g.
+#   "CVSS:3.1/AV:N/AC:L/..."), NOT numeric base scores; computing the score
+#   needs a CVSS calculator. Type "Ubuntu" carries a priority word (negligible,
+#   low, medium, high, critical). Labels live elsewhere: GHSA records in
+#   database_specific.severity (LOW, MODERATE, HIGH, CRITICAL), OSS-Fuzz in
+#   affected[].ecosystem_specific.severity, Debian in
+#   affected[].ecosystem_specific.urgency. Many records (older PYSEC, Go)
+#   have no severity at all. The query tools surface these as severity_label.
+# - AFFECTED RANGES: affected[] lists every package (and, for distros, every
+#   release) the record applies to, not only the queried one. ranges[].events
+#   are {introduced}, {fixed}, {last_affected} or {limit}; ECOSYSTEM/SEMVER
+#   ranges use version strings, GIT ranges commit hashes. introduced "0" means
+#   "since the first version". No "fixed" event = no fix released (yet). One
+#   range can hold several branches (Go stdlib: introduced 0 / fixed 1.21.8,
+#   introduced 1.22.0-0 / fixed 1.22.1): pick the fixed version on the
+#   installed version's branch, not the lowest one.
+# - WITHDRAWN: a record with a "withdrawn" timestamp is retracted; ignore it.
+# - PAGINATION uses a body token, not query params: a response may carry
+#   next_page_token, and the same query is repeated with page_token set until
+#   no token comes back. It happens above ~1,000 vulnerabilities per query
+#   (querybatch: ~1,000 per query or ~3,000 in total) OR when the server hits
+#   its 20-second time limit. In the latter case the response can contain ONLY
+#   a token and zero vulns. ToolMesh's automatic pagination cannot follow body
+#   tokens on object responses, so every tool sets pagination: none and
+#   exposes page_token / next_page_token instead.
+# - LINUX KERNEL (verified 2026-11-24): {"name": "Kernel", "ecosystem":
+#   "Linux"} with version "6.6.1" paged through four 20-second rounds of
+#   0 vulns + token and ended after ~87 s with NO result, although the
+#   records exist: they are CVE-* records with ECOSYSTEM ranges such as
+#   introduced 5.11.0 / fixed 5.15.23 (2,700+ of them, ~13 MB unfiltered).
+#   Distro kernel packages (Debian "linux" at 6.1.112-1: 2,920 records,
+#   12.9 MB in the first page) exceed ToolMesh's response limit (below).
+#   Kernel checks therefore do not work reliably through this backend; use
+#   osv-scanner or the bulk export instead.
+# - RESPONSE SIZE: full records are large. Ubuntu records repeat their
+#   affected entry for every Ubuntu release and Pro variant (openssl on
+#   Ubuntu:24.04:LTS = 67 records, 1.75 MB). query_vulnerabilities therefore
+#   projects each record (drops details, references, credits, the enumerated
+#   affected[].versions list and the ecosystem_specific/database_specific
+#   blobs); get_vulnerability returns the complete record. The API caps
+#   responses at 32 MiB on HTTP/1.1, but ToolMesh reads at most 10 MiB of a
+#   response BEFORE the projection runs: a larger body is cut off, the jq
+#   projection fails on the truncated JSON and the call returns the raw text
+#   as a STRING instead of {vulns}. Treat a string result as a failed check,
+#   never as "no findings".
+# - ERRORS are gRPC-status JSON: {"code": 3, "message": "invalid ecosystem"}
+#   (code 3 = INVALID_ARGUMENT -> HTTP 400, code 5 = NOT_FOUND -> HTTP 404).
+# - EXPERIMENTAL endpoints may change without notice: determine_version only
+#   knows C/C++ libraries indexed for OSS-Fuzz and expects base64-encoded MD5
+#   digests; list_import_findings is meant for operators of home databases;
+#   map_ubuntu_binary_packages resolves at most 1,000 Ubuntu binary names.
+# - NOT COVERED (other host): the bulk data exports in the public GCS bucket
+#   gs://osv-vulnerabilities (per-ecosystem all.zip, modified_id.csv,
+#   ecosystems.txt).
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "OSV.dev API"
+source_url: "https://google.github.io/osv.dev/api/"
+date: "2026-11-24"
+
+backend:
+  name: osv
+  type: rest
+  version: "1.0"
+  base_url: "https://api.osv.dev"
+  description: "OSV.dev open source vulnerability database API (public, no key): query known vulnerabilities by package and version, PURL or git commit (single and batched up to 1,000), fetch full OSV records by ID (GHSA, CVE, PYSEC, GO, RUSTSEC, Debian, Ubuntu, ...), run patch-level checks with fixed versions, plus experimental C/C++ version detection, Ubuntu binary-to-source mapping and import findings."
+
+  # No authentication -- OSV.dev is fully public. ToolMesh requires an auth
+  # block; the credential "none" is its placeholder for APIs without auth: it
+  # is never looked up and no header or query parameter is injected.
+  auth:
+    type: apikey
+    credential: none
+    inject_into: header
+
+  # Health: there is no credential to verify, so the check covers reachability
+  # and the response format only. GET /v1/vulns/OSV-2020-111 is the cheapest
+  # side-effect-free call (~1 KB, an OSS-Fuzz record unchanged since 2020); the
+  # API has no dedicated status endpoint.
+  health:
+    method: GET
+    path: /v1/vulns/OSV-2020-111
+    expect_path: "$.id"
+    timeout: 5s
+
+  defaults:
+    headers:
+      Accept: application/json
+    content_type: application/json
+    # No default pagination block: OSV pages with a page_token in the JSON
+    # body and a next_page_token in an object response, which ToolMesh's
+    # automatic pagination cannot follow. Every tool sets pagination: none and
+    # exposes the token explicitly.
+    errors:
+      format: json
+      message_path: "$.message"
+      code_path: "$.code"          # gRPC status code: 3 = invalid argument, 5 = not found
+      retry_on: [429, 500, 502, 503, 504]
+      terminal: [400, 401, 403, 404]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+    response:
+      result_path: "$"
+      allow_jq_override: true
+
+  types:
+    OsvPackage:
+      type: object
+      description: "Package identity: name + ecosystem, plus the purl when the record has one."
+      properties:
+        ecosystem: { type: string }
+        name: { type: string }
+        purl: { type: string }
+    OsvSeverity:
+      type: object
+      description: "Severity entry. score is a CVSS vector string (e.g. CVSS:3.1/AV:N/AC:L/...), not a numeric base score; type Ubuntu carries a priority word."
+      properties:
+        type: { type: string, enum: [CVSS_V2, CVSS_V3, CVSS_V4, Ubuntu] }
+        score: { type: string }
+        source: { type: string }
+    OsvEvent:
+      type: object
+      description: "One range event; exactly one key is set. Versions for ECOSYSTEM/SEMVER ranges, commit hashes for GIT ranges."
+      properties:
+        introduced: { type: string }
+        fixed: { type: string }
+        last_affected: { type: string }
+        limit: { type: string }
+    OsvRange:
+      type: object
+      properties:
+        type: { type: string, enum: [GIT, SEMVER, ECOSYSTEM] }
+        repo: { type: string, description: "Repository URL (GIT ranges only)" }
+        events: { type: array, items: OsvEvent }
+    AffectedSummary:
+      type: object
+      properties:
+        package: OsvPackage
+        ranges: { type: array, items: OsvRange }
+        fixed: { type: array, items: { type: string }, description: "fixed events of the ECOSYSTEM/SEMVER ranges (absent = no fix known)" }
+        last_affected: { type: array, items: { type: string } }
+        versions: { type: array, items: { type: string }, description: "Only present when the entry has no ranges" }
+        severity: { type: array, items: OsvSeverity }
+        severity_label: { type: string, description: "ecosystem_specific.severity / .urgency or database_specific.severity of this entry" }
+    VulnSummary:
+      type: object
+      properties:
+        id: { type: string }
+        summary: { type: string, description: "Record summary, or the first 240 characters of details when the record has none" }
+        aliases: { type: array, items: { type: string } }
+        upstream: { type: array, items: { type: string } }
+        published: { type: string }
+        modified: { type: string }
+        withdrawn: { type: string, description: "Set when the record was retracted -- ignore such records" }
+        severity: { type: array, items: OsvSeverity }
+        severity_label: { type: string, description: "database_specific.severity (e.g. GHSA LOW|MODERATE|HIGH|CRITICAL), else the Ubuntu priority from severity" }
+        affected: { type: array, items: AffectedSummary }
+      required: [id]
+    VulnSummaryPage:
+      type: object
+      properties:
+        vulns: { type: array, items: VulnSummary }
+        next_page_token: { type: string, description: "Present when more results exist -- repeat the query with page_token" }
+      required: [vulns]
+    BatchVulnRef:
+      type: object
+      properties:
+        id: { type: string }
+        modified: { type: string }
+    BatchResult:
+      type: object
+      properties:
+        vulns: { type: array, items: BatchVulnRef }
+        next_page_token: { type: string }
+      required: [vulns]
+    VersionMatch:
+      type: object
+      properties:
+        score: { type: number, description: "0 < score <= 1, 1 = perfect match" }
+        repo_info:
+          type: object
+          properties:
+            type: { type: string }
+            address: { type: string }
+            tag: { type: string }
+            version: { type: string }
+            commit: { type: string }
+        minimum_file_matches: { type: string }
+        estimated_diff_files: { type: string }
+    ImportFinding:
+      type: object
+      properties:
+        bug_id: { type: string }
+        source: { type: string }
+        findings: { type: array, items: { type: string } }
+        first_seen: { type: string }
+        last_attempt: { type: string }
+    SourcePackages:
+      type: object
+      properties:
+        source_names: { type: array, items: { type: string } }
+
+  tools:
+
+    # =========================================================================
+    # Vulnerability queries -- "which known vulnerabilities affect this package
+    # version / this commit?" Single query (projected records), batched query
+    # (ids only, up to 1,000 packages) and full record lookup by id.
+    # =========================================================================
+
+    query_vulnerabilities:
+      method: POST
+      path: /v1/query
+      access: read
+      retry_unsafe: true
+      description: >
+        List the known vulnerabilities affecting one package version or one git
+        commit (POST /v1/query). Identify the package as {name, ecosystem} or as
+        {purl}; ecosystem names are CASE-SENSITIVE ("PyPI", "npm", "Maven", "Go",
+        "crates.io", "RubyGems", "NuGet", "Debian:12", "Ubuntu:24.04:LTS",
+        "Alpine:v3.20"; a wrong spelling is HTTP 400 "invalid ecosystem"). Distro
+        ecosystems need the release suffix -- plain "Debian" mixes all releases.
+        Use the exact ecosystem version string (distros: full version incl. epoch
+        and revision); omit version to get every vulnerability ever recorded for
+        the package. Put the version in the purl OR in version, never both (400).
+        Returns {vulns, next_page_token?}; each record is projected to id,
+        summary (falls back to the first 240 chars of details), aliases,
+        upstream, published, modified, withdrawn, severity (CVSS VECTOR strings,
+        not numeric scores), severity_label (GHSA label such as HIGH, else the
+        Ubuntu priority) and affected[]
+        with package, ranges (introduced/fixed/last_affected events), fixed
+        (fixed versions of the non-GIT ranges; absent = no fix known),
+        last_affected and severity_label. affected[] lists EVERY package and
+        distro release the record covers, not only the queried one -- match
+        package.ecosystem and package.name. One range may hold several branches:
+        pick the fix on the installed version's branch. The same vulnerability
+        often appears under several ids (GHSA + PYSEC + CVE via aliases):
+        deduplicate before counting. Ignore records with withdrawn set. Details,
+        references, credits and the enumerated versions list are dropped: call
+        get_vulnerability for the full record. An empty vulns list is NOT proof
+        that the version is safe -- coverage depends on the upstream advisory
+        feeds. PAGINATION: when next_page_token is present (more than ~1,000
+        results, or the server's 20-second limit was hit, in which case a page
+        can hold ZERO vulns plus a token), call again with the same query and
+        page_token until no token comes back. SIZE LIMIT: ToolMesh reads at
+        most 10 MiB of the raw response; above that (distro kernel packages
+        such as Debian "linux": ~13 MB) the projection fails and the call
+        returns a STRING instead of {vulns} -- treat that as a failed check,
+        not as "no findings". Linux kernel version queries ({name: "Kernel",
+        ecosystem: "Linux"}) take several 20-second rounds and returned no
+        match for 6.6.1 although kernel CVEs exist: not usable for kernel
+        checks.
+      params:
+        package:
+          type: object
+          in: body
+          description: "Package to query: {name, ecosystem} (e.g. {name: 'jinja2', ecosystem: 'PyPI'}) or {purl} (e.g. {purl: 'pkg:npm/lodash@4.17.15'}). Optional for commit queries."
+        version:
+          type: string
+          in: body
+          description: "Exact version string in the ecosystem's format (e.g. '2.4.1', Debian '3.0.11-1~deb12u2'). Must not be combined with commit or a versioned purl."
+        commit:
+          type: string
+          in: body
+          description: "Full git commit hash to query GIT ranges for (mostly C/C++ projects). Must not be combined with version."
+        page_token:
+          type: string
+          in: body
+          description: "next_page_token from the previous response, sent together with the unchanged query."
+      returns: VulnSummaryPage
+      response:
+        result_path: "$"
+        transform: |
+          def nn: with_entries(select(.value != null));
+          def nonempty: if (. == null or length == 0) then null else . end;
+          def sev_label: if type == "object" then (.severity // .urgency) else null end;
+          {
+            vulns: [(.vulns // [])[] | {
+              id,
+              summary: (.summary // ((.details // "") | .[0:240] | if . == "" then null else . end)),
+              aliases: (.aliases | nonempty),
+              upstream: (.upstream | nonempty),
+              published,
+              modified,
+              withdrawn,
+              severity: (.severity | nonempty),
+              severity_label: (((.database_specific // null) | sev_label) // ([(.severity // [])[] | select(.type == "Ubuntu") | .score][0])),
+              affected: [(.affected // [])[] | {
+                package: (if .package == null then null else (.package | {ecosystem, name, purl} | nn) end),
+                ranges: ([(.ranges // [])[] | {type, repo, events} | nn] | nonempty),
+                fixed: ([(.ranges // [])[] | select(.type != "GIT") | (.events // [])[] | .fixed // empty] | nonempty),
+                last_affected: ([(.ranges // [])[] | select(.type != "GIT") | (.events // [])[] | .last_affected // empty] | nonempty),
+                versions: (if ((.ranges // []) | length) == 0 then (.versions | nonempty) else null end),
+                severity: (.severity | nonempty),
+                severity_label: (((.ecosystem_specific // null) | sev_label) // ((.database_specific // null) | sev_label))
+              } | nn]
+            } | nn],
+            next_page_token
+          } | nn
+        allow_jq_override: true
+      pagination: none
+
+    query_vulnerabilities_batch:
+      method: POST
+      path: /v1/querybatch
+      access: read
+      retry_unsafe: true
+      description: >
+        Check up to 1,000 package versions or commits in one request
+        (POST /v1/querybatch). Each item of queries has the same shape as a
+        query_vulnerabilities call: {package: {name, ecosystem} | {purl},
+        version?} or {commit}, optionally page_token. Returns an array in the
+        SAME ORDER as queries; each element is {vulns: [{id, modified}],
+        next_page_token?} -- ids only, no summaries, severities or fixed
+        versions. An unaffected item yields vulns: [] (NOT proof that it is
+        safe; coverage depends on the upstream feeds). One invalid item (e.g.
+        ecosystem "pypi" instead of "PyPI") fails the whole batch with HTTP 400
+        "error in query at index N". Follow up with query_vulnerabilities for an
+        affected package (projected records with fixed versions) or
+        get_vulnerability for single ids -- or use the check_package_vulns
+        composite, which does both. Records describing the same vulnerability
+        (GHSA + PYSEC + CVE) are listed separately. Pagination is per item: an
+        item carries next_page_token above ~1,000 vulns per item or ~3,000 in
+        total; re-send only those items with page_token set.
+      params:
+        queries:
+          type: array
+          in: body
+          required: true
+          description: "Array of 1-1000 query objects, e.g. [{package: {name: 'jinja2', ecosystem: 'PyPI'}, version: '2.4.1'}, {package: {purl: 'pkg:npm/lodash@4.17.15'}}, {commit: '<40-hex sha>'}]."
+      returns:
+        type: array
+        items: BatchResult
+      response:
+        result_path: "$"
+        transform: |
+          [(.results // [])[] | {vulns: [(.vulns // [])[] | {id, modified}], next_page_token} | with_entries(select(.value != null))]
+        allow_jq_override: true
+      pagination: none
+
+    get_vulnerability:
+      method: GET
+      path: /v1/vulns/{id}
+      access: read
+      description: >
+        Get the complete OSV record for one vulnerability id (GET
+        /v1/vulns/{id}): id, summary, details (Markdown), aliases, related,
+        upstream, published, modified, withdrawn, severity (CVSS vector
+        strings), affected[] (package, ranges with introduced/fixed/
+        last_affected events, the enumerated versions list, ecosystem_specific,
+        database_specific), references (advisories, fix commits, reports),
+        credits, database_specific and schema_version. Ids are CASE-SENSITIVE
+        ("GHSA-462w-v97r-4m45", not "ghsa-..."); an unknown id is HTTP 404
+        "Vulnerability not found". Many CVE ids resolve directly (records
+        converted from NVD, with GIT commit ranges); otherwise query by package
+        and read the CVE from aliases/upstream. Records can be large (Log4Shell
+        CVE-2021-44228 ~60 KB, Ubuntu records list every release): project the
+        fields you need in code.
+      params:
+        id:
+          type: string
+          in: path
+          required: true
+          description: "OSV record id, case-sensitive, e.g. GHSA-462w-v97r-4m45, PYSEC-2019-217, GO-2024-2598, CVE-2021-44228, UBUNTU-CVE-2024-13176, OSV-2020-111."
+      returns:
+        type: object
+        description: "Full OSV record (OSV schema), see https://ossf.github.io/osv-schema/"
+        properties:
+          id: { type: string }
+          summary: { type: string }
+          details: { type: string }
+          aliases: { type: array, items: { type: string } }
+          related: { type: array, items: { type: string } }
+          upstream: { type: array, items: { type: string } }
+          published: { type: string }
+          modified: { type: string }
+          withdrawn: { type: string }
+          severity: { type: array, items: OsvSeverity }
+          affected: { type: array, items: { type: object } }
+          references: { type: array, items: { type: object } }
+          credits: { type: array, items: { type: object } }
+          database_specific: { type: object }
+          schema_version: { type: string }
+      response:
+        result_path: "$"
+        allow_jq_override: true
+      pagination: none
+
+    # =========================================================================
+    # Experimental endpoints (/v1experimental/) -- documented by OSV.dev as
+    # experimental; shape and availability may change without notice.
+    # =========================================================================
+
+    determine_version:
+      method: POST
+      path: /v1experimental/determineversion
+      access: read
+      retry_unsafe: true
+      description: >
+        Identify the upstream library and version of a C/C++ source tree from
+        file hashes, e.g. for vendored code without a package manager
+        (EXPERIMENTAL endpoint POST /v1experimental/determineversion, may
+        change without notice). Only libraries indexed
+        for OSS-Fuzz are known. Hash every .c, .cc, .h, .hh, .cpp and .hpp file
+        of the library: file_hashes = [{file_path: 'src/zlib.h' (relative to the
+        library root), hash: '<base64 of the raw 16-byte MD5 digest, NOT hex>'}].
+        Returns matches sorted by score (1.0 = perfect), each with repo_info
+        {type, address, tag, version}, minimum_file_matches and
+        estimated_diff_files (int64 values as strings). An empty array means no
+        match. Then query the likely versions with query_vulnerabilities_batch
+        (ecosystem "GIT", name = repo_info.address, version = repo_info.tag).
+      params:
+        name:
+          type: string
+          in: body
+          description: "Optional library name to narrow the search, e.g. 'protobuf'."
+        file_hashes:
+          type: array
+          in: body
+          required: true
+          description: "Array of {file_path, hash} -- hash is the base64-encoded raw MD5 digest of the file."
+      returns:
+        type: array
+        items: VersionMatch
+      response:
+        result_path: "$"
+        transform: |
+          .matches // []
+        allow_jq_override: true
+      pagination: none
+
+    map_ubuntu_binary_packages:
+      method: POST
+      path: /v1experimental/ubuntu/binary-to-source
+      access: read
+      retry_unsafe: true
+      description: >
+        Map Ubuntu BINARY package names (as listed by dpkg/apt, e.g.
+        libssl3t64, libcurl4t64) to the SOURCE package names that OSV's Ubuntu
+        records are indexed by (EXPERIMENTAL endpoint POST
+        /v1experimental/ubuntu/binary-to-source). Run this before querying
+        Ubuntu packages by name: query_vulnerabilities with ecosystem
+        "Ubuntu:24.04:LTS" expects "openssl", not "libssl3t64". Up to 1,000
+        names per call. Returns an array in the SAME ORDER as binary_names, each
+        {source_names: [...]}; an empty source_names means the binary is unknown
+        in that release (binary names change between releases, e.g. libcurl4 on
+        22.04 vs libcurl4t64 on 24.04). The ecosystem must carry a release
+        ("Ubuntu:24.04", "Ubuntu:24.04:LTS", "Ubuntu:Pro:24.04:LTS"); other
+        distros are rejected with HTTP 400.
+      params:
+        ecosystem:
+          type: string
+          in: body
+          required: true
+          description: "Ubuntu release ecosystem, e.g. 'Ubuntu:24.04:LTS', 'Ubuntu:22.04:LTS', 'Ubuntu:Pro:20.04:LTS'."
+        binary_names:
+          type: array
+          in: body
+          required: true
+          description: "Non-empty array of up to 1000 Ubuntu binary package names."
+      returns:
+        type: array
+        items: SourcePackages
+      response:
+        result_path: "$"
+        transform: |
+          [(.results // [])[] | {source_names: (.source_names // [])}]
+        allow_jq_override: true
+      pagination: none
+
+    list_import_findings:
+      method: GET
+      path: /v1experimental/importfindings/{source}
+      access: read
+      description: >
+        List the records of one OSV.dev data source that failed OSV.dev's
+        import-time quality checks and were therefore NOT imported
+        (EXPERIMENTAL endpoint GET /v1experimental/importfindings/{source}).
+        Meant for operators of
+        home databases that publish OSV records; also useful to explain why a
+        known advisory is missing from query results. source is the source name
+        from OSV.dev's source.yaml (case-sensitive, lowercase, e.g. 'ghsa').
+        Returns an array of {bug_id, source, findings: [IMPORT_FINDING_TYPE_...],
+        first_seen, last_attempt}. An empty array means no findings -- an
+        unknown source name ALSO returns an empty array, not an error.
+      params:
+        source:
+          type: string
+          in: path
+          required: true
+          description: "Data source name as in OSV.dev's source.yaml (name field), e.g. 'ghsa'."
+      returns:
+        type: array
+        items: ImportFinding
+      response:
+        result_path: "$"
+        transform: |
+          .invalid_records // []
+        allow_jq_override: true
+      pagination: none
+
+  # ===========================================================================
+  # Composites
+  # ===========================================================================
+  composites:
+
+    check_package_vulns:
+      access: read
+      description: >
+        Patch-level check for a list of package versions (or commits): one
+        query_vulnerabilities_batch call, then query_vulnerabilities for every
+        affected item, merged into findings per input item. Input queries: the
+        same objects as for query_vulnerabilities_batch (1-1000). Returns
+        {checked, vulnerable, detail_budget_exhausted, results: [{index, query,
+        vulnerable, finding_count, findings: [{ids, aliases, upstream, summary,
+        severity, severity_label, fixed, last_affected, ranges}],
+        package_match, incomplete, detailed, record_ids, withdrawn_ids,
+        error}]} in input order. A finding is one vulnerability: records linked
+        via aliases (GHSA + PYSEC + CVE) are merged; distro advisories that
+        bundle several CVEs (DSA, DLA, USN) stay separate. fixed and ranges are
+        taken from the affected entries matching the queried package (ecosystem
+        incl. release prefix + normalized name, or purl without version);
+        package_match false means no entry matched and all entries were used.
+        fixed lists every fixed version of the matched ranges (several branches
+        possible -- pick the one on the installed version's branch; empty = no
+        fix known). At most 49 affected items get details per run (sandbox limit
+        of 50 calls); the rest come back with detailed: false and record_ids
+        only -- call again with those items. An item whose detail query failed
+        or exceeded ToolMesh's 10 MiB response limit (distro kernel packages)
+        keeps vulnerable: true with detailed: false, record_ids and error.
+        incomplete: true means OSV paginated (>1,000 results or its 20-second
+        limit): use query_vulnerabilities with page_token for that item.
+        vulnerable: false is NOT proof of "clean" -- coverage depends on the
+        upstream feeds.
+      params:
+        queries:
+          type: array
+          required: true
+          description: "Array of 1-1000 query objects: {package: {name, ecosystem} | {purl}, version?} or {commit}."
+      timeout: 120s
+      depends_on: [query_vulnerabilities_batch, query_vulnerabilities]
+      code: |
+        const queries = params.queries;
+        if (!Array.isArray(queries) || queries.length === 0) {
+          throw new Error("queries must be a non-empty array of OSV query objects");
+        }
+        if (queries.length > 1000) {
+          throw new Error("at most 1000 queries per call (OSV querybatch limit)");
+        }
+        // 50 api.* calls per composite run; one is the batch call.
+        let budget = 49;
+
+        const normName = (s) => String(s || "").toLowerCase().replace(/[-_.]+/g, "-");
+        const purlBase = (p) => {
+          let s = String(p || "");
+          try { s = decodeURIComponent(s); } catch (e) { /* keep the raw purl */ }
+          s = s.split("#")[0].split("?")[0];
+          const at = s.lastIndexOf("@");
+          if (at > s.lastIndexOf("/")) s = s.slice(0, at);
+          return s.toLowerCase();
+        };
+        const matchesQuery = (q, aff) => {
+          const ap = aff.package || {};
+          const qp = q.package || {};
+          if (qp.purl) return !!ap.purl && purlBase(ap.purl) === purlBase(qp.purl);
+          if (qp.name && qp.ecosystem) {
+            const ae = String(ap.ecosystem || "");
+            const sameEco = ae === qp.ecosystem || ae.indexOf(qp.ecosystem + ":") === 0;
+            return sameEco && normName(ap.name) === normName(qp.name);
+          }
+          return false;
+        };
+        const uniq = (arr) => Array.from(new Set(arr));
+        const uniqBy = (arr, keyFn) => {
+          const seen = {};
+          return arr.filter((x) => {
+            const k = keyFn(x);
+            if (seen[k]) return false;
+            seen[k] = true;
+            return true;
+          });
+        };
+
+        const batch = await api.query_vulnerabilities_batch({ queries: queries });
+        if (!Array.isArray(batch)) {
+          // A string here means the raw batch response was cut off at ToolMesh's
+          // 10 MiB limit and the projection could not run.
+          throw new Error("querybatch response could not be parsed (over 10 MiB?) -- split the queries into smaller batches");
+        }
+        const results = [];
+
+        for (let i = 0; i < queries.length; i++) {
+          const q = queries[i] || {};
+          const r = (batch && batch[i]) || {};
+          const refs = r.vulns || [];
+          const entry = { index: i, query: q, vulnerable: refs.length > 0 };
+          if (r.next_page_token) entry.incomplete = true;
+          if (refs.length === 0) {
+            entry.finding_count = 0;
+            results.push(entry);
+            continue;
+          }
+          if (budget <= 0) {
+            entry.detailed = false;
+            entry.record_ids = refs.map((v) => v.id);
+            results.push(entry);
+            continue;
+          }
+          budget--;
+
+          const args = {};
+          if (q.package) args.package = q.package;
+          if (q.version) args.version = q.version;
+          if (q.commit) args.commit = q.commit;
+          let page;
+          try {
+            page = await api.query_vulnerabilities(args);
+          } catch (e) {
+            entry.detailed = false;
+            entry.record_ids = refs.map((v) => v.id);
+            entry.error = String((e && e.message) || e);
+            results.push(entry);
+            continue;
+          }
+          if (!page || typeof page !== "object" || !Array.isArray(page.vulns)) {
+            // Never report "not affected" for an unparseable detail response:
+            // the raw body exceeded ToolMesh's 10 MiB limit (distro kernel
+            // packages) or the projection failed.
+            entry.detailed = false;
+            entry.record_ids = refs.map((v) => v.id);
+            entry.error = "detail response could not be parsed (raw response over ToolMesh's 10 MiB limit?)";
+            results.push(entry);
+            continue;
+          }
+          if (page.next_page_token) entry.incomplete = true;
+
+          const records = page.vulns;
+          const live = records.filter((v) => !v.withdrawn);
+          const withdrawnIds = records.filter((v) => v.withdrawn).map((v) => v.id);
+          if (withdrawnIds.length > 0) entry.withdrawn_ids = withdrawnIds;
+
+          // Merge records that describe the same vulnerability (alias-linked).
+          let groups = [];
+          for (const rec of live) {
+            const keys = new Set([rec.id].concat(rec.aliases || []));
+            const merged = { keys: keys, recs: [rec] };
+            const rest = [];
+            for (const g of groups) {
+              let overlaps = false;
+              g.keys.forEach((k) => { if (keys.has(k)) overlaps = true; });
+              if (overlaps) {
+                g.keys.forEach((k) => merged.keys.add(k));
+                merged.recs = merged.recs.concat(g.recs);
+              } else {
+                rest.push(g);
+              }
+            }
+            rest.push(merged);
+            groups = rest;
+          }
+
+          let packageMatched = true;
+          entry.findings = groups.map((g) => {
+            const ids = g.recs.map((v) => v.id).sort();
+            const allAff = [];
+            g.recs.forEach((v) => (v.affected || []).forEach((a) => allAff.push(a)));
+            let aff = allAff.filter((a) => matchesQuery(q, a));
+            if (aff.length === 0) {
+              aff = allAff;
+              packageMatched = false;
+            }
+            let severity = [];
+            g.recs.forEach((v) => { severity = severity.concat(v.severity || []); });
+            aff.forEach((a) => { severity = severity.concat(a.severity || []); });
+            severity = uniqBy(severity, (s) => s.type + "|" + s.score);
+            let label = null;
+            g.recs.forEach((v) => { if (!label && v.severity_label) label = v.severity_label; });
+            aff.forEach((a) => { if (!label && a.severity_label) label = a.severity_label; });
+            let fixed = [];
+            let lastAffected = [];
+            let ranges = [];
+            aff.forEach((a) => {
+              fixed = fixed.concat(a.fixed || []);
+              lastAffected = lastAffected.concat(a.last_affected || []);
+              ranges = ranges.concat(a.ranges || []);
+            });
+            let upstream = [];
+            g.recs.forEach((v) => { upstream = upstream.concat(v.upstream || []); });
+            const summaryRec = g.recs.find((v) => v.summary);
+            const finding = {
+              ids: ids,
+              aliases: uniq(Array.from(g.keys).filter((k) => ids.indexOf(k) < 0)).sort(),
+              summary: summaryRec ? summaryRec.summary : null,
+              severity: severity,
+              fixed: uniq(fixed)
+            };
+            if (label) finding.severity_label = label;
+            if (upstream.length > 0) finding.upstream = uniq(upstream).sort();
+            if (lastAffected.length > 0) finding.last_affected = uniq(lastAffected);
+            finding.ranges = uniqBy(ranges, (x) => JSON.stringify(x));
+            return finding;
+          });
+          entry.vulnerable = entry.findings.length > 0;
+          entry.finding_count = entry.findings.length;
+          if (entry.findings.length > 0) entry.package_match = packageMatched;
+          results.push(entry);
+        }
+
+        return {
+          checked: queries.length,
+          vulnerable: results.filter((x) => x.vulnerable).length,
+          detail_budget_exhausted: results.some((x) => x.detailed === false && !x.error),
+          results: results
+        };
+
+  coverage:
+    endpoints: 6
+    total_endpoints: 6
+    percentage: 100
+    focus: "OSV.dev vulnerability API: vulnerabilities (package versions, PURLs, git commits, IDs, batches of 1,000), packages (patch-level checks with fixed versions and severity), versions (C/C++ source fingerprinting), Ubuntu (binary-to-source mapping), import findings (record quality)."
+    missing: "Every documented REST endpoint is covered (three of them are experimental). Not covered because they live on another host: the bulk data exports in the public GCS bucket gs://osv-vulnerabilities (per-ecosystem all.zip archives, modified_id.csv, ecosystems.txt). The osv.dev web UI and the osv-scanner CLI are separate products."
+    last_reviewed: "2026-11-24"
+
+  setup:
+    credential_steps:
+      - "No credentials are required -- the OSV.dev API is public and anonymous."
+      - "No signup, API key, token or OAuth client is needed for any endpoint."
+      - "Keep credential: none in the DADL; ToolMesh then sends every request without authentication."
+    env_var: ""
+    backends_yaml: |
+      - name: osv
+        transport: rest
+        dadl: osv.dadl
+        url: "https://api.osv.dev"
+        options:
+          timeout: "60s"
+    required_scopes: []
+    optional_scopes: []
+    docs_url: "https://google.github.io/osv.dev/api/"
+    notes: >
+      Public read API operated by Google's open source security team (osv.dev,
+      source code Apache-2.0). No authentication and no documented rate limit.
+      Base URL is https://api.osv.dev; the file uses full paths because the
+      stable endpoints live under /v1/ and the experimental ones under
+      /v1experimental/. OpenAPI (Swagger 2.0) spec:
+      https://osv.dev/docs/osv_service_v1.swagger.json . OSV schema reference:
+      https://ossf.github.io/osv-schema/ . Valid ecosystem names:
+      https://osv-vulnerabilities.storage.googleapis.com/ecosystems.txt .
+      The health check fetches one small fixed record (OSV-2020-111): with no
+      credential involved it verifies reachability and the response format only.
+      OSV limits responses to 32 MiB over HTTP/1.1 and pages very broad queries
+      after 20 seconds of server time, so the backends.yaml entry above raises
+      the ToolMesh request timeout to 60 s (default 30 s). ToolMesh reads at
+      most 10 MiB per response: distro kernel packages (Debian/Ubuntu "linux",
+      ~13 MB) exceed that and cannot be checked through this backend.
+
+  examples:
+    - name: "Patch-level check for several packages"
+      description: "Check installed package versions and report findings with severity and fixed versions"
+      code: |
+        const report = await api.check_package_vulns({
+          queries: [
+            { package: { name: "jinja2", ecosystem: "PyPI" }, version: "2.10" },
+            { package: { purl: "pkg:npm/lodash@4.17.15" } },
+            { package: { name: "openssl", ecosystem: "Debian:12" }, version: "3.0.11-1~deb12u2" }
+          ]
+        });
+        return report.results.map((r) => ({
+          query: r.query,
+          findings: (r.findings || []).map((f) => ({ ids: f.ids, label: f.severity_label, fixed: f.fixed }))
+        }));
+    - name: "Follow pagination with page_token"
+      description: "Collect all results of a broad query that OSV returns in pages (or after its 20-second limit)"
+      code: |
+        const query = { package: { name: "openssl", ecosystem: "Debian:12" } };
+        let all = [];
+        let token;
+        for (let i = 0; i < 20; i++) {
+          const page = await api.query_vulnerabilities(token ? Object.assign({}, query, { page_token: token }) : query);
+          if (typeof page === "string") throw new Error("response over the 10 MiB limit -- narrow the query");
+          all = all.concat(page.vulns);
+          token = page.next_page_token;
+          if (!token) break;
+        }
+        return { count: all.length, complete: !token, ids: all.map((v) => v.id) };
+    - name: "Full record for one advisory"
+      description: "Fetch a vulnerability by id and keep the fields needed for a report"
+      code: |
+        const v = await api.get_vulnerability({ id: "GHSA-462w-v97r-4m45" });
+        return {
+          id: v.id,
+          aliases: v.aliases,
+          summary: v.summary,
+          severity: v.severity,
+          fix_refs: (v.references || []).filter((r) => r.type === "FIX").map((r) => r.url)
+        };
