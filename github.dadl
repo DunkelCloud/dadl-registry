@@ -9,17 +9,17 @@ date: "2026-11-24"
 backend:
   name: github
   type: rest
-  version: "1.1"
+  version: "1.2"
   # base_url: https://api.github.com — provide via backends.yaml url field
   description: "GitHub REST API — repositories, issues, pull requests, commits, and code search"
 
   coverage:
-    endpoints: 300
+    endpoints: 320
     total_endpoints: 1000
-    percentage: 30
-    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions + types), sub-issues (hierarchy + reprioritize), issue dependencies (blocked_by + blocking), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), rulesets (repo + org full CRUD + branch rules + rule suites), custom properties (org schema + repo/org values), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + variables + artifacts + dispatch + permissions + fork PR approval policy), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, traffic (views + clones + paths + referrers), statistics (contributors + commit activity + code frequency + participation + punch card), code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions), projects v2 (items + fields + views + draft issues), codespaces, security advisories (global + repository + organization), rate limit"
-    missing: "creating, editing and deleting projects v2 (GraphQL only), codespace creation and deletion, repository security advisory writes, copilot, git LFS, autolinks"
-    last_reviewed: "2026-11-20"
+    percentage: 32
+    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions + types), sub-issues (hierarchy + reprioritize), issue dependencies (blocked_by + blocking), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), rulesets (repo + org full CRUD + branch rules + rule suites), custom properties (org schema + repo/org values), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + variables + artifacts + dispatch + permissions + fork PR approval policy), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, traffic (views + clones + paths + referrers), statistics (contributors + commit activity + code frequency + participation + punch card), code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions), deploy keys, SSH keys (authentication + signing), GPG keys, autolinks, projects v2 (items + fields + views + draft issues), codespaces, security advisories (global + repository + organization), rate limit"
+    missing: "creating, editing and deleting projects v2 (GraphQL only), codespace creation and deletion, repository security advisory writes, copilot, git LFS"
+    last_reviewed: "2026-11-24"
 
   setup:
     credential_steps:
@@ -27,6 +27,7 @@ backend:
       - "Click 'Generate new token (classic)'"
       - "Select scopes: repo (full access), read:org (list organizations), admin:org (org rulesets, custom properties, issue types), workflow (actions), admin:repo_hook (webhooks), delete_repo (delete repos), gist, notifications, read:packages, write:packages, delete:packages"
       - "Optional: project (read:project for read-only use) for projects v2, codespace for codespaces"
+      - "Optional, only to manage the account's own keys: also select admin:public_key (SSH keys), admin:gpg_key (GPG keys) and admin:ssh_signing_key (SSH signing keys)"
       - "Copy the token (starts with ghp_ or github_pat_)"
     env_var: CREDENTIAL_GITHUB_TOKEN
     backends_yaml: |
@@ -49,6 +50,9 @@ backend:
       - read:project
       - project
       - codespace
+      - admin:public_key
+      - admin:gpg_key
+      - admin:ssh_signing_key
     docs_url: "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
 
   auth:
@@ -113,6 +117,28 @@ backend:
   # Permissions:
   #   Some endpoints require specific token scopes (e.g. delete_repo,
   #   admin:repo_hook). Check setup.optional_scopes for details.
+  #
+  # Keys (deploy vs. user):
+  #   A deploy key is an SSH public key bound to ONE repository and
+  #   may be read-only; managing it requires admin access to that
+  #   repository. User keys belong to the authenticated account and
+  #   come in three kinds: SSH keys (Git authentication), GPG keys
+  #   and SSH signing keys (both only verify signed commits and
+  #   tags). Classic tokens need one scope family per kind
+  #   (public_key, gpg_key, ssh_signing_key), each as read:, write:
+  #   or admin: — deleting needs admin:. Keys cannot be edited:
+  #   delete and create again. create_deploy_key defaults read_only
+  #   to true; the raw API would create a key with push access.
+  #   Without admin access to the repository the deploy key and
+  #   autolink endpoints answer 404 Not Found; a rejected create
+  #   answers 422 Validation Failed without naming the reason.
+  #
+  # Autolinks:
+  #   An autolink turns key_prefix + reference (e.g. TICKET-123) in
+  #   issues, PRs and commit messages into a link built from
+  #   url_template, which must contain the placeholder <num>. Only
+  #   repository admins can read or change autolinks, and they
+  #   cannot be edited either.
   #
   # Issue ID vs issue_number (IMPORTANT):
   #   Most issue endpoints address an issue by its issue_number (the
@@ -2115,6 +2141,111 @@ backend:
         hook_id: { type: integer, in: path, required: true }
       pagination: none
 
+    # ── Deploy Keys ───────────────────────────────────────────
+    #
+    # SSH public keys bound to one repository instead of a user
+    # account. Reading and changing them requires admin access to
+    # the repository. Deploy keys are immutable: delete the key and
+    # create a new one to change it.
+
+    list_deploy_keys:
+      method: GET
+      path: /repos/{owner}/{repo}/keys
+      access: read
+      description: "List the deploy keys of a repository. Each key has id, title, key (the public key), read_only, verified, added_by, created_at, last_used and enabled. Requires admin access to the repository; without it the API answers 404 Not Found."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_deploy_key:
+      method: GET
+      path: /repos/{owner}/{repo}/keys/{key_id}
+      access: read
+      description: "Get a single deploy key by its id (the id field from list_deploy_keys). Requires admin access to the repository."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        key_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_deploy_key:
+      method: POST
+      path: /repos/{owner}/{repo}/keys
+      access: admin
+      description: "Add a deploy key to a repository. key is the SSH public key in OpenSSH format (e.g. 'ssh-ed25519 AAAA...'); the private key stays with the system that deploys. read_only defaults to true in this tool (the key can only pull), unlike the raw API; pass read_only=false for a key that can also push. Returns 422 Validation Failed, without naming the reason, if the key is invalid or already in use. Deploy keys are immutable: to change one, delete it and create a new key."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        title: { type: string, in: body, description: "A name for the key" }
+        key: { type: string, in: body, required: true, description: "SSH public key in OpenSSH format" }
+        read_only: { type: boolean, in: body, default: true, description: "true = pull only, false = pull and push" }
+      pagination: none
+
+    delete_deploy_key:
+      method: DELETE
+      path: /repos/{owner}/{repo}/keys/{key_id}
+      access: dangerous
+      description: "Remove a deploy key from a repository. Systems that use the key lose access to the repository."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        key_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── Autolinks ─────────────────────────────────────────────
+    #
+    # Turn references such as TICKET-123 in issues, pull requests and
+    # commit messages into links to an external system. Only
+    # repository administrators can read or change them. An autolink
+    # cannot be updated: delete it and create a new one.
+
+    list_autolinks:
+      method: GET
+      path: /repos/{owner}/{repo}/autolinks
+      access: read
+      description: "List all autolink references of a repository (id, key_prefix, url_template, is_alphanumeric) in one response. Requires admin access to the repository; without it the API answers 404 Not Found."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+      pagination: none
+
+    get_autolink:
+      method: GET
+      path: /repos/{owner}/{repo}/autolinks/{autolink_id}
+      access: read
+      description: "Get a single autolink reference by its id (the id field from list_autolinks). Requires admin access to the repository."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        autolink_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_autolink:
+      method: POST
+      path: /repos/{owner}/{repo}/autolinks
+      access: admin
+      description: "Create an autolink reference: key_prefix followed by a reference (e.g. 'TICKET-123') in issues, pull requests and commit messages becomes a link. url_template must contain the placeholder <num>, which is replaced by the reference (e.g. 'https://example.com/TICKET?query=<num>'). is_alphanumeric=true (default) lets the reference contain A-Z, 0-9 and '-'; false matches digits only. Returns 422 Validation Failed if url_template lacks <num> or the key_prefix is already in use. Autolinks cannot be updated: delete and create again. Requires admin access to the repository."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        key_prefix: { type: string, in: body, required: true, description: "Prefix that starts a reference, e.g. 'TICKET-'" }
+        url_template: { type: string, in: body, required: true, description: "Target URL containing the placeholder <num>" }
+        is_alphanumeric: { type: boolean, in: body, default: true }
+      pagination: none
+
+    delete_autolink:
+      method: DELETE
+      path: /repos/{owner}/{repo}/autolinks/{autolink_id}
+      access: dangerous
+      description: "Delete an autolink reference from a repository. Requires admin access to the repository."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        autolink_id: { type: integer, in: path, required: true }
+      pagination: none
+
     # ── Deployments ──────────────────────────────────────────
 
     list_deployments:
@@ -2419,6 +2550,139 @@ backend:
         username: { type: string, in: path, required: true }
         page: { type: integer, in: query }
         per_page: { type: integer, in: query, default: 30 }
+
+    # ── SSH Keys (Authenticated User) ─────────────────────────
+    #
+    # Public SSH keys that authenticate Git operations as the
+    # authenticated user. Classic tokens need the read:public_key
+    # scope to read, write:public_key to add and admin:public_key to
+    # delete.
+
+    list_ssh_keys:
+      method: GET
+      path: /user/keys
+      access: read
+      description: "List the public SSH authentication keys of the authenticated user (id, key, title, created_at, last_used, verified, read_only). Classic tokens need the read:public_key scope."
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_ssh_key:
+      method: GET
+      path: /user/keys/{key_id}
+      access: read
+      description: "Get a single public SSH authentication key of the authenticated user by its id. Classic tokens need the read:public_key scope."
+      params:
+        key_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_ssh_key:
+      method: POST
+      path: /user/keys
+      access: admin
+      description: "Add a public SSH authentication key to the authenticated user's account. Whoever holds the matching private key can then act as this user over Git. key is the public key in OpenSSH format (e.g. 'ssh-ed25519 AAAA...'). Returns 422 if validation fails. Classic tokens need the write:public_key scope. For a key that only verifies commit signatures use create_ssh_signing_key."
+      params:
+        title: { type: string, in: body, description: "A descriptive name for the key" }
+        key: { type: string, in: body, required: true, description: "SSH public key in OpenSSH format" }
+      pagination: none
+
+    delete_ssh_key:
+      method: DELETE
+      path: /user/keys/{key_id}
+      access: dangerous
+      description: "Remove a public SSH authentication key from the authenticated user's account. Git access with that key stops working. Classic tokens need the admin:public_key scope."
+      params:
+        key_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── GPG Keys (Authenticated User) ─────────────────────────
+    #
+    # GPG public keys GitHub uses to verify signed commits and tags
+    # of the authenticated user. Classic tokens need read:gpg_key,
+    # write:gpg_key or admin:gpg_key. In responses raw_key holds
+    # the armored key as uploaded; public_key is the extracted
+    # cryptographic key, which gpg cannot import.
+
+    list_gpg_keys:
+      method: GET
+      path: /user/gpg_keys
+      access: read
+      description: "List the GPG keys of the authenticated user (id, key_id, emails with verified flag, subkeys, can_sign, created_at, expires_at, revoked). raw_key holds the ASCII-armored key as uploaded; public_key is the extracted cryptographic key, which gpg cannot import. Classic tokens need the read:gpg_key scope."
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_gpg_key:
+      method: GET
+      path: /user/gpg_keys/{gpg_key_id}
+      access: read
+      description: "Get a single GPG key of the authenticated user. gpg_key_id is the numeric id field, not the hexadecimal key_id. Classic tokens need the read:gpg_key scope."
+      params:
+        gpg_key_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_gpg_key:
+      method: POST
+      path: /user/gpg_keys
+      access: admin
+      description: "Add a GPG public key to the authenticated user's account so GitHub can verify commits and tags signed with it. armored_public_key is the ASCII-armored key block (starts with '-----BEGIN PGP PUBLIC KEY BLOCK-----'). Returns 422 if validation fails. Classic tokens need the write:gpg_key scope."
+      params:
+        name: { type: string, in: body, description: "A descriptive name for the key" }
+        armored_public_key: { type: string, in: body, required: true, description: "GPG public key in ASCII-armored format" }
+      pagination: none
+
+    delete_gpg_key:
+      method: DELETE
+      path: /user/gpg_keys/{gpg_key_id}
+      access: dangerous
+      description: "Remove a GPG key from the authenticated user's account. gpg_key_id is the numeric id field, not the hexadecimal key_id. Classic tokens need the admin:gpg_key scope."
+      params:
+        gpg_key_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── SSH Signing Keys (Authenticated User) ─────────────────
+    #
+    # SSH public keys GitHub uses to verify SSH-signed commits and
+    # tags of the authenticated user. They do not grant Git access.
+    # Classic tokens need read:ssh_signing_key,
+    # write:ssh_signing_key or admin:ssh_signing_key.
+
+    list_ssh_signing_keys:
+      method: GET
+      path: /user/ssh_signing_keys
+      access: read
+      description: "List the SSH signing keys of the authenticated user (id, key, title, created_at). Signing keys verify SSH-signed commits and tags; they do not grant Git access. Classic tokens need the read:ssh_signing_key scope."
+      params:
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_ssh_signing_key:
+      method: GET
+      path: /user/ssh_signing_keys/{ssh_signing_key_id}
+      access: read
+      description: "Get a single SSH signing key of the authenticated user by its id. Classic tokens need the read:ssh_signing_key scope."
+      params:
+        ssh_signing_key_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_ssh_signing_key:
+      method: POST
+      path: /user/ssh_signing_keys
+      access: admin
+      description: "Add an SSH signing key to the authenticated user's account so GitHub can verify commits and tags signed with it. It does not grant Git access (use create_ssh_key for that). key is the public key in OpenSSH format (e.g. 'ssh-ed25519 AAAA...'). Returns 422 if validation fails. Classic tokens need the write:ssh_signing_key scope."
+      params:
+        title: { type: string, in: body, description: "A descriptive name for the key" }
+        key: { type: string, in: body, required: true, description: "SSH public key in OpenSSH format" }
+      pagination: none
+
+    delete_ssh_signing_key:
+      method: DELETE
+      path: /user/ssh_signing_keys/{ssh_signing_key_id}
+      access: dangerous
+      description: "Remove an SSH signing key from the authenticated user's account. Classic tokens need the admin:ssh_signing_key scope."
+      params:
+        ssh_signing_key_id: { type: integer, in: path, required: true }
+      pagination: none
 
     # ── Rate Limit ────────────────────────────────────────────
 
