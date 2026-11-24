@@ -1,14 +1,15 @@
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "GitHub REST API v3"
 source_url: "https://docs.github.com/en/rest"
-date: "2026-11-20"
+date: "2026-11-24"
 
 backend:
   name: github
   type: rest
+  version: "1.1"
   # base_url: https://api.github.com — provide via backends.yaml url field
   description: "GitHub REST API — repositories, issues, pull requests, commits, and code search"
 
@@ -73,7 +74,7 @@ backend:
     errors: &standard-errors
       format: json
       message_path: "$.message"
-      retry_on: [429, 502, 503]
+      retry_on: [429, 502, 503, 504]
       terminal: [400, 401, 403, 404, 409, 422]
       retry_strategy:
         max_retries: 3
@@ -183,6 +184,10 @@ backend:
   #   Found although both exist; a repeated call succeeds, so those
   #   two tools retry on 404.
   # ──────────────────────────────────────────────────────────────
+
+  health:
+    tool: get_authenticated_user
+    expect_path: $.login
 
   tools:
 
@@ -1840,7 +1845,7 @@ backend:
       errors: &variable-repo-errors
         format: json
         message_path: "$.message"
-        retry_on: [404, 429, 502, 503]
+        retry_on: [404, 429, 502, 503, 504]
         terminal: [400, 401, 403, 409, 422]
         retry_strategy:
           max_retries: 3
@@ -4016,7 +4021,7 @@ backend:
       errors: &stats-errors
         format: json
         message_path: "$.message"
-        retry_on: [202, 429, 502, 503]
+        retry_on: [202, 429, 502, 503, 504]
         terminal: [400, 401, 403, 404, 409, 422]
         retry_strategy:
           max_retries: 5
