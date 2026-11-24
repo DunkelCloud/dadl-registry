@@ -27,17 +27,17 @@
 # - Webhook endpoints are for registering YOUR server URLs, not for reading events
 # - Events are read-only and retained for 30 days
 # - Charges are mostly legacy — prefer PaymentIntents for new integrations
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "Stripe REST API"
 source_url: https://docs.stripe.com/api
-date: "2026-04-02"
+date: "2026-11-24"
 
 backend:
   name: stripe
   type: rest
-  version: "1.0"
+  version: "1.1"
   base_url: https://api.stripe.com/v1
   description: "Stripe REST API — payment processing, billing, subscriptions, invoices, products, and financial infrastructure"
   openapi_source: https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.yaml
@@ -94,7 +94,7 @@ backend:
       format: json
       message_path: "$.error.message"
       code_path: "$.error.type"
-      retry_on: [429, 502, 503]
+      retry_on: [429, 502, 503, 504]
       terminal: [400, 401, 402, 403, 404, 409]
       # 402 = card declined / payment required (Stripe-specific)
       retry_strategy:
@@ -127,6 +127,10 @@ backend:
       lifecycle: "draft → open (finalize) → paid/void/uncollectible"
     create_refund:
       partial_refund: "set amount for partial refund, omit for full refund of the PaymentIntent"
+
+  health:
+    tool: get_balance
+    expect_path: $.object
 
   tools:
     # ──────────────────────────────────────────────

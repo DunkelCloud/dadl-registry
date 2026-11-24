@@ -1,30 +1,32 @@
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "GitHub REST API v3"
 source_url: "https://docs.github.com/en/rest"
-date: "2026-11-15"
+date: "2026-11-24"
 
 backend:
   name: github
   type: rest
+  version: "1.2"
   # base_url: https://api.github.com — provide via backends.yaml url field
   description: "GitHub REST API — repositories, issues, pull requests, commits, and code search"
 
   coverage:
-    endpoints: 279
+    endpoints: 320
     total_endpoints: 1000
-    percentage: 28
-    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions + types), sub-issues (hierarchy + reprioritize), issue dependencies (blocked_by + blocking), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), rulesets (repo + org full CRUD + branch rules + rule suites), custom properties (org schema + repo/org values), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + artifacts + dispatch + permissions + fork PR approval policy), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, traffic (views + clones + paths + referrers), statistics (contributors + commit activity + code frequency + participation + punch card), code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions), deploy keys, SSH keys (authentication + signing), GPG keys, autolinks"
-    missing: "projects v2, codespaces, copilot, security advisories, rate limit API, git LFS"
-    last_reviewed: "2026-11-15"
+    percentage: 32
+    focus: "repos (full CRUD + fork + collaborators + topics), orgs (members + teams), issues (full CRUD + comments + events + reactions + types), sub-issues (hierarchy + reprioritize), issue dependencies (blocked_by + blocking), PRs (full CRUD + merge + reviews + review comments + requested reviewers), commits, branches (+ protection), rulesets (repo + org full CRUD + branch rules + rule suites), custom properties (org schema + repo/org values), git refs + objects (blobs, trees, commits), file management, labels, milestones, search (code + issues + repos + users + commits), releases (full CRUD), actions (workflows + runs + jobs + logs + secrets + variables + artifacts + dispatch + permissions + fork PR approval policy), users, tags, webhooks, deployments (+ statuses), environments, gists (full CRUD), notifications, check runs/suites, commit statuses, starring, watching, pages, traffic (views + clones + paths + referrers), statistics (contributors + commit activity + code frequency + participation + punch card), code scanning, dependabot, secret scanning, packages (org + user: list, get, delete, restore, versions), deploy keys, SSH keys (authentication + signing), GPG keys, autolinks, projects v2 (items + fields + views + draft issues), codespaces, security advisories (global + repository + organization), rate limit"
+    missing: "creating, editing and deleting projects v2 (GraphQL only), codespace creation and deletion, repository security advisory writes, copilot, git LFS"
+    last_reviewed: "2026-11-24"
 
   setup:
     credential_steps:
       - "Navigate to GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)"
       - "Click 'Generate new token (classic)'"
       - "Select scopes: repo (full access), read:org (list organizations), admin:org (org rulesets, custom properties, issue types), workflow (actions), admin:repo_hook (webhooks), delete_repo (delete repos), gist, notifications, read:packages, write:packages, delete:packages"
+      - "Optional: project (read:project for read-only use) for projects v2, codespace for codespaces"
       - "Optional, only to manage the account's own keys: also select admin:public_key (SSH keys), admin:gpg_key (GPG keys) and admin:ssh_signing_key (SSH signing keys)"
       - "Copy the token (starts with ghp_ or github_pat_)"
     env_var: CREDENTIAL_GITHUB_TOKEN
@@ -45,6 +47,9 @@ backend:
       - gist
       - notifications
       - read:packages
+      - read:project
+      - project
+      - codespace
       - admin:public_key
       - admin:gpg_key
       - admin:ssh_signing_key
@@ -73,7 +78,7 @@ backend:
     errors: &standard-errors
       format: json
       message_path: "$.message"
-      retry_on: [429, 502, 503]
+      retry_on: [429, 502, 503, 504]
       terminal: [400, 401, 403, 404, 409, 422]
       retry_strategy:
         max_retries: 3
@@ -159,15 +164,56 @@ backend:
   #   The /stats/* endpoints are computed asynchronously. On a cold
   #   cache the first call returns 202 Accepted with an empty body
   #   while GitHub builds the data; the request must be retried until
-  #   it returns 200. These tools list 202 in not_ready_on, so
-  #   ToolMesh re-requests automatically. Stat timestamps are Unix
-  #   epoch SECONDS; weekly buckets start on Sunday.
+  #   it returns 200. These tools add 202 to retry_on so ToolMesh
+  #   re-requests automatically. Stat timestamps are Unix epoch
+  #   SECONDS; weekly buckets start on Sunday.
   #
   # Traffic:
   #   Traffic endpoints cover a rolling 14-day window and require
   #   push (write) access to the repository even though they read.
   #   Counts come as total and "uniques" (de-duplicated by actor).
+  #
+  # Cursor pagination (projects, security advisories):
+  #   These list endpoints page with opaque before/after cursors
+  #   that GitHub sends only in the Link response header, which
+  #   ToolMesh does not pass on. A call returns at most per_page
+  #   (max 100) entries; narrow the result with the filters (q and
+  #   fields for project items, ghsa_id, cve_id, affects or
+  #   ecosystem for advisories) instead of paging.
+  #
+  # Projects (v2):
+  #   The REST API reads projects, fields and items, adds issues,
+  #   pull requests and draft issues, sets field values, removes
+  #   items and adds fields and views. Creating, renaming, closing
+  #   or deleting a project is not available over REST. Most tools
+  #   take owner_type ("orgs" or "users") plus the owner login;
+  #   creating views and draft issues in a user project takes the
+  #   numeric user id instead. add_project_item takes the database
+  #   id of the issue or pull request (as sub-issues do), not its
+  #   number. update_project_item takes text, number and date values
+  #   directly and the option or iteration id (a string) for single
+  #   select and iteration fields; null clears a field. Fields with
+  #   an issue_field_id are organization issue fields whose values
+  #   belong to the issue; the item endpoint refuses them with 400
+  #   "Field validation errors". Text values, option names and
+  #   iteration titles come back as {raw, html}. The project's own
+  #   workflows react to these changes (the default ones close an
+  #   issue whose status is set to Done).
+  #
+  # Variables vs. secrets:
+  #   Actions variables are plain text and come back with their
+  #   values; secrets are write-only. Names are case-insensitive and
+  #   stored in uppercase. When names collide, an environment
+  #   variable wins over a repository variable, which wins over an
+  #   organization variable. Adding a repository to or removing it
+  #   from an organization variable sporadically answers 404 Not
+  #   Found although both exist; a repeated call succeeds, so those
+  #   two tools retry on 404.
   # ──────────────────────────────────────────────────────────────
+
+  health:
+    tool: get_authenticated_user
+    expect_path: $.login
 
   tools:
 
@@ -1703,6 +1749,215 @@ backend:
         name: { type: string, in: path, required: true }
       pagination: none
 
+    get_repo_variable:
+      method: GET
+      path: /repos/{owner}/{repo}/actions/variables/{name}
+      access: read
+      description: "Get one repository variable for GitHub Actions by name: name, value (plain text), created_at and updated_at. Names are case-insensitive; GitHub stores and returns them in uppercase."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_repo_org_variables:
+      method: GET
+      path: /repos/{owner}/{repo}/actions/organization-variables
+      access: read
+      description: "List the organization variables a repository can use, as {total_count, variables:[{name, value, created_at, updated_at}]}. A repository or environment variable with the same name takes precedence in workflows."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    # ── Actions Variables (Organization) ──────────────────────
+    #
+    # Plain-text configuration shared by the repositories of an
+    # organization, read in workflows as ${{ vars.NAME }}. visibility
+    # decides which repositories see a variable: all, private
+    # (private and internal repositories) or selected (the
+    # repositories in selected_repository_ids). Classic tokens need
+    # admin:org, plus repo for private repositories.
+
+    list_org_variables:
+      method: GET
+      path: /orgs/{org}/actions/variables
+      access: read
+      description: "List the Actions variables of an organization as {total_count, variables:[...]}; each has name, value (plain text), visibility (all, private, selected), created_at and updated_at. Classic tokens need the admin:org scope."
+      params:
+        org: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_org_variable:
+      method: GET
+      path: /orgs/{org}/actions/variables/{name}
+      access: read
+      description: "Get one organization variable by name, with value and visibility (all, private, selected)."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+      pagination: none
+
+    create_org_variable:
+      method: POST
+      path: /orgs/{org}/actions/variables
+      access: admin
+      description: "Create an organization variable for GitHub Actions. visibility: all (every repository), private (private and internal repositories) or selected (only the repositories in selected_repository_ids, numeric ids from get_repo). Values are stored and returned in plain text: use secrets for sensitive data. The name is stored in uppercase. Returns 409 Conflict if a variable with that name exists."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        value: { type: string, in: body, required: true }
+        visibility: { type: string, in: body, required: true, description: "all, private or selected" }
+        selected_repository_ids: { type: array, in: body, description: "Numeric repository ids, only with visibility selected" }
+      pagination: none
+
+    update_org_variable:
+      method: PATCH
+      path: /orgs/{org}/actions/variables/{name}
+      access: admin
+      description: "Change the value, visibility or selected repositories of an organization variable; omitted fields keep their values. This tool cannot rename a variable: delete it and create it under the new name."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+        value: { type: string, in: body }
+        visibility: { type: string, in: body, description: "all, private or selected" }
+        selected_repository_ids: { type: array, in: body, description: "Numeric repository ids, only with visibility selected" }
+      pagination: none
+
+    delete_org_variable:
+      method: DELETE
+      path: /orgs/{org}/actions/variables/{name}
+      access: dangerous
+      description: "Delete an organization variable. Workflows that still reference it read an empty value from then on."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+      pagination: none
+
+    list_org_variable_repos:
+      method: GET
+      path: /orgs/{org}/actions/variables/{name}/repositories
+      access: read
+      description: "List the repositories that can use an organization variable with visibility selected, as {total_count, repositories:[...]}. Returns 409 Conflict if the variable's visibility is not selected."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    set_org_variable_repos:
+      method: PUT
+      path: /orgs/{org}/actions/variables/{name}/repositories
+      access: admin
+      description: "Replace the whole list of repositories that can use an organization variable with visibility selected. selected_repository_ids are numeric repository ids (from get_repo); repositories missing from the list lose access. Returns 409 Conflict if the visibility is not selected."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+        selected_repository_ids: { type: array, in: body, required: true }
+      pagination: none
+
+    add_org_variable_repo:
+      method: PUT
+      path: /orgs/{org}/actions/variables/{name}/repositories/{repository_id}
+      access: admin
+      description: "Give one more repository access to an organization variable with visibility selected. repository_id is the numeric id from get_repo. Returns 409 Conflict if the visibility is not selected. GitHub sporadically answers 404 Not Found to valid calls of this endpoint; the tool repeats the call on 404, so a 404 that persists means the variable or repository does not exist."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+        repository_id: { type: integer, in: path, required: true }
+      pagination: none
+      errors: &variable-repo-errors
+        format: json
+        message_path: "$.message"
+        retry_on: [404, 429, 502, 503, 504]
+        terminal: [400, 401, 403, 409, 422]
+        retry_strategy:
+          max_retries: 3
+          backoff: exponential
+          initial_delay: 1s
+
+    remove_org_variable_repo:
+      method: DELETE
+      path: /orgs/{org}/actions/variables/{name}/repositories/{repository_id}
+      access: admin
+      description: "Take one repository off an organization variable with visibility selected. Returns 409 Conflict if the visibility is not selected. GitHub sporadically answers 404 Not Found to valid calls of this endpoint; the tool repeats the call on 404, so a 404 that persists means the variable or repository is not (or no longer) there."
+      params:
+        org: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+        repository_id: { type: integer, in: path, required: true }
+      pagination: none
+      errors: *variable-repo-errors
+
+    # ── Actions Variables (Environment) ───────────────────────
+    #
+    # Variables of one deployment environment of a repository. Jobs
+    # that run in the environment read them, and they override
+    # repository and organization variables of the same name.
+
+    list_environment_variables:
+      method: GET
+      path: /repos/{owner}/{repo}/environments/{environment_name}/variables
+      access: read
+      description: "List the variables of a deployment environment as {total_count, variables:[{name, value, created_at, updated_at}]}. environment_name is the plain environment name (e.g. 'production')."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        environment_name: { type: string, in: path, required: true }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_environment_variable:
+      method: GET
+      path: /repos/{owner}/{repo}/environments/{environment_name}/variables/{name}
+      access: read
+      description: "Get one variable of a deployment environment by name, with its plain-text value."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        environment_name: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+      pagination: none
+
+    create_environment_variable:
+      method: POST
+      path: /repos/{owner}/{repo}/environments/{environment_name}/variables
+      access: write
+      description: "Create a variable in a deployment environment (the environment must exist, see create_or_update_environment). Values are stored and returned in plain text; the name is stored in uppercase. Returns 409 Conflict if the environment already has a variable with that name, whatever its case."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        environment_name: { type: string, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        value: { type: string, in: body, required: true }
+      pagination: none
+
+    update_environment_variable:
+      method: PATCH
+      path: /repos/{owner}/{repo}/environments/{environment_name}/variables/{name}
+      access: write
+      description: "Change the value of an environment variable. This tool cannot rename it: delete it and create it under the new name."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        environment_name: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+        value: { type: string, in: body, required: true }
+      pagination: none
+
+    delete_environment_variable:
+      method: DELETE
+      path: /repos/{owner}/{repo}/environments/{environment_name}/variables/{name}
+      access: dangerous
+      description: "Delete a variable from a deployment environment."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        environment_name: { type: string, in: path, required: true }
+        name: { type: string, in: path, required: true }
+      pagination: none
+
     # ── Actions Permissions ───────────────────────────────────
 
     get_actions_permissions:
@@ -2429,6 +2684,60 @@ backend:
         ssh_signing_key_id: { type: integer, in: path, required: true }
       pagination: none
 
+    # ── Rate Limit ────────────────────────────────────────────
+
+    get_rate_limit:
+      method: GET
+      path: /rate_limit
+      access: read
+      description: "Rate limit status of the authenticated token per resource family under resources: core (REST API except search), search, code_search, graphql and further families such as integration_manifest or code_scanning_upload. Each entry has limit, used, remaining and reset (Unix epoch seconds). This call does not count against the core limit. The top-level rate field is deprecated and repeats resources.core."
+      pagination: none
+
+    # ── Codespaces (Authenticated User) ───────────────────────
+    #
+    # Cloud development environments of the authenticated user,
+    # addressed by their generated name, not the display_name. A
+    # running codespace is billed for compute; a stopped one keeps
+    # its storage (still billed) until it is deleted. Classic tokens
+    # need the codespace scope.
+
+    list_codespaces:
+      method: GET
+      path: /user/codespaces
+      access: read
+      description: "List the authenticated user's codespaces as {total_count, codespaces:[...]}. Each codespace has name (the identifier the other codespace tools take), display_name, state (e.g. Available, Shutdown, Starting, ShuttingDown, Failed), repository, machine, git_status, last_used_at, idle_timeout_minutes and web_url. repository_id (the numeric id from get_repo) limits the list to one repository. Classic tokens need the codespace scope."
+      params:
+        repository_id: { type: integer, in: query, description: "Numeric repository id" }
+        page: { type: integer, in: query }
+        per_page: { type: integer, in: query, default: 30 }
+
+    get_codespace:
+      method: GET
+      path: /user/codespaces/{codespace_name}
+      access: read
+      description: "Get one codespace of the authenticated user by its name (the name field from list_codespaces, not display_name), with state, machine, git_status (ahead, behind, has_uncommitted_changes, has_unpushed_changes, ref) and web_url."
+      params:
+        codespace_name: { type: string, in: path, required: true }
+      pagination: none
+
+    start_codespace:
+      method: POST
+      path: /user/codespaces/{codespace_name}/start
+      access: write
+      description: "Start a stopped codespace of the authenticated user and return it; state moves through Starting to Available. Compute is billed while it runs. Returns 402 Payment Required when the account has no codespaces budget left and 409 Conflict when the codespace cannot start in its current state."
+      params:
+        codespace_name: { type: string, in: path, required: true }
+      pagination: none
+
+    stop_codespace:
+      method: POST
+      path: /user/codespaces/{codespace_name}/stop
+      access: write
+      description: "Stop a running codespace of the authenticated user and return it with state ShuttingDown or Shutdown. Files and uncommitted changes stay in the codespace's storage; nothing is deleted."
+      params:
+        codespace_name: { type: string, in: path, required: true }
+      pagination: none
+
     # ── Tags ─────────────────────────────────────────────────
 
     list_tags:
@@ -2946,6 +3255,87 @@ backend:
         resolution_comment: { type: string, in: body }
       pagination: none
 
+    # ── Security Advisories ───────────────────────────────────
+    #
+    # Global advisories form the GitHub Advisory Database:
+    # vulnerabilities in open source packages (reviewed by GitHub or
+    # unreviewed) and malware. Repository advisories are the ones a
+    # maintainer drafts and publishes for their own repository. Both
+    # are addressed by their GHSA id (GHSA-xxxx-xxxx-xxxx). The list
+    # endpoints page with cursors that GitHub sends only in the Link
+    # header: one call returns at most per_page (max 100) results.
+
+    list_global_advisories:
+      method: GET
+      path: /advisories
+      access: read
+      description: "Search the GitHub Advisory Database. Without filters it returns GitHub-reviewed advisories that are not malware, newest published first. Each advisory has ghsa_id, cve_id, summary, description, severity, cvss_severities, epss, cwes, vulnerabilities (package ecosystem and name, vulnerable_version_range, first_patched_version), identifiers, references, published_at, updated_at and withdrawn_at. Returns at most per_page (max 100) results; the next-page cursor is only in a response header, so narrow the search with the filters instead of paging."
+      params:
+        ghsa_id: { type: string, in: query, description: "GHSA identifier, e.g. GHSA-xxxx-xxxx-xxxx" }
+        cve_id: { type: string, in: query, description: "CVE identifier, e.g. CVE-2024-12345" }
+        type: { type: string, in: query, description: "reviewed (default), unreviewed or malware" }
+        ecosystem: { type: string, in: query, description: "rubygems, npm, pip, maven, nuget, composer, go, rust, erlang, actions, pub, swift or other" }
+        severity: { type: string, in: query, description: "unknown, low, medium, high or critical" }
+        affects: { type: string, in: query, description: "Comma-separated package names or package@version, e.g. lodash@4.17.20" }
+        cwes: { type: string, in: query, description: "Comma-separated CWE numbers, e.g. 79,89" }
+        is_withdrawn: { type: boolean, in: query, description: "true = only withdrawn advisories" }
+        published: { type: string, in: query, description: "Date or range in search syntax, e.g. >2026-01-01 or 2026-01-01..2026-03-31" }
+        updated: { type: string, in: query, description: "Date or range in search syntax" }
+        modified: { type: string, in: query, description: "Updated or published on a date or range" }
+        epss_percentage: { type: string, in: query, description: "EPSS probability filter, e.g. >0.5" }
+        epss_percentile: { type: string, in: query, description: "EPSS percentile filter, e.g. >0.9" }
+        sort: { type: string, in: query, description: "published (default), updated, epss_percentage or epss_percentile" }
+        direction: { type: string, in: query, description: "desc (default) or asc" }
+        per_page: { type: integer, in: query, default: 30, description: "Max 100" }
+      pagination: none
+
+    get_global_advisory:
+      method: GET
+      path: /advisories/{ghsa_id}
+      access: read
+      description: "Get one advisory from the GitHub Advisory Database by its GHSA id, with summary, description, severity, CVSS and EPSS scores, CWEs, affected packages and version ranges, first patched versions and references."
+      params:
+        ghsa_id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_repo_advisories:
+      method: GET
+      path: /repos/{owner}/{repo}/security-advisories
+      access: read
+      description: "List the security advisories of a repository. Published advisories of public repositories are visible to everyone; drafts and advisories in triage only to repository administrators, security managers and collaborators on the advisory. Each advisory has ghsa_id, cve_id, state (triage, draft, published, closed), summary, description, severity, cvss, cwes, vulnerabilities, credits, collaborating_users, private_fork, published_at and closed_at. Classic tokens need the repo scope for private repositories and unpublished advisories. Returns at most per_page (max 100) results."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        state: { type: string, in: query, description: "triage, draft, published or closed" }
+        sort: { type: string, in: query, description: "created (default), updated or published" }
+        direction: { type: string, in: query, description: "desc (default) or asc" }
+        per_page: { type: integer, in: query, default: 30, description: "Max 100" }
+      pagination: none
+
+    get_repo_advisory:
+      method: GET
+      path: /repos/{owner}/{repo}/security-advisories/{ghsa_id}
+      access: read
+      description: "Get one security advisory of a repository by its GHSA id, including its state (triage, draft, published, closed), so a release process can check whether an advisory is still a draft. Unpublished advisories are visible only to repository administrators, security managers and collaborators on the advisory."
+      params:
+        owner: { type: string, in: path, required: true }
+        repo: { type: string, in: path, required: true }
+        ghsa_id: { type: string, in: path, required: true }
+      pagination: none
+
+    list_org_advisories:
+      method: GET
+      path: /orgs/{org}/security-advisories
+      access: read
+      description: "List the repository security advisories of all repositories in an organization, with the same fields as list_repo_advisories. The authenticated user must be an organization owner or security manager. Returns at most per_page (max 100) results."
+      params:
+        org: { type: string, in: path, required: true }
+        state: { type: string, in: query, description: "triage, draft, published or closed" }
+        sort: { type: string, in: query, description: "created (default), updated or published" }
+        direction: { type: string, in: query, description: "desc (default) or asc" }
+        per_page: { type: integer, in: query, default: 30, description: "Max 100" }
+      pagination: none
+
     # ── Packages (Organization) ───────────────────────────────────
 
     list_org_packages:
@@ -3097,6 +3487,217 @@ backend:
         package_type: { type: string, in: path, required: true }
         package_name: { type: string, in: path, required: true }
         package_version_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    # ── Projects (v2) ─────────────────────────────────────────
+    #
+    # Planning boards owned by an organization or a user. Most tools
+    # take owner_type ("orgs" or "users"), owner (the login) and
+    # project_number (the number in the project URL). Items are
+    # issues, pull requests or draft issues; field values (status,
+    # iteration, custom fields) are read and set per item. Creating,
+    # renaming, closing or deleting a project itself is not part of
+    # the REST API. Lists return at most per_page (max 100) entries:
+    # the next-page cursor is only in the Link header. Classic tokens
+    # need read:project to read and project to change.
+
+    list_projects:
+      method: GET
+      path: /{owner_type}/{owner}/projectsV2
+      access: read
+      description: "List the projects (v2) of an organization (owner_type 'orgs') or a user (owner_type 'users') that the token can see. Each project has id, number (used by the other project tools), title, short_description, public, state, closed_at, creator, created_at and updated_at. Returns at most per_page (max 100) projects. Classic tokens need the read:project scope."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true, description: "Organization or user login" }
+        q: { type: string, in: query, description: "Search text to narrow the list" }
+        per_page: { type: integer, in: query, default: 30, description: "Max 100" }
+      pagination: none
+
+    get_project:
+      method: GET
+      path: /{owner_type}/{owner}/projectsV2/{project_number}
+      access: read
+      description: "Get one project (v2) of an organization (owner_type 'orgs') or a user (owner_type 'users') by its number, with title, description, short_description, public, state, closed_at and latest_status_update."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_project_fields:
+      method: GET
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/fields
+      access: read
+      description: "List the fields of a project (v2): id, name and data_type (e.g. title, assignees, labels, text, number, date, single_select, iteration). Single select fields carry their options [{id, name:{raw, html}, color, description}] and iteration fields their configuration with iterations [{id, title:{raw, html}, start_date, duration, completed}]; those option and iteration ids are the values update_project_item takes. A field with an issue_field_id is an organization issue field: its value belongs to the issue and cannot be set through update_project_item. Returns at most per_page (max 100) fields."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        per_page: { type: integer, in: query, default: 30, description: "Max 100" }
+      pagination: none
+
+    get_project_field:
+      method: GET
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/fields/{field_id}
+      access: read
+      description: "Get one field of a project (v2) by its id, including the options of a single select field and the iterations of an iteration field."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        field_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    create_project_field:
+      method: POST
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/fields
+      access: write
+      description: "Add a custom field to a project (v2). data_type text, number or date needs only name. single_select needs single_select_options, a list of {name, color, description} with plain strings; color is one of BLUE, GRAY, GREEN, ORANGE, PINK, PURPLE, RED, YELLOW. iteration needs iteration_configuration {start_date (YYYY-MM-DD), duration (days), iterations:[{title, start_date, duration}]}. Returns the new field with its id and the ids of its options or iterations. Fields cannot be renamed or deleted through the REST API."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        data_type: { type: string, in: body, required: true, description: "text, number, date, single_select or iteration" }
+        single_select_options: { type: array, in: body, description: "Options of a single_select field" }
+        iteration_configuration: { type: object, in: body, description: "Configuration of an iteration field" }
+      pagination: none
+
+    list_project_items:
+      method: GET
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/items
+      access: read
+      description: "List the items of a project (v2). Each item has id (the item id for the other item tools), content_type (Issue, PullRequest or DraftIssue), content (the issue, pull request or draft), creator, created_at, updated_at, archived_at and fields. Without the fields parameter only the title field is returned; pass field ids (from list_project_fields) to get their values as [{id, name, data_type, value}]. q filters with the project filter syntax, e.g. 'status:Done', 'is:pr', 'is:issue is:open', 'assignee:octocat' or 'label:bug'. An item added a moment ago can be missing from the list for a short time. Returns at most per_page (max 100) items."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        q: { type: string, in: query, description: "Project filter query" }
+        fields: { type: string, in: query, description: "Comma-separated field ids whose values to return" }
+        per_page: { type: integer, in: query, default: 30, description: "Max 100" }
+      pagination: none
+
+    get_project_item:
+      method: GET
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/items/{item_id}
+      access: read
+      description: "Get one item of a project (v2) by its item id, with content and field values. Without the fields parameter only the title field is returned."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        item_id: { type: integer, in: path, required: true }
+        fields: { type: string, in: query, description: "Comma-separated field ids whose values to return" }
+      pagination: none
+
+    add_project_item:
+      method: POST
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/items
+      access: write
+      description: "Add an existing issue or pull request to a project (v2). type is Issue or PullRequest; id is the database id of the issue or pull request (the id field from get_issue or get_pull, a large integer), not its number. Returns the item with its item id; an issue or pull request that is already in the project is refused with 422 'Content already exists in this project'."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        type: { type: string, in: body, required: true, description: "Issue or PullRequest" }
+        id: { type: integer, in: body, required: true, description: "Database id of the issue or pull request" }
+      pagination: none
+
+    update_project_item:
+      method: PATCH
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/items/{item_id}
+      access: write
+      description: "Set field values of a project (v2) item; several fields can change in one call. fields is a list of {id, value}: id is the field id from list_project_fields; value is the text, number or date (YYYY-MM-DD) itself for those field types, the option id (a string) for a single select field, the iteration id (a string) for an iteration field, or null to clear the field. Organization issue fields (fields with an issue_field_id) cannot be set here and fail with 400 'Field validation errors'. The project's workflows still run: with the default workflows, setting the status to Done closes the issue. Returns the updated item."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        item_id: { type: integer, in: path, required: true }
+        fields: { type: array, in: body, required: true, description: "List of {id, value}" }
+      pagination: none
+
+    delete_project_item:
+      method: DELETE
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/items/{item_id}
+      access: dangerous
+      description: "Remove an item from a project (v2) together with its field values in this project. An issue or pull request itself stays in its repository; a draft issue is deleted."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        item_id: { type: integer, in: path, required: true }
+      pagination: none
+
+    list_project_view_items:
+      method: GET
+      path: /{owner_type}/{owner}/projectsV2/{project_number}/views/{view_number}/items
+      access: read
+      description: "List the items of a project (v2) with the filter of a saved view applied. view_number is the number in the view URL (.../views/2). Without the fields parameter only the title field is returned. Returns at most per_page (max 100) items."
+      params:
+        owner_type: { type: string, in: path, required: true, description: "orgs or users" }
+        owner: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        view_number: { type: integer, in: path, required: true }
+        fields: { type: string, in: query, description: "Comma-separated field ids whose values to return" }
+        per_page: { type: integer, in: query, default: 30, description: "Max 100" }
+      pagination: none
+
+    create_org_project_view:
+      method: POST
+      path: /orgs/{org}/projectsV2/{project_number}/views
+      access: write
+      description: "Add a saved view to an organization project (v2). layout is table, board or roadmap; filter uses the project filter syntax. visible_fields (field ids; not for roadmap), sort_by (list of [field_id, 'asc' or 'desc']), group_by and vertical_group_by (board columns) each take field ids. Returns the new view with its number."
+      params:
+        org: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        layout: { type: string, in: body, required: true, description: "table, board or roadmap" }
+        filter: { type: string, in: body }
+        visible_fields: { type: array, in: body, description: "Field ids" }
+        sort_by: { type: array, in: body, description: "List of [field_id, direction]" }
+        group_by: { type: array, in: body, description: "One field id" }
+        vertical_group_by: { type: array, in: body, description: "One field id (board columns)" }
+      pagination: none
+
+    create_user_project_view:
+      method: POST
+      path: /users/{user_id}/projectsV2/{project_number}/views
+      access: write
+      description: "Add a saved view to a user's project (v2). user_id is the numeric user id (the id field from get_user), not the login. Parameters as in create_org_project_view."
+      params:
+        user_id: { type: integer, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        name: { type: string, in: body, required: true }
+        layout: { type: string, in: body, required: true, description: "table, board or roadmap" }
+        filter: { type: string, in: body }
+        visible_fields: { type: array, in: body, description: "Field ids" }
+        sort_by: { type: array, in: body, description: "List of [field_id, direction]" }
+        group_by: { type: array, in: body, description: "One field id" }
+        vertical_group_by: { type: array, in: body, description: "One field id (board columns)" }
+      pagination: none
+
+    create_org_project_draft_item:
+      method: POST
+      path: /orgs/{org}/projectsV2/{project_number}/drafts
+      access: write
+      description: "Add a draft issue to an organization project (v2): a card with title and optional Markdown body that exists only in the project. Returns the new item with its item id."
+      params:
+        org: { type: string, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        body: { type: string, in: body }
+      pagination: none
+
+    create_user_project_draft_item:
+      method: POST
+      path: /user/{user_id}/projectsV2/{project_number}/drafts
+      access: write
+      description: "Add a draft issue to a user's project (v2). user_id is the numeric user id (the id field from get_user), not the login. Returns the new item with its item id."
+      params:
+        user_id: { type: integer, in: path, required: true }
+        project_number: { type: integer, in: path, required: true }
+        title: { type: string, in: body, required: true }
+        body: { type: string, in: body }
       pagination: none
 
     # ── Sub-Issues ────────────────────────────────────────────
@@ -3668,10 +4269,9 @@ backend:
     # Expensive aggregates GitHub computes asynchronously. On a cold
     # cache the first request returns 202 Accepted (empty body) while
     # a background job runs; it must be retried until it returns 200.
-    # Each tool lists 202 in not_ready_on, so ToolMesh re-requests
-    # automatically; the errors override below gives these tools a
-    # longer retry strategy. All timestamps are Unix epoch SECONDS;
-    # weekly buckets start on Sunday.
+    # The errors override below adds 202 to retry_on so ToolMesh
+    # re-requests automatically. All timestamps are Unix epoch
+    # SECONDS; weekly buckets start on Sunday.
 
     get_stats_contributors:
       method: GET
@@ -3682,11 +4282,10 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
-      not_ready_on: [202]
       errors: &stats-errors
         format: json
         message_path: "$.message"
-        retry_on: [429, 502, 503]
+        retry_on: [202, 429, 502, 503, 504]
         terminal: [400, 401, 403, 404, 409, 422]
         retry_strategy:
           max_retries: 5
@@ -3702,7 +4301,6 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
-      not_ready_on: [202]
       errors: *stats-errors
 
     get_stats_code_frequency:
@@ -3714,7 +4312,6 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
-      not_ready_on: [202]
       errors: *stats-errors
 
     get_stats_participation:
@@ -3726,7 +4323,6 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
-      not_ready_on: [202]
       errors: *stats-errors
 
     get_stats_punch_card:
@@ -3738,5 +4334,4 @@ backend:
         owner: { type: string, in: path, required: true }
         repo: { type: string, in: path, required: true }
       pagination: none
-      not_ready_on: [202]
       errors: *stats-errors

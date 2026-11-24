@@ -1,14 +1,15 @@
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH"
 source_name: "GitLab REST API v4"
 source_url: "https://docs.gitlab.com/ee/api/rest/"
-date: "2026-10-10"
+date: "2026-11-24"
 
 backend:
   name: gitlab
   type: rest
+  version: "1.1"
   # base_url: https://gitlab.example.com/api/v4 — provide via backends.yaml url field
   description: "GitLab REST API v4 — projects, issues, merge requests, pipelines, CI/CD, and code search"
 
@@ -68,7 +69,7 @@ backend:
     errors: &standard-errors
       format: json
       message_path: "$.message"
-      retry_on: [429, 500, 502, 503]
+      retry_on: [429, 500, 502, 503, 504]
       terminal: [400, 401, 403, 404, 405, 409, 422]
       retry_strategy:
         max_retries: 3
@@ -139,6 +140,12 @@ backend:
   #   items, call the per-item tool (get_merge_request / get_project_issue)
   #   or filter client-side after a list call.
   # ──────────────────────────────────────────────────────────────
+
+  health:
+    method: GET
+    path: /personal_access_tokens/self
+    expect_path: $.active
+    auth_expires_path: $.expires_at
 
   tools:
 
