@@ -1,0 +1,894 @@
+# endoflife.dadl -- endoflife.date REST API (v1) for ToolMesh
+# endoflife.date is a community-maintained catalog of support lifecycles for
+# about 490 products: operating systems, languages, databases, frameworks,
+# server software, cloud services and devices. For every product it lists the
+# release cycles with release date, LTS flag, end of active support, end of
+# life, end of extended support and the newest version within each cycle. It
+# answers "is this version still supported, until when, and is there a newer
+# patch or a newer cycle?" without reading release notes.
+#
+# Domain Notes for LLM consumers:
+# - PUBLIC, KEY-FREE, READ-ONLY API. No account, key or token. The auth block
+#   below is the ToolMesh placeholder for APIs without authentication
+#   (credential "none"). The API is static JSON served from a CDN; the data is
+#   regenerated whenever the project's repository changes (several times a
+#   day), so generated_at moves often while a product's last_modified says
+#   when its own data changed. No rate limit is published; the API documents
+#   HTTP 429 with a Retry-After header.
+# - TWELVE ENDPOINTS under /api/v1: the index (used here as the health check)
+#   and eleven GETs, all covered: products (summary list, full dump, one
+#   product), releases (one cycle, the first-listed cycle), categories and
+#   tags (lists and their products), identifiers (types and the id-to-product
+#   map).
+# - VOCABULARY: API v1 calls a release cycle a "release" (path
+#   /products/{product}/releases/{release}); the website and API v0 call it a
+#   "cycle". A release cycle such as Ubuntu "22.04", PostgreSQL "16" or
+#   Python "3.12" groups many versions; its "latest" is the newest version
+#   inside the cycle ("22.04.5", "16.4", "3.12.7"). Tool names keep the API
+#   word; descriptions say "release cycle".
+# - PRODUCT NAMES are slugs: "ubuntu", "postgresql", "nodejs",
+#   "hashicorp-vault", "alpine-linux", "docker-engine". Lookups are
+#   case-insensitive. Aliases ("postgres", "node", "vault", "alpine",
+#   "golang") answer with a 301 redirect to the canonical product, which
+#   ToolMesh follows, so get_product returns the canonical name. An unknown
+#   name is HTTP 404 with an HTML body (no JSON error message). Find slugs
+#   with list_products (name, label, aliases) or, for a purl, CPE or repology
+#   id, with list_identifiers.
+# - RELEASE NAMES are the cycle names exactly as the product lists them
+#   ("22.04", "16", "3.12", "1.27", "11-26h2-e", "6+"). They are not
+#   versions: "22.04.5" or "16.4" return 404. Map an installed version to its
+#   cycle by the longest cycle name that is a prefix of the version at a
+#   ".", "-", "_" or "+" boundary (check_release_status does this). Some
+#   products name cycles differently from the version string a host reports
+#   (Java "8" vs "1.8.0_392"); pass the cycle explicitly there.
+# - "LATEST" in /releases/latest is the FIRST cycle in the product's list:
+#   usually the newest by release date, but a few products list an umbrella
+#   cycle first (jenkins and log4j list "2"). It is never "the newest LTS":
+#   for Ubuntu it is the newest interim release. Filter get_product's
+#   releases by isLts for the newest LTS.
+# - LIFECYCLE FIELDS (v1 splits the v0 union fields into boolean + date):
+#   isLts/ltsFrom; isEoas/eoasFrom = end of ACTIVE support (bug fixes stop,
+#   security fixes may continue); isEol/eolFrom = end of life (no more
+#   security fixes in standard support); isEoes/eoesFrom = end of EXTENDED
+#   support, usually paid (Ubuntu ESM, RHEL ELS, Windows ESU);
+#   isDiscontinued/discontinuedFrom (hardware); isMaintained = any level of
+#   support left, extended support included. The booleans reflect the day
+#   the data was generated. Fields that do not apply are ABSENT (isEoas and
+#   eoasFrom without an active-support phase, isEoes and eoesFrom without an
+#   extended phase, isDiscontinued for software); isEoes is null when a cycle
+#   is not eligible for extended support. A null date means "not known", not
+#   "never": hundreds of cycles are isEol: true with eolFrom null. A cycle can
+#   be isEol: true and isMaintained: true at once (only extended support
+#   left).
+# - PHASE LABELS: labels.eoas, labels.eol and labels.eoes on a product say
+#   what each phase means for that vendor ("Hardware & Maintenance",
+#   "Maintenance & Security Support", "Expanded Security Maintenance").
+# - LATEST VERSION is {name, date, link} or null (about a quarter of all
+#   cycles have none, mostly devices and services). name is in the vendor's
+#   format and can be a word ("N/A", "unknown", "Patch 9"): compare versions
+#   numerically, never as strings. For operating systems latest is the
+#   newest point release (installation media); a host patched through its
+#   package manager can report only the cycle ("22.04").
+# - CUSTOM FIELDS: some products add per-cycle fields under custom
+#   (supportedPhpVersions, recommendedReplacement,
+#   supportedKubernetesVersions, chromeVersion, ...); null when the product
+#   defines none.
+# - IDENTIFIERS map external ids to products: purl (~1,000, e.g.
+#   pkg:docker/library/postgres -> postgresql), cpe (CPE 2.2 and 2.3 names
+#   without version, e.g. cpe:2.3:o:canonical:ubuntu_linux -> ubuntu) and
+#   repology project names. The ids carry no version; strip "@version",
+#   qualifiers ("?...") and subpath ("#...") before matching, and percent-
+#   decode (pkg:npm/%40scope/name). Coverage is partial: many products and
+#   images have no purl (e.g. pkg:docker/library/nginx is not listed while
+#   the product nginx exists).
+# - SIZES: list_products ~490 summaries (~60 KB after projection);
+#   get_product 2-20 KB; list_identifiers for purl ~1,000 entries (~75 KB
+#   after projection); /products/full is a dump of nearly all data (~3 MB
+#   raw, ~2 MB after the projection here) for scans inside code only.
+# - ERRORS: a 404 carries the semantic code not_found and, as its message,
+#   the site's whole HTML error page (~800 bytes), because the API has no
+#   JSON error body. Inside code a failed call comes back as that error
+#   text; test for an object before reading fields.
+# - CATEGORIES AND TAGS: every product has exactly one category (os, lang,
+#   database, framework, server-app, app, service, device, standard; new
+#   values may appear), which is also one of its tags. Tags group vendors
+#   and kinds ("linux-distribution", "hashicorp", "java-distribution",
+#   "web-server"). Unknown names are HTTP 404.
+# - API v0 (/api/{product}.json, /api/{product}/{cycle}.json,
+#   /api/all.json) is the legacy format with union fields (eol: date or
+#   false) that the project plans to retire; this file covers v1 only.
+# - Verified against the live API (2026-11, schema_version 1.2.1).
+
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+
+credits:
+  - "Dunkel Cloud GmbH -- maintainer"
+
+source_name: "endoflife.date API v1"
+source_url: "https://endoflife.date/docs/api/v1/"
+date: "2026-11-25"
+
+backend:
+  name: endoflife
+  type: rest
+  version: "1.0"
+  base_url: "https://endoflife.date/api/v1"
+  description: "endoflife.date API v1 (public, no key): end-of-life dates and support lifecycles of ~490 products (operating systems, languages, databases, frameworks, server software, cloud services, devices) -- release cycles with LTS flag, end of active support, end of life, extended support and the newest version per cycle; lookup by name, alias, category, tag, purl or CPE; batch check of installed versions."
+
+  # No authentication -- endoflife.date is fully public. ToolMesh requires an
+  # auth block; the credential "none" is its placeholder for APIs without
+  # auth: it is never looked up and no header or query parameter is injected.
+  auth:
+    type: apikey
+    credential: none
+    inject_into: header
+
+  # Health: there is no credential to verify, so the check covers
+  # reachability and the response format only. The API index (~300 bytes)
+  # is the cheapest side-effect-free call.
+  health:
+    method: GET
+    path: /
+    expect_path: "$.result"
+    timeout: 5s
+
+  defaults:
+    headers:
+      Accept: application/json
+    errors:
+      format: json
+      message_path: "$.message"   # error pages are HTML; the status code is what counts
+      retry_on: [429, 500, 502, 503, 504]
+      terminal: [400, 401, 403, 404]
+      retry_strategy:
+        max_retries: 3
+        backoff: exponential
+        initial_delay: 1s
+      map:
+        404: not_found
+        429: rate_limited
+    response:
+      result_path: "$"
+      allow_jq_override: true
+
+  types:
+    ProductSummary:
+      type: object
+      properties:
+        name: { type: string, description: "Product slug taken by every other tool" }
+        label: { type: string, description: "Display name" }
+        aliases: { type: array, items: { type: string }, description: "Other accepted names (redirect to name)" }
+        category: { type: string, description: "os | lang | database | framework | server-app | app | service | device | standard (new values may appear)" }
+        tags: { type: array, items: { type: string } }
+      required: [name]
+    LatestVersion:
+      type: object
+      description: "Newest version inside a release cycle."
+      properties:
+        name: { type: string, description: "Version in the vendor's format; can be a word such as N/A" }
+        date: { type: string, description: "Release date (YYYY-MM-DD) or null" }
+        link: { type: string, description: "Changelog or release notes, or null" }
+    Release:
+      type: object
+      description: "One release cycle. Fields that do not apply to the product are absent; a null date means unknown."
+      properties:
+        name: { type: string, description: "Cycle name, e.g. 22.04, 16, 3.12" }
+        codename: { type: string }
+        label: { type: string }
+        releaseDate: { type: string, description: "YYYY-MM-DD" }
+        isLts: { type: boolean }
+        ltsFrom: { type: string }
+        isEoas: { type: boolean, description: "Active support over" }
+        eoasFrom: { type: string }
+        isEol: { type: boolean, description: "End of life reached" }
+        eolFrom: { type: string }
+        isEoes: { type: boolean, description: "Extended support over (null = not eligible)" }
+        eoesFrom: { type: string }
+        isDiscontinued: { type: boolean }
+        discontinuedFrom: { type: string }
+        isMaintained: { type: boolean, description: "Any level of support left, extended support included" }
+        latest: LatestVersion
+        custom: { type: object, description: "Product-specific per-cycle fields, or null" }
+      required: [name]
+    Identifier:
+      type: object
+      properties:
+        type: { type: string, description: "purl | cpe | repology" }
+        id: { type: string }
+    Product:
+      type: object
+      properties:
+        name: { type: string }
+        label: { type: string }
+        aliases: { type: array, items: { type: string } }
+        category: { type: string }
+        tags: { type: array, items: { type: string } }
+        versionCommand: { type: string, description: "Shell command that prints the installed version, or null" }
+        identifiers: { type: array, items: Identifier }
+        labels: { type: object, description: "Phase names: eoas, eol, eoes, discontinued" }
+        links: { type: object, description: "html (product page), releasePolicy, icon" }
+        releases: { type: array, items: Release }
+        last_modified: { type: string, description: "When this product's data last changed" }
+      required: [name, releases]
+    ProductReleases:
+      type: object
+      properties:
+        name: { type: string }
+        label: { type: string }
+        aliases: { type: array, items: { type: string } }
+        category: { type: string }
+        tags: { type: array, items: { type: string } }
+        releases: { type: array, items: Release, description: "Without label, custom and latest.link" }
+      required: [name, releases]
+    IdentifierRef:
+      type: object
+      properties:
+        identifier: { type: string, description: "purl, CPE name or repology project, without version" }
+        product: { type: string, description: "Product slug" }
+      required: [identifier, product]
+
+  tools:
+
+    # =========================================================================
+    # Products -- the catalog and one product with all its release cycles.
+    # =========================================================================
+
+    list_products:
+      method: GET
+      path: /products
+      access: read
+      description: >
+        List all products on endoflife.date (about 490; ~60 KB): name (the
+        slug every other tool takes), label (display name), aliases (other
+        accepted names, e.g. "postgres" for postgresql, "vault" for
+        hashicorp-vault, "node" for nodejs), category (os, lang, database,
+        framework, server-app, app, service, device, standard) and tags.
+        Summaries only, no release cycles -- call get_product for those. Use it
+        to find the slug before get_product or check_release_status; inside
+        code, filter by name, label and aliases rather than returning the whole
+        list. Narrower lists: list_category_products, list_tag_products.
+      returns:
+        type: array
+        items: ProductSummary
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | {name, label, aliases, category, tags}]
+        allow_jq_override: true
+      pagination: none
+
+    list_products_full:
+      method: GET
+      path: /products/full
+      access: read
+      description: >
+        Dump of ALL products with ALL their release cycles (about 490 products
+        and 9,500 cycles; ~3 MB raw, ~2 MB after projection). Meant for scans
+        across products INSIDE CODE -- e.g. "which cycles reach end of life in
+        the next 90 days" -- never as a direct result. Each product: name,
+        label, aliases, category, tags and releases[] with the fields of
+        get_release except label, custom and latest.link (dropped here; call
+        get_product for them). Lifecycle fields: isLts, isEoas/eoasFrom (end of
+        active support), isEol/eolFrom (end of life), isEoes/eoesFrom (end of
+        extended support), isMaintained; absent fields do not apply, null dates
+        are unknown. For one or a few products call get_product instead.
+      returns:
+        type: array
+        items: ProductReleases
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | {
+            name, label, aliases, category, tags,
+            releases: [(.releases // [])[]
+              | del(.label, .custom)
+              | if .latest == null then . else .latest |= {name, date} end]
+          }]
+        allow_jq_override: true
+      pagination: none
+
+    get_product:
+      method: GET
+      path: /products/{product}
+      access: read
+      description: >
+        Get one product with ALL its release cycles (GET /products/{product}).
+        Returns name, label, aliases, category, tags, versionCommand (shell
+        command that prints the installed version), identifiers ([{type, id}]
+        with purl, cpe, repology), labels (what the phases mean for this
+        vendor: eoas, eol, eoes, discontinued), links (html product page,
+        releasePolicy, icon), last_modified and releases[], usually newest
+        first. Each release cycle: name ("22.04", "16", "3.12"), codename,
+        label, releaseDate, isLts/ltsFrom, isEoas/eoasFrom (end of ACTIVE
+        support), isEol/eolFrom (END OF LIFE), isEoes/eoesFrom (end of EXTENDED,
+        usually paid support; isEoes null = not eligible), isDiscontinued/
+        discontinuedFrom (hardware), isMaintained (any support left, extended
+        included), latest ({name, date, link} of the newest version in the
+        cycle, or null; name may be a word like "N/A") and custom
+        (product-specific fields or null). Fields that do not apply are ABSENT;
+        a null date means unknown, not never. isEol true with isMaintained true
+        means only extended support is left. Accepts aliases ("postgres") and
+        any letter case; an unknown name is HTTP 404 (code not_found, the
+        message is the site's HTML error page).
+      params:
+        product:
+          type: string
+          in: path
+          required: true
+          description: "Product slug or alias, case-insensitive (e.g. 'ubuntu', 'postgresql', 'postgres', 'nodejs', 'hashicorp-vault', 'alpine-linux'); not a display label."
+      returns: Product
+      response:
+        result_path: "$"
+        transform: |
+          (.result // {}) + {last_modified}
+        allow_jq_override: true
+      pagination: none
+
+    # =========================================================================
+    # Releases -- one release cycle of a product.
+    # =========================================================================
+
+    get_release:
+      method: GET
+      path: /products/{product}/releases/{release}
+      access: read
+      description: >
+        Get one release cycle of a product (GET
+        /products/{product}/releases/{release}): name, codename, label,
+        releaseDate, isLts/ltsFrom, isEoas/eoasFrom (end of active support),
+        isEol/eolFrom (end of life), isEoes/eoesFrom (end of extended support),
+        isDiscontinued/discontinuedFrom, isMaintained, latest ({name, date,
+        link} of the newest version in the cycle, or null) and custom. release
+        is the CYCLE NAME exactly as get_product lists it ("22.04", "16",
+        "3.12", "1.27"), NOT a full version: "22.04.5" or "16.4" is HTTP 404.
+        To map an installed version to its cycle use check_release_status.
+        Fields that do not apply are absent; a null date means unknown.
+      params:
+        product:
+          type: string
+          in: path
+          required: true
+          description: "Product slug or alias, case-insensitive (e.g. 'ubuntu', 'postgresql')."
+        release:
+          type: string
+          in: path
+          required: true
+          description: "Release cycle name as listed in get_product releases[].name (e.g. '22.04', '16', '3.12'), not a full version."
+      returns: Release
+      response:
+        result_path: "$.result"
+      pagination: none
+
+    get_release_latest:
+      method: GET
+      path: /products/{product}/releases/latest
+      access: read
+      description: >
+        Get the FIRST release cycle in the product's list (GET
+        /products/{product}/releases/latest), same fields as get_release. This
+        is usually the newest cycle by release date, but not always: a few
+        products list an umbrella cycle first (jenkins and log4j return "2"),
+        and it is never "the newest LTS" (for Ubuntu it is the newest interim
+        release). For the newest LTS or a date-based choice, call get_product
+        and filter releases (isLts, releaseDate).
+      params:
+        product:
+          type: string
+          in: path
+          required: true
+          description: "Product slug or alias, case-insensitive (e.g. 'ubuntu', 'nodejs')."
+      returns: Release
+      response:
+        result_path: "$.result"
+      pagination: none
+
+    # =========================================================================
+    # Categories and tags -- browse products by kind or vendor.
+    # =========================================================================
+
+    list_categories:
+      method: GET
+      path: /categories
+      access: read
+      description: >
+        List the category names (GET /categories): os, lang, database,
+        framework, server-app, app, service, device, standard (new values may
+        appear). Every product has exactly one category. Returns an array of
+        names; pass one to list_category_products.
+      returns:
+        type: array
+        items: { type: string }
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | .name]
+        allow_jq_override: true
+      pagination: none
+
+    list_category_products:
+      method: GET
+      path: /categories/{category}
+      access: read
+      description: >
+        List the products of one category (GET /categories/{category}), as
+        summaries {name, label, aliases, category, tags} like list_products
+        (no release cycles). An unknown category is HTTP 404.
+      params:
+        category:
+          type: string
+          in: path
+          required: true
+          description: "Category name from list_categories (e.g. 'os', 'database', 'lang', 'server-app')."
+      returns:
+        type: array
+        items: ProductSummary
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | {name, label, aliases, category, tags}]
+        allow_jq_override: true
+      pagination: none
+
+    list_tags:
+      method: GET
+      path: /tags
+      access: read
+      description: >
+        List the tag names (GET /tags, about 90): the categories plus vendor
+        and kind tags such as "linux-distribution", "web-server",
+        "java-distribution", "hashicorp", "microsoft". Returns an array of
+        names; pass one to list_tag_products.
+      returns:
+        type: array
+        items: { type: string }
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | .name]
+        allow_jq_override: true
+      pagination: none
+
+    list_tag_products:
+      method: GET
+      path: /tags/{tag}
+      access: read
+      description: >
+        List the products carrying one tag (GET /tags/{tag}), as summaries
+        {name, label, aliases, category, tags} like list_products (no release
+        cycles). An unknown tag is HTTP 404 -- take names from list_tags.
+      params:
+        tag:
+          type: string
+          in: path
+          required: true
+          description: "Tag name from list_tags (e.g. 'linux-distribution', 'web-server', 'hashicorp')."
+      returns:
+        type: array
+        items: ProductSummary
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | {name, label, aliases, category, tags}]
+        allow_jq_override: true
+      pagination: none
+
+    # =========================================================================
+    # Identifiers -- map purl, CPE and repology ids to products.
+    # =========================================================================
+
+    list_identifier_types:
+      method: GET
+      path: /identifiers
+      access: read
+      description: >
+        List the identifier types endoflife.date maps to products (GET
+        /identifiers): purl, cpe, repology. Returns an array of names; pass one
+        to list_identifiers.
+      returns:
+        type: array
+        items: { type: string }
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | .name]
+        allow_jq_override: true
+      pagination: none
+
+    list_identifiers:
+      method: GET
+      path: /identifiers/{identifier_type}
+      access: read
+      description: >
+        List every known identifier of one type with the product it belongs to
+        (GET /identifiers/{identifier_type}), as [{identifier, product}] where
+        product is the slug for get_product. purl: about 1,000 package URLs
+        WITHOUT version (pkg:docker/library/postgres -> postgresql,
+        pkg:github/traefik/traefik -> traefik, pkg:npm/%40scope/name stays
+        percent-encoded); cpe: CPE 2.2 and 2.3 names without version
+        (cpe:2.3:o:canonical:ubuntu_linux -> ubuntu); repology: project names.
+        To look up an inventory purl, strip "@version", "?qualifiers" and
+        "#subpath" first (check_release_status does this). Coverage is partial:
+        a missing purl does not mean the product is unknown (nginx exists, but
+        pkg:docker/library/nginx is not listed) -- fall back to list_products.
+      params:
+        identifier_type:
+          type: string
+          in: path
+          required: true
+          description: "Identifier type: 'purl', 'cpe' or 'repology' (see list_identifier_types)."
+      returns:
+        type: array
+        items: IdentifierRef
+      response:
+        result_path: "$"
+        transform: |
+          [(.result // [])[] | {identifier, product: .product.name}]
+        allow_jq_override: true
+      pagination: none
+
+  # ===========================================================================
+  # Composites
+  # ===========================================================================
+  composites:
+
+    check_release_status:
+      access: read
+      description: >
+        Support-status check for a list of installed products: resolves each
+        item to a product (slug, alias or purl), maps the version to its
+        release cycle and reports end-of-life, extended support, the newest
+        patch in the cycle and newer cycles. Input items: {product, version}
+        or {purl} with the version in the purl ("pkg:docker/library/postgres@16.4")
+        or in version; release names the cycle explicitly when the version
+        string does not start with the cycle name (Java "1.8.0_392" -> "8").
+        A leading "v" is ignored. The cycle is the longest cycle name that
+        prefixes the version at a ".", "-", "_", "+" or space boundary. Returns
+        {checked, status_counts, results: [...]} in input order; each result
+        has index, query, status, product, product_label, release, codename,
+        is_lts, release_date, is_eoas/eoas_from, is_eol/eol_from/days_to_eol,
+        is_eoes/eoes_from, is_maintained, installed_version,
+        latest_in_release/latest_date, update_available, newest_release,
+        newer_release_available, newest_lts_release and error (keys without a
+        value are left out). status is one of: eol (end of life, no
+        support left), extended_support_only (past end of life, only extended
+        or paid support left), eol_soon (end of life within warn_days),
+        update_available (a newer patch exists in the cycle), supported,
+        unknown_release (no cycle matches -- see the product's releases or pass
+        release), unknown_product (no product or no purl match -- pass
+        product), not_checked (over the budget of 50 product lookups per run --
+        call again with the remaining items) or error. Versions are compared
+        numerically on their leading digits ("7.2.5-alpine" = 7.2.5), and only
+        when the installed and the latest version both start with the cycle
+        name; otherwise update_available is left out (Java "1.8.0_392" against
+        "8u514-b01", a latest of "N/A", or a version that is only the cycle
+        such as Ubuntu "22.04" -- for operating systems latest is the newest
+        point release, not the package patch level). days_to_eol counts from
+        today (UTC), negative once past; left out when the date is unknown.
+      params:
+        items:
+          type: array
+          required: true
+          description: "Array of 1-200 items: {product: 'postgresql', version: '16.4'}, {purl: 'pkg:docker/library/redis@7.2.5'}, {product: 'eclipse-temurin', version: '1.8.0_392', release: '8'}. version is optional (without it only the cycle given by release, or none, is checked)."
+        warn_days:
+          type: integer
+          default: 90
+          description: "Report eol_soon when end of life is at most this many days away (default 90)."
+      timeout: 120s
+      depends_on: [get_product, list_identifiers]
+      code: |
+        const items = params.items;
+        if (!Array.isArray(items) || items.length === 0) {
+          throw new Error("items must be a non-empty array of {product | purl, version?, release?}");
+        }
+        if (items.length > 200) {
+          throw new Error("at most 200 items per call");
+        }
+        const warnDays = (params.warn_days === undefined || params.warn_days === null) ? 90 : Number(params.warn_days);
+        const DAY = 86400000;
+        const now = Date.now();
+        // 50 api.* calls per composite run: one per distinct product, plus one
+        // for the purl map when any item carries a purl.
+        let budget = 50;
+
+        const nn = (o) => {
+          const out = {};
+          Object.keys(o).forEach((k) => { if (o[k] !== null && o[k] !== undefined) out[k] = o[k]; });
+          return out;
+        };
+        const decode = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+        const purlParts = (p) => {
+          let s = decode(String(p || "")).trim();
+          s = s.split("#")[0].split("?")[0];
+          let version = null;
+          const at = s.lastIndexOf("@");
+          if (at > s.lastIndexOf("/")) {
+            version = s.slice(at + 1);
+            s = s.slice(0, at);
+          }
+          s = s.toLowerCase();
+          // Docker images without a namespace live in "library" (purl spec).
+          const m = /^pkg:docker\/([^\/]+)$/.exec(s);
+          if (m) s = "pkg:docker/library/" + m[1];
+          return { base: s, version: version };
+        };
+        const normVersion = (v) => String(v).trim().replace(/^v(?=\d)/i, "");
+        const numCore = (v) => {
+          const m = /^(\d+(?:\.\d+)*)/.exec(String(v || ""));
+          return m ? m[1].split(".").map(Number) : null;
+        };
+        const cmpCore = (a, b) => {
+          const n = Math.max(a.length, b.length);
+          for (let i = 0; i < n; i++) {
+            const x = a[i] || 0;
+            const y = b[i] || 0;
+            if (x !== y) return x < y ? -1 : 1;
+          }
+          return 0;
+        };
+        const matchRelease = (releases, version) => {
+          const v = normVersion(version).toLowerCase();
+          let best = null;
+          releases.forEach((r) => {
+            const n = String(r.name).toLowerCase();
+            const boundary = v.length > n.length && /[.\-_+ ]/.test(v.charAt(n.length));
+            if (v === n || (v.indexOf(n) === 0 && boundary)) {
+              if (!best || n.length > String(best.name).length) best = r;
+            }
+          });
+          return best;
+        };
+        const daysUntil = (d) => {
+          if (!d) return null;
+          const t = Date.parse(String(d) + "T00:00:00Z");
+          return isNaN(t) ? null : Math.ceil((t - now) / DAY);
+        };
+        const errText = (e) => String((e && e.message) || e);
+
+        // purl -> product map, fetched once and only when needed.
+        let purlMap = null;
+        let purlMapError = null;
+        const needPurls = items.some((it) => it && it.purl && !it.product);
+        if (needPurls) {
+          budget--;
+          try {
+            const ids = await api.list_identifiers({ identifier_type: "purl" });
+            if (!Array.isArray(ids)) throw new Error("unexpected purl list response");
+            purlMap = {};
+            ids.forEach((x) => {
+              const b = purlParts(x.identifier).base;
+              if (!purlMap[b]) purlMap[b] = x.product;
+            });
+          } catch (e) {
+            purlMapError = "purl lookup failed: " + errText(e);
+          }
+        }
+
+        const cache = {};
+        const fetchProduct = async (name) => {
+          const key = String(name).toLowerCase();
+          if (cache[key]) return cache[key];
+          if (budget <= 0) return { skipped: true };
+          budget--;
+          let res;
+          try {
+            const p = await api.get_product({ product: name });
+            if (p && typeof p === "object" && Array.isArray(p.releases)) {
+              res = { product: p };
+            } else {
+              const t = typeof p === "string" ? p : JSON.stringify(p);
+              res = { error: t, notFound: /404|not.?found/i.test(t) };
+            }
+          } catch (e) {
+            const t = errText(e);
+            res = { error: t, notFound: /404|not.?found/i.test(t) };
+          }
+          cache[key] = res;
+          return res;
+        };
+
+        const results = [];
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i] || {};
+          const entry = { index: i, query: it };
+          let productName = it.product ? String(it.product).trim() : null;
+          let version = (it.version !== undefined && it.version !== null && String(it.version).trim() !== "") ? String(it.version) : null;
+          if (it.purl) {
+            const pp = purlParts(it.purl);
+            if (!version && pp.version) version = pp.version;
+            if (!productName) {
+              if (purlMapError) {
+                entry.status = "error";
+                entry.error = purlMapError;
+                results.push(nn(entry));
+                continue;
+              }
+              productName = purlMap ? purlMap[pp.base] : null;
+              if (!productName) {
+                entry.status = "unknown_product";
+                entry.error = "no product lists the purl " + pp.base + " -- pass product (see list_products)";
+                results.push(nn(entry));
+                continue;
+              }
+            }
+          }
+          if (!productName) {
+            entry.status = "error";
+            entry.error = "item needs product or purl";
+            results.push(nn(entry));
+            continue;
+          }
+
+          const fp = await fetchProduct(productName);
+          if (fp.skipped) {
+            entry.status = "not_checked";
+            entry.error = "budget of 50 product lookups per run exhausted -- call again with the remaining items";
+            results.push(nn(entry));
+            continue;
+          }
+          if (!fp.product) {
+            entry.status = fp.notFound ? "unknown_product" : "error";
+            entry.error = fp.notFound ? ("no product named " + productName + " -- see list_products for slugs and aliases") : fp.error;
+            results.push(nn(entry));
+            continue;
+          }
+          const p = fp.product;
+          const releases = p.releases || [];
+          entry.product = p.name;
+          entry.product_label = p.label;
+
+          let newest = null;
+          let newestLts = null;
+          releases.forEach((r) => {
+            if (!newest || String(r.releaseDate || "") > String(newest.releaseDate || "")) newest = r;
+            if (r.isLts && (!newestLts || String(r.releaseDate || "") > String(newestLts.releaseDate || ""))) newestLts = r;
+          });
+          if (newest) entry.newest_release = newest.name;
+          if (newestLts) entry.newest_lts_release = newestLts.name;
+
+          let rel = null;
+          if (it.release !== undefined && it.release !== null && String(it.release) !== "") {
+            const want = String(it.release).toLowerCase();
+            rel = releases.find((r) => String(r.name).toLowerCase() === want) || null;
+          } else if (version) {
+            rel = matchRelease(releases, version);
+          }
+          if (version) entry.installed_version = normVersion(version);
+          if (!rel) {
+            entry.status = "unknown_release";
+            entry.error = it.release
+              ? ("product " + p.name + " has no release cycle named " + it.release)
+              : (version ? ("no release cycle of " + p.name + " matches version " + version + " -- pass release") : "item needs version or release");
+            entry.known_releases = releases.slice(0, 12).map((r) => r.name);
+            results.push(nn(entry));
+            continue;
+          }
+
+          entry.release = rel.name;
+          entry.codename = rel.codename;
+          entry.is_lts = rel.isLts;
+          entry.release_date = rel.releaseDate;
+          entry.is_eoas = rel.isEoas;
+          entry.eoas_from = rel.eoasFrom;
+          entry.is_eol = rel.isEol;
+          entry.eol_from = rel.eolFrom;
+          entry.days_to_eol = daysUntil(rel.eolFrom);
+          entry.is_eoes = rel.isEoes;
+          entry.eoes_from = rel.eoesFrom;
+          entry.is_maintained = rel.isMaintained;
+          if (rel.latest) {
+            entry.latest_in_release = rel.latest.name;
+            entry.latest_date = rel.latest.date;
+          }
+          if (newest) entry.newer_release_available = newest.name !== rel.name;
+
+          // Compare only when the installed and the latest version both follow
+          // the cycle's naming ("16.4" and "16.16" in cycle "16"); Java's
+          // "1.8.0_392" against "8u514-b01" or a latest of "N/A" stay unknown.
+          let update = null;
+          if (version && rel.latest && rel.latest.name) {
+            const iv = normVersion(version);
+            const lv = normVersion(rel.latest.name);
+            const inCycle = (v) => matchRelease([rel], v) !== null;
+            if (iv.toLowerCase() !== String(rel.name).toLowerCase() && inCycle(iv) && inCycle(lv)) {
+              const a = numCore(iv);
+              const b = numCore(lv);
+              if (a && b) update = cmpCore(a, b) < 0;
+            }
+          }
+          entry.update_available = update;
+
+          if (rel.isEol) {
+            entry.status = rel.isMaintained ? "extended_support_only" : "eol";
+          } else if (entry.days_to_eol !== null && entry.days_to_eol <= warnDays) {
+            entry.status = "eol_soon";
+          } else if (update === true) {
+            entry.status = "update_available";
+          } else {
+            entry.status = "supported";
+          }
+          results.push(nn(entry));
+        }
+
+        const counts = {};
+        results.forEach((r) => { counts[r.status] = (counts[r.status] || 0) + 1; });
+        return { checked: items.length, status_counts: counts, results: results };
+
+  coverage:
+    endpoints: 11
+    total_endpoints: 12
+    percentage: 92
+    focus: "endoflife.date API v1: products (EOL dates, support phases, LTS, latest versions per cycle), release cycles (EOL status by cycle name, installed-version checks with newer patches and cycles), identifiers (purl, CPE, repology lookups)."
+    missing: "The API index (GET /api/v1/, a list of the top-level collections) is used only as the health check. Not covered: API v0 (/api/{product}.json, /api/{product}/{cycle}.json, /api/all.json), the legacy format the project plans to retire. The website's product pages are not part of the API."
+    last_reviewed: "2026-11-25"
+
+  setup:
+    credential_steps:
+      - "No credentials are required -- the endoflife.date API is public and anonymous."
+      - "No signup, API key, token or OAuth client is needed for any endpoint."
+      - "Keep credential: none in the DADL; ToolMesh then sends every request without authentication."
+    env_var: ""
+    backends_yaml: |
+      - name: endoflife
+        transport: rest
+        dadl: endoflife.dadl
+        url: "https://endoflife.date/api/v1"
+    required_scopes: []
+    optional_scopes: []
+    docs_url: "https://endoflife.date/docs/api/v1/"
+    notes: >
+      Public read API of the community project endoflife.date (data and code
+      under the MIT license). No authentication and no published rate limit;
+      the API documents HTTP 429 with Retry-After. Base URL is
+      https://endoflife.date/api/v1 . OpenAPI 3.1 spec:
+      https://endoflife.date/docs/api/v1/openapi.yml , changelog:
+      https://github.com/endoflife-date/endoflife.date/blob/master/CHANGELOG_API.md .
+      The data is static JSON on a CDN, regenerated whenever the project's
+      repository changes. Unknown product, release, category or tag names
+      return HTTP 404 with an HTML page instead of a JSON error. Renamed
+      products and aliases answer with a 301 redirect that ToolMesh follows.
+      The health check reads the API index (about 300 bytes): with no
+      credential involved it verifies reachability and the response format
+      only. Corrections to the data go to the project's repository on GitHub,
+      not to the API.
+
+  examples:
+    - name: "Support status of installed versions"
+      description: "Check several installed products for end of life, newer patches and newer release cycles"
+      code: |
+        const report = await api.check_release_status({
+          items: [
+            { product: "ubuntu", version: "22.04.4" },
+            { product: "postgresql", version: "16.4" },
+            { purl: "pkg:docker/library/redis@7.2.5" },
+            { product: "python", version: "3.9.20" }
+          ],
+          warn_days: 120
+        });
+        return report.results.map((r) => ({
+          product: r.product,
+          release: r.release,
+          status: r.status,
+          eol_from: r.eol_from,
+          latest: r.latest_in_release,
+          newest: r.newest_release
+        }));
+    - name: "End of life in the next 90 days across all products"
+      description: "Scan the full dump inside code and return only the cycles that reach end of life soon"
+      code: |
+        const products = await api.list_products_full();
+        const today = new Date().toISOString().slice(0, 10);
+        const limit = new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
+        const soon = [];
+        products.forEach((p) => p.releases.forEach((r) => {
+          if (r.eolFrom && r.eolFrom >= today && r.eolFrom <= limit) {
+            soon.push({ product: p.name, release: r.name, eol: r.eolFrom });
+          }
+        }));
+        return soon.sort((a, b) => (a.eol < b.eol ? -1 : 1));
+    - name: "Newest LTS release cycle of a product"
+      description: "Pick the newest cycle flagged LTS, which /releases/latest does not return"
+      code: |
+        const p = await api.get_product({ product: "ubuntu" });
+        const lts = p.releases.filter((r) => r.isLts)
+          .sort((a, b) => (a.releaseDate < b.releaseDate ? 1 : -1))[0];
+        return { release: lts.name, codename: lts.codename, eol: lts.eolFrom, latest: lts.latest && lts.latest.name };
