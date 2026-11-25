@@ -1,11 +1,11 @@
-spec: "https://dadl.ai/spec/dadl-spec-v0.1.md"
+spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
 
 credits:
   - "Dunkel Cloud GmbH -- maintainer"
 
 source_name: "Umami Analytics REST API"
 source_url: "https://umami.is/docs/api"
-date: "2026-10-10"
+date: "2026-11-25"
 
 backend:
   name: umami
@@ -15,12 +15,12 @@ backend:
   description: "Umami open-source web analytics — privacy-friendly alternative to Google Analytics"
 
   coverage:
-    endpoints: 89
-    total_endpoints: 89
-    percentage: 100
+    endpoints: 94
+    total_endpoints: 195
+    percentage: 48
     focus: "authentication, me, websites, statistics, metrics, pageviews, events, event-data, sessions, session-data, realtime, users, teams, reports, share, links, pixels, admin"
-    missing: "none"
-    last_reviewed: "2026-10-10"
+    missing: "saved goal and funnel definitions, revenue sessions, segments and cohorts, boards, session replays, annotations, website charts and exports, the legacy /reports run routes (replaced by the analytics endpoints)"
+    last_reviewed: "2026-11-25"
 
   setup:
     credential_steps:
@@ -37,7 +37,7 @@ backend:
     required_scopes:
       - "admin or view-only access depending on endpoints used"
     docs_url: "https://docs.umami.is/docs/api"
-    notes: "Umami is self-hosted. Replace the URL with your instance address. Token is a JWT obtained via /auth/login."
+    notes: "Umami is self-hosted. Replace the URL with your instance address. Token is a JWT obtained via /auth/login. The run_*_report tools and the performance and revenue tools use the analytics API of Umami 3.4 or later."
 
   auth:
     type: bearer
@@ -45,6 +45,11 @@ backend:
     inject_into: header
     header_name: Authorization
     prefix: "Bearer "
+
+  # get_me is the cheapest authenticated GET; the response carries no token expiry.
+  health:
+    tool: get_me
+    expect_path: $.user.id
 
   defaults:
     headers:
@@ -71,7 +76,7 @@ backend:
   # Timestamps:
   #   All time-based query parameters (startAt, endAt) use Unix timestamps
   #   in MILLISECONDS (not seconds). Example: 1711929600000 for 2024-04-01.
-  #   Report endpoints use ISO date strings (startDate, endDate) instead.
+  #   The report tools (run_*_report) use the same millisecond timestamps.
   #
   # Metrics types (Umami v3, verified against v3.4.0 source and a live instance 2026-10-10):
   #   The metrics endpoints (get_website_metrics, get_website_metrics_expanded) accept a
@@ -92,7 +97,7 @@ backend:
   #   team-ownership effect, not an auth failure.
   #
   # Filters:
-  #   Stats, metrics, pageviews, events, and sessions endpoints accept
+  #   Stats, metrics, pageviews, events, sessions and report endpoints accept
   #   filter parameters as query params: path, referrer, title, query,
   #   browser, os, device, country, region, city, language, hostname,
   #   tag, event, distinctId, utmSource, utmMedium, utmCampaign,
@@ -104,9 +109,23 @@ backend:
   # User roles:
   #   admin, user, view-only
   #
-  # Report types:
-  #   attribution, breakdown, funnel, goal, journey, performance,
-  #   retention, revenue, utm
+  # Reports (verified against v3.4.0 source and a live instance 2026-11-25):
+  #   Since Umami 3.4 the reports are GET endpoints under /websites/{websiteId}/
+  #   (attribution, breakdown, funnels/stats, goals/stats, heatmaps, journeys,
+  #   performance/{stats,chart,metrics}, retention, revenue/{stats,chart,metrics},
+  #   utm/metrics) with the conventions of the stats endpoints: startAt/endAt in ms,
+  #   filters as query params. Array inputs (breakdown fields, funnel steps) are
+  #   JSON-encoded strings in the query, because a plain array is not serialized as
+  #   JSON. Value pitfalls: attribution model is "first-click"/"last-click"; the UTM
+  #   report type is snake_case (utm_source), while metrics types and filters are
+  #   camelCase (utmSource).
+  #   The older POST /reports/<type> routes survive only as an unpublished
+  #   compatibility rewrite. They need the body {websiteId, type, filters: {},
+  #   parameters: {startDate, endDate, ...}} (a flat body is rejected with HTTP 400),
+  #   and in 3.4 the UTM variant drops the date range. The saved-report tools
+  #   (list_reports ... delete_report) still use /reports.
+  #   The live check covered every report tool; the instance recorded no web vitals,
+  #   heatmap or revenue data, so the row shapes of those tools come from the source.
   #
   # Typical workflow:
   #   1. authenticate (login) → get token
@@ -816,7 +835,7 @@ backend:
         pageSize: { type: integer, in: query }
       pagination: none
 
-    # ── Reports ─────────────────────────────────────────────────────
+    # ── Saved reports (legacy /reports routes) ─────────────────────
 
     list_reports:
       method: GET
@@ -875,131 +894,411 @@ backend:
         reportId: { type: string, in: path, required: true }
       pagination: none
 
+    # ── Reports (analytics API, Umami 3.4+) ─────────────────────────
+    # GET endpoints under /websites/{websiteId}/ with the conventions of the
+    # stats endpoints: startAt/endAt in Unix ms, filters as plain query params.
+    # The older POST /reports/<type> routes only survive as an unpublished
+    # compatibility rewrite (see the domain notes).
+
     run_attribution_report:
-      method: POST
-      path: /reports/attribution
+      method: GET
+      path: /websites/{websiteId}/attribution
       access: read
-      description: "Run an attribution report. Models: firstClick, lastClick. Types: path, event."
+      description: >
+        Attribution report (Umami 3.4+): which referrers, paid ads and UTM values brought
+        the sessions that reached a conversion step. model is "first-click" or "last-click"
+        (hyphenated); type is "path" or "event"; step is the URL path or event name of the
+        conversion. Returns {referrer, paidAds, utm_source, utm_medium, utm_campaign,
+        utm_content, utm_term} as [{name, value}] lists (value = sessions) plus
+        total {pageviews, visitors, visits}. startAt/endAt are Unix MILLISECONDS. Optional
+        filters (exact values): path, referrer, hostname, country, device, browser, os,
+        event, utmSource, utmMedium, utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        timezone: { type: string, in: body }
-        model: { type: string, in: body, required: true }
-        type: { type: string, in: body, required: true }
-        step: { type: string, in: body, required: true }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        model: { type: string, in: query, required: true }
+        type: { type: string, in: query, required: true }
+        step: { type: string, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
       pagination: none
 
     run_breakdown_report:
-      method: POST
-      path: /reports/breakdown
+      method: GET
+      path: /websites/{websiteId}/breakdown
       access: read
-      description: "Run a breakdown report to cross-reference multiple dimensions."
+      description: >
+        Breakdown report (Umami 3.4+): traffic cross-tabulated by one or more dimensions.
+        fields is a JSON-ENCODED STRING of an array of column names, e.g. '["path","country"]'
+        (a plain array is rejected). Allowed columns: path, referrer, title, query, os,
+        browser, device, country, region, city, tag, hostname, distinctId, language, event,
+        utmSource, utmMedium, utmCampaign, utmContent, utmTerm. Returns one row per value
+        combination with the field values plus views, visitors, visits, bounces and
+        totaltime (seconds); views and totaltime may arrive as strings. startAt/endAt are
+        Unix MILLISECONDS. Optional filters (exact values):
+        path, referrer, hostname, country, device, browser, os, event, utmSource, utmMedium,
+        utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        fields: { type: array, in: body, required: true }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        fields: { type: string, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
       pagination: none
 
     run_funnel_report:
-      method: POST
-      path: /reports/funnel
+      method: GET
+      path: /websites/{websiteId}/funnels/stats
       access: read
-      description: "Run a funnel report. Requires at least 2 steps, each with type (path/event) and value."
+      description: >
+        Funnel report (Umami 3.4+): how many visitors pass an ordered list of steps.
+        steps is a JSON-ENCODED STRING of an array with 2 to 8 objects
+        {type: "path"|"event", value, filters?: [{property, operator: eq|neq|c|dnc, value}]},
+        e.g. '[{"type":"path","value":"/"},{"type":"event","value":"signup"}]'. window is
+        the maximum time between two steps in MINUTES. Returns one entry per step:
+        [{type, value, visitors, previous, dropped, dropoff, remaining}]. startAt/endAt
+        are Unix MILLISECONDS. Optional filters (exact values): path, referrer, hostname,
+        country, device, browser, os, event, utmSource, utmMedium, utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        steps: { type: array, in: body, required: true }
-        window: { type: integer, in: body }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        steps: { type: string, in: query, required: true }
+        window: { type: integer, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
       pagination: none
 
     run_goal_report:
-      method: POST
-      path: /reports/goal
+      method: GET
+      path: /websites/{websiteId}/goals/stats
       access: read
-      description: "Run a goal report. Type: path or event."
+      description: >
+        Goal report (Umami 3.4+): how many sessions reached a page or fired an event.
+        type is "path" or "event"; value is the URL path or event name. Returns
+        {num, total}: sessions that reached the goal and all sessions in the range.
+        startAt/endAt are Unix MILLISECONDS. Optional filters (exact values): path,
+        referrer, hostname, country, device, browser, os, event, utmSource, utmMedium,
+        utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        type: { type: string, in: body, required: true }
-        value: { type: string, in: body, required: true }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        type: { type: string, in: query, required: true }
+        value: { type: string, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
+      pagination: none
+
+    run_heatmap_report:
+      method: GET
+      path: /websites/{websiteId}/heatmaps
+      access: read
+      description: >
+        Heatmap report (Umami 3.4+): click positions or scroll depth recorded by the
+        tracker. urlPath picks the page (e.g. "/pricing"); mode is "click" (default) or
+        "scroll". Returns {mode, pages: [{..., count, sessions}], points: [{x, y, pageX,
+        pageY, pageW, pageH, viewportW, viewportH, count}], snapshot, scroll: {buckets,
+        totalSessions, ...}}. pages and points stay empty for websites that record no
+        heatmap data. startAt/endAt are Unix MILLISECONDS.
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        urlPath: { type: string, in: query }
+        mode: { type: string, in: query }
+        timezone: { type: string, in: query }
       pagination: none
 
     run_journey_report:
-      method: POST
-      path: /reports/journey
+      method: GET
+      path: /websites/{websiteId}/journeys
       access: read
-      description: "Run a journey/path report. Steps must be 3-7."
+      description: >
+        Journey report (Umami 3.4+): the most common paths of pages and events through a
+        visit. steps is the path length (2 to 7); startStep and endStep optionally pin the
+        first or last step to a URL path or event name; eventType restricts the steps to
+        one event type (1 = page view, 2 = custom event). Returns [{items, count}] sorted by
+        count descending, where items lists the steps in order, padded with null for
+        visits that ended earlier. startAt/endAt are Unix MILLISECONDS. Optional filters (exact values): path, referrer, hostname, country,
+        device, browser, os, event, utmSource, utmMedium, utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        steps: { type: integer, in: body, required: true }
-        startStep: { type: string, in: body, required: true }
-        endStep: { type: string, in: body }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        steps: { type: integer, in: query, required: true }
+        startStep: { type: string, in: query }
+        endStep: { type: string, in: query }
+        eventType: { type: integer, in: query }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
       pagination: none
 
     run_performance_report:
-      method: POST
-      path: /reports/performance
+      method: GET
+      path: /websites/{websiteId}/performance/stats
       access: read
-      description: "Run a web vitals performance report. Metrics: lcp, inp, cls, fcp, ttfb."
+      description: >
+        Web vitals summary (Umami 3.4+): p50, p75 and p95 of LCP, INP, CLS, FCP and TTFB
+        over the range, as {lcp: {p50, p75, p95}, inp, cls, fcp, ttfb, count}; count 0 and
+        all values 0 mean the tracker records no web vitals. Time series per
+        metric: get_performance_chart; breakdown by page, title, device or browser:
+        get_performance_metrics. startAt/endAt are Unix MILLISECONDS. Optional filters
+        (exact values): path, referrer, hostname, country, device, browser, os, event,
+        utmSource, utmMedium, utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        unit: { type: string, in: body }
-        timezone: { type: string, in: body }
-        metric: { type: string, in: body }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
+      pagination: none
+
+    get_performance_chart:
+      method: GET
+      path: /websites/{websiteId}/performance/chart
+      access: read
+      description: >
+        Web vitals time series (Umami 3.4+) for one metric: lcp, inp, cls, fcp or ttfb.
+        unit sets the bucket size (hour, day, month, year), timezone the bucket boundaries
+        (e.g. "Europe/Berlin"). Returns {chart: [{t, p50, p75, p95}]}. startAt/endAt are
+        Unix MILLISECONDS.
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        metric: { type: string, in: query }
+        unit: { type: string, in: query }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+      pagination: none
+
+    get_performance_metrics:
+      method: GET
+      path: /websites/{websiteId}/performance/metrics
+      access: read
+      description: >
+        Web vitals broken down by type (Umami 3.4+): "path", "title", "device" or
+        "browser". metric selects lcp, inp, cls, fcp or ttfb; limit caps the rows
+        (1 to 500). Returns rows with the group value and p50, p75, p95 and count.
+        startAt/endAt are Unix MILLISECONDS.
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        type: { type: string, in: query, required: true }
+        metric: { type: string, in: query }
+        limit: { type: integer, in: query }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
       pagination: none
 
     run_retention_report:
-      method: POST
-      path: /reports/retention
+      method: GET
+      path: /websites/{websiteId}/retention
       access: read
-      description: "Run a retention/cohort report."
+      description: >
+        Retention report (Umami 3.4+): cohorts by the day of the first visit and how many
+        of them return on day 0 to 31. Returns [{date, day, visitors, returnVisitors,
+        percentage}]. timezone sets the day boundaries (e.g. "Europe/Berlin").
+        startAt/endAt are Unix MILLISECONDS. Optional filters (exact values): path,
+        referrer, hostname, country, device, browser, os, event, utmSource, utmMedium,
+        utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        timezone: { type: string, in: body, required: true }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
       pagination: none
 
     run_revenue_report:
-      method: POST
-      path: /reports/revenue
+      method: GET
+      path: /websites/{websiteId}/revenue/stats
       access: read
-      description: "Run a revenue report."
+      description: >
+        Revenue summary for one currency (ISO code, e.g. "EUR"), from events tracked with
+        revenue data. Returns {sum, count, unique_count, average, arpu, total_sessions,
+        comparison}; sum is null when there is no revenue. comparison holds the same
+        figures for the previous period (compare "prev", default) or the same period a
+        year earlier ("yoy"). Time series: get_revenue_chart; revenue
+        by country, region, referrer or channel: get_revenue_metrics. startAt/endAt are
+        Unix MILLISECONDS. Optional filters (exact values): path, referrer, hostname,
+        country, device, browser, os, event, utmSource, utmMedium, utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        timezone: { type: string, in: body, required: true }
-        currency: { type: string, in: body, required: true }
-        compare: { type: string, in: body }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        currency: { type: string, in: query, required: true }
+        compare: { type: string, in: query }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
+      pagination: none
+
+    get_revenue_chart:
+      method: GET
+      path: /websites/{websiteId}/revenue/chart
+      access: read
+      description: >
+        Revenue time series for one currency (ISO code, e.g. "EUR"). unit sets the bucket
+        size (hour, day, month, year), timezone the bucket boundaries. Returns
+        {chart: [{x, t, y, count}]} with y = revenue and count = revenue events.
+        startAt/endAt are Unix MILLISECONDS.
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        currency: { type: string, in: query, required: true }
+        unit: { type: string, in: query }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
+      pagination: none
+
+    get_revenue_metrics:
+      method: GET
+      path: /websites/{websiteId}/revenue/metrics
+      access: read
+      description: >
+        Revenue for one currency (ISO code, e.g. "EUR") grouped by type: "country",
+        "region", "referrer" or "channel". Returns [{name, value}] with value = revenue;
+        region rows also carry country. startAt/endAt are Unix MILLISECONDS.
+      params:
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        type: { type: string, in: query, required: true }
+        currency: { type: string, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
       pagination: none
 
     run_utm_report:
-      method: POST
-      path: /reports/utm
+      method: GET
+      path: /websites/{websiteId}/utm/metrics
       access: read
-      description: "Run a UTM campaign report."
+      description: >
+        UTM report (Umami 3.4+) for ONE UTM parameter, selected by type in snake_case:
+        utm_source, utm_medium, utm_campaign, utm_term or utm_content (the metrics types
+        and filters elsewhere use camelCase utmSource etc.). Returns [{utm, views}] sorted
+        by views, one row per value, [] for a parameter without values; call once per
+        type for the full report. startAt/endAt are Unix MILLISECONDS. Optional filters (exact values): path,
+        referrer, hostname, country, device, browser, os, event, utmSource, utmMedium,
+        utmCampaign.
       params:
-        websiteId: { type: string, in: body, required: true }
-        startDate: { type: string, in: body, required: true }
-        endDate: { type: string, in: body, required: true }
-        filters: { type: array, in: body }
+        websiteId: { type: string, in: path, required: true }
+        startAt: { type: integer, in: query, required: true }
+        endAt: { type: integer, in: query, required: true }
+        type: { type: string, in: query, required: true }
+        timezone: { type: string, in: query }
+        path: { type: string, in: query }
+        referrer: { type: string, in: query }
+        hostname: { type: string, in: query }
+        country: { type: string, in: query }
+        device: { type: string, in: query }
+        browser: { type: string, in: query }
+        os: { type: string, in: query }
+        event: { type: string, in: query }
+        utmSource: { type: string, in: query }
+        utmMedium: { type: string, in: query }
+        utmCampaign: { type: string, in: query }
       pagination: none
 
     # ── Share ───────────────────────────────────────────────────────
