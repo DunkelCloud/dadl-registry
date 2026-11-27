@@ -1,11 +1,31 @@
 # youtube.dadl — YouTube Data API v3 for ToolMesh
-# Read video metadata, status and statistics, and update a video's visibility and
-# snippet (title, description, tags) without losing fields the caller did not touch.
+# Upload videos with their metadata, set custom thumbnails, read video metadata, status
+# and statistics, and update a video's visibility and snippet (title, description, tags)
+# without losing fields the caller did not touch.
 #
 # Domain Notes for LLM consumers:
 # - SCOPE: this file is deliberately narrow. It covers what a release workflow needs:
-#   read videos by ID, switch a video between private / unlisted / public, and edit its
-#   snippet. No upload, no search, no comments, no playlists (see coverage.missing).
+#   upload a video (private by default), set its thumbnail, read videos by ID, switch a
+#   video between private / unlisted / public, and edit its snippet. No search, no
+#   comments, no playlists, no delete (see coverage.missing).
+# - UPLOAD: upload_video sends the file and the metadata in one call through YouTube's
+#   resumable upload protocol (requires a ToolMesh with the resumable_upload feature).
+#   The file is a tm-blob:// handle from upload_file; an http(s) URL is refused. Store
+#   it with a ttl that covers the upload (upload_file keeps a file 1 hour by default,
+#   24 hours at most); a new handle of the same file starts a new upload. The
+#   video is created with the snippet and status passed in the same call, so it is never
+#   public by accident: status.privacyStatus defaults to private here (the API itself
+#   would default to public). If the call fails with error code upload_incomplete (a
+#   large file and the call's time limit, or a flaky connection), call upload_video again
+#   with exactly the same arguments: the upload continues where it stopped instead of
+#   starting a second video. After a finished upload the same call returns the same
+#   video for an hour instead of uploading again. upload_outcome_unknown means the
+#   session was lost after bytes were sent: check the channel's videos before uploading
+#   again. YouTube processes the file after the upload: status.uploadStatus is
+#   "uploaded" first, "processed" later (read with list_videos, part=status,processingDetails).
+#   A vertical or square video of up to three minutes becomes a Short.
+# - THUMBNAILS: set_thumbnail replaces the custom thumbnail of a video. For a Short call
+#   it only after processing has succeeded, or the thumbnail may not be applied.
 # - AUTH is OAuth 2.0 with a user-delegated refresh token. There is no service-account
 #   path for YouTube channels and an API key can only read public data. The token is
 #   bound to ONE channel: the channel (personal or brand account) picked on the Google
@@ -45,9 +65,11 @@
 #   replacement, nothing changes. This makes the call safe to repeat.
 # - QUOTA: every request costs units from a per-project daily budget (default 10,000,
 #   reset at midnight Pacific Time). videos.list = 1 unit per call (regardless of the
-#   number of IDs or parts), channels.list = 1 unit, videos.update = 50 units. One
-#   update_video call that changes something costs 51 units (1 read + 1 write), an
-#   unchanged one 1 unit. Exceeding the budget returns 403 with reason quotaExceeded.
+#   number of IDs or parts), channels.list = 1 unit, videos.update = 50 units,
+#   thumbnails.set about 50 units. One update_video call that changes something costs
+#   51 units (1 read + 1 write), an unchanged one 1 unit. videos.insert (upload_video)
+#   has a budget of its own: 100 uploads per day by default, 1 unit each, not counted
+#   against the 10,000. Exceeding a budget returns 403 with reason quotaExceeded.
 # - IDs: a video ID is the 11-character value from the watch URL
 #   (https://www.youtube.com/watch?v=VIDEO_ID). list_videos accepts up to 50 IDs,
 #   comma-separated. Unknown IDs and private videos of other channels are silently
@@ -65,33 +87,46 @@
 #   it stays unused for six months, or more than 100 tokens exist for the same client
 #   and account. A revoked token shows up as "invalid_grant" on the next call.
 spec: "https://dadl.ai/spec/dadl-spec-v0.2.md"
+# upload_video needs a runtime that speaks the resumable upload protocol. A runtime
+# without it would ignore the upload block and send the file as a plain request, so
+# it has to refuse the file instead.
+requires:
+  features: [resumable_upload]
 credits:
   - "Dunkel Cloud GmbH -- maintainer"
 source_name: "YouTube Data API v3"
 source_url: https://developers.google.com/youtube/v3/docs
-date: "2026-10-19"
+date: "2026-11-26"
 
 backend:
   name: youtube
   type: rest
-  version: "1.0"
+  version: "1.1"
   base_url: https://www.googleapis.com
   description: >
-    YouTube Data API v3 — read videos (metadata, visibility, statistics) by ID and
-    update a video's visibility, title, description and tags with a read-merge-write
-    that keeps every field the caller did not change.
+    YouTube Data API v3 — upload videos with their metadata (private by default) and set
+    custom thumbnails, read videos (metadata, visibility, statistics) by ID, and update
+    a video's visibility, title, description and tags with a read-merge-write that keeps
+    every field the caller did not change.
 
   coverage:
-    endpoints: 3
+    endpoints: 5
     total_endpoints: 52
-    percentage: 6
+    percentage: 10
     focus: "Video release workflow: videos, visibility, description, channel."
     missing: >
-      Everything outside reading and updating existing videos: video upload, delete and
-      rating, thumbnails, captions, playlists and playlist items, search, comments and
-      comment threads, subscriptions, channel sections and branding, members, activities,
-      i18n and category lookups, live streaming (separate API).
-    last_reviewed: "2026-10-19"
+      Everything outside uploading, reading and updating videos: video delete and
+      rating, captions, playlists and playlist items, search, comments and comment
+      threads, subscriptions, channel sections and branding, members, activities, i18n
+      and category lookups, live streaming (separate API).
+    last_reviewed: "2026-11-26"
+
+  # list_channels is the cheapest call that needs a valid token for a channel: 1 unit,
+  # 96 units a day at the default check interval of 15 minutes. A refresh token of an
+  # app in production does not expire, so there is no expiry to read.
+  health:
+    tool: list_channels
+    expect_path: "$.items[0].id"
 
   setup:
     credential_steps:
@@ -120,11 +155,15 @@ backend:
       YouTube has no service-account access to channels; the refresh_token flow with a
       one-time interactive consent is the only headless option. ToolMesh exchanges the
       refresh token for short-lived access tokens on demand, no external refresh job is
-      needed. The scope youtube.force-ssl allows reading and editing the channel's
-      videos; youtube.readonly is enough if only list_videos and list_channels are used.
-      The consent binds the token to one channel, so one backend instance manages one
-      channel. Quota is counted per Google Cloud project: 1 unit per read, 50 units per
-      video update, 10,000 units per day by default.
+      needed. The scope youtube.force-ssl allows reading, editing and uploading the
+      channel's videos and setting thumbnails; youtube.readonly is enough if only
+      list_videos and list_channels are used. The consent binds the token to one
+      channel, so one backend instance manages one channel. Quota is counted per Google
+      Cloud project: 1 unit per read, 50 units per video update or thumbnail, 10,000
+      units per day by default; uploads have a budget of their own (100 per day). The
+      video file reaches ToolMesh through upload_file (or POST /files/upload) as a
+      tm-blob:// handle; files larger than 100 MiB need a higher
+      TOOLMESH_FILE_BROKER_MAX_FILE_BYTES on the ToolMesh instance.
 
   auth:
     type: oauth2
@@ -221,6 +260,119 @@ backend:
           description: "Complete status: privacyStatus, embeddable, license, publicStatsViewable, publishAt, selfDeclaredMadeForKids, containsSyntheticMedia."
       response:
         result_path: "$"
+      pagination: none
+
+    upload_video:
+      method: POST
+      path: /upload/youtube/v3/videos
+      access: write
+      upload:
+        protocol: google_resumable
+      nest_body_keys: true
+      description: >
+        Upload a video file to the authorized channel together with its title,
+        description and settings (videos.insert). The video is created PRIVATE unless
+        status.privacyStatus says otherwise; for a scheduled release keep it private and
+        set status.publishAt. Set snippet.defaultLanguage and snippet.defaultAudioLanguage
+        (the "video language" in YouTube Studio), otherwise YouTube may guess the spoken
+        language. The file is a tm-blob:// handle from upload_file. ToolMesh sends it in
+        chunks and resumes after interruptions. If the call fails with error code
+        upload_incomplete, call again with exactly the same arguments: the upload
+        continues instead of starting a second video. After a finished upload the same
+        call returns the same video again for an hour. upload_outcome_unknown: check the
+        channel's videos before uploading again. Returns the new video resource: id, snippet
+        and status (uploadStatus "uploaded" while YouTube still processes the file). A
+        vertical or square video of up to three minutes becomes a Short. Costs 1 unit of
+        the separate upload budget (100 uploads per day by default).
+      params:
+        part:
+          type: string
+          in: query
+          default: "snippet,status"
+          description: "Parts the metadata contains and the response returns. Keep the default."
+        snippet.title:
+          type: string
+          in: body
+          required: true
+          description: "Title, max 100 characters, no angle brackets."
+        snippet.description:
+          type: string
+          in: body
+          description: "Description, max 5000 bytes, no angle brackets."
+        snippet.tags:
+          type: array
+          in: body
+          description: "List of tags."
+        snippet.categoryId:
+          type: string
+          in: body
+          description: "Video category ID, for example 28 = Science & Technology, 22 = People & Blogs."
+        snippet.defaultLanguage:
+          type: string
+          in: body
+          description: "Language of title and description (BCP-47, for example de)."
+        snippet.defaultAudioLanguage:
+          type: string
+          in: body
+          description: "Language spoken in the video (BCP-47, for example de)."
+        status.privacyStatus:
+          type: string
+          in: body
+          default: "private"
+          description: "private (default), unlisted or public. public publishes the video as soon as it is processed."
+        status.publishAt:
+          type: string
+          in: body
+          description: "Scheduled publication time (ISO 8601, for example 2026-12-07T06:00:00+01:00). Requires privacyStatus private."
+        status.selfDeclaredMadeForKids:
+          type: boolean
+          in: body
+          default: false
+          description: "Creator's declaration that the video is made for kids. Default false (not made for kids)."
+        status.containsSyntheticMedia:
+          type: boolean
+          in: body
+          description: "Disclosure that the video contains realistic altered or synthetic content."
+        file:
+          type: file_url
+          in: body
+          required: true
+          description: "The video file: a tm-blob:// handle from upload_file (MP4, MOV, WebM, ...). http(s) URLs are not accepted."
+      response:
+        result_path: "$"
+      pagination: none
+
+    # ──────────────────────────────────────────────────────────────
+    # Thumbnails
+    # ──────────────────────────────────────────────────────────────
+
+    set_thumbnail:
+      method: POST
+      path: /upload/youtube/v3/thumbnails/set?uploadType=media
+      access: write
+      description: >
+        Upload a custom thumbnail image and set it for a video of the authorized channel,
+        Shorts included (thumbnails.set). The image is a JPEG or PNG; 1280x720 (16:9) for
+        regular videos. For a Short, call this only after the video has finished
+        processing (list_videos with part=processingDetails shows processingStatus
+        succeeded); set earlier, the thumbnail may not be applied. Replaces the current
+        custom thumbnail. Returns the thumbnail URLs per size (default, medium, high, ...).
+        The channel must be allowed to use custom thumbnails (a verified channel);
+        otherwise 403 forbidden. Costs about 50 quota units.
+      params:
+        videoId:
+          type: string
+          in: query
+          required: true
+          description: "ID of the video (11 characters). Must belong to the authorized channel."
+        image:
+          type: file_url
+          in: body
+          required: true
+          description: "The image: a tm-blob:// handle from upload_file or an http(s) URL of a JPEG or PNG."
+      max_body_size: "50MB"
+      response:
+        result_path: "$.items[0]"
       pagination: none
 
     # ──────────────────────────────────────────────────────────────
@@ -398,8 +550,27 @@ backend:
       publishes: "privacy_status public takes effect immediately and is visible to everyone"
       quota: "1 unit when nothing changes, 51 units when something is written"
       line_swap: "replace_line_prefix must match exactly one description line"
+    upload_video:
+      private_default: "the video is created private unless status.privacyStatus is set"
+      resume: "on error code upload_incomplete call again with exactly the same arguments; the upload continues"
+      file_source: "pass a tm-blob:// handle from upload_file; http(s) URLs are refused"
+    set_thumbnail:
+      shorts: "for a Short, wait until processingDetails.processingStatus is succeeded"
 
   examples:
+    - name: "Upload a Short privately, scheduled for a release time"
+      description: "Store the file with upload_file first, then upload it with title, description, languages and a publish time"
+      code: |
+        const video = await api.upload_video({
+          file: "tm-blob://FILE_ID",
+          "snippet.title": "A short title",
+          "snippet.description": "What the video shows.\n\nMore: https://www.example.com/",
+          "snippet.categoryId": "28",
+          "snippet.defaultLanguage": "de",
+          "snippet.defaultAudioLanguage": "de",
+          "status.publishAt": "2026-12-07T06:00:00+01:00",
+        });
+        return { id: video.id, privacy: video.status.privacyStatus, publishAt: video.status.publishAt };
     - name: "Publish an unlisted video and swap its link line"
       description: "Make a video public and replace the description line that starts with a placeholder link"
       code: |
